@@ -46,3 +46,27 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # docker push 到不存在的仓库时会自动创建，可见性继承 namespace 默认值；
+      # 这里显式设为 Public，避免外部 docker pull 得到 401。
+      - name: Ensure DockerHub repository is public
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            JWT=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+              -d "{\"username\":\"${DH_USER}\",\"password\":\"${DH_TOKEN}\"}" \
+              https://hub.docker.com/v2/users/login/ | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+            [ -n "$JWT" ] && break
+            sleep 5
+          done
+          [ -n "$JWT" ] || { echo "DockerHub login failed"; exit 1; }
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+            -H "Authorization: JWT ${JWT}" -H 'Content-Type: application/json' \
+            -d '{"is_private":false}' \
+            "https://hub.docker.com/v2/repositories/${DH_USER}/${IMAGE_NAME}/")
+          echo "set public HTTP ${CODE}"
+          [ "$CODE" = "200" ] || { echo "failed to make repository public"; exit 1; }
