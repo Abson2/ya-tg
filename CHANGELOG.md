@@ -16,7 +16,7 @@
 - 光鸭授权页：Device Code 与 Web OAuth PKCE 双方案步骤引导，授权码一键复制
 - 消息模板：变量一键插入、条件块、默认模板标记
 - GitHub Actions 自动构建镜像并创建 GitHub Release，DockerHub 仓库自动设为 Public
-- `docker-compose.hub.yml` 支持直接从 DockerHub 拉取部署
+- `docker-compose.yml` 直接拉取 DockerHub 镜像部署，普通用户无需源码或构建（另提供 `docker-compose.build.yml` 供源码构建）
 - 一键发布脚本 `scripts/release.sh` 与更新脚本 `scripts/update.sh`
 
 ### 变更
