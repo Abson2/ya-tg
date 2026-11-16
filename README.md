@@ -1,104 +1,343 @@
-# Ya-TG 0.3.0
+# Ya-TG
 
-光鸭网盘资源分发工作台。链路：光鸭授权 → 定时扫描 → fileId 去重 → TMDB 识别 → 自动建分享 → 规则分发 → Telegram 多 Bot/多频道推送。独立 Docker 部署，不依赖 TgtoDrive，不监控 TG 来源频道。
+一个跑在 Docker 里的「光鸭网盘资源分发机器人」。它会定时扫描你的光鸭网盘文件，用 TMDB 识别出电影/电视剧信息，自动生成分享链接，再按你设定的规则推送到 Telegram 频道。
 
-> 0.2.0 及以前的项目名为 GuangYa TG Publisher。0.3.0 起品牌统一为 **Ya-TG**，Docker 镜像、容器名与管理界面均已改名；`guangya_*` 代码模块与 `GUANGYA_*` 环境变量保留，因为它们是光鸭开放平台的官方命名，改动反而增加迁移成本。
+简单说：**把网盘里的片子，自动整理成带海报简介的 Telegram 帖子发出去。**
 
-## 管理界面（0.3.0 重做）
+- 项目地址：https://github.com/Abson2/ya-tg
+- 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
+- 当前版本：v0.3.0
+- 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
-- 深色侧栏 + 浅色工作区，靛蓝/青绿主色，卡片式布局与响应式收窄
-- 概览：渐变 Hero、六项统计卡、系统健康清单、队列分布条、最近操作时间线
-- 光鸭授权：Device / PKCE 双方案步骤卡、授权码大字展示与一键复制、会话状态面板
-- 资源库：海报网格 / 表格双视图，搜索与分享状态筛选，分享角标、TMDB 标记、更新次数
-- 分发中心：Bot → 频道 → 规则三步卡片，状态色标签，审核与队列独立页面
-- 消息模板：变量一键插入、默认标记、文本预览
-- 操作审计：全量时间线
-- 所有交互均调用既有 `/api/*`，未改动后端接口契约
+---
 
-## 功能实现
+## 一、它能做什么
 
-| 模块 | 实现 |
+| 步骤 | 说明 |
 | --- | --- |
-| 光鸭授权 | Device Code（后端 sign_secret 签名）、Web OAuth 2.0 + PKCE、refresh_token 自动刷新、定时刷新、117 无效 Token 刷新重试一次 |
-| 凭证安全 | Access/Refresh Token 与 Bot Token 使用 Fernet 加密落库；管理端只显示掩码；sign_secret 仅后端环境变量 |
-| 分享闭环 | 队列 worker 推送前自动建分享并保存 share_url；幂等；分享/取消/修改全链路审计 |
-| TMDB | 文件名解析（分辨率/年份/SxxEexx）、电影/电视剧决策、详情补全、自动与手动识别 |
-| 消息 | 可配置模板（`{{变量}}` + `{{#if 变量}}` 条件块）、有海报用 sendPhoto，无海报回退 sendMessage |
-| 队列 | 指数退避 + `next_retry_at`、Telegram 429 Retry-After、最大尝试次数、手动重试；resource+channel 唯一约束防重复推送 |
-| 扫描 | 断点游标（已访问目录/待扫栈/页码持久化）、失败续扫、utime/size 变化计入 revision 并记审计 |
+| 光鸭授权 | 用官方 Device Code 或网页 PKCE 登录你的光鸭账号， token 加密保存，自动刷新 |
+| 定时扫描 | 按 Cron（默认每 30 分钟）递归扫描指定目录，用 fileId 去重，只处理新文件 |
+| TMDB 识别 | 从文件名解析片名/年份/集数，搜索 TMDB 补全海报、简介，区分电影和电视剧 |
+| 自动建分享 | 推送前自动创建光鸭分享链接（永久/1天/7天/30天可选），保存链接 |
+| 规则分发 | 按「目录 ID」或「文件名关键词」把资源路由到不同 Telegram 频道 |
+| 多 Bot 推送 | 支持多个 Bot、多个频道；有海报发图片+简介，没海报发纯文本 |
+| 审核模式 | 规则可选「自动发布」或「人工审核」，审核通过后才推送 |
+| 失败重试 | 推送失败按指数退避自动重试，避免被 Telegram 限流 |
+| 管理界面 | 中文 Web 后台，统计、资源库、授权、模板、审计一应俱全 |
 
-## 重要边界
+---
 
-1. **官方 OpenAPI 不提供创建分享接口。** `share_file` / `update_share` / `delete_share` 来自网页端抓包，不在公开清单内。本项目把两套认证彻底分开：扫描走官方 OpenAPI（`x-client-id` + Bearer），建分享走网页会话凭证。网页升级或认证策略变化可能导致失效。
-2. **Device Code 有出口 IP 白名单。** 申请设备码由后端用 `sign_secret` 签名，平台按出口 IP 校验；未报备返回 `code=111`。轮询 Token、刷新、业务接口不校验该名单。
-3. **`APP_SECRET` 是加密主密钥。** 更换后已加密的 Token 与 Bot Token 无法解密，需重新授权 / 重新录入 Bot。请一次设置、长期保留并备份。
-4. 未做真实账号端到端验收。请先按下方清单用小样本验证，再全盘扫描。
+## 二、开始前要准备什么
 
-## 部署方式
+请先把下面 4 项准备好，缺一样都会卡住：
 
-### A. 从 DockerHub 拉取（推荐）
+1. **一台装了 Docker 的机器**
+   - 飞牛 NAS、群晖、普通 Linux 服务器都可以。
+   - 需要能执行 `docker` 和 `docker compose` 命令（新版本 Docker 用 `docker compose`，旧版用 `docker-compose`）。
+   - 验证：执行 `docker --version`，能显示版本号即可。
 
-在 NAS 上准备目录 `/vol1/1000/docker/ya-tg/`，放入 `docker-compose.hub.yml`、`.env`、`data/`、`logs/`：
+2. **一个光鸭网盘账号，并且拿到开放平台应用凭证**
+   - 到光鸭开放平台申请接入，拿到 `client_id`。
+   - 想用 Device 授权：还要 `project_id` 和 `sign_secret`，并报备机器出口 IP。
+   - 想用网页 PKCE 授权：只要 `client_id`，并在平台登记一个回调网址。
+   - 官方文档：https://app.guangyapan.com/pan/docs/open-api
+
+3. **分享接口会话凭证（用于自动建分享）**
+   - 光鸭官方 OpenAPI **没有**创建分享的接口。程序里的建分享走的是网页端接口，需要你从浏览器抓包拿到 4 个值：`share_authorization`、`did`、`dt`、`smid`。
+   - 这些值会过期，过期后需重新抓包更新。
+
+4. **Telegram Bot 和 TMDB（可选但推荐）**
+   - 在 Telegram 找 @BotFather 创建 Bot，拿到 token；把 Bot 拉进目标频道并给它发消息权限。
+   - TMDB API：到 https://www.themoviedb.org/settings/api 申请，用于识别海报和简介。不填也能推送，但没有海报和简介。
+
+> 只想先跑起来看看界面？第 3、4 项可以先留空，部署成功后在管理后台慢慢补。
+
+---
+
+## 三、部署（普通用户看这一节就够了）
+
+### 第 1 步：建目录
+
+在 NAS 或服务器上新建一个文件夹，例如飞牛 NAS 的 `/vol1/1000/docker/ya-tg`：
 
 ```bash
-cp .env.example .env && chmod 600 .env
-# 编辑 .env：ADMIN_PASSWORD、APP_SECRET、DOCKERHUB_USERNAME 及各凭证
-docker compose -f docker-compose.hub.yml pull
-docker compose -f docker-compose.hub.yml up -d
+mkdir -p /vol1/1000/docker/ya-tg/ya-tg-data
+mkdir -p /vol1/1000/docker/ya-tg/ya-tg-logs
+cd /vol1/1000/docker/ya-tg
 ```
 
-访问 `http://NAS地址:8787`。
+### 第 2 步：下载两个文件
 
-### B. 本地源码构建
+在这个目录里放两个文件：`docker-compose.yml` 和 `.env`。
+
+**docker-compose.yml** —— 直接复制下面整段（无需修改）：
+
+```yaml
+services:
+  ya-tg:
+    image: abson2/ya-tg:${IMAGE_TAG:-latest}
+    container_name: ya-tg
+    restart: unless-stopped
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8787}:8787"
+    env_file: [.env]
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_URL: sqlite:////app/data/ya-tg.db
+    volumes:
+      - ./ya-tg-data:/app/data
+      - ./ya-tg-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+```
+
+**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.3.0`，详见第六节。
+
+**.env** —— 把下面内容复制进去，至少改掉 `ADMIN_PASSWORD` 和 `APP_SECRET`：
+
+```env
+# 必填：管理后台密码，改成你自己的强密码
+ADMIN_PASSWORD=请改成强密码
+
+# 必填：32 位以上随机字符串，用来加密 token。生成方法见下方
+APP_SECRET=请改成32位以上随机字符串
+
+# 网页访问端口，默认 8787
+WEB_PORT=8787
+
+# 光鸭官方 OpenAPI 凭证
+GUANGYA_CLIENT_ID=
+GUANGYA_PROJECT_ID=
+GUANGYA_SIGN_SECRET=
+
+# 网页分享会话凭证（自动建分享用）
+GUANGYA_SHARE_AUTHORIZATION=
+GUANGYA_SHARE_DID=
+GUANGYA_SHARE_DT=4
+GUANGYA_SHARE_SMID=
+
+# TMDB（识别海报和简介）
+TMDB_BEARER_TOKEN=
+TMDB_LANGUAGE=zh-CN
+
+# 扫描计划：每 30 分钟扫一次，扫描根目录 ID 留空表示全盘
+SCAN_CRON=*/30 * * * *
+SCAN_ROOT_ID=
+
+# 分享期限：0=永久，86400=1天，604800=7天，2592000=30天
+AUTO_CREATE_SHARE=true
+SHARE_DURATION=0
+```
+
+生成 `APP_SECRET` 的方法（复制命令执行，把结果粘到 .env）：
 
 ```bash
-cp .env.example .env && chmod 600 .env
-docker compose up -d --build
+openssl rand -hex 32
 ```
 
-### 配置要点
+> `.env` 里有密码和 token，执行 `chmod 600 .env` 保护它，并且**永远不要**把它发到网上或提交到 Git。
 
-- 至少设置 `ADMIN_PASSWORD`、`APP_SECRET`（32 位以上随机串）。
-- 光鸭授权二选一：Device（`GUANGYA_CLIENT_ID` / `GUANGYA_PROJECT_ID` / `GUANGYA_SIGN_SECRET` + 出口 IP 报备）或 Web PKCE（`GUANGYA_CLIENT_ID` / `GUANGYA_OAUTH_REDIRECT_URI`）。旧 Token 可留在 `GUANGYA_ACCESS_TOKEN` / `GUANGYA_REFRESH_TOKEN` 启动时一次性导入。
-- 分享功能另需 `GUANGYA_SHARE_AUTHORIZATION` / `GUANGYA_SHARE_DID` / `GUANGYA_SHARE_DT` / `GUANGYA_SHARE_SMID`（在 NAS 本机填写，不要提交 Git）。
-- TMDB 二选一：`TMDB_BEARER_TOKEN`（v4，优先）或 `TMDB_API_KEY`（v3）。
+### 第 3 步：启动
 
-## 验收清单（小样本）
+```bash
+docker compose up -d
+```
 
-1. `/api/health` 返回 `version=0.3.0`、`app=Ya-TG`。
-2. 管理后台「光鸭授权」完成授权 → 「验证连接」返回用户 ID 与 VIP 状态。
-3. 扫描根目录设为测试目录 → 立即扫描 → 资源库出现文件且 fileId 不重复。
-4. 资源库创建永久分享 → `share_status=active` 且保存 share_url。
-5. 添加测试 Bot / 频道 / 自动发布规则 → 推送队列出现 `sent`，Telegram 收到消息。
-6. 新建不勾选自动发布的规则 → 队列项 `review` → 审核中心通过 → 自动建分享并推送。
-7. 扫描中途停容器 → 重启后扫描提示 `resumed=true`。
-8. 通过后再做全盘扫描与多 Bot 分发。
+第一次会自动从 DockerHub 拉取镜像，等几十秒。查看状态：
 
-## GitHub + DockerHub 发布与后续更新
+```bash
+docker compose ps
+```
 
-本仓库带 GitHub Actions：push 到 `main` 或打 `v*` tag 时，云端自动 `docker build` 并推送镜像到 DockerHub。
+看到 `ya-tg` 状态是 `Up (healthy)` 就成功了。如果一直是 `health: starting`，看日志：
 
-首次发布步骤：
+```bash
+docker compose logs -f ya-tg
+```
 
-1. 在 GitHub 创建空仓库（建议名 `ya-tg`），在 DockerHub 创建仓库 `ya-tg`。
-2. 本机或 NAS 上执行 `bash scripts/release.sh`，按提示输入仓库 HTTPS 地址。脚本会初始化 git、提交并推送 `main` 与 `v0.3.0` tag。
-   - 若本机未配置 git 身份，先执行 `git config --global user.name "你的名字"` 与 `git config --global user.email "你的邮箱"`。
-   - 私有仓库需使用 Personal Access Token 作为 HTTPS 密码。
-3. 在 GitHub 仓库 **Settings → Secrets and variables → Actions** 添加：
-   - `DOCKERHUB_USERNAME`：DockerHub 用户名
-   - `DOCKERHUB_TOKEN`：DockerHub Access Token（非登录密码）
-4. 推送后进入 Actions 页确认 `Build & Push Docker image` 成功；DockerHub 仓库出现 `latest` 与 `v0.3.0` 标签。
-5. 日常更新：修改代码 → `git commit` → `git push origin main` → Actions 自动出新 `latest` 镜像；重要版本打 tag 生成不可变版本镜像。
+### 第 4 步：打开管理界面
 
-安全提醒：`.env` 与 `data/` 已被 `.gitignore` 排除，切勿把真实凭证提交到仓库。
+浏览器访问：
 
-## 关键接口与文档
+```
+http://你的机器IP:8787
+```
 
-官方 OpenAPI v1.3（2026-09-20）：`https://app.guangyapan.com/pan/docs/open-api`
-- 设备码：`POST https://openapi.guangyapan.com/v1/auth/device/code`（后端签名）
-- Token：`POST https://openapi-account.guangyapan.com/v1/auth/token`
-- 授权页：`https://www.guangyapan.com/oauth/`
-- 文件列表：`GET /openapi/v1/file/get_file_list`（5 次/秒/IP）
-- 用户信息：`GET /openapi/v1/user/get_user_info`
+输入 `.env` 里的 `ADMIN_PASSWORD`，进入控制台。
 
-错误码：`111` 出口 IP 未报备、`116` 签名/时间戳错误、`117` Token 无效（自动刷新重试）、`123` 应用未开通写能力、`430` 用户非会员。
+> 如果访问不了：检查防火墙是否放行 8787 端口；飞牛 NAS 需要在「控制面板 → 防火墙」里添加规则。
+
+---
+
+## 四、首次使用向导（进入后台后做什么）
+
+按这个顺序点，一般不会错：
+
+1. **光鸭授权**
+   - 进入「光鸭授权」页。
+   - 推荐点「Device Code 授权」→ 复制授权码 → 打开授权链接 → 在光鸭 App 里确认。系统会自动轮询完成。
+   - 或者点「Web PKCE 授权」→ 在打开的页面登录确认。
+   - 完成后点右上角「验证连接」，能看到用户 ID 就说明授权成功。
+
+2. **配置分享会话**
+   - 同一页下方「网页分享会话」应显示「已配置」。如果显示未配置，回到 `.env` 补上 4 个分享凭证，然后 `docker compose restart`。
+
+3. **设置扫描范围**
+   - 进入「扫描设置」页。建议第一次先填一个**测试目录 ID**，不要直接全盘。
+   - 点「立即扫描」，看资源库里有没有文件出现。
+
+4. **添加 Telegram Bot 和频道**
+   - 进入「分发规则」页，按 01 → 02 → 03 的顺序：
+     - 添加 Bot（填 @BotFather 给的 token）
+     - 添加频道（填频道 ID，形如 `-1001234567890`）
+     - 添加规则（选频道，决定「自动发布」还是「人工审核」）
+
+5. **测试推送**
+   - 在资源库点某个资源的「分享」，期限选 0（永久）。
+   - 如果规则是自动发布，稍等片刻队列里会出现 `sent`，Telegram 频道收到消息。
+   - 如果是人工审核，去「审核中心」点「通过」。
+
+6. **正式使用**
+   - 测试都通过后，把扫描根目录 ID 清空（全盘）或设为正式目录，保存计划，让定时任务自动跑。
+
+---
+
+## 五、常用配置项说明
+
+| 配置项 | 作用 | 建议 |
+| --- | --- | --- |
+| `ADMIN_PASSWORD` | 管理后台登录密码 | 必须修改，用强密码 |
+| `APP_SECRET` | 加密 token 的主密钥 | 必须修改；**改了之后要重新授权和重新添加 Bot** |
+| `GUANGYA_CLIENT_ID` | 光鸭开放平台应用 ID | 必填 |
+| `GUANGYA_PROJECT_ID` / `GUANGYA_SIGN_SECRET` | Device 授权用 | 用 Device 授权时必填 |
+| `GUANGYA_OAUTH_REDIRECT_URI` | PKCE 回调地址 | 用网页授权时必填，需和平台登记一致 |
+| `GUANGYA_SHARE_AUTHORIZATION` 等 4 项 | 自动建分享的网页会话 | 要用自动分享就必填，过期需更新 |
+| `TMDB_BEARER_TOKEN` | TMDB v4 令牌 | 推荐填，用于海报和简介 |
+| `SCAN_CRON` | 扫描频率 | 默认每 30 分钟；5 段 Cron，北京时间 |
+| `SCAN_ROOT_ID` | 从哪个目录开始扫 | 留空=全盘；测试时填小目录 |
+| `SHARE_DURATION` | 分享有效期 | 0=永久，最省心 |
+| `AUTO_CREATE_SHARE` | 是否自动建分享 | 默认 true |
+| `IMAGE_TAG` | 镜像版本 | 留空=latest；指定版本见下节 |
+| `WEB_PORT` | 网页端口 | 默认 8787，被占用可改 |
+
+---
+
+## 六、指定版本与回滚（历史版本）
+
+每个正式版本都有独立的镜像标签和 GitHub Release，**不会被覆盖**。
+
+- 查看所有版本：https://github.com/Abson2/ya-tg/releases
+- 查看所有镜像标签：https://hub.docker.com/r/abson2/ya-tg/tags
+
+### 部署指定版本
+
+在 `.env` 里加一行（例如锁定 v0.3.0）：
+
+```env
+IMAGE_TAG=v0.3.0
+```
+
+然后：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+也可以用一键脚本切换：
+
+```bash
+bash scripts/update.sh v0.3.0
+```
+
+### 回滚到上一版
+
+把 `IMAGE_TAG` 改成旧版本号，再执行 `docker compose pull && docker compose up -d`。数据库文件在 `./ya-tg-data` 里，不会被删除，回滚后数据还在。
+
+> 如果旧版本的数据结构不兼容，请先备份 `ya-tg-data` 目录再回滚。
+
+---
+
+## 七、日常更新
+
+```bash
+cd /vol1/1000/docker/ya-tg
+docker compose pull          # 拉取最新镜像
+docker compose up -d         # 用新镜像重建容器
+docker compose logs -f ya-tg # 观察日志
+```
+
+或者一条命令：
+
+```bash
+bash scripts/update.sh
+```
+
+---
+
+## 八、常见问题
+
+**Q：容器起不来，日志报光鸭接口 111？**
+A：Device 授权申请设备码时校验出口 IP。到你光鸭开放平台后台把机器公网出口 IP 加入白名单。查看出口 IP：`curl ifconfig.me`。
+
+**Q：授权成功了，但扫描报 117？**
+A：Token 失效，程序会自动刷新重试。如果反复失败，去授权页重新授权一次。
+
+**Q：推送一直失败，队列里显示错误？**
+A：常见原因：Bot token 错、Bot 没在频道里、频道 ID 写错（要带负号）、建分享的网页会话过期。看队列页的 `error` 字段定位。
+
+**Q：分享创建失败？**
+A：网页会话凭证（`GUANGYA_SHARE_AUTHORIZATION` 等）会过期。重新抓包后更新 `.env`，`docker compose restart`。这是网页端接口，不是官方 OpenAPI，属于已知限制。
+
+**Q：TMDB 识别不准？**
+A：在资源库点「手动识别」，输入正确的 TMDB ID。文件名越规范（含年份、SxxEexx），自动识别越准。
+
+**Q：改了 .env 没生效？**
+A：需要重建容器：`docker compose up -d --force-recreate`。
+
+**Q：数据会丢吗？**
+A：数据库和配置都在 `./ya-tg-data`，只要不删这个目录，升级/回滚数据都在。建议定期备份。
+
+---
+
+## 九、安全提醒
+
+- `.env` 含密码和 token，权限设为 `chmod 600`，不要提交 Git、不要发聊天。
+- 首次部署建议只在局域网访问；外网访问请叠加 VPN 或 Cloudflare Access。
+- 不要用已经泄露过的会话凭证，撤销旧会话后重新登录。
+- 定期备份 `ya-tg-data` 目录。
+
+---
+
+## 十、开发者：从源码构建
+
+普通用户不需要这一节。如果你想改代码：
+
+```bash
+git clone https://github.com/Abson2/ya-tg.git
+cd ya-tg
+cp .env.example .env && chmod 600 .env
+docker compose -f docker-compose.build.yml up -d --build
+```
+
+本地跑测试：
+
+```bash
+pip install -r backend/requirements.txt pytest
+pytest tests -q
+```
+
+---
+
+## 附：技术说明
+
+- 官方 OpenAPI v1.3 文档：https://app.guangyapan.com/pan/docs/open-api
+- 文件列表接口限频 5 次/秒，程序已内置限速和指数退避。
+- 错误码：`111` IP 未报备、`116` 签名错误、`117` Token 无效、`123` 应用未开通写能力、`430` 非会员。
+- 品牌说明：v0.2.0 及以前叫 GuangYa TG Publisher，v0.3.0 起改为 Ya-TG。`guangya_*` 模块名和 `GUANGYA_*` 环境变量保留（光鸭官方命名）。
+
+版本历史详见 [CHANGELOG.md](CHANGELOG.md)。

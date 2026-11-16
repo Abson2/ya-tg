@@ -1,7 +1,8 @@
+# Ya-TG 部署文件：直接拉取 DockerHub 官方镜像，无需源码、无需构建。
+# 使用方法：把本文件与 .env 放在同一目录，执行 docker compose up -d
 services:
   ya-tg:
-    build: .
-    image: ya-tg:latest
+    image: abson2/ya-tg:${IMAGE_TAG:-latest}
     container_name: ya-tg
     restart: unless-stopped
     ports:

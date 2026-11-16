@@ -1,4 +1,4 @@
-name: Build & Push Docker image
+name: Build, Push & Release
 
 on:
   push:
@@ -6,14 +6,15 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
   IMAGE_NAME: ya-tg
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +34,8 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            # latest 只在 main 分支更新；tag 构建不覆盖它，保证历史版本可稳定拉取
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag
             type=sha,prefix=sha-
 
@@ -46,9 +48,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # docker push 到不存在的仓库时会自动创建，可见性继承 namespace 默认值；
-      # 这里显式设为 Public，避免外部 docker pull 得到 401。
       - name: Ensure DockerHub repository is public
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -70,3 +69,26 @@ jobs:
             "https://hub.docker.com/v2/repositories/${DH_USER}/${IMAGE_NAME}/")
           echo "set public HTTP ${CODE}"
           [ "$CODE" = "200" ] || { echo "failed to make repository public"; exit 1; }
+
+  release:
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/changelog_for_release.py "$TAG" > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Ya-TG ${{ github.ref_name }}
+          body_path: release_notes.md
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

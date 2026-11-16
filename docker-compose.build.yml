@@ -1,6 +1,9 @@
+# 仅在需要自己改源码构建时使用：docker compose -f docker-compose.build.yml up -d --build
+# 普通用户请直接使用 docker-compose.yml（拉取官方镜像，无需构建）。
 services:
   ya-tg:
-    image: ${DOCKERHUB_USERNAME}/ya-tg:latest
+    build: .
+    image: ya-tg:local
     container_name: ya-tg
     restart: unless-stopped
     ports:
