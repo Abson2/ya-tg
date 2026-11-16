@@ -1,0 +1,175 @@
+import asyncio
+from urllib.parse import urlencode
+
+import httpx
+from sqlalchemy.orm import Session
+
+from . import guangya_auth
+from .config import settings
+from .utils import RateLimiter, retry_after_seconds, traceparent
+
+_limiter = RateLimiter()
+
+# 每个业务接口的每秒限额（OpenAPI v1.3 §10）
+_RATE = {
+    "/openapi/v1/file/get_file_list": 5,
+    "/openapi/v1/file/get_file_detail": 2,
+    "/openapi/v1/file/get_res_download_url": 2,
+    "/openapi/v1/file/get_vod_download_url": 2,
+    "/openapi/v1/user/get_user_info": 2,
+    "/openapi/v1/file/create_dir": 2,
+    "/openapi/v1/file/rename": 2,
+    "/openapi/v1/file/move_file": 2,
+    "/openapi/v1/file/get_task_status": 5,
+}
+
+
+class GuangYaError(RuntimeError):
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class GuangYaOpenAPI:
+    """业务接口统一入口：x-client-id + Bearer Token，117 自动刷新重试一次。"""
+
+    def __init__(self, db: Session):
+        self.db = db
+        self.base = settings.guangya_api_base.rstrip("/")
+
+    async def _call(self, method: str, path: str, *, params: dict | None = None,
+                    body: dict | None = None, allow_117_retry: bool = True) -> dict:
+        limit = _RATE.get(path, 2)
+        await _limiter.wait(path, 1.0 / limit)
+        token = await guangya_auth.get_access_token(self.db)
+        headers = {
+            "x-client-id": settings.guangya_client_id,
+            "Authorization": f"Bearer {token}",
+            "traceparent": traceparent(),
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        for attempt in range(2):
+            async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+                r = await client.request(method, f"{self.base}{path}", params=params,
+                                         json=body, headers=headers)
+            if r.status_code == 429:
+                wait = retry_after_seconds(r.headers.get("Retry-After")) or 2 ** attempt
+                await asyncio.sleep(wait)
+                continue
+            payload = self._json(r)
+            code = payload.get("code")
+            if code == 117 and allow_117_retry:
+                try:
+                    token = await guangya_auth.refresh(self.db, force=True)
+                except guangya_auth.AuthError as exc:
+                    raise GuangYaError(f"Access Token 无效且刷新失败：{exc}", 117) from exc
+                headers["Authorization"] = f"Bearer {token}"
+                continue
+            if r.status_code >= 400 or (code is not None and code != 0):
+                raise GuangYaError(f"光鸭接口 {path} 失败 code={code} msg={payload.get('msg') or r.text[:200]}", code)
+            return payload
+        raise GuangYaError(f"光鸭接口 {path} 重试后仍失败", code)
+
+    async def list_files(self, parent_id: str = "", page: int = 0, page_size: int = 100) -> dict:
+        params = {"page": page, "pageSize": page_size}
+        if parent_id:
+            params["parentId"] = parent_id
+        payload = await self._call("GET", "/openapi/v1/file/get_file_list", params=params)
+        return payload.get("data") or {}
+
+    async def get_file_detail(self, file_id: str) -> dict:
+        payload = await self._call("GET", "/openapi/v1/file/get_file_detail",
+                                   params={"fileId": file_id})
+        return payload.get("data") or {}
+
+    async def get_user_info(self) -> dict:
+        payload = await self._call("GET", "/openapi/v1/user/get_user_info")
+        return payload.get("data") or {}
+
+    @staticmethod
+    def _json(r: httpx.Response) -> dict:
+        try:
+            data = r.json()
+            return data if isinstance(data, dict) else {"raw": data}
+        except Exception:
+            return {"msg": r.text[:500], "http_status": r.status_code}
+
+
+# 兼容旧 import
+GuangYaClient = GuangYaOpenAPI
+
+
+class GuangYaShareClient:
+    """网页端抓包分享接口。公开 OpenAPI 文档不提供建分享接口，故认证体系独立。"""
+
+    def __init__(self):
+        if not settings.guangya_share_authorization:
+            raise GuangYaError("请配置 GUANGYA_SHARE_AUTHORIZATION（网页会话凭证）")
+        self.base = settings.guangya_share_base.rstrip("/")
+        self.headers = {
+            "Authorization": settings.guangya_share_authorization,
+            "did": settings.guangya_share_did,
+            "dt": settings.guangya_share_dt,
+            "Content-Type": "application/json",
+            "Origin": "https://www.guangyapan.com",
+            "Referer": "https://www.guangyapan.com/",
+        }
+        if settings.guangya_share_smid:
+            self.headers["smid"] = settings.guangya_share_smid
+
+    @staticmethod
+    def config_status() -> dict:
+        return {
+            "configured": bool(settings.guangya_share_authorization),
+            "base": settings.guangya_share_base,
+            "did_set": bool(settings.guangya_share_did),
+            "smid_set": bool(settings.guangya_share_smid),
+            "note": "网页端接口未列入公开 OpenAPI 文档；凭证需自行在 NAS 本机更新，勿写入仓库",
+        }
+
+    async def post(self, endpoint: str, payload: dict) -> dict:
+        last_error = ""
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+                r = await client.post(f"{self.base}/userres/v1/{endpoint}",
+                                      json=payload, headers=self.headers)
+            if r.status_code == 429 or r.status_code >= 500:
+                last_error = f"HTTP {r.status_code}"
+                await asyncio.sleep(2 ** attempt)
+                continue
+            data = self._json(r)
+            if data.get("msg") == "success" or data.get("code") == 0:
+                return data
+            msg = str(data.get("msg") or data.get("message") or r.text[:300])
+            # 会话过期通常伴随登录跳转/鉴权失败文案；不硬编码具体文案，交由使用者核对
+            if any(k in msg.lower() for k in ("login", "登录", "unauthor", "token", "会话")):
+                raise GuangYaError(f"网页分享会话可能已失效：{msg}。请在 NAS 本机重新抓包更新 .env", 401)
+            last_error = msg
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        raise GuangYaError(f"网页分享接口 {endpoint} 失败：{last_error}")
+
+    async def create(self, file_id, title, duration):
+        body = {"fileIds": [str(file_id)], "title": title, "validateDuration": int(duration),
+                "downloadType": 1, "enableShareCode": False, "shareCode": "",
+                "shareType": 0, "maxRestoreCount": 0, "trafficLimit": "0"}
+        return await self.post("share_file", body)
+
+    async def update(self, share_id, title, duration):
+        body = {"id": str(share_id), "title": title, "validateDuration": int(duration),
+                "shareType": 0, "downloadType": 1, "enableShareCode": False,
+                "shareCode": "", "maxRestoreCount": 0, "trafficLimit": "0",
+                "shareTemplate": "光鸭云盘用户给你分享了：{{filename}}，点击链接或复制整段内容，打开「光鸭APP」即可获取。\n链接：{{link}}"}
+        return await self.post("update_share", body)
+
+    async def delete(self, share_id):
+        return await self.post("delete_share", {"ids": [str(share_id)]})
+
+    @staticmethod
+    def _json(r: httpx.Response) -> dict:
+        try:
+            data = r.json()
+            return data if isinstance(data, dict) else {"raw": data}
+        except Exception:
+            return {"raw": r.text[:500]}

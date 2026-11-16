@@ -1,0 +1,20 @@
+services:
+  ya-tg:
+    image: ${DOCKERHUB_USERNAME}/ya-tg:latest
+    container_name: ya-tg
+    restart: unless-stopped
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8787}:8787"
+    env_file: [.env]
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_URL: sqlite:////app/data/ya-tg.db
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
