@@ -5,8 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal, json_dumps
-from .guangya import GuangYaOpenAPI
-from .models import AuditLog, QueueItem, Resource, Rule, ScanCursor, ScanTask, utcnow
+from .guangya import GuangYaOpenAPI, GuangYaWebFiles
+from .models import AuditLog, AuthToken, QueueItem, Resource, Rule, ScanCursor, ScanTask, utcnow
 
 
 def _cursor(db: Session) -> ScanCursor:
@@ -82,7 +82,13 @@ def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule]) ->
 async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = None) -> dict:
     own_db = db is None
     db = db or SessionLocal()
-    api = GuangYaOpenAPI(db)
+    # 短信登录用户走网页端文件接口（无需开放平台 client_id，真正零配置）；
+    # 仅当使用官方 Device/PKCE 授权时才走官方 OpenAPI 业务接口。
+    t = db.get(AuthToken, 1)
+    if t and t.flow in ("sms", "tgto"):
+        api = GuangYaWebFiles(db)
+    else:
+        api = GuangYaOpenAPI(db)
     try:
         c = _cursor(db)
         can_resume = resume and c.status == "running" and (not root_id or c.root_id == root_id)

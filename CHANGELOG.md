@@ -6,6 +6,28 @@
 
 ---
 
+## v0.5.3 (2026-11-17)
+
+修复扫描报 `code=120 缺少clientId`：短信登录用户改用光鸭网页端文件接口，真正实现零配置扫描。
+
+### 问题
+- 扫描走官方 OpenAPI `/openapi/v1/file/get_file_list`，官方要求 `x-client-id` 为**开放平台分配的应用 ID**（与 project_id/sign_secret 配套，错误码 120 = 应用 ID/参数错误）；普通用户短信登录拿的是网页端凭证，不含该应用 ID，导致扫描失败
+- 官方 curl 示例：`--header 'x-client-id: {client_id}' --header 'Authorization: Bearer {access_token}'`，其中 client_id 由开放平台分配，不是网页公开标识
+
+### 修复
+- 逆向光鸭网页前端确认网页端文件列表接口：`POST https://api.guangyapan.com/userres/v1/file/get_file_list`，body `{page,pageSize,parentId,...}`（根目录 `parentId="*"`），认证为 `Bearer + did + dt=4`，与短信登录/分享完全同一套，无需 client_id
+- 新增 `GuangYaWebFiles` 客户端：复用短信登录的 token + did + dt 调网页端接口；登录态失效（401/116/117/登录失效文案）直接提示重新登录
+- `scanner.run_scan()` 按登录通道分流：`flow in (sms,tgto)` 走网页端接口，官方 Device/PKCE 授权仍走官方 OpenAPI；两种接口返回字段一致，扫描解析逻辑零改动
+- 网页端接口返回字段已核实：`fileId/fileName/fileSize/ext/ctime/utime/resType(=2 为目录)/parentId/thumbnail`，与原 scanner 完全兼容
+
+### 测试
+- 新增 `tests/test_web_files.py`：验证网页端请求带 Bearer+did+dt、**不含 x-client-id**、根目录映射 `*`、非短信登录被拒；全套 18 项通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.5.3
+```
+
 ## v0.5.2 (2026-11-17)
 
 修复"短信登录后页面一刷新就显示未授权/凭证掉了"的问题，并把凭证有效期与自动刷新状态做成可见信息。功能链路不变，凭证本身一直安全存在库中。

@@ -6,7 +6,7 @@
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
-- 当前版本：v0.5.2
+- 当前版本：v0.5.3
 - 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
 ---
@@ -91,7 +91,7 @@ services:
       start_period: 20s
 ```
 
-**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.5.2`，详见第六节。
+**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.5.3`，详见第六节。
 
 **.env** —— 把下面内容复制进去，至少改掉 `ADMIN_PASSWORD` 和 `APP_SECRET`：
 
@@ -225,10 +225,10 @@ http://你的机器IP:8787
 
 ### 部署指定版本
 
-在 `.env` 里加一行（例如锁定 v0.5.2）：
+在 `.env` 里加一行（例如锁定 v0.5.3）：
 
 ```env
-IMAGE_TAG=v0.5.2
+IMAGE_TAG=v0.5.3
 ```
 
 然后：
@@ -241,7 +241,7 @@ docker compose up -d
 也可以用一键脚本切换：
 
 ```bash
-bash scripts/update.sh v0.5.2
+bash scripts/update.sh v0.5.3
 ```
 
 ### 回滚到上一版

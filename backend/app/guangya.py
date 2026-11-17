@@ -103,6 +103,80 @@ class GuangYaOpenAPI:
 GuangYaClient = GuangYaOpenAPI
 
 
+class WebFileError(RuntimeError):
+    """网页端文件接口错误。401/登录失效时 code 用于上层判定是否需重新短信登录。"""
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class GuangYaWebFiles:
+    """网页端文件列表客户端：复用短信登录凭证（Bearer + did + dt），无需开放平台 client_id。
+
+    接口来自光鸭网页前端：POST https://api.guangyapan.com/userres/v1/file/get_file_list
+    body {page,pageSize,parentId,...}；根目录 parentId 为 "*"。返回 data.list / data.total。
+    这样普通用户只需短信登录即可扫描，不必申请开放平台应用。
+    """
+
+    LIST_PATH = "/userres/v1/file/get_file_list"
+
+    def __init__(self, db: Session):
+        from .models import AuthToken
+        from .security import decrypt_secret
+
+        t = db.get(AuthToken, 1)
+        if not t or not t.access_token_enc or t.flow not in ("sms", "tgto"):
+            raise WebFileError("尚未用短信登录光鸭，请在管理页完成手机号+验证码登录", 401)
+        self.db = db
+        self.base = settings.guangya_share_base.rstrip("/")
+        did = getattr(t, "device_id", "") or ""
+        if not did:
+            raise WebFileError("短信登录凭证缺少设备 ID（did），请重新登录", 401)
+        self.headers = {
+            "Authorization": "Bearer " + decrypt_secret(t.access_token_enc),
+            "did": did,
+            "dt": "4",
+            "Content-Type": "application/json",
+            "Origin": "https://www.guangyapan.com",
+            "Referer": "https://www.guangyapan.com/",
+        }
+
+    async def list_files(self, parent_id: str = "", page: int = 0, page_size: int = 100) -> dict:
+        body = {
+            "page": page,
+            "pageSize": page_size,
+            "parentId": parent_id or "*",  # 网页端根目录标识为 "*"
+            "needSubFolderStat": True,
+        }
+        last_error = ""
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+                r = await client.post(f"{self.base}{self.LIST_PATH}", json=body, headers=self.headers)
+            data = self._json(r)
+            code = data.get("code")
+            # 网页端成功约定同分享接口：code=0 或 msg=success
+            if r.status_code == 200 and (code == 0 or data.get("msg") == "success"):
+                return data.get("data") or {}
+            msg = str(data.get("msg") or data.get("message") or r.text[:200])
+            last_error = f"网页端文件列表失败 code={code} msg={msg}"
+            # 登录态失效：不再重试，交由上层提示重新登录
+            if code in (401, 116, 117) or any(k in msg.lower() for k in ("login", "登录", "unauthor", "token")):
+                raise WebFileError(last_error, code)
+            if r.status_code >= 500 or r.status_code == 429:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            break
+        raise WebFileError(last_error)
+
+    @staticmethod
+    def _json(r: httpx.Response) -> dict:
+        try:
+            data = r.json()
+            return data if isinstance(data, dict) else {"raw": data}
+        except Exception:
+            return {"msg": r.text[:300], "http_status": r.status_code}
+
+
 class GuangYaShareClient:
     """网页端分享接口。凭证来自运行时配置（管理页一键登录优先，.env 兜底）。"""
 
