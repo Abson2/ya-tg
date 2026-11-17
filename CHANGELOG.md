@@ -4,6 +4,8 @@
 - GitHub Releases：`https://github.com/Abson2/ya-tg/releases`
 - DockerHub：`abson2/ya-tg:vX.Y.Z`
 
+> 文档分工：`README.md` 只讲功能、部署与使用；逐版本的变更与修复细节统一写在这里，不写进 README。
+
 ---
 
 ## v0.6.1 (2026-11-17)
