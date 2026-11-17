@@ -37,6 +37,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "ai_timeout": ("ai_timeout", "30"),
     # Telegram API 反代地址：国内网络直连 api.telegram.org 常超时，允许管理页配置
     "telegram_api_base": ("telegram_api_base", "https://api.telegram.org"),
+    # v0.6.4：队列推送调度。interval 秒数优先；cron 非空时覆盖（CronTrigger 5 段）
+    "queue_interval_seconds": ("queue_interval_seconds", "30"),
+    "queue_cron": ("queue_cron", ""),
 }
 
 

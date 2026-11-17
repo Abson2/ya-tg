@@ -118,12 +118,12 @@ def test_default_template_emits_tmdb_classification_tags():
     db.add(res)
     db.commit()
     text, _ = publisher._build_message(db, res, "https://share.example/xxx")
-    assert "type=movie" in text
-    assert "origin_country=西班牙" in text
-    assert "genres=爱情、惊悚" in text
+    # v0.6.4：新默认模板改为整剧展示，用标签串替代 type=/origin_country=/genres= 调试行
     assert "#保镖恋人" in text and "#电影" in text and "#爱情" in text
+    assert "资源：" not in text and ".mkv" not in text  # 不再暴露单集文件名
+    assert "🎬" in text and "🎞" in text
     tpl = db.scalar(select(MessageTemplate).where(MessageTemplate.is_default.is_(True)))
-    assert tpl and "{{tags}}" in tpl.content and "{{type}}" in tpl.content
+    assert tpl and "{{tags}}" in tpl.content and "{{version}}" in tpl.content
     db.delete(res)
     db.commit()
     db.close()

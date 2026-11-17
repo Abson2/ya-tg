@@ -87,6 +87,31 @@ async def _job_token_refresh():
         db.close()
 
 
+def _queue_trigger(db: Session):
+    """v0.6.4：按管理页配置生成队列推送触发器。cron 优先（5 段），否则用间隔秒数。"""
+    cron = (runtime_config.get(db, "queue_cron") or "").strip()
+    if cron:
+        try:
+            return CronTrigger.from_crontab(cron, timezone="Asia/Shanghai")
+        except Exception:
+            pass  # 非法 cron 回退到间隔
+    try:
+        seconds = max(5, int(runtime_config.get(db, "queue_interval_seconds") or 30))
+    except ValueError:
+        seconds = 30
+    return "interval", {"seconds": seconds}
+
+
+def _schedule_queue_worker(trigger) -> None:
+    """注册/热更新队列 worker；保存调度配置后立即生效，无需重启容器。"""
+    if isinstance(trigger, tuple):
+        scheduler.add_job(process_queue, trigger[0], **trigger[1], id="queue_worker",
+                          max_instances=1, coalesce=True, replace_existing=True)
+    else:
+        scheduler.add_job(process_queue, trigger, id="queue_worker",
+                          max_instances=1, coalesce=True, replace_existing=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     migrate()
@@ -98,6 +123,7 @@ async def lifespan(app: FastAPI):
             db.commit()
             task = db.scalar(select(ScanTask).limit(1))
         cron, root, enabled = task.cron, task.root_id, task.enabled
+        queue_trigger = _queue_trigger(db)
     if enabled:
         try:
             scheduler.add_job(run_scan, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
@@ -105,8 +131,7 @@ async def lifespan(app: FastAPI):
                               max_instances=1, coalesce=True)
         except Exception:
             pass
-    scheduler.add_job(process_queue, "interval", seconds=30, id="queue_worker",
-                      max_instances=1, coalesce=True)
+    _schedule_queue_worker(queue_trigger)
     scheduler.add_job(_job_device_poll, "interval", seconds=3, id="device_poll",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_token_refresh, "interval", seconds=60, id="token_refresh",
@@ -116,13 +141,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.4", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -355,6 +380,132 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
     return [{k: getattr(x, k) for k in keys} for x in db.scalars(stmt).all()]
 
 
+def _series_group_key(x: Resource) -> str:
+    """v0.6.4：把单集聚合成「作品」的 key。优先级：TMDB ID > 剧集目录 fileId > 父目录名 > 单文件。
+
+    这样同一部剧的 N 个单集在资源库里只显示为一张作品卡，而不是 N 个散落条目。
+    """
+    if x.tmdb_id and x.media_type:
+        return f"tmdb:{x.media_type}:{x.tmdb_id}"
+    dir_id = str(getattr(x, "share_dir_id", "") or "")
+    if dir_id:
+        return f"dir:{dir_id}"
+    # v0.6.3 之前的老资源没有 share_dir_id，用父目录名 + 作品名兜底
+    parent_name = ""
+    parts = [s for s in re.split(r"[/\\]+", x.path_hint or "") if s.strip()]
+    if parts:
+        last = parts[-1]
+        parent_name = "" if _SEASON_DIR_RE.match(last) else last
+        if not parent_name and len(parts) >= 2:
+            parent_name = parts[-2]
+    if parent_name:
+        return f"path:{parent_name}"
+    if x.media_title:
+        return f"title:{x.media_type or ''}:{x.media_title}"
+    return f"file:{x.file_id}"
+
+
+_SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$|^S\d{1,2}$", re.I)
+
+
+@app.get("/api/library/series", dependencies=ADMIN)
+def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_db)):
+    """v0.6.4：按作品聚合的资源库视图，参考 STRM 刮削海报墙。
+
+    每个作品返回海报、标题、年份、类型、集数范围、识别/分享汇总，并带成员单集 id 列表，
+    前端据此按「一部剧一张卡」呈现，操作（推送/识别/取消分享）落到代表资源。
+    """
+    stmt = select(Resource).order_by(Resource.id.desc())
+    if media_type in ("movie", "tv"):
+        stmt = stmt.where(Resource.media_type == media_type)
+    rows = list(db.scalars(stmt).all())
+    groups: dict[str, dict] = {}
+    for x in rows:
+        key = _series_group_key(x)
+        g = groups.get(key)
+        if g is None:
+            hint = parse_media_name(x.name)
+            g = groups[key] = {
+                "key": key,
+                "title": x.media_title or hint.get("primary_title") or x.name,
+                "year": str(hint.get("year") or ""),
+                "media_type": x.media_type or ("tv" if hint.get("is_tv_hint") else ""),
+                "poster_path": x.poster_path or "",
+                "overview": x.overview or "",
+                "genres": x.genres or "",
+                "vote_average": float(x.vote_average or 0),
+                "tmdb_id": x.tmdb_id,
+                "identify_status": x.identify_status,
+                "share_url": "",
+                "share_status": "not_created",
+                "count": 0, "identified_count": 0,
+                "seasons": set(), "episodes": [],
+                "ids": [], "representative_id": x.id,
+                "unidentified_count": 0,
+            }
+        g["count"] += 1
+        g["ids"].append(x.id)
+        if x.identify_status == "identified":
+            g["identified_count"] += 1
+        else:
+            g["unidentified_count"] += 1
+        if x.poster_path and not g["poster_path"]:
+            g["poster_path"] = x.poster_path
+        if x.overview and not g["overview"]:
+            g["overview"] = x.overview
+        if x.tmdb_id and not g["tmdb_id"]:
+            g["tmdb_id"] = x.tmdb_id
+        if x.share_url and not g["share_url"]:
+            g["share_url"] = x.share_url
+        if x.share_status == "active":
+            g["share_status"] = "active"
+        elif g["share_status"] != "active":
+            g["share_status"] = x.share_status
+        if x.media_type == "tv" and (x.season or x.episode):
+            if x.season:
+                g["seasons"].add(int(x.season))
+            g["episodes"].append((int(x.season or 0), int(x.episode or 0)))
+    out = []
+    for g in groups.values():
+        seasons = sorted(g.pop("seasons"))
+        eps = sorted(g.pop("episodes"))
+        label = ""
+        if seasons:
+            label = f"第{seasons[0]}季" if len(seasons) == 1 else f"第{seasons[0]}-{seasons[-1]}季"
+            if eps:
+                first = next((e for s, e in eps if s == seasons[0]), eps[0][1])
+                last = next((e for s, e in reversed(eps) if s == seasons[-1]), eps[-1][1])
+                label += f" · E{first:02d}-E{last:02d}"
+        g["episode_label"] = label
+        g["season_count"] = len(seasons)
+        # 筛选：标题/文件名关键词
+        if q and q.lower() not in (str(g["title"]) + " " + " ".join(str(i) for i in g["ids"])).lower():
+            # 关键词也匹配成员文件名
+            member_hit = any(q.lower() in (db.get(Resource, i).name or "").lower() for i in g["ids"])
+            if not member_hit:
+                continue
+        out.append(g)
+    return out
+
+
+@app.post("/api/library/clear", dependencies=ADMIN)
+def clear_library(db: Session = Depends(get_db)):
+    """v0.6.4：清空当前扫描结果（资源 + 队列 + 审核 + 扫描断点），保留 Bot/频道/规则/模板/凭证。
+
+    用于重新扫描前清除旧的识别失败、重试残留数据。不触碰光鸭网盘文件、不删除已建分享。
+    """
+    resources = db.query(Resource).count()
+    queue = db.query(QueueItem).count()
+    cursors = db.query(ScanCursor).count()
+    db.query(QueueItem).delete(synchronize_session=False)
+    db.query(Resource).delete(synchronize_session=False)
+    db.query(ScanCursor).delete(synchronize_session=False)
+    add_audit(db, "library_cleared", detail=json_dumps({"resources": resources,
+                                                          "queue": queue, "cursors": cursors}))
+    db.commit()
+    return {"ok": True, "resources": resources, "queue": queue, "cursors": cursors}
+
+
 def _check_duration(duration: int):
     if duration not in VALID_DURATIONS:
         raise HTTPException(400, "只支持永久(0)、1天(86400)、7天(604800)、30天(2592000)")
@@ -403,9 +554,15 @@ async def delete_share(rid: int, db: Session = Depends(get_db)):
     if not x or not x.share_id:
         raise HTTPException(404, "分享记录不存在")
     try:
-        await GuangYaShareClient(db).delete(x.share_id)
-        x.share_status = "cancelled"
-        add_audit(db, "share_cancelled", target_type="resource", target_id=str(rid))
+        share_id = x.share_id
+        await GuangYaShareClient(db).delete(share_id)
+        # v0.6.4：清空本条及共用该分享的同目录剧集（v0.6.3 起整剧共用一个分享），
+        # 否则 share_url 残留会让前端仍显示已分享、ensure_share 继续复用已删链接。
+        for item in db.scalars(select(Resource).where(Resource.share_id == share_id)).all():
+            item.share_status = "cancelled"
+            item.share_url, item.share_id = "", ""
+        add_audit(db, "share_cancelled", target_type="resource", target_id=str(rid),
+                  detail=json_dumps({"share_id": share_id}))
         db.commit()
         return {"ok": True}
     except Exception as e:
@@ -1089,6 +1246,11 @@ class TelegramConfigInput(BaseModel):
     base_url: str = ""
 
 
+class QueueScheduleInput(BaseModel):
+    interval_seconds: int = 30
+    cron: str = ""
+
+
 class TranslateSearchInput(BaseModel):
     title: str
     media_type: str = ""
@@ -1275,6 +1437,38 @@ def telegram_config_save(p: TelegramConfigInput, db: Session = Depends(get_db)):
     add_audit(db, "telegram_config_saved", target_type="config", detail=p.base_url.strip()[:200])
     db.commit()
     return {"ok": True, "base_url": runtime_config.get(db, "telegram_api_base")}
+
+
+@app.get("/api/queue/schedule", dependencies=ADMIN)
+def queue_schedule_get(db: Session = Depends(get_db)):
+    """v0.6.4：读取队列推送调度配置。"""
+    try:
+        seconds = int(runtime_config.get(db, "queue_interval_seconds") or 30)
+    except ValueError:
+        seconds = 30
+    return {"interval_seconds": max(5, seconds),
+            "cron": runtime_config.get(db, "queue_cron") or "",
+            "default_interval": 30}
+
+
+@app.post("/api/queue/schedule", dependencies=ADMIN)
+def queue_schedule_save(p: QueueScheduleInput, db: Session = Depends(get_db)):
+    """保存推送间隔/Cron 并立即热更新定时任务，无需重启容器。"""
+    cron = (p.cron or "").strip()
+    if cron:
+        try:
+            CronTrigger.from_crontab(cron, timezone="Asia/Shanghai")
+        except Exception as e:
+            raise HTTPException(400, f"Cron 表达式无效：{e}。示例 */1 * * * * 表示每分钟推送一次")
+    seconds = max(5, min(int(p.interval_seconds or 30), 86400))
+    runtime_config.set_many(db, {"queue_interval_seconds": str(seconds), "queue_cron": cron})
+    add_audit(db, "queue_schedule_saved", target_type="config",
+              detail=json_dumps({"interval_seconds": seconds, "cron": cron}))
+    db.commit()
+    trigger = _queue_trigger(db)
+    _schedule_queue_worker(trigger)
+    return {"ok": True, "interval_seconds": seconds, "cron": cron,
+            "mode": "cron" if cron else "interval"}
 
 
 @app.post("/api/tmdb/translate-search", dependencies=ADMIN)

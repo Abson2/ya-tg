@@ -58,8 +58,21 @@ _COLUMNS = {
 }
 
 
-# v0.6.0 默认模板：带 TMDB 分类标签（type / origin_country / genres / tags）
+# v0.6.4 默认模板：参考「保镖恋人」示例，整剧/整季展示，不暴露单集文件名
 DEFAULT_TEMPLATE = (
+    "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
+    "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
+    "{{#if tmdb_url}}🔗 TMDB：<a href=\"{{tmdb_url}}\">#{{tmdb_id}}</a>\n{{/if}}"
+    "{{#if vote_average}}⭐ 评分：{{vote_average}}/10\n{{/if}}"
+    "{{#if resolution}}📐 画质：{{resolution}}\n{{/if}}"
+    "{{#if version}}🎞 版本：{{version}}\n{{/if}}"
+    "{{#if size}}💾 大小：{{size}}\n{{/if}}"
+    "{{#if overview}}\n📖 {{overview}}\n\n{{/if}}"
+    "{{#if tags}}🏷 {{tags}}\n{{/if}}"
+    "{{share_url}}"
+)
+# v0.6.0 旧版默认模板：仍在使用它（用户没改过）时自动升级到 v0.6.4 新版
+PREV_DEFAULT_TEMPLATE = (
     "<b>{{title}}</b>{{#if year}}（{{year}}）{{/if}}\n"
     "{{#if type_label}}类型：{{type_label}}\n{{/if}}"
     "{{#if vote_average}}评分：{{vote_average}}\n{{/if}}"
@@ -103,7 +116,9 @@ def migrate() -> None:
             db.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
                                    enabled=True, is_default=True))
             db.commit()
-        elif tpl.content == OLD_DEFAULT_TEMPLATE:
+        elif tpl.content in (OLD_DEFAULT_TEMPLATE, PREV_DEFAULT_TEMPLATE):
+            # v0.6.4：旧版默认模板（含「资源：单集文件名」）自动升级为整剧展示版；
+            # 用户改过的模板不动。
             tpl.content = DEFAULT_TEMPLATE
             db.commit()
 

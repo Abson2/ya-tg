@@ -12,7 +12,7 @@ from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import AuditLog, Bot, Channel, MessageTemplate, QueueItem, Resource, utcnow
 from .security import decrypt_secret
-from .utils import backoff_seconds, parse_media_name, plus_seconds, render_template, retry_after_seconds
+from .utils import backoff_seconds, parse_media_name, plus_seconds, render_template, retry_after_seconds, version_spec
 
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
@@ -100,6 +100,9 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     season = res.season if res.season is not None else hint.get("season")
     episode = res.episode if res.episode is not None else hint.get("episode")
     episode_tag = f"S{int(season):02d}E{int(episode):02d}" if season and episode else ""
+    # v0.6.4：整剧展示用「第N季」而非单集信息；版本规格从文件名提取
+    season_label = f"第{int(season)}季" if season else ""
+    version = version_spec(res.name)
 
     # 标签串按「片名 · 类型 · 地区 · 分类」打标（示例：#保镖恋人 #电影 #美国 #爱情 #惊悚）
     tag_parts = [title, type_text]
@@ -130,6 +133,8 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "season": season or "",
         "episode": episode or "",
         "episode_tag": episode_tag,
+        "season_label": esc(season_label),
+        "version": esc(version),
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
     return text[:1000], text[:1000]

@@ -271,6 +271,41 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
     }
 
 
+def version_spec(name: str) -> str:
+    """从文件名提取「画质 · 编码 · 音轨」技术规格串，供消息模板 {{version}} 使用。
+
+    参考保镖恋人示例：2160p · WEB-DL · H.265 · 10bit · DoVi P5 · DDP Atmos 5.1。
+    只取能识别到的片段，用 · 连接；识别不到返回空串。
+    """
+    if not name:
+        return ""
+    parts = []
+    pats = [
+        r"\b(2160p|1080p|720p|480p|4K)\b",
+        r"\b(WEB-?DL|WEBRip|BluRay|BLURAY|BDRip|REMUX|HDTV)\b",
+        r"\b(H\.?265|HEVC|x265|H\.?264|AVC|x264)\b",
+        r"\b(10bit|8bit)\b",
+        r"\b(DoVi|DV)\b",
+        r"\b(HDR10\+?|HDR)\b",
+        r"\b(DDP|EAC3|AC3|AAC|TrueHD|DTS-?HD)\b(?:\s*5\.?1)?",
+        r"\bAtmos\b",
+    ]
+    for p in pats:
+        m = re.search(p, name, re.I)
+        if m:
+            v = m.group(0).strip()
+            vu = v.upper().replace(".", "")
+            if vu == "DV":
+                v = "DoVi"
+            elif vu in ("HEVC", "X265", "H265"):
+                v = "H.265"
+            elif vu in ("AVC", "X264", "H264"):
+                v = "H.264"
+            if v not in parts:
+                parts.append(v)
+    return " · ".join(parts)
+
+
 def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
                     parent_id: str = "") -> dict:
     """v0.6.3：判定单集文件对应的「剧集目录」层级与 fileId。
