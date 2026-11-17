@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from .db import SessionLocal, json_dumps
 from .guangya import GuangYaOpenAPI, GuangYaWebFiles
-from .models import AuditLog, AuthToken, QueueItem, Resource, Rule, ScanCursor, ScanTask, utcnow
+from .models import AuditLog, AuthToken, Resource, ScanCursor, ScanTask, utcnow
 
 
 def _cursor(db: Session) -> ScanCursor:
@@ -48,7 +48,7 @@ def _dir_name(item: dict) -> str:
     return ""
 
 
-def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule],
+def _upsert_resource(db: Session, item: dict, parent: str,
                      path_hint: str = "", dir_chain: list[str] | None = None) -> tuple[Resource, bool]:
     """返回 (资源, 是否新增)。同一 fileId 只保留一行；utime/size 变化记入 revision。
 
@@ -56,6 +56,7 @@ def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule],
     往往只是英文译名（The.Silent.Storm.S01E04），真正的作品名在父目录（谷雨 (2026)），
     识别必须拿得到这层线索，否则会误命中同名英文作品。
     v0.6.3：dir_chain 保存从直接父目录到根的 fileId 链，用于定位剧集目录层级。
+    v0.6.5：扫描只入库，不再按规则入队；推送改由「识别成功且有 TMDB 海报」触发。
     """
     fid = str(item.get("fileId", ""))
     name = item.get("fileName", "")
@@ -92,16 +93,6 @@ def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule],
                             detail=json_dumps({"file_id": fid, "utime": utime, "size": size})))
     db.flush()
 
-    for rule in rules:
-        match_dir = not rule.directory_id or rule.directory_id == row.parent_id
-        match_key = not rule.keyword or rule.keyword.lower() in row.name.lower()
-        if not (match_dir and match_key):
-            continue
-        exists = db.scalar(select(QueueItem).where(
-            QueueItem.resource_id == row.id, QueueItem.channel_id == rule.channel_id))
-        if not exists:
-            db.add(QueueItem(resource_id=row.id, channel_id=rule.channel_id,
-                             status="pending" if rule.auto_publish else "review"))
     return row, created
 
 
@@ -148,7 +139,7 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
         c.status = "running"
         db.commit()
 
-        rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))).all())
+        # v0.6.5：扫描只入库，不再读取规则入队；推送由识别成功触发
         while stack:
             parent = stack.pop()
             if parent in visited:
@@ -173,7 +164,7 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                         if fid not in visited:
                             stack.append(fid)
                         continue
-                    _upsert_resource(db, item, parent, rules, dir_paths.get(parent, ""),
+                    _upsert_resource(db, item, parent, dir_paths.get(parent, ""),
                                      dir_chains.get(parent, []))
                     files += 1
                 db.commit()

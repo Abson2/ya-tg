@@ -40,6 +40,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # v0.6.4：队列推送调度。interval 秒数优先；cron 非空时覆盖（CronTrigger 5 段）
     "queue_interval_seconds": ("queue_interval_seconds", "30"),
     "queue_cron": ("queue_cron", ""),
+    # v0.6.5：每条 TG 消息发送后的节流秒数，避免短时间连发触发 Telegram 风控
+    "telegram_send_delay": ("telegram_send_delay", "2"),
 }
 
 

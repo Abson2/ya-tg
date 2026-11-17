@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 from datetime import timedelta
@@ -100,8 +101,32 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     season = res.season if res.season is not None else hint.get("season")
     episode = res.episode if res.episode is not None else hint.get("episode")
     episode_tag = f"S{int(season):02d}E{int(episode):02d}" if season and episode else ""
-    # v0.6.4：整剧展示用「第N季」而非单集信息；版本规格从文件名提取
-    season_label = f"第{int(season)}季" if season else ""
+    # v0.6.5：整剧推送——大小取同作品所有单集之和，集数取全集范围，不是代表单集
+    total_size = int(res.size or 0)
+    whole_season_label = f"第{int(season)}季" if season else ""
+    episode_count = ""
+    if res.media_type == "tv":
+        from sqlalchemy import select as _select
+        dir_id = str(getattr(res, "share_dir_id", "") or "")
+        if dir_id:
+            sibs = list(db.scalars(_select(Resource).where(Resource.share_dir_id == dir_id)).all())
+        elif res.tmdb_id:
+            sibs = list(db.scalars(_select(Resource).where(
+                Resource.tmdb_id == res.tmdb_id, Resource.media_type == "tv")).all())
+        else:
+            sibs = []
+        if sibs:
+            total_size = sum(int(s.size or 0) for s in sibs)
+            seasons = sorted({int(s.season) for s in sibs if s.season is not None})
+            if seasons:
+                whole_season_label = (f"第{seasons[0]}季" if len(seasons) == 1
+                                      else f"第{seasons[0]}-{seasons[-1]}季")
+            # 整剧集数：按 (季, 集) 去重计数；无集号时用成员数兜底
+            eps = {(int(s.season or 0), int(s.episode)) for s in sibs if s.episode is not None}
+            n = len(eps) if eps else len(sibs)
+            if n > 0:
+                episode_count = str(n)
+    season_label = whole_season_label  # v0.6.4：整剧展示用「第N季」而非单集信息
     version = version_spec(res.name)
 
     # 标签串按「片名 · 类型 · 地区 · 分类」打标（示例：#保镖恋人 #电影 #美国 #爱情 #惊悚）
@@ -118,7 +143,7 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "share_url": share_url,
         "year": esc(hint.get("year") or ""),
         "resolution": esc(hint.get("resolution") or ""),
-        "size": human_size(res.size),
+        "size": human_size(total_size),
         "tmdb_id": res.tmdb_id or "",
         "tmdb_url": tmdb.tmdb_url(res.media_type, res.tmdb_id) if res.tmdb_id and res.media_type else "",
         "media_type": res.media_type or "",
@@ -134,6 +159,7 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "episode": episode or "",
         "episode_tag": episode_tag,
         "season_label": esc(season_label),
+        "episode_count": esc(episode_count),
         "version": esc(version),
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
@@ -172,9 +198,24 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
     return True, str((data.get("result") or {}).get("message_id", "")), "", retry_after
 
 
+def _work_group_key(res: Resource) -> str:
+    """运行时整剧去重键（与后端展示/入队口径一致）：目录 > TMDB > 单文件。"""
+    dir_id = str(getattr(res, "share_dir_id", "") or "")
+    if dir_id:
+        return f"dir:{dir_id}"
+    if res.tmdb_id:
+        return f"tmdb:{res.media_type or ''}:{res.tmdb_id}"
+    return f"file:{res.id}"
+
+
 async def process_queue(limit: int = 20) -> dict:
     db: Session = SessionLocal()
     sent = failed = shared = 0
+    # v0.6.5：逐条发送节流，避免一次轮询连发多条触发 Telegram 风控
+    try:
+        delay = max(0, min(int(runtime_config.get(db, "telegram_send_delay") or 2), 60))
+    except ValueError:
+        delay = 2
     try:
         now = utcnow()
         rows = list(db.scalars(
@@ -183,13 +224,34 @@ async def process_queue(limit: int = 20) -> dict:
                 or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
             ).order_by(QueueItem.id).limit(limit)
         ).all())
-        for q in rows:
+        for idx, q in enumerate(rows):
+            if idx and delay:
+                await asyncio.sleep(delay)  # v0.6.5：与上一条消息保持间隔，规避 TG 风控
             res = db.get(Resource, q.resource_id)
             channel = db.get(Channel, q.channel_id)
             bot = db.get(Bot, channel.bot_id) if channel else None
             if not res or not channel or not bot:
                 q.status, q.error = "failed", "资源、频道或 Bot 已不存在（可能被删除）"
                 failed += 1
+                continue
+            # v0.6.5 兜底：同一作品同一频道只要已有 sent 项（整剧已推过），
+            # 其余同作品残留项一律跳过，绝不逐集再推。即便旧队列/手动入队漏收敛也拦得住。
+            wkey = _work_group_key(res)
+            dup_sent = None
+            for other_id, other_rid in db.execute(
+                select(QueueItem.id, QueueItem.resource_id).where(
+                    QueueItem.channel_id == q.channel_id,
+                    QueueItem.status == "sent",
+                    QueueItem.id != q.id)
+            ).all():
+                other_res = db.get(Resource, other_rid)
+                if other_res and _work_group_key(other_res) == wkey:
+                    dup_sent = other_id
+                    break
+            if dup_sent:
+                q.status = "sent"
+                q.error = f"同作品已由队列项 #{dup_sent} 整剧推送，本单集跳过（去重）"
+                q.sent_at = utcnow()
                 continue
             if not bot.enabled or not channel.enabled:
                 # v0.6.1：Bot 与频道各自独立启停。停用不算失败、不消耗重试次数，
@@ -223,8 +285,9 @@ async def process_queue(limit: int = 20) -> dict:
             else:
                 q.attempts += 1
                 q.error = error[:1500]
-                delay = retry_after or backoff_seconds(q.attempts)
-                q.next_retry_at = plus_seconds(utcnow(), delay)
+                # v0.6.5：用独立变量，勿覆盖逐条发送节流的 delay，否则下一条的间隔会被退避秒数篡改
+                retry_delay = retry_after or backoff_seconds(q.attempts)
+                q.next_retry_at = plus_seconds(utcnow(), retry_delay)
                 q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
         db.commit()

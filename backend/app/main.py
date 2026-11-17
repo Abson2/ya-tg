@@ -141,13 +141,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.4", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.5", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.4", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.5", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -380,28 +380,35 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
     return [{k: getattr(x, k) for k in keys} for x in db.scalars(stmt).all()]
 
 
-def _series_group_key(x: Resource) -> str:
-    """v0.6.4：把单集聚合成「作品」的 key。优先级：TMDB ID > 剧集目录 fileId > 父目录名 > 单文件。
+def _normalize_work_name(s: str) -> str:
+    """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
+    if not s:
+        return ""
+    v = re.sub(r"[\[(（【][^\])）】]*[\])）】]", "", str(s))
+    v = re.sub(r"[\s\-_.,·:：]+", "", v).lower()
+    v = re.sub(r"(19|20)\d{2}$", "", v)
+    return v
 
-    这样同一部剧的 N 个单集在资源库里只显示为一张作品卡，而不是 N 个散落条目。
+
+def _series_group_key(x: Resource) -> str:
+    """v0.6.5：单集 → 作品的聚合键。目录/作品名优先，TMDB 兜底。
+
+    已识别单集有 tmdb_id、未识别的没有；若优先 TMDB 会把同一部剧裂成两张卡。
+    统一用「归一化作品名」让识别与否都归到同一作品，展示与推送共用此键。
     """
-    if x.tmdb_id and x.media_type:
-        return f"tmdb:{x.media_type}:{x.tmdb_id}"
-    dir_id = str(getattr(x, "share_dir_id", "") or "")
-    if dir_id:
-        return f"dir:{dir_id}"
-    # v0.6.3 之前的老资源没有 share_dir_id，用父目录名 + 作品名兜底
-    parent_name = ""
+    work_name = str(getattr(x, "share_dir_name", "") or "").strip()
     parts = [s for s in re.split(r"[/\\]+", x.path_hint or "") if s.strip()]
+    parent_name = ""
     if parts:
         last = parts[-1]
         parent_name = "" if _SEASON_DIR_RE.match(last) else last
         if not parent_name and len(parts) >= 2:
             parent_name = parts[-2]
-    if parent_name:
-        return f"path:{parent_name}"
-    if x.media_title:
-        return f"title:{x.media_type or ''}:{x.media_title}"
+    normalized = _normalize_work_name(work_name or parent_name or x.media_title)
+    if normalized:
+        return f"work:{normalized}"
+    if x.tmdb_id and x.media_type:
+        return f"tmdb:{x.media_type}:{x.tmdb_id}"
     return f"file:{x.file_id}"
 
 
@@ -468,14 +475,21 @@ def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_
     out = []
     for g in groups.values():
         seasons = sorted(g.pop("seasons"))
-        eps = sorted(g.pop("episodes"))
+        eps = sorted(set(g.pop("episodes")))
         label = ""
         if seasons:
             label = f"第{seasons[0]}季" if len(seasons) == 1 else f"第{seasons[0]}-{seasons[-1]}季"
-            if eps:
-                first = next((e for s, e in eps if s == seasons[0]), eps[0][1])
-                last = next((e for s, e in reversed(eps) if s == seasons[-1]), eps[-1][1])
+        # v0.6.5：只有已识别集数 >= 2 且连续时才显示 E 范围；单集或零散集数显示进度，
+        # 避免只识别到 E25 时显示误导性的「E25-E25」。
+        if len(eps) >= 2:
+            first, last = eps[0][1], eps[-1][1]
+            contiguous = (last - first + 1) == len([e for s, e in eps if s == seasons[0]]) if seasons else False
+            if contiguous and last > first:
                 label += f" · E{first:02d}-E{last:02d}"
+            else:
+                label += f" · 已识别 {len(eps)} 集"
+        elif len(eps) == 1:
+            label += f" · 已识别 E{eps[0][1]:02d}"
         g["episode_label"] = label
         g["season_count"] = len(seasons)
         # 筛选：标题/文件名关键词
@@ -518,16 +532,43 @@ async def create_share(rid: int, duration: int = 0, db: Session = Depends(get_db
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        result = await GuangYaShareClient(db).create(x.file_id, x.media_title or x.name, duration)
+        # v0.6.5：剧集一律按「剧集目录」分享，绝不按单集——单集分享是逐集推送的根因。
+        # 与 publisher.ensure_share 同口径：目录 fileId + 标题带季，链接同步给同目录所有单集。
+        dir_id = str(getattr(x, "share_dir_id", "") or "")
+        scope = str(getattr(x, "share_scope", "") or "")
+        is_series = x.media_type == "tv" and bool(dir_id)
+        target_id = dir_id if is_series else x.file_id
+        title = x.media_title or x.name or ""
+        if is_series and x.season:
+            title = f"{title} 第{int(x.season)}季" if title else f"第{int(x.season)}季"
+        # 同目录已有分享则直接复用，避免重复建链
+        if is_series:
+            sibling = db.scalar(select(Resource).where(
+                Resource.share_dir_id == dir_id, Resource.share_url != "",
+                Resource.id != x.id).limit(1))
+            if sibling and sibling.share_url:
+                x.share_id, x.share_url = sibling.share_id, sibling.share_url
+                x.share_status, x.share_duration = "active", sibling.share_duration
+                db.commit()
+                return {"ok": True, "share_id": x.share_id, "share_url": x.share_url,
+                        "scope": scope, "reused": True}
+        result = await GuangYaShareClient(db).create(target_id, title, duration)
         data = result.get("data") or {}
-        x.share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
-        x.share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
-        x.share_status = "active" if x.share_url else "failed"
-        x.share_duration = duration
+        share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
+        share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
+        # 同步给同目录所有单集，一处分享整剧可见
+        targets = list(db.scalars(select(Resource).where(Resource.share_dir_id == dir_id)).all()) if is_series else [x]
+        targets = targets or [x]
+        for item in targets:
+            item.share_id, item.share_url = share_id, share_url
+            item.share_status = "active" if share_url else "failed"
+            item.share_duration = duration
         add_audit(db, "share_created_manual", target_type="resource", target_id=str(rid),
-                  detail=json_dumps({"duration": duration, "has_url": bool(x.share_url)}))
+                  detail=json_dumps({"duration": duration, "has_url": bool(share_url),
+                                     "target_id": target_id, "scope": scope, "members": len(targets)}))
         db.commit()
-        return {"ok": True, "share_id": x.share_id, "share_url": x.share_url}
+        return {"ok": True, "share_id": x.share_id, "share_url": x.share_url,
+                "scope": scope, "members": len(targets)}
     except Exception as e:
         raise HTTPException(502, str(e))
 
@@ -608,6 +649,63 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
         x.share_dir_name = info["dir_name"]
     else:
         x.share_scope, x.share_dir_id, x.share_dir_name = "file", "", ""
+
+
+def _work_key(x: Resource) -> str:
+    """推送去重键：与资源库展示聚合键完全一致，保证「一张卡 = 一条推送」。"""
+    return _series_group_key(x)
+
+
+def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
+    """v0.6.5：把「已识别 + 有海报」的资源按规则入队，同一作品同一频道只入一条。
+
+    返回是否新增。扫描/识别/加规则三条路径都走这里，保证「一张卡 = 一条推送」
+    在任何入口都成立。注意 Session 是 autoflush=False，入队后必须显式 flush，
+    否则 identify_all 批量识别时前一条队列项对后续同剧单集不可见，36 集会全部入队。
+    """
+    if x.identify_status != "identified" or not (x.poster_path or "").strip():
+        return False
+    # v0.6.5：旧数据/未重扫的剧集可能缺 share_dir_id（旧版按单集分享），
+    # 入队前现场补算剧集目录，确保推送走整剧目录分享而非单集。
+    if x.media_type == "tv" and not (getattr(x, "share_dir_id", "") or "").strip():
+        from .utils import series_dir_info
+        info = series_dir_info(x.path_hint or "", getattr(x, "dir_chain_json", "[]"), x.parent_id)
+        x.share_scope, x.share_dir_id, x.share_dir_name = info["scope"], info["dir_id"], info["dir_name"]
+    ch = db.get(Channel, rule.channel_id)
+    bot = db.get(Bot, ch.bot_id) if ch else None
+    if not ch or not ch.enabled or not bot or not bot.enabled:
+        return False  # 停用的频道/Bot 不入队，启用后由回溯补齐
+    # 同一作品（含自身与所有兄弟单集）在该频道已有任意队列项就不再入队
+    all_members = [s.id for s in db.scalars(select(Resource)).all()
+                   if _work_key(s) == _work_key(x)]
+    exists = db.scalar(select(QueueItem).where(
+        QueueItem.resource_id.in_(all_members),
+        QueueItem.channel_id == rule.channel_id).limit(1))
+    if exists:
+        return False
+    db.add(QueueItem(resource_id=x.id, channel_id=rule.channel_id,
+                     status="pending" if rule.auto_publish else "review"))
+    db.flush()  # autoflush=False：立即落库，供同批次后续单集的去重查询看到
+    return True
+
+
+def _enqueue_after_identify(db: Session, x: Resource) -> int:
+    """v0.6.5：识别成功且拿到 TMDB 海报后才入队推送。
+
+    扫描只负责入库，不再触发推送；未识别/无海报的单集永不入队，
+    保证用户看到的每条消息都有完整海报与元数据，且同一作品只推一条。
+    """
+    if x.identify_status != "identified" or not (x.poster_path or "").strip():
+        return 0
+    added = 0
+    for rule in db.scalars(select(Rule).where(Rule.enabled.is_(True))).all():
+        if rule.directory_id and rule.directory_id != x.parent_id:
+            continue
+        if rule.keyword and rule.keyword.lower() not in (x.name or "").lower():
+            continue
+        if _enqueue_ready(db, x, rule):
+            added += 1
+    return added
 
 
 def _clear_identification(x: Resource, status: str = "none", source: str = "manual",
@@ -713,13 +811,14 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
         d = await tmdb.detail(p.tmdb_id, p.media_type, db)
         _apply_identification(x, d, source="manual", note=p.note or "手动匹配",
                               hint=parse_media_name(x.name, x.path_hint or ""))
+        queued = _enqueue_after_identify(db, x)  # v0.6.5：识别成功且有海报才推送
         add_audit(db, "resource_identified", target_type="resource", target_id=str(rid),
                   detail=json_dumps({"tmdb_id": p.tmdb_id, "media_type": p.media_type,
-                                     "title": x.media_title, "source": "manual"}))
+                                     "title": x.media_title, "source": "manual", "queued": queued}))
         db.commit()
         return {"ok": True, "media_title": x.media_title, "poster": tmdb.poster_url(x.poster_path),
                 "type": x.media_type, "genres": tmdb.as_list(x.genres),
-                "origin_country": tmdb.country_label(x.origin_country)}
+                "origin_country": tmdb.country_label(x.origin_country), "queued": queued}
     except Exception as e:
         raise _tmdb_error(e)
 
@@ -746,13 +845,14 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
         r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
         if r["ok"] and r.get("best"):
             _apply_identification(x, r["best"], source=r["source"], note=r["reason"], hint=r["hint"])
+            queued = _enqueue_after_identify(db, x)  # v0.6.5
             add_audit(db, "resource_auto_identified", target_type="resource", target_id=str(rid),
                       detail=json_dumps({"tmdb_id": x.tmdb_id, "media_type": x.media_type,
-                                         "source": r["source"], "reason": r["reason"]}))
+                                         "source": r["source"], "reason": r["reason"], "queued": queued}))
             db.commit()
             return {"ok": True, "status": "identified", "candidates": r["candidates"][:8],
                     "applied": r["best"], "reason": r["reason"], "source": r["source"],
-                    "hint": r["hint"], "ai": r.get("ai")}
+                    "hint": r["hint"], "ai": r.get("ai"), "queued": queued}
         x.identify_status = r["status"]
         x.identify_source = r["source"]
         x.identify_note = r["reason"]
@@ -776,13 +876,14 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
         stmt = stmt.where(Resource.identify_status.in_(
             ["unidentified", "ambiguous", "failed", "none", ""]))
     rows = list(db.scalars(stmt).all())
-    done = pending = 0
+    done = pending = queued = 0
     for x in rows:
         try:
             r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
             if r["ok"] and r.get("best"):
                 _apply_identification(x, r["best"], source=r["source"],
                                       note=r["reason"], hint=r["hint"])
+                queued += _enqueue_after_identify(db, x)  # v0.6.5：识别成功且有海报才推
                 done += 1
             else:
                 x.identify_status = r["status"]
@@ -795,9 +896,10 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
             pending += 1
     add_audit(db, "identify_all", target_type="resource",
               detail=json_dumps({"scanned": len(rows), "identified": done,
-                                 "pending": pending, "force": force}))
+                                 "pending": pending, "force": force, "queued": queued}))
     db.commit()
-    return {"ok": True, "scanned": len(rows), "identified": done, "pending": pending}
+    return {"ok": True, "scanned": len(rows), "identified": done, "pending": pending,
+            "queued": queued}
 
 
 # ---------- AI 辅助识别（OpenAI 兼容接口，可选） ----------
@@ -1194,7 +1296,7 @@ def add_template(p: TemplateInput, db: Session = Depends(get_db)):
 
 @app.post("/api/templates/default", dependencies=ADMIN)
 def reset_default_template(db: Session = Depends(get_db)):
-    """一键恢复 v0.6.0 带分类标签的默认模板（老用户升级后可用）。"""
+    """一键恢复 v0.6.4 整剧风格的默认模板（emoji + 海报，不含单集文件名）。"""
     x = db.scalar(select(MessageTemplate).where(MessageTemplate.name == "默认图文模板"))
     if not x:
         x = MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
@@ -1249,6 +1351,7 @@ class TelegramConfigInput(BaseModel):
 class QueueScheduleInput(BaseModel):
     interval_seconds: int = 30
     cron: str = ""
+    send_delay: int = 2   # v0.6.5：每条消息之间的节流秒数，避免 TG 风控
 
 
 class TranslateSearchInput(BaseModel):
@@ -1260,23 +1363,19 @@ class TranslateSearchInput(BaseModel):
 def _enqueue_existing(db: Session, rule: Rule) -> int:
     """保存规则后回溯已入库资源。
 
-    用户常「先扫描、再识别、最后才加规则」，旧逻辑只在扫描瞬间入队，
-    这些老资源永远没有队列项，表现为「识别后并没有推送到 TG」。
+    用户常「先扫描、再识别、最后才加规则」，识别时还没有规则、这些资源没有队列项。
+    v0.6.5：回溯同样遵守「已识别 + 有海报 + 同一作品同一频道只入一条」，
+    绝不把未识别的单集也补进去，否则扫描→识别→加规则后仍会一集一集推。
     """
     rows = list(db.scalars(select(Resource)).all())
     added = 0
     for r in rows:
         if rule.directory_id and rule.directory_id != r.parent_id:
             continue
-        if rule.keyword and rule.keyword.lower() not in r.name.lower():
+        if rule.keyword and rule.keyword.lower() not in (r.name or "").lower():
             continue
-        exists = db.scalar(select(QueueItem).where(
-            QueueItem.resource_id == r.id, QueueItem.channel_id == rule.channel_id))
-        if exists:
-            continue
-        db.add(QueueItem(resource_id=r.id, channel_id=rule.channel_id,
-                         status="pending" if rule.auto_publish else "review"))
-        added += 1
+        if _enqueue_ready(db, r, rule):
+            added += 1
     return added
 
 
@@ -1446,8 +1545,13 @@ def queue_schedule_get(db: Session = Depends(get_db)):
         seconds = int(runtime_config.get(db, "queue_interval_seconds") or 30)
     except ValueError:
         seconds = 30
+    try:
+        delay = int(runtime_config.get(db, "telegram_send_delay") or 2)
+    except ValueError:
+        delay = 2
     return {"interval_seconds": max(5, seconds),
             "cron": runtime_config.get(db, "queue_cron") or "",
+            "send_delay": max(0, min(delay, 60)),
             "default_interval": 30}
 
 
@@ -1461,13 +1565,15 @@ def queue_schedule_save(p: QueueScheduleInput, db: Session = Depends(get_db)):
         except Exception as e:
             raise HTTPException(400, f"Cron 表达式无效：{e}。示例 */1 * * * * 表示每分钟推送一次")
     seconds = max(5, min(int(p.interval_seconds or 30), 86400))
-    runtime_config.set_many(db, {"queue_interval_seconds": str(seconds), "queue_cron": cron})
+    delay = max(0, min(int(p.send_delay or 0), 60))
+    runtime_config.set_many(db, {"queue_interval_seconds": str(seconds), "queue_cron": cron,
+                                 "telegram_send_delay": str(delay)})
     add_audit(db, "queue_schedule_saved", target_type="config",
-              detail=json_dumps({"interval_seconds": seconds, "cron": cron}))
+              detail=json_dumps({"interval_seconds": seconds, "cron": cron, "send_delay": delay}))
     db.commit()
     trigger = _queue_trigger(db)
     _schedule_queue_worker(trigger)
-    return {"ok": True, "interval_seconds": seconds, "cron": cron,
+    return {"ok": True, "interval_seconds": seconds, "cron": cron, "send_delay": delay,
             "mode": "cron" if cron else "interval"}
 
 

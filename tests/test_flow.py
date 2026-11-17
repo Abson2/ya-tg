@@ -4,6 +4,7 @@ from unittest.mock import patch
 from sqlalchemy import func, select
 
 from app.db import SessionLocal, migrate
+from app.main import _enqueue_after_identify
 from app.models import AuthToken, Bot, Channel, QueueItem, Resource, Rule
 from app.publisher import process_queue
 from app.scanner import run_scan
@@ -61,6 +62,24 @@ def test_scan_to_share_to_push_flow():
         scan = asyncio.run(run_scan(""))
         assert scan["files"] == 2
         assert scan["directories"] == 2
+        # v0.6.5：扫描只入库，不产生队列项
+        db = SessionLocal()
+        assert db.query(QueueItem).count() == 0
+        db.close()
+        # 模拟识别成功（带 TMDB 海报）后才入队
+        db = SessionLocal()
+        for r in db.scalars(select(Resource)).all():
+            r.identify_status = "identified"
+            r.media_type = "movie"
+            r.media_title = r.name.split(".")[0]
+            r.poster_path = "/poster.jpg"
+        db.commit()
+        queued = 0
+        for r in db.scalars(select(Resource)).all():
+            queued += _enqueue_after_identify(db, r)
+        db.commit()
+        db.close()
+        assert queued == 2
         result = asyncio.run(process_queue())
         assert result["sent"] == 2
         assert result["shares_created"] == 2

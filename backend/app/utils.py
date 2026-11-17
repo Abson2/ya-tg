@@ -336,8 +336,15 @@ def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
     if chain:
         return {"dir_id": chain[0], "dir_name": parent_name, "scope": "series_dir",
                 "reason": "父目录即剧集目录（未整理剧集）"}
-    return {"dir_id": parent_id, "dir_name": parent_name, "scope": "file",
-            "reason": "缺目录链，退化为按单集分享"}
+    # v0.6.5：只要能定位到父目录，就按目录分享，绝不退化成单集——
+    # 单集分享正是「一集一条链接 → 一集一条推送」的根因。缺 dir_chain（旧数据/未重扫）
+    # 时用 parent_id 兜底：未整理剧集即整剧目录；已整理剧集退而求其次按季目录分享，
+    # 仍比单集合理。只有连 parent_id 都没有才无法分享目录。
+    if parent_id and parent_id != "*":
+        return {"dir_id": parent_id, "dir_name": parent_name or "剧集目录", "scope": "series_dir",
+                "reason": "缺目录链，按父目录分享（剧集目录兜底，不按单集）"}
+    return {"dir_id": "", "dir_name": parent_name, "scope": "file",
+            "reason": "缺父目录信息，无法按目录分享"}
 
 
 def backoff_seconds(attempts: int, base: int | None = None, cap: int | None = None) -> int:

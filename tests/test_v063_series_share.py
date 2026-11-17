@@ -63,11 +63,14 @@ def test_series_dir_organized_season_goes_up():
     assert "季目录" in info["reason"]
 
 
-def test_series_dir_no_chain_falls_back_to_file():
-    """缺目录链（升级前老资源）退化为按单集分享，不崩"""
+def test_series_dir_no_chain_falls_back_to_parent_dir():
+    """v0.6.5：缺目录链但有父目录时按父目录分享，绝不退化成单集（单集分享=逐集推送根因）"""
     info = series_dir_info("发布组/天仙配/Season 01", [], "parent-fid")
-    assert info["scope"] == "file"
+    assert info["scope"] == "series_dir"
     assert info["dir_id"] == "parent-fid"
+    # 连父目录都没有才无法按目录分享
+    info2 = series_dir_info("裸文件名", [], "")
+    assert info2["scope"] == "file"
 
 
 def test_series_dir_accepts_json_chain_and_cn_season():

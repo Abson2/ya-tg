@@ -190,6 +190,14 @@ def test_scan_persists_directory_path_hint_and_cursor():
 # ---------- 4. 规则保存回溯入队 / 中文校验 / 立即推送 ----------
 def test_rule_save_backfills_queue_and_gives_friendly_error():
     bid, cid, resid = _seed()
+    # v0.6.5：回溯只补「已识别 + 有海报」的资源，未识别资源不应入队
+    db = SessionLocal()
+    res = db.get(Resource, resid)
+    res.identify_status = "identified"
+    res.media_type = "movie"
+    res.media_title = "测试影片"
+    res.poster_path = "/poster.jpg"
+    db.commit(); db.close()
     c = TestClient(app)
     r = c.post("/api/rules", headers=H,
                json={"name": "v061-rule", "channel_id": cid})

@@ -23,7 +23,7 @@ const typeFilter = ref(''), identifyFilter = ref('')
 // v0.6.1：链路自检、Telegram 反代地址、批量重识别/立即推送状态
 const diagnostics = ref({ blockers: [] }), telegramBase = ref(''), telegramSaving = ref(false)
 // v0.6.4：队列推送调度（间隔秒 / Cron 二选一）
-const queueSchedule = ref({ interval_seconds: 30, cron: '' }), scheduleSaving = ref(false)
+const queueSchedule = ref({ interval_seconds: 30, cron: '', send_delay: 2 }), scheduleSaving = ref(false)
 const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 
@@ -191,14 +191,14 @@ const icon = name => paths[name] || paths.grid
 const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件块支持嵌套')
 // 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
 const tagHint = computed(() => 'TMDB 分类打标：{{type}}=movie/tv，{{type_label}}=电影/剧集，{{origin_country}}=制片地区，{{genres}}=类型，{{tags}}=组合标签（示例 #保镖恋人 #电影 #爱情 #惊悚）。按示例打标可写：type={{type}} · origin_country={{origin_country}} · genres={{genres}}')
-const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'size', 'share_url',
+const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'size', 'share_url',
   'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
   'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename']
 const previewDemo = {
   title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
   filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
   version: '2160p · WEB-DL · H.265 · 10bit · DoVi P5 · DDP Atmos 5.1', season_label: '',
-  size: '14.9GB', share_url: 'https://share.example/xxx', tmdb_id: '1440098',
+  episode_count: '36', size: '14.9GB', share_url: 'https://share.example/xxx', tmdb_id: '1440098',
   tmdb_url: 'https://www.themoviedb.org/movie/1440098',
   type: 'movie', type_label: '电影', origin_country: '西班牙', origin_country_code: 'ES',
   genres: '爱情、惊悚', tags: '#保镖恋人 #电影 #西班牙 #爱情 #惊悚',
@@ -408,7 +408,8 @@ async function saveQueueSchedule() {
   scheduleSaving.value = true
   try {
     const d = await api('/queue/schedule', { method: 'POST', body: JSON.stringify({
-      interval_seconds: queueSchedule.value.interval_seconds, cron: queueSchedule.value.cron || '' }) })
+      interval_seconds: queueSchedule.value.interval_seconds, cron: queueSchedule.value.cron || '',
+      send_delay: queueSchedule.value.send_delay ?? 2 }) })
     queueSchedule.value = d
     ElMessage.success(d.cron ? `Cron 已生效：${d.cron}` : `推送间隔已生效：每 ${d.interval_seconds} 秒`)
   } catch (e) { ElMessage.error(e.message) }
@@ -678,7 +679,7 @@ async function restoreDefaultTpl() {
   try {
     const d = await api('/templates/default', { method: 'POST' })
     tpl.value = { name: '默认图文模板', content: d.content, enabled: true, is_default: true }
-    ElMessage.success('已载入 默认模板（含分类标签），保存后生效')
+    ElMessage.success('已载入整剧风格默认模板（含分类标签），保存后生效')
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -728,7 +729,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.6.1 · Asia/Shanghai</div>
+        <div class="foot-version">v0.6.5 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -931,6 +932,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
                 <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">取消分享</el-button>
                 <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
                 <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
+                <el-button size="small" text @click="openMatch(seriesRepresentative(g) || {id:g.representative_id, name:g.title, path_hint:''})">手动修正</el-button>
               </div>
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
@@ -966,8 +968,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <p v-else class="hint" style="margin:8px 0">链路完整：Bot / 频道 / 规则均已启用，队列每 30 秒自动推送一次；也可点「立即推送队列」马上验证。</p>
             <p v-if="diagnostics.last_error" class="hint" style="color:#c0392b;margin:8px 0">最近失败：{{ diagnostics.last_error }}</p>
             <div class="match-controls"><el-input v-model="telegramBase" placeholder="Telegram API 地址，默认 https://api.telegram.org（国内网络可填反代）"/><el-button :loading="telegramSaving" @click="saveTelegramBase">保存地址</el-button></div>
-            <div class="match-controls schedule-controls"><span class="schedule-label">推送间隔</span><el-input-number v-model="queueSchedule.interval_seconds" :min="5" :max="86400" controls-position="right" style="width:130px"/><span class="schedule-label">秒 · 或 Cron</span><el-input v-model="queueSchedule.cron" placeholder="留空用间隔；如 */1 * * * * 每分钟" style="max-width:280px"/><el-button type="primary" :loading="scheduleSaving" @click="saveQueueSchedule">保存调度</el-button></div>
-            <p class="hint" style="margin:6px 0 0">Cron 为 5 段（分 时 日 月 周，北京时间），非空时优先于间隔；保存后立即生效，无需重启。默认每 30 秒推送一次。</p>
+            <div class="match-controls schedule-controls"><span class="schedule-label">检查队列</span><el-input-number v-model="queueSchedule.interval_seconds" :min="5" :max="86400" controls-position="right" style="width:110px"/><span class="schedule-label">秒 · 或 Cron</span><el-input v-model="queueSchedule.cron" placeholder="留空用间隔；如 */1 * * * * 每分钟" style="max-width:230px"/><span class="schedule-label">每条间隔</span><el-input-number v-model="queueSchedule.send_delay" :min="0" :max="60" controls-position="right" style="width:100px"/><span class="schedule-label">秒</span><el-button type="primary" :loading="scheduleSaving" @click="saveQueueSchedule">保存调度</el-button></div>
+            <p class="hint" style="margin:6px 0 0">「检查队列」= 多久扫一次待推队列；「每条间隔」= 两条 TG 消息之间隔几秒（防风控，默认 2 秒）。Cron 5 段（分 时 日 月 周，北京时间），非空时优先于检查间隔；保存即生效，无需重启。</p>
           </div>
           <div class="manage-grid">
             <!-- Bot 管理卡片 -->
@@ -1318,4 +1320,76 @@ button{font-family:inherit}
 .ai-result{margin-top:10px;background:#f7f8fc;border:1px solid var(--yg-line);border-radius:10px;padding:10px}
 .ai-result pre{margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:#4a5578}
 @media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}}
+
+/* ============ v0.6.5 手机 / 触屏适配 ============ */
+/* ≤900px：侧栏从左侧竖排改为顶部横向导航，主区占满宽度 */
+@media(max-width:900px){
+  .app-shell{flex-direction:column}
+  .sidebar{width:100%;height:auto;position:sticky;top:0;z-index:30;flex-direction:column;border-radius:0;box-shadow:0 4px 16px rgba(23,27,53,.18)}
+  .brand{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
+  .brand-mark{width:30px;height:30px;border-radius:9px;font-size:12px}
+  .brand-name{font-size:15px}
+  .nav-groups{display:flex;flex-direction:row;gap:6px;padding:8px 10px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;-webkit-overflow-scrolling:touch}
+  .nav-group{display:flex;flex-direction:row;gap:6px;margin:0;flex:none}
+  .nav-group-label,.sidebar-foot{display:none}
+  .nav-text,.nav-badge{display:inline}
+  .nav-item{width:auto;flex:none;justify-content:flex-start;gap:7px;padding:8px 12px;font-size:12px}
+  .nav-item .ico{width:15px;height:15px}
+  .nav-badge{margin-left:2px}
+  .main-wrap{width:100%}
+  .topbar{height:56px;padding:0 14px}
+  .content{padding:16px 14px 48px}
+  .hero{padding:20px;flex-wrap:wrap}
+  .hero h2{font-size:22px}
+  .top-actions .clock{display:none}
+  /* 顶部操作区在窄屏允许按钮收缩 */
+  .top-actions{gap:6px}
+}
+/* 表格横向滚动：包一层即可，避免列多撑破布局 */
+.table-scroll{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.table-scroll .el-table{min-width:560px}
+/* 固定宽度内联控件的通用兜底：窄屏不要溢出 */
+.head-tools .el-input,.head-tools .el-select{max-width:100%}
+/* ≤680px：单列 + 海报墙两列 + 表单堆叠 */
+@media(max-width:680px){
+  .content{padding:14px 10px 44px}
+  .topbar{padding:0 10px}
+  .crumb{font-size:12px}
+  .page-head{align-items:flex-start}
+  .page-head h2{font-size:19px}
+  .head-tools{width:100%;justify-content:flex-start}
+  .head-tools .el-input,.head-tools .el-select{width:100%!important;flex:1 1 100%}
+  .stat-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .stat-num{font-size:22px}
+  .hero{padding:18px;gap:14px}
+  .hero h2{font-size:20px}
+  .hero p{font-size:11px}
+  .hero-actions{width:100%;justify-content:space-between}
+  .media-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .media-poster{height:auto;aspect-ratio:2/3}
+  .media-actions .el-button{margin:0 3px 4px 0;padding:5px 8px;font-size:11px}
+  .credential-bar,.auth-summary,.kv-grid,.var-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .cursor-box{grid-template-columns:repeat(2,1fr);gap:10px}
+  .connect-steps{flex-wrap:wrap}
+  .cstep{flex:1 1 45%}
+  .match-controls{flex-wrap:wrap}
+  .match-controls .el-input,.match-controls .el-select{min-width:140px;flex:1 1 100%}
+  .schedule-controls{flex-wrap:wrap;gap:6px}
+  .schedule-controls .schedule-label{width:auto}
+  .match-grid{grid-template-columns:1fr;max-height:50vh}
+  .field.inline{flex-wrap:wrap}
+  .panel{padding:15px}
+  .panel-foot{flex-wrap:wrap}
+  .el-dialog{width:92%!important;margin-top:6vh!important}
+  .el-dialog__body{padding:16px}
+  .tl-action{min-width:0}
+  .tl-time{min-width:60px}
+  .device-code{font-size:22px;letter-spacing:4px}
+}
+/* ≤400px：极窄屏海报墙保留两列但进一步压缩 */
+@media(max-width:400px){
+  .media-grid{gap:8px}
+  .series-card .media-actions .el-button{font-size:10px;padding:4px 6px}
+  .stat-card{padding:14px}
+}
 </style>
