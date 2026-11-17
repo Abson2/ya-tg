@@ -28,13 +28,35 @@ def human_size(size: int) -> str:
 
 
 async def ensure_share(db: Session, res: Resource) -> str:
-    """幂等创建分享；返回 share_url。失败抛出 GuangYaError。"""
+    """幂等创建分享；返回 share_url。失败抛出 GuangYaError。
+
+    v0.6.3：剧集按「剧集目录」分享（未整理=父目录，已整理=剧名目录），
+    同一目录只建一个分享，share_url 同步给同目录所有单集，避免每集一条链接。
+    """
     if res.share_url:
         return res.share_url
     if not settings.auto_create_share:
         raise GuangYaError("AUTO_CREATE_SHARE=false，且该资源尚无分享链接")
+    # 剧集目录级分享：找同目录已有分享，直接复用
+    dir_id = str(getattr(res, "share_dir_id", "") or "")
+    scope = str(getattr(res, "share_scope", "") or "")
+    if scope == "series_dir" and dir_id:
+        from sqlalchemy import select as _select
+        sibling = db.scalar(_select(Resource).where(
+            Resource.share_dir_id == dir_id, Resource.share_url != "",
+            Resource.id != res.id).limit(1))
+        if sibling and sibling.share_url:
+            res.share_id, res.share_url = sibling.share_id, sibling.share_url
+            res.share_status, res.share_duration = "active", sibling.share_duration
+            db.commit()
+            return res.share_url
     client = GuangYaShareClient(db)
-    result = await client.create(res.file_id, res.name or res.media_title or "", settings.share_duration)
+    # 剧集分享整目录，标题用「剧名 S01」；电影/无目录线索仍按单集
+    target_id = dir_id if (scope == "series_dir" and dir_id) else res.file_id
+    title = res.media_title or res.name or ""
+    if scope == "series_dir" and res.season:
+        title = f"{title} 第{int(res.season)}季" if title else f"第{int(res.season)}季"
+    result = await client.create(target_id, title, settings.share_duration)
     data = result.get("data") or {}
     share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
     share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or data.get("link") or "")

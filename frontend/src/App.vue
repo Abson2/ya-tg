@@ -294,8 +294,8 @@ async function addRule() {
   if (!rule.value.channel_id) { ElMessage.warning('请选择「目标频道」'); return }
   if (!String(rule.value.name || '').trim()) { ElMessage.warning('请填写规则名称'); return }
   try {
-    const d = await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) })
-    ElMessage.success(d.message || '规则已保存')
+    await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) })
+    // v0.6.3：保存成功后直接关弹窗、刷新列表即可，不再弹「规则已保存」提示（多余）
     rule.value = { name: '', directory_id: '', keyword: '', channel_id: rule.value.channel_id, auto_publish: true }
     manageDialog.value = ''
     await load()
@@ -354,9 +354,9 @@ async function publishResource(row) {
   try {
     const d = await api(`/resources/${row.id}/publish`, { method: 'POST' })
     const base = `已入队 ${d.queued || 0} 条，发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条`
-    if (d.detail?.length) {
-      ElMessageBox.alert(d.detail.map(x => `频道 #${x.channel_id}：${x.error}`).join('\n'),
-        `${base}（失败原因）`, { confirmButtonText: '知道了', type: 'warning' })
+    const reasons = [...(d.skipped || []), ...(d.detail || []).map(x => x.error)]
+    if (reasons.length) {
+      ElMessage({ type: 'warning', message: `${base}｜${reasons[0]}`, duration: 6000, showClose: true })
     } else {
       ElMessage.success(base + (d.queued ? '， Telegram 频道稍后即可收到' : ''))
     }

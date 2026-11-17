@@ -116,13 +116,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.2", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.3", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.2", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.3", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -442,6 +442,15 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     x.identify_status = "identified"
     x.identify_source = source
     x.identify_note = note or ""
+    # v0.6.3：剧集按「剧集目录」分享而非单集。未整理取父目录，已整理取上上层。
+    if x.media_type == "tv":
+        from .utils import series_dir_info
+        info = series_dir_info(x.path_hint, getattr(x, "dir_chain_json", "[]"), x.parent_id)
+        x.share_scope = info["scope"]
+        x.share_dir_id = info["dir_id"]
+        x.share_dir_name = info["dir_name"]
+    else:
+        x.share_scope, x.share_dir_id, x.share_dir_name = "file", "", ""
 
 
 def _clear_identification(x: Resource, status: str = "none", source: str = "manual",
@@ -1154,20 +1163,33 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
     if not rules:
         raise HTTPException(400, "还没有启用的分发规则：请先在「分发规则」页完成 Bot → 频道 → 规则")
     added = 0
+    skipped = []
     for r in rules:
+        ch = db.get(Channel, r.channel_id)
+        if not ch or not ch.enabled:
+            skipped.append(f"规则「{r.name}」的目标频道不存在或已停用")
+            continue
+        bot = db.get(Bot, ch.bot_id) if ch else None
+        if not bot or not bot.enabled:
+            skipped.append(f"规则「{r.name}」的 Bot 不存在或已停用")
+            continue
         if r.directory_id and r.directory_id != x.parent_id:
+            skipped.append(f"规则「{r.name}」限定目录 {r.directory_id}，与资源目录 {x.parent_id} 不符")
             continue
         if r.keyword and r.keyword.lower() not in x.name.lower():
+            skipped.append(f"规则「{r.name}」限定关键词「{r.keyword}」，文件名不含该词")
             continue
         q = db.scalar(select(QueueItem).where(
             QueueItem.resource_id == x.id, QueueItem.channel_id == r.channel_id))
         if q:
-            if q.status in ("review", "failed"):
-                q.status, q.error, q.next_retry_at = "pending", "", None
-                added += 1
-            continue
-        db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
-        added += 1
+            # v0.6.3：「立即推送」是手动强制动作， ANY 状态（含 sent/retry）都重置为 pending
+            # 立即重推。旧逻辑只重置 review/failed，用户第一次推成功后反复点都显示
+            # 「已入队 0 条」，误以为按钮无反应。
+            q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+            added += 1
+        else:
+            db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
+            added += 1
     db.commit()
     result = await process_queue(limit=50)
     # v0.6.2：把本次入队项的即时结果带回前端，避免"点了没反应"的错觉。
@@ -1177,7 +1199,7 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         QueueItem.resource_id == x.id).order_by(QueueItem.id.desc()).limit(len(rules) or 1)).all())
     detail = [{"channel_id": q.channel_id, "status": q.status,
                "error": str(q.error or "")[:300]} for q in recent if q.error]
-    return {"ok": True, "queued": added, "detail": detail, **result}
+    return {"ok": True, "queued": added, "detail": detail, "skipped": skipped, **result}
 
 
 @app.put("/api/bots/{bid}", dependencies=ADMIN)

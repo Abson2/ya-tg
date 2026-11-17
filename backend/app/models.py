@@ -16,6 +16,13 @@ class Resource(Base):
     # v0.6.1：扫描时记录的目录显示名链，如「谷雨 (2026)(1)/Season 1」。
     # 剧集单集文件名往往是英文译名，作品名要靠父目录，识别必须带上它。
     path_hint: Mapped[str] = mapped_column(Text, default="")
+    # v0.6.3：从直接父目录往上到根的 fileId 链，如 ["f_s1","f_show","f_root"]。
+    # 用于定位剧集目录：未整理=父目录，已整理(剧名/Season N/单集)=上上层。
+    dir_chain_json: Mapped[str] = mapped_column(Text, default="[]")
+    # v0.6.3：分享粒度与目标目录。file=单集；series_dir=整剧/季目录。
+    share_scope: Mapped[str] = mapped_column(String(16), default="file")
+    share_dir_id: Mapped[str] = mapped_column(String(64), default="")
+    share_dir_name: Mapped[str] = mapped_column(String(256), default="")
     name: Mapped[str] = mapped_column(String(512))
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     file_type: Mapped[int] = mapped_column(Integer, default=0)
@@ -68,6 +75,8 @@ class ScanCursor(Base):
     stack_json: Mapped[str] = mapped_column(Text, default="[]")
     # v0.6.1：目录 fileId -> 显示名路径，断点续扫后仍能给资源补上目录线索
     dir_paths_json: Mapped[str] = mapped_column(Text, default="{}")
+    # v0.6.3：目录 fileId -> 到根的 fileId 链，断点续扫后仍能定位剧集目录层级
+    dir_chains_json: Mapped[str] = mapped_column(Text, default="{}")
     next_page: Mapped[int] = mapped_column(Integer, default=0)
     files_count: Mapped[int] = mapped_column(Integer, default=0)
     dirs_count: Mapped[int] = mapped_column(Integer, default=0)

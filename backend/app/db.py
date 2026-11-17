@@ -39,6 +39,11 @@ _COLUMNS = {
         "identify_note": "TEXT DEFAULT ''",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
+        # v0.6.3：目录 fileId 链 + 剧集目录级分享
+        "dir_chain_json": "TEXT DEFAULT '[]'",
+        "share_scope": "TEXT DEFAULT 'file'",
+        "share_dir_id": "TEXT DEFAULT ''",
+        "share_dir_name": "TEXT DEFAULT ''",
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
@@ -48,6 +53,7 @@ _COLUMNS = {
     },
     "scan_cursors": {
         "dir_paths_json": "TEXT DEFAULT '{}'",
+        "dir_chains_json": "TEXT DEFAULT '{}'",
     },
 }
 

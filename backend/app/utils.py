@@ -271,6 +271,40 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
     }
 
 
+def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
+                    parent_id: str = "") -> dict:
+    """v0.6.3：判定单集文件对应的「剧集目录」层级与 fileId。
+
+    两种剧集存放方式：
+      1) 未整理：剧名/单集.mkv          → 剧集目录 = 直接父目录
+      2) 已整理：剧名/Season 01/单集.mkv → 剧集目录 = 父目录的上一层（剧名目录）
+
+    dir_chain 来自扫描，形如 [父fileId, 祖父fileId, ...]（index 0 = 直接父）。
+    path_hint 形如「剧名/Season 1」（从根到父的显示名链，最后一段是父目录名）。
+    返回 {"dir_id": ..., "dir_name": ..., "scope": "series_dir"/"file", "reason": ...}
+    """
+    import json as _json
+    if isinstance(dir_chain, str):
+        try:
+            dir_chain = _json.loads(dir_chain or "[]")
+        except Exception:
+            dir_chain = []
+    chain = [str(x) for x in (dir_chain or []) if x]
+    segments = [s for s in re.split(r"[/\\]+", path_hint or "") if s.strip()]
+    parent_name = segments[-1] if segments else ""
+    is_season_dir = bool(parent_name and _SEASON_DIR.match(parent_name))
+
+    if is_season_dir and len(chain) >= 2:
+        return {"dir_id": chain[1], "dir_name": segments[-2] if len(segments) >= 2 else parent_name,
+                "scope": "series_dir",
+                "reason": f"父目录「{parent_name}」是季目录，剧集目录取上上层"}
+    if chain:
+        return {"dir_id": chain[0], "dir_name": parent_name, "scope": "series_dir",
+                "reason": "父目录即剧集目录（未整理剧集）"}
+    return {"dir_id": parent_id, "dir_name": parent_name, "scope": "file",
+            "reason": "缺目录链，退化为按单集分享"}
+
+
 def backoff_seconds(attempts: int, base: int | None = None, cap: int | None = None) -> int:
     """第 attempts 次失败后的等待秒数，带少量抖动防止惊群。"""
     base = base or settings.queue_backoff_base
