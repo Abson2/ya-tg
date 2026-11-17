@@ -6,6 +6,31 @@
 
 ---
 
+## v0.5.4 (2026-11-17)
+
+修复资源库识别报 `HTTP 401 Invalid API key`，并把 TMDB 密钥改成管理页可配置。登录、扫描、建分享、推送链路不受影响。
+
+### 问题
+- 用户填了无效密钥、或把 v4 Read Access Token 当成 v3 API Key 填（旧版按字段名死板判断），TMDB 返回 `status_code:7 Invalid API key`，前端弹出原始英文 401，且资源库看起来"无法识别"
+- 旧版密钥只能写 `.env` 并重启容器才能改；部分识别端点没把 `db` 传给 TMDB 模块，导致管理页配置读不到
+- 明确一点：TMDB 只负责海报/简介，**publisher 只读本地已存字段、不发起 TMDB 请求**，所以 401 从未阻断资源入库、建分享和推送
+
+### 修复
+- `tmdb.py`：按值特征自动识别凭证类型（v4 `eyJ...` → Bearer；v3 32位hex → api_key），填错框也能纠正；修正两个字段填相同值时的来源误判；新增 `auth_status()` / `test_connection()` / `TmdbAuthError`
+- 401/403 与未配置统一转成**可操作的中文提示**（含 v3/v4 格式说明与「测试连接」引导），不再抛原始 `TMDB 请求失败 HTTP 401`
+- `runtime_config` 增加 `tmdb_api_key` / `tmdb_bearer_token` / `tmdb_language`，密钥加密落库、DB 优先 `.env` 兜底
+- 新增管理端点 `GET /api/tmdb/status`、`POST /api/tmdb/config`、`POST /api/tmdb/test`；所有识别/搜索端点（candidates、identify、auto-identify、search）都传 `db`，凭证问题返回 400 而非 502
+- 前端新增「TMDB 设置」页：状态展示、密钥输入、保存、测试连接、TMDB 申请链接；概览健康检查反映真实配置状态；资源库识别失败时弹窗引导跳转设置页，并说明"不影响推送"
+- 文档：`.env.example` 与 README 补管理页配置说明和 401 FAQ
+
+### 测试
+- 新增 `tests/test_tmdb_config.py`：v3/v4 自动纠正、同值不误判、未配置/401 的中文提示、配置端点与 400 引导；全套 23 项通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.5.4
+```
+
 ## v0.5.3 (2026-11-17)
 
 修复扫描报 `code=120 缺少clientId`：短信登录用户改用光鸭网页端文件接口，真正实现零配置扫描。

@@ -25,6 +25,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "guangya_share_did": ("guangya_share_did", ""),
     "guangya_share_dt": ("guangya_share_dt", "4"),
     "guangya_share_smid": ("guangya_share_smid", ""),
+    "tmdb_api_key": ("tmdb_api_key", ""),
+    "tmdb_bearer_token": ("tmdb_bearer_token", ""),
+    "tmdb_language": ("tmdb_language", "zh-CN"),
 }
 
 

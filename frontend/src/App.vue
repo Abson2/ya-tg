@@ -15,6 +15,30 @@ const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
+const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
+
+async function loadTmdb() {
+  try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
+}
+async function saveTmdb() {
+  tmdbSaving.value = true
+  try {
+    const d = await api('/tmdb/config', { method: 'POST', body: JSON.stringify(tmdbForm.value) })
+    tmdbStatus.value = d.status || {}
+    ElMessage.success('TMDB 密钥已保存（加密存储），无需重启')
+  } catch (e) { ElMessage.error(e.message) }
+  finally { tmdbSaving.value = false }
+}
+async function testTmdb() {
+  tmdbTesting.value = true
+  try {
+    const d = await api('/tmdb/test', { method: 'POST' })
+    if (d.ok) ElMessage.success('连接成功，密钥有效')
+    else ElMessage.error(d.message || '密钥无效')
+    await loadTmdb()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { tmdbTesting.value = false }
+}
 
 const smsCountdown = ref('')  // 凭证到期倒计时（本地每秒刷新）
 function fmtBj(iso) {
@@ -90,6 +114,7 @@ const navGroups = [
     { key: '推送队列', icon: 'send', label: '推送队列' }
   ] },
   { label: '系统', items: [
+    { key: 'TMDB 设置', icon: 'image', label: 'TMDB 设置' },
     { key: '消息模板', icon: 'file', label: '消息模板' },
     { key: '操作审计', icon: 'clock', label: '操作审计' }
   ] }
@@ -136,7 +161,7 @@ const filteredResources = computed(() => resources.value.filter(r => {
 const healthChecks = computed(() => [
   { label: '光鸭 OpenAPI 授权', ok: overview.value.auth === 'ok', hint: auth.value.authenticated ? (auth.value.flow || '已授权') : '尚未完成授权' },
   { label: '网页分享会话', ok: !!shareStatus.value.configured, hint: shareStatus.value.configured ? ('已配置 · ' + (shareStatus.value.source || '')) : '请到「光鸭授权」一键登录' },
-  { label: 'TMDB 识别', ok: true, hint: '搜索与详情接口已接入' },
+  { label: 'TMDB 识别', ok: !!tmdbStatus.value.configured, hint: tmdbStatus.value.configured ? ('已配置 · ' + (tmdbStatus.value.mode || '') + (tmdbStatus.value.format_warning ? ' · 格式可疑' : '')) : '未配置 · 到「TMDB 设置」填密钥（可选，仅影响海报简介）' },
   { label: '队列 Worker', ok: true, hint: '每 30 秒轮询一次' }
 ])
 
@@ -159,6 +184,7 @@ async function load() {
   templates.value = await api('/templates')
   audit.value = await api('/audit')
   await loadAuth()
+  await loadTmdb()
 }
 async function loadAuth() {
   // 三个请求独立加载：任一端点报错不再拖垮其余状态展示
@@ -210,7 +236,20 @@ async function identify(row, auto) {
     }
     ElMessage.success(d.ok ? '识别完成' : '未找到候选，请用手动识别')
     await load()
-  } catch (e) { if (e !== 'cancel') ElMessage.error(e.message) }
+  } catch (e) {
+    if (e === 'cancel') return
+    const msg = e.message || ''
+    // TMDB 凭证缺失/无效：给可操作引导，而不是抛原始 401
+    if (/TMDB 密钥|尚未配置 TMDB|Invalid API key|401/.test(msg)) {
+      try {
+        await ElMessageBox.confirm(
+          `${msg}\n\n识别只影响海报和简介，资源入库、建分享与推送不受影响。现在去「TMDB 设置」页配置密钥？`,
+          'TMDB 无法识别', { confirmButtonText: '去设置', cancelButtonText: '稍后', type: 'warning' })
+        tab.value = 'TMDB 设置'
+        await loadTmdb()
+      } catch (_) {}
+    } else ElMessage.error(msg)
+  }
 }
 async function approve(id) { await api(`/review/${id}/approve`, { method: 'POST' }); ElMessage.success('已通过'); await load() }
 async function reject(id) { await api(`/review/${id}/reject`, { method: 'POST' }); ElMessage.success('已拒绝'); await load() }
@@ -522,6 +561,49 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           <div class="panel">
             <el-table :data="queue" stripe max-height="640"><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="resource" label="资源" min-width="200"/><el-table-column prop="channel" label="频道"/><el-table-column prop="status" label="状态" width="100"><template #default="s"><span class="status-tag" :class="'st-'+s.row.status">{{ s.row.status }}</span></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="next_retry_at" label="下次重试"/><el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip/><el-table-column label="操作" width="90"><template #default="s"><el-button size="small" @click="retry(s.row.id)">重试</el-button></template></el-table-column></el-table>
             <div v-if="!queue.length" class="empty big">队列为空</div>
+          </div>
+        </section>
+
+        <section v-else-if="tab === 'TMDB 设置'" class="fade">
+          <div class="page-head"><div><h2>TMDB 设置</h2><p>自动识别电影/剧集，补全海报与简介；可选功能，不配置不影响扫描、建分享和推送</p></div><el-button plain @click="loadTmdb">刷新状态</el-button></div>
+
+          <div class="panel" style="margin-bottom:16px">
+            <div class="panel-head"><h3>当前状态</h3>
+              <el-tag :type="tmdbStatus.configured ? 'success' : 'warning'" size="small">{{ tmdbStatus.configured ? '已配置' : '未配置' }}</el-tag>
+            </div>
+            <div class="auth-summary" style="margin-bottom:0">
+              <div class="auth-summary-item"><small>识别方式</small><b>{{ tmdbStatus.mode === 'v4-bearer' ? 'v4 Read Access Token' : (tmdbStatus.mode === 'v3-key' ? 'v3 API Key' : '—') }}</b></div>
+              <div class="auth-summary-item"><small>已保存密钥</small><b>{{ tmdbStatus.masked || '—' }}</b></div>
+              <div class="auth-summary-item"><small>语言</small><b>{{ tmdbStatus.language || 'zh-CN' }}</b></div>
+              <div class="auth-summary-item"><small>格式检查</small><b :class="tmdbStatus.format_warning ? 'bad' : 'good'">{{ tmdbStatus.format_warning ? '格式可疑，请重新粘贴' : '正常' }}</b></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h3>配置密钥</h3><span class="hint">密钥加密保存在本机数据库，无需改 .env、无需重启</span></div>
+            <p class="hint" style="margin:0 0 14px">
+              二选一即可：<b>v4 Read Access Token</b>（以 <code>eyJ</code> 开头的长串，推荐）或 <b>v3 API Key</b>（32 位十六进制）。
+              系统会自动按格式判断类型，不用区分填在哪个框。
+            </p>
+            <div class="form-grid">
+              <div><small>v4 Read Access Token（推荐）</small><el-input v-model="tmdbForm.bearer_token" type="password" show-password placeholder="eyJhbGciOi..." clearable/></div>
+              <div><small>v3 API Key（32 位十六进制）</small><el-input v-model="tmdbForm.api_key" type="password" show-password placeholder="例如 1a2b3c...（32 位）" clearable/></div>
+              <div><small>语言</small><el-input v-model="tmdbForm.language" placeholder="zh-CN"/></div>
+            </div>
+            <div class="connect-actions" style="margin-top:16px">
+              <el-button type="primary" :loading="tmdbSaving" @click="saveTmdb">保存密钥</el-button>
+              <el-button plain :loading="tmdbTesting" @click="testTmdb">测试连接</el-button>
+            </div>
+            <p class="hint" style="margin-top:14px">
+              没有密钥？到 <a href="https://www.themoviedb.org/settings/api" target="_blank" class="device-link">TMDB 账号设置 → API</a> 免费申请，
+              复制 <b>API Read Access Token</b> 粘贴到上面第一个框。
+            </p>
+          </div>
+
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>说明</h3></div>
+            <p class="hint" style="margin:0 0 8px">未配置或密钥无效时，资源仍会正常入库、创建分享并推送到 Telegram，只是没有海报、简介和 TMDB 链接。配置好之后，回到「资源库」对已有资源点「自动识别」即可补全。</p>
+            <p class="hint" style="margin:0">若之前报 <code>HTTP 401 Invalid API key</code>，多半是把 v4 Token 当成 v3 Key 用了，或密钥已失效；重新粘贴后点「测试连接」确认。</p>
           </div>
         </section>
 

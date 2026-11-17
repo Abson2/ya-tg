@@ -113,13 +113,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.5.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.5.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.4", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -393,15 +393,51 @@ def _apply_identification(x: Resource, d: dict) -> None:
     x.identify_status = "identified"
 
 
+def _tmdb_error(exc: Exception) -> HTTPException:
+    """TMDB 凭证问题返回 400（可操作的中文提示），其它才是 502。"""
+    if isinstance(exc, tmdb.TmdbAuthError):
+        return HTTPException(400, str(exc))
+    return HTTPException(502, str(exc))
+
+
+# ---------- TMDB 设置（管理页配置，无需改 .env / 重启） ----------
+class TmdbConfigInput(BaseModel):
+    api_key: str = ""
+    bearer_token: str = ""
+    language: str = ""
+
+
+@app.get("/api/tmdb/status", dependencies=ADMIN)
+def tmdb_status(db: Session = Depends(get_db)):
+    return tmdb.auth_status(db)
+
+
+@app.post("/api/tmdb/config", dependencies=ADMIN)
+def tmdb_config_save(p: TmdbConfigInput, db: Session = Depends(get_db)):
+    runtime_config.set_many(db, {
+        "tmdb_api_key": p.api_key.strip(),
+        "tmdb_bearer_token": p.bearer_token.strip(),
+        "tmdb_language": (p.language.strip() or "zh-CN"),
+    })
+    add_audit(db, "tmdb_config_saved", target_type="config", detail="TMDB 密钥已更新（密文存储）")
+    db.commit()
+    return {"ok": True, "status": tmdb.auth_status(db)}
+
+
+@app.post("/api/tmdb/test", dependencies=ADMIN)
+async def tmdb_test(db: Session = Depends(get_db)):
+    return await tmdb.test_connection(db)
+
+
 @app.get("/api/tmdb/candidates/{rid}", dependencies=ADMIN)
 async def tmdb_candidates(rid: int, db: Session = Depends(get_db)):
     x = db.get(Resource, rid)
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        return await tmdb.identify_by_filename(x.name)
+        return await tmdb.identify_by_filename(x.name, db)
     except Exception as e:
-        raise HTTPException(502, str(e))
+        raise _tmdb_error(e)
 
 
 @app.post("/api/resources/{rid}/identify", dependencies=ADMIN)
@@ -412,14 +448,14 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        d = await tmdb.detail(p.tmdb_id, p.media_type)
+        d = await tmdb.detail(p.tmdb_id, p.media_type, db)
         _apply_identification(x, d)
         add_audit(db, "resource_identified", target_type="resource", target_id=str(rid),
                   detail=json_dumps(d))
         db.commit()
         return {"ok": True, "media_title": x.media_title, "poster": tmdb.poster_url(x.poster_path)}
     except Exception as e:
-        raise HTTPException(502, str(e))
+        raise _tmdb_error(e)
 
 
 @app.post("/api/resources/{rid}/auto-identify", dependencies=ADMIN)
@@ -428,7 +464,7 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        candidates = await tmdb.identify_by_filename(x.name)
+        candidates = await tmdb.identify_by_filename(x.name, db)
         if not candidates:
             return {"ok": False, "candidates": []}
         _apply_identification(x, candidates[0])
@@ -437,15 +473,15 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
         db.commit()
         return {"ok": True, "candidates": candidates, "applied": candidates[0]}
     except Exception as e:
-        raise HTTPException(502, str(e))
+        raise _tmdb_error(e)
 
 
 @app.get("/api/tmdb/search", dependencies=ADMIN)
-async def tmdb_search(q: str):
+async def tmdb_search(q: str, db: Session = Depends(get_db)):
     try:
-        return await tmdb.search(q)
+        return await tmdb.search(q, None, db)
     except Exception as e:
-        raise HTTPException(502, str(e))
+        raise _tmdb_error(e)
 
 
 # ---------- Bot / 频道 / 规则 ----------
