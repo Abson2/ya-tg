@@ -22,7 +22,7 @@ from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, MessageTemp
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, mask_secret
-from .utils import utcnow
+from .utils import as_utc, utcnow
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 _last_device_poll = 0.0
@@ -65,7 +65,7 @@ async def _job_token_refresh():
             return
         # 短信登录通道：用 refresh_token 经光鸭账号服务刷新
         if t.flow in ("sms", "tgto"):
-            if not t.expires_at or t.expires_at <= utcnow() + timedelta(minutes=10):
+            if not t.expires_at or as_utc(t.expires_at) <= utcnow() + timedelta(minutes=10):
                 await guangya_sms.refresh(db)
                 add_audit(db, "token_refreshed", target_type="auth", detail="短信登录通道定时刷新成功")
                 db.commit()
@@ -73,7 +73,7 @@ async def _job_token_refresh():
         # 官方 Device/PKCE 通道：refresh_token 刷新
         if not t.refresh_token_enc or not t.expires_at:
             return
-        if t.expires_at <= utcnow() + timedelta(minutes=10):
+        if as_utc(t.expires_at) <= utcnow() + timedelta(minutes=10):
             await guangya_auth.refresh(db)
             add_audit(db, "token_refreshed", target_type="auth", detail="定时刷新成功")
             db.commit()
@@ -113,13 +113,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.5.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.5.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.2", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)

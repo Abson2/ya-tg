@@ -6,6 +6,31 @@
 
 ---
 
+## v0.5.2 (2026-11-17)
+
+修复"短信登录后页面一刷新就显示未授权/凭证掉了"的问题，并把凭证有效期与自动刷新状态做成可见信息。功能链路不变，凭证本身一直安全存在库中。
+
+### 修复
+- 根因：SQLite 的 `DateTime(timezone=True)` 读回会丢 tzinfo（naive UTC），而 `/api/auth/status` 用 aware 的 `utcnow()` 与之比较，抛 `TypeError: can't compare offset-naive and offset-aware datetimes` 导致 500；前端把三个状态请求放在同一 `try`，一处失败就连 `sms/status` 一起跳过，页面显示"未授权、用户 ID —、过期时间 —"，看起来像凭证掉了
+- 新增 `utils.as_utc()` 统一归一化所有从库读出的时间，修复 `guangya_auth.status`、`poll_device`、`refresh`、`_job_token_refresh` 等全部 naive/aware 比较点，定时刷新任务不再有崩溃隐患
+- 前端 `loadAuth()` 拆成三个独立请求，任一端点失败不再拖垮其余状态
+- 页面刷新后按 `/sms/status` 的真实登录态自动恢复向导到"已连接"，不再回到第 1 步的假象
+
+### 新增（凭证可视化）
+- `/api/sms/status` 增加 `expires_in_seconds`（剩余秒数）、`auto_refresh`（是否可自动续期）、`needs_refresh`（是否临近到期）字段；`expires_at` 改为带 `Z` 的 UTC 时间，前端显示无歧义
+- 管理页"光鸭授权"新增凭证状态栏：**到期倒计时**（每秒刷新）、**自动刷新开关状态**、**北京时间过期时间**，以及"置顶已连接"状态标签；临近到期会提示正在自动刷新
+
+### 配置
+- `docker-compose.yml` / `docker-compose.build.yml` 及文档示例的 `env_file` 由 `[.env]` 改为块列表 `- ./.env`，消除不同 compose 版本的解析歧义
+
+### 测试
+- 新增 `tests/test_status_consistency.py`：锁定"短信登录后所有状态端点均 200 且数据一致"、倒计时字段、naive 时间归一化；全套 16 项通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.5.2
+```
+
 ## v0.5.1 (2026-11-17)
 
 **纯文档修正版本**，功能与镜像行为同 v0.5.0。修正上一版文档中仍残留、会误导普通用户填写光鸭凭证的内容，与自研短信登录的实际使用方式对齐。

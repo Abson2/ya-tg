@@ -182,17 +182,44 @@ async def refresh(db: Session) -> str:
 
 
 def status(db: Session) -> dict:
+    from .utils import as_utc, utcnow
     t = db.get(AuthToken, 1)
     flow = t.flow if t else ""
+    expires = as_utc(t.expires_at) if (t and t.expires_at) else None
+    now = utcnow()
+    # 剩余秒数：SQLite 读回的 expires_at 是 naive UTC，必须归一化后再比较，
+    # 否则与 aware 的 now 相减会抛 offset-naive/aware 错误。
+    seconds_left = int((expires - now).total_seconds()) if expires else None
+    has_refresh = bool(t and t.refresh_token_enc)
+    logged_in = bool(t and t.access_token_enc)
+    # 自动刷新：每 60 秒巡检一次，到期前 10 分钟触发；有 refresh_token 才具备能力。
+    auto_refresh = bool(logged_in and has_refresh and flow in ("sms", "tgto"))
+    needs_refresh = bool(expires and seconds_left is not None and seconds_left <= 600)
+    if not logged_in:
+        message = "尚未登录"
+    elif needs_refresh and auto_refresh:
+        message = "凭证即将到期，系统正在自动刷新"
+    elif needs_refresh and not auto_refresh:
+        message = "凭证即将到期，请重新登录"
+    elif flow == "sms":
+        message = "已登录（短信）· 自动刷新已开启"
+    elif flow == "tgto":
+        message = "已登录 · 自动刷新已开启"
+    else:
+        message = f"已授权（{flow}）"
     return {
-        "logged_in": bool(t and t.access_token_enc),
+        "logged_in": logged_in,
         "flow": flow,
         "sms_mode": flow in ("sms", "tgto"),  # 兼容旧 tgto 通道已有 token
         "account": t.sub if t else "",
-        "expires_at": t.expires_at.isoformat() if (t and t.expires_at) else None,
-        "has_refresh_token": bool(t and t.refresh_token_enc),
+        # 带 Z 的 UTC 时间，前端 Date 解析无歧义（naive 会被当成本地时间）
+        "expires_at": expires.isoformat().replace("+00:00", "Z") if expires else None,
+        "expires_in_seconds": max(0, seconds_left) if seconds_left is not None else None,
+        "has_refresh_token": has_refresh,
+        "auto_refresh": auto_refresh,
+        "needs_refresh": needs_refresh,
         "pending": bool(_load_pending(db)),
-        "message": "已登录（短信）" if flow == "sms" else ("尚未登录" if not t or not t.access_token_enc else f"已授权（{flow}）"),
+        "message": message,
     }
 
 

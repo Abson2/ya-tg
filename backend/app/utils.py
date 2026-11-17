@@ -11,6 +11,20 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """把数据库读回的时间统一成带 UTC 时区的 datetime。
+
+    SQLite 的 DateTime(timezone=True) 不会保存 tzinfo，读回来是 naive；
+    直接与 aware 的 utcnow() 比较会抛 'can't compare offset-naive and
+    offset-aware datetimes'。所有时间比较都必须先经过本函数。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 def traceparent() -> str:
     return f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"
 

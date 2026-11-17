@@ -50,7 +50,8 @@ services:
     restart: unless-stopped
     ports:
       - "8787:8787"
-    env_file: [.env]
+    env_file:
+      - ./.env
     environment:
       TZ: Asia/Shanghai
       DATABASE_URL: sqlite:////app/db/ya-tg.db

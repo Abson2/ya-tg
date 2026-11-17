@@ -8,7 +8,8 @@ services:
     restart: unless-stopped
     ports:
       - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8787}:8787"
-    env_file: [.env]
+    env_file:
+      - ./.env
     environment:
       TZ: Asia/Shanghai
       DATABASE_URL: sqlite:////app/db/ya-tg.db

@@ -9,7 +9,7 @@ from .config import settings
 from .db import json_dumps
 from .models import AuthSession, AuthToken
 from .security import decrypt_secret, encrypt_secret, secret_configured
-from .utils import device_sign, generate_pkce, traceparent, utcnow
+from .utils import as_utc, device_sign, generate_pkce, traceparent, utcnow
 
 
 class AuthError(RuntimeError):
@@ -36,7 +36,7 @@ def status(db: Session) -> dict:
     t = _token(db)
     s = _session(db)
     now = utcnow()
-    expires = t.expires_at if t else None
+    expires = as_utc(t.expires_at) if t else None
     flow = t.flow if t else ""
     client_id = runtime_config.get(db, "guangya_client_id")
     share_configured = bool(runtime_config.get(db, "guangya_share_authorization"))
@@ -48,7 +48,8 @@ def status(db: Session) -> dict:
         "flow": flow,
         "share_configured": share_configured,
         "sub": t.sub if t else "",
-        "expires_at": expires.isoformat() if expires else None,
+        "expires_at": expires.isoformat().replace("+00:00", "Z") if expires else None,
+        "expires_in_seconds": max(0, int((expires - now).total_seconds())) if expires else None,
         "expired": bool(expires and expires <= now),
         "needs_refresh": bool(expires and expires <= now + timedelta(minutes=5)),
         "pending_flow": s.purpose or None,
@@ -132,7 +133,7 @@ async def poll_device(db: Session) -> dict:
     s = _session(db)
     if s.purpose != "device" or not s.device_code:
         raise AuthError("没有进行中的 Device 授权，请先发起设备码授权", "no_pending")
-    if s.expires_at and s.expires_at <= utcnow():
+    if s.expires_at and as_utc(s.expires_at) <= utcnow():
         s.purpose = ""
         db.commit()
         raise AuthError("设备码已过期，请重新发起授权", "expired")
@@ -212,7 +213,7 @@ async def exchange_pkce(db: Session, code: str, state: str, error: str = "", err
         s.purpose = ""
         db.commit()
         raise AuthError(f"用户拒绝授权：{error_description or error}", "denied")
-    if s.expires_at and s.expires_at <= utcnow():
+    if s.expires_at and as_utc(s.expires_at) <= utcnow():
         s.purpose = ""
         db.commit()
         raise AuthError("授权会话已过期，请重新发起", "expired")
@@ -250,7 +251,7 @@ async def refresh(db: Session, force: bool = False) -> str:
             raise AuthError(str(exc), "sms_refresh_failed") from exc
     if not t or not t.refresh_token_enc:
         raise AuthError("没有可用 Refresh Token，请重新授权", "no_refresh_token")
-    if not force and t.expires_at and t.expires_at > utcnow() + timedelta(minutes=5):
+    if not force and t.expires_at and as_utc(t.expires_at) > utcnow() + timedelta(minutes=5):
         return decrypt_secret(t.access_token_enc)
     body = {
         "client_id": settings.guangya_client_id or t.client_id,
@@ -274,7 +275,7 @@ async def get_access_token(db: Session) -> str:
     t = _token(db)
     if not t or not t.access_token_enc:
         raise AuthError("尚未完成光鸭授权，请在管理后台「光鸭授权」页完成授权", "not_authorized")
-    if t.expires_at and t.expires_at <= utcnow() + timedelta(minutes=5):
+    if t.expires_at and as_utc(t.expires_at) <= utcnow() + timedelta(minutes=5):
         return await refresh(db)
     return decrypt_secret(t.access_token_enc)
 

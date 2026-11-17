@@ -16,7 +16,41 @@ const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 
-async function loadSms() { try { smsStatus.value = await api('/sms/status') } catch (e) {} }
+const smsCountdown = ref('')  // 凭证到期倒计时（本地每秒刷新）
+function fmtBj(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return ''
+  return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+function fmtCountdown(sec) {
+  if (sec == null || sec < 0) return '—'
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60)
+  return `${h}小时${String(m).padStart(2, '0')}分${String(s).padStart(2, '0')}秒`
+}
+function updateCountdown() {
+  const d = smsStatus.value
+  if (!d || !d.logged_in || d.expires_at) {
+    // 有 expires_at 时按绝对时间算，避免依赖后端秒数需要频繁轮询
+  }
+  if (d && d.logged_in && d.expires_at) {
+    const left = Math.floor((new Date(d.expires_at).getTime() - Date.now()) / 1000)
+    smsCountdown.value = left > 0 ? fmtCountdown(left) : '已到期，等待自动刷新'
+  } else if (d && d.logged_in && d.expires_in_seconds != null) {
+    smsCountdown.value = fmtCountdown(d.expires_in_seconds)
+  } else {
+    smsCountdown.value = ''
+  }
+}
+async function loadSms() {
+  try {
+    smsStatus.value = await api('/sms/status')
+    // 页面刷新后根据后端真实登录态恢复向导步骤，避免"登录后又变回未连接"
+    if (smsStatus.value.logged_in) smsStep.value = 3
+    updateCountdown()
+  } catch (e) {}
+}
 async function sendSms() {
   if (!smsPhone.value.trim()) { ElMessage.warning('请输入手机号'); return }
   smsBusy.value = true
@@ -127,7 +161,10 @@ async function load() {
   await loadAuth()
 }
 async function loadAuth() {
-  try { auth.value = await api('/auth/status'); shareStatus.value = await api('/share/status'); await loadSms() } catch (e) {}
+  // 三个请求独立加载：任一端点报错不再拖垮其余状态展示
+  try { auth.value = await api('/auth/status') } catch (e) {}
+  try { shareStatus.value = await api('/share/status') } catch (e) {}
+  await loadSms()
 }
 async function login() {
   try { await load(); authed.value = true; localStorage.setItem('ya_tg_password', password.value) }
@@ -217,7 +254,10 @@ async function copyCode() {
   catch (e) { ElMessage.error('复制失败，请手动选择') }
 }
 function insertVar(key) { tpl.value.content = (tpl.value.content || '') + '{{' + key + '}}' }
-function tick() { clock.value = new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
+function tick() {
+  clock.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  if (authed.value && smsStatus.value && smsStatus.value.logged_in) updateCountdown()
+}
 
 onMounted(() => { tick(); clockTimer = setInterval(tick, 1000); if (password.value) login() })
 onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
@@ -360,14 +400,40 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
                 <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshSms">立即刷新凭证</el-button></template>
               </el-result>
             </div>
-            <div class="connect-foot"><span>状态：{{ smsStatus.message || '—' }}</span><span v-if="smsStatus.account">账号：{{ smsStatus.account }}</span><span v-if="smsStatus.expires_at">到期：{{ smsStatus.expires_at }}</span></div>
+            <div class="connect-foot">
+              <span>状态：{{ smsStatus.message || '—' }}</span>
+              <span v-if="smsStatus.account">账号：{{ smsStatus.account }}</span>
+              <el-tag v-if="smsStatus.logged_in" :type="smsStatus.auto_refresh ? 'success' : 'warning'" size="small" effect="plain">
+                {{ smsStatus.auto_refresh ? '自动刷新：开启' : '自动刷新：不可用' }}
+              </el-tag>
+            </div>
+          </div>
+
+          <!-- 凭证有效期与自动刷新状态：以短信登录状态为准 -->
+          <div v-if="smsStatus.logged_in" class="credential-bar">
+            <div class="cred-cell">
+              <small>凭证状态</small>
+              <b class="good"><span class="dot live"></span>已连接</b>
+            </div>
+            <div class="cred-cell">
+              <small>到期倒计时</small>
+              <b :class="smsStatus.needs_refresh ? 'warn' : ''">{{ smsCountdown || '计算中…' }}</b>
+            </div>
+            <div class="cred-cell">
+              <small>自动刷新</small>
+              <b :class="smsStatus.auto_refresh ? 'good' : 'bad'">{{ smsStatus.auto_refresh ? '已开启 · 到期前自动续期' : '不可用 · 请重新登录' }}</b>
+            </div>
+            <div class="cred-cell">
+              <small>过期时间（北京时间）</small>
+              <b>{{ fmtBj(smsStatus.expires_at) }}</b>
+            </div>
           </div>
 
           <div class="auth-summary">
-            <div class="auth-summary-item"><small>授权状态</small><b :class="auth.authenticated ? 'good' : 'bad'">{{ auth.authenticated ? '已授权' : '未授权' }}</b></div>
-            <div class="auth-summary-item"><small>授权方式</small><b>{{ auth.flow || '—' }}</b></div>
-            <div class="auth-summary-item"><small>用户 ID</small><b>{{ auth.sub || '—' }}</b></div>
-            <div class="auth-summary-item"><small>过期时间</small><b>{{ auth.expires_at || '—' }}</b></div>
+            <div class="auth-summary-item"><small>授权状态</small><b :class="smsStatus.logged_in || auth.authenticated ? 'good' : 'bad'">{{ smsStatus.logged_in ? '已授权（短信登录）' : (auth.authenticated ? '已授权' : '未授权') }}</b></div>
+            <div class="auth-summary-item"><small>授权方式</small><b>{{ smsStatus.logged_in ? '短信验证码（自研）' : (auth.flow || '—') }}</b></div>
+            <div class="auth-summary-item"><small>用户 ID</small><b>{{ smsStatus.account || auth.sub || '—' }}</b></div>
+            <div class="auth-summary-item"><small>过期时间</small><b>{{ fmtBj(smsStatus.expires_at) || auth.expires_at || '—' }}</b></div>
           </div>
           <div class="sub-head"><span>高级方式 · 直连光鸭开放平台（需自行申请应用凭证）</span></div>
           <div class="two-col">
@@ -556,7 +622,13 @@ button{font-family:inherit}
 .connect-form{display:flex;flex-direction:column;gap:10px;max-width:560px}
 .connect-actions{display:flex;gap:10px}
 .connect-done .el-result{padding:6px 0}
-.connect-foot{display:flex;gap:20px;margin-top:14px;font-size:12px;color:var(--yg-muted);flex-wrap:wrap}
+.connect-foot{display:flex;gap:20px;margin-top:14px;font-size:12px;color:var(--yg-muted);flex-wrap:wrap;align-items:center}
+.credential-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;padding:16px 18px;border-radius:14px;background:linear-gradient(135deg,#f2fbf9,#f7f9fe);border:1px solid #d8efe9}
+.cred-cell small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:7px}
+.cred-cell b{font-size:13px;word-break:break-all}
+.credential-bar .good{color:#128f84}.credential-bar .bad{color:var(--yg-rose)}.credential-bar .warn{color:#d8861a}
+.dot.live{background:#19b3a6;box-shadow:0 0 0 4px rgba(25,179,166,.15);margin-right:6px;animation:pulseDot 1.8s ease-in-out infinite}
+@keyframes pulseDot{0%,100%{opacity:1}50%{opacity:.45}}
 .auth-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.auth-summary-item{background:#fff;border:1px solid var(--yg-line);border-radius:14px;padding:15px 18px}.auth-summary-item small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px}.auth-summary-item b{font-size:14px;word-break:break-all}.auth-summary-item .good{color:#19b3a6}.auth-summary-item .bad{color:var(--yg-rose)}
 .method-card{background:#fff;border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px;box-shadow:var(--yg-shadow);margin-bottom:18px}
 .method-top{display:flex;gap:14px;align-items:center;margin-bottom:16px}.method-top h3{margin:0 0 4px;font-size:16px}.method-top p{margin:0;color:var(--yg-muted);font-size:12px}
@@ -591,5 +663,5 @@ button{font-family:inherit}
 .login-brand{display:flex;align-items:center;gap:14px}.login-brand h1{margin:0;font-size:24px;letter-spacing:-.5px}.login-brand p{margin:3px 0 0;color:var(--yg-muted);font-size:12px}
 .login-divider{height:1px;background:var(--yg-line);margin:26px 0}.login-card h3{margin:0 0 5px;font-size:18px}.login-hint{color:var(--yg-muted);font-size:12px;margin:0 0 18px}
 .login-btn{width:100%;margin-top:16px}.login-foot{display:flex;align-items:center;gap:7px;justify-content:center;color:#9aa3bd;font-size:11px;margin-top:20px}
-@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid{grid-template-columns:1fr}}
+@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar{grid-template-columns:1fr}}
 </style>
