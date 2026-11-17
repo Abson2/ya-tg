@@ -16,9 +16,46 @@ const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
+const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
+const aiParseName = ref(''), aiParseResult = ref(null)
+const typeFilter = ref(''), identifyFilter = ref('')
 
 async function loadTmdb() {
   try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
+}
+async function loadAi() {
+  try {
+    aiStatus.value = await api('/ai/status')
+    aiForm.value.enabled = !!aiStatus.value.enabled
+    aiForm.value.base_url = aiStatus.value.base_url || 'https://api.openai.com/v1'
+    aiForm.value.model = aiStatus.value.model || 'gpt-4o-mini'
+    aiForm.value.prompt = aiStatus.value.custom_prompt || ''
+    aiForm.value.timeout = aiStatus.value.timeout || 30
+  } catch (e) {}
+}
+async function saveAi() {
+  aiSaving.value = true
+  try {
+    const d = await api('/ai/config', { method: 'POST', body: JSON.stringify(aiForm.value) })
+    aiStatus.value = d.status || {}
+    ElMessage.success('AI 配置已保存（密钥加密存储），无需重启')
+  } catch (e) { ElMessage.error(e.message) }
+  finally { aiSaving.value = false }
+}
+async function testAi() {
+  aiTesting.value = true
+  try {
+    const d = await api('/ai/test', { method: 'POST' })
+    if (d.ok) ElMessage.success('连接成功，模型可用')
+    else ElMessage.warning(d.message || '连接失败')
+    await loadAi()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { aiTesting.value = false }
+}
+async function parseAi() {
+  if (!aiParseName.value.trim()) { ElMessage.warning('请输入文件名'); return }
+  try { aiParseResult.value = await api('/ai/parse', { method: 'POST', body: JSON.stringify({ name: aiParseName.value }) }) }
+  catch (e) { ElMessage.error(e.message) }
 }
 async function saveTmdb() {
   tmdbSaving.value = true
@@ -144,18 +181,42 @@ const paths = {
 }
 const icon = name => paths[name] || paths.grid
 
-const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}}')
-
+const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件块支持嵌套')
+// 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
+const tagHint = computed(() => 'TMDB 分类打标：{{type}}=movie/tv，{{type_label}}=电影/剧集，{{origin_country}}=制片地区，{{genres}}=类型，{{tags}}=组合标签（示例 #保镖恋人 #电影 #爱情 #惊悚）。按示例打标可写：type={{type}} · origin_country={{origin_country}} · genres={{genres}}')
+const templateVars = ['title', 'overview', 'filename', 'year', 'resolution', 'size', 'share_url',
+  'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
+  'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type']
+const previewDemo = {
+  title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
+  filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
+  size: '14.9GB', share_url: 'https://share.example/xxx', tmdb_id: '1440098',
+  tmdb_url: 'https://www.themoviedb.org/movie/1440098',
+  type: 'movie', type_label: '电影', origin_country: '西班牙', origin_country_code: 'ES',
+  genres: '爱情、惊悚', tags: '#保镖恋人 #电影 #西班牙 #爱情 #惊悚',
+  vote_average: '7.0', original_title: 'Marfil', season: '', episode: '',
+  episode_tag: '', media_type: 'movie'
+}
 const previewText = computed(() => {
   const raw = tpl.value.content || ''
   if (!raw) return '在左侧编写模板后显示预览'
-  return raw.split('{{title}}').join('示例影片').split('{{share_url}}').join('https://share.example/xxx')
+  let t = raw.replace(/\{\{#if\s+\w+\}\}/g, '').replace(/\{\{\/if\}\}/g, '')
+  for (const [k, v] of Object.entries(previewDemo)) t = t.split('{{' + k + '}}').join(v)
+  return t
 })
+
+function identifyLabel(s) {
+  return { identified: '已识别', ambiguous: '匹配存疑', failed: '识别失败',
+           none: '无匹配', unidentified: '未识别' }[s] || s
+}
+function mediaLabel(t) { return t === 'tv' ? '剧集' : (t === 'movie' ? '电影' : '') }
 
 const filteredResources = computed(() => resources.value.filter(r => {
   const hitKey = !keyword.value || (r.name + (r.media_title || '')).toLowerCase().includes(keyword.value.toLowerCase())
   const hitStatus = !statusFilter.value || r.share_status === statusFilter.value
-  return hitKey && hitStatus
+  const hitType = !typeFilter.value || r.media_type === typeFilter.value
+  const hitIdentify = !identifyFilter.value || r.identify_status === identifyFilter.value
+  return hitKey && hitStatus && hitType && hitIdentify
 }))
 
 const healthChecks = computed(() => [
@@ -185,6 +246,7 @@ async function load() {
   audit.value = await api('/audit')
   await loadAuth()
   await loadTmdb()
+  await loadAi()
 }
 async function loadAuth() {
   // 三个请求独立加载：任一端点报错不再拖垮其余状态展示
@@ -217,6 +279,59 @@ async function addRule() {
   try { await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) }); ElMessage.success('规则已保存'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
+// ---------- Bot / 频道 / 规则：测试与删除 ----------
+const testingBot = ref(0), testingChannel = ref(0)
+async function testBot(b) {
+  testingBot.value = b.id
+  try {
+    const d = await api(`/bots/${b.id}/test`, { method: 'POST' })
+    if (d.ok) ElMessage.success(d.message)
+    else ElMessage.error(d.message)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { testingBot.value = 0 }
+}
+async function testChannel(c) {
+  testingChannel.value = c.id
+  try {
+    const d = await api(`/channels/${c.id}/test`, { method: 'POST' })
+    if (d.ok) ElMessage.success(d.message + (d.message_id ? `（消息 #${d.message_id}）` : ''))
+    else ElMessage.error(d.message)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { testingChannel.value = 0 }
+}
+async function delBot(b) {
+  const chs = channels.value.filter(c => c.bot_id === b.id)
+  const nRules = chs.reduce((n, c) => n + rules.value.filter(r => r.channel_id === c.id).length, 0)
+  let msg = `确定删除 Bot「${b.name}」？`
+  if (chs.length) msg += `\n将同时删除其下 ${chs.length} 个频道`
+  if (nRules) msg += `、${nRules} 条关联分发规则`
+  msg += '\n关联的待推送队列项也会被清理，此操作不可撤销。'
+  try {
+    await ElMessageBox.confirm(msg, '删除 Bot', { confirmButtonText: '确认删除', cancelButtonText: '取消', type: 'warning' })
+    await api(`/bots/${b.id}`, { method: 'DELETE' })
+    ElMessage.success('已删除 Bot' + (chs.length ? `及 ${chs.length} 个频道` : ''))
+    await load()
+  } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message) }
+}
+async function delChannel(c) {
+  const n = rules.value.filter(r => r.channel_id === c.id).length
+  let msg = `确定删除频道「${c.name}」？`
+  if (n) msg += `\n将同时删除 ${n} 条引用该频道的分发规则`
+  msg += '\n该频道的待推送队列项也会被清理，此操作不可撤销。'
+  try {
+    await ElMessageBox.confirm(msg, '删除频道', { confirmButtonText: '确认删除', cancelButtonText: '取消', type: 'warning' })
+    await api(`/channels/${c.id}`, { method: 'DELETE' })
+    ElMessage.success('频道已删除'); await load()
+  } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message) }
+}
+async function delRule(r) {
+  try {
+    await ElMessageBox.confirm(`确定删除分发规则「${r.name}」？`, '删除规则',
+      { confirmButtonText: '确认删除', cancelButtonText: '取消', type: 'warning' })
+    await api(`/rules/${r.id}`, { method: 'DELETE' })
+    ElMessage.success('规则已删除'); await load()
+  } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message) }
+}
 async function createShare(row) {
   try {
     const { value } = await ElMessageBox.prompt('0=永久 · 86400=1天 · 604800=7天 · 2592000=30天', '创建光鸭分享', { inputValue: '0' })
@@ -225,21 +340,95 @@ async function createShare(row) {
     await load()
   } catch (e) { if (e !== 'cancel') ElMessage.error(e.message) }
 }
-async function identify(row, auto) {
+// ---------- LitePan 风格「重新匹配元数据」 ----------
+const matchVisible = ref(false), matchRow = ref(null), matchType = ref('tv'), matchQuery = ref('')
+const matchCandidates = ref([]), matchSelected = ref(null), matchBusy = ref(false)
+
+const matchClue = computed(() => {
+  const n = matchRow.value?.name || ''
+  const ep = n.match(/S(\d{1,2})[ ._-]?E(\d{1,3})/i)
+  if (ep) return `检测到季集信息 S${ep[1]}E${ep[2]}：按「剧集」识别，不会把单集当成电影`
+  if (/第\d+\s*[集期话]|EP\d+|Season\s*\d+/i.test(n)) return '检测到集号/季信息：按「剧集」识别'
+  return matchType.value === 'tv' ? '当前按「剧集」搜索候选' : '当前按「电影」搜索候选'
+})
+function guessType(name) {
+  return /S\d{1,2}[ ._-]?E\d{1,3}|第\d+\s*[集期话]|EP\d+|Season\s*\d+|\d{1,2}[xX]\d{2}|电视剧|剧集/i.test(name || '') ? 'tv' : 'movie'
+}
+function cleanName(name) {
+  return String(name || '')
+    .replace(/\.[A-Za-z0-9]{1,5}$/, '')
+    .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+    .replace(/\bS\d{1,2}[ ._-]?E\d{1,3}\b/gi, ' ')
+    .replace(/\b(?:2160p|1080p|720p|480p|4K|WEB-?DL|BluRay|BDRip|REMUX|x265|H\.?264|DDP5\.?1|DTS|10bit)\b/gi, ' ')
+    .replace(/[._]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+async function openMatch(row) {
+  matchRow.value = row
+  matchType.value = (row.media_type === 'movie' || row.media_type === 'tv') ? row.media_type : guessType(row.name)
+  matchQuery.value = cleanName(row.media_title || row.name)
+  matchCandidates.value = []
+  matchSelected.value = null
+  matchVisible.value = true
+  await searchMatch(true)
+}
+async function searchMatch(silent = false) {
+  const q = (matchQuery.value || '').trim() || cleanName(matchRow.value?.name || '')
+  if (!q) { if (!silent) ElMessage.warning('请填写片名或 TMDB ID'); return }
+  matchBusy.value = true
+  matchSelected.value = null
   try {
-    let d
-    if (auto) d = await api(`/resources/${row.id}/auto-identify`, { method: 'POST' })
-    else {
-      const { value } = await ElMessageBox.prompt('输入 TMDB ID', '手动识别')
-      if (!value) return
-      d = await api(`/resources/${row.id}/identify`, { method: 'POST', body: JSON.stringify({ tmdb_id: Number(value), media_type: 'movie' }) })
+    const d = await api(`/tmdb/search?q=${encodeURIComponent(q)}&media_type=${matchType.value}`)
+    matchCandidates.value = Array.isArray(d) ? d : (d.candidates || [])
+    if (!silent && !matchCandidates.value.length) ElMessage.warning('没有找到候选，换个片名或类型再试')
+  } catch (e) { if (!silent) ElMessage.error(e.message) }
+  finally { matchBusy.value = false }
+}
+async function applyMatch() {
+  if (!matchSelected.value) { ElMessage.warning('请先选择一个候选'); return }
+  matchBusy.value = true
+  try {
+    const d = await api(`/resources/${matchRow.value.id}/identify`, {
+      method: 'POST',
+      body: JSON.stringify({ tmdb_id: matchSelected.value.tmdb_id,
+                             media_type: matchSelected.value.media_type, note: '手动匹配' })
+    })
+    ElMessage.success('已应用匹配：' + (d.media_title || ''))
+    matchVisible.value = false
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { matchBusy.value = false }
+}
+async function markNoMatch() {
+  try {
+    await ElMessageBox.confirm(
+      '标记为「无匹配」后会清空已识别的元数据，且不再被自动识别误配。可随时重新手动匹配。',
+      '确认无匹配', { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' })
+    await api(`/resources/${matchRow.value.id}/match-none`, { method: 'POST' })
+    ElMessage.success('已标记无匹配')
+    matchVisible.value = false
+    await load()
+  } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message) }
+}
+async function identify(row, auto) {
+  if (!auto) return openMatch(row)
+  try {
+    const d = await api(`/resources/${row.id}/auto-identify`, { method: 'POST' })
+    if (d.ok) {
+      ElMessage.success(`识别完成：${d.applied?.title || ''}${d.source === 'ai' ? '（AI 辅助）' : ''}`)
+      await load()
+      return
     }
-    ElMessage.success(d.ok ? '识别完成' : '未找到候选，请用手动识别')
+    try {
+      await ElMessageBox.confirm(
+        `${d.reason || '未能自动识别'}\n\n可以手动指定电影/剧集类型、片名或 TMDB ID，凭海报和类型选择。`,
+        '需要手动匹配', { confirmButtonText: '去手动匹配', cancelButtonText: '稍后', type: 'warning' })
+      await openMatch(row)
+    } catch (_) {}
     await load()
   } catch (e) {
-    if (e === 'cancel') return
     const msg = e.message || ''
-    // TMDB 凭证缺失/无效：给可操作引导，而不是抛原始 401
     if (/TMDB 密钥|尚未配置 TMDB|Invalid API key|401/.test(msg)) {
       try {
         await ElMessageBox.confirm(
@@ -247,7 +436,7 @@ async function identify(row, auto) {
           'TMDB 无法识别', { confirmButtonText: '去设置', cancelButtonText: '稍后', type: 'warning' })
         tab.value = 'TMDB 设置'
         await loadTmdb()
-      } catch (_) {}
+      } catch (_2) {}
     } else ElMessage.error(msg)
   }
 }
@@ -277,8 +466,12 @@ async function refreshToken() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function verify() {
-  try { const d = await api('/auth/openapi/verify'); ElMessage.success(`OpenAPI 可用 · 用户 ${d.user_id || ''}`) }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const d = await api('/auth/openapi/verify')
+    ElMessage.success(d.message || (d.channel === 'web'
+      ? '光鸭网页端连接正常 · 短信登录'
+      : `官方 OpenAPI 可用 · 用户 ${d.user_id || ''}`))
+  } catch (e) { ElMessage.error(e.message) }
 }
 async function saveTpl() {
   try {
@@ -286,6 +479,14 @@ async function saveTpl() {
     else await api('/templates', { method: 'POST', body: JSON.stringify(tpl.value) })
     tpl.value = { name: '', content: '', enabled: true, is_default: false }
     ElMessage.success('模板已保存'); await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function restoreDefaultTpl() {
+  try {
+    const d = await api('/templates/default', { method: 'POST' })
+    tpl.value = { name: '默认图文模板', content: d.content, enabled: true, is_default: true }
+    ElMessage.success('已载入 v0.6.0 默认模板（含分类标签），保存后生效')
+    await load()
   } catch (e) { ElMessage.error(e.message) }
 }
 async function copyCode() {
@@ -334,7 +535,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.3.0 · Asia/Shanghai</div>
+        <div class="foot-version">v0.6.0 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -519,11 +720,11 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>fileId 去重 · TMDB 识别 · 分享链接管理</p></div><div class="head-tools"><el-input v-model="keyword" placeholder="搜索资源名或 TMDB 标题" clearable style="width:260px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:150px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><div class="view-switch"><button :class="{on:viewMode==='grid'}" @click="viewMode='grid'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('grid')"/></svg></button><button :class="{on:viewMode==='list'}" @click="viewMode='list'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('file')"/></svg></button></div></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>fileId 去重 · TMDB 识别 · 分享链接管理</p></div><div class="head-tools"><el-input v-model="keyword" placeholder="搜索资源名或 TMDB 标题" clearable style="width:260px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:140px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="typeFilter" placeholder="媒体类型" clearable style="width:120px"><el-option label="电影" value="movie"/><el-option label="剧集" value="tv"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:130px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select><div class="view-switch"><button :class="{on:viewMode==='grid'}" @click="viewMode='grid'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('grid')"/></svg></button><button :class="{on:viewMode==='list'}" @click="viewMode='list'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('file')"/></svg></button></div></div></div>
           <div v-if="viewMode === 'grid'" class="media-grid">
             <div v-for="r in filteredResources" :key="r.id" class="media-card">
               <div class="media-poster"><el-image v-if="r.poster_path" :src="'https://image.tmdb.org/t/p/w342'+r.poster_path" fit="cover" style="width:100%;height:100%"/><div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ (r.ext||'FILE').toUpperCase() }}</span></div><span class="media-badge" :class="'badge-'+r.share_status">{{ r.share_status }}</span></div>
-              <div class="media-body"><b :title="r.name">{{ r.media_title || r.name }}</b><small>{{ r.name }}</small><div class="media-meta"><span v-if="r.tmdb_id">TMDB #{{ r.tmdb_id }}</span><span v-if="r.revision">更新 {{ r.revision }} 次</span></div></div>
+              <div class="media-body"><b :title="r.name">{{ r.media_title || r.name }}</b><small>{{ r.name }}</small><div class="media-meta"><span v-if="r.media_type" class="type-chip" :class="'type-'+r.media_type">{{ mediaLabel(r.media_type) }}</span><span v-if="r.season && r.episode">S{{ String(r.season).padStart(2,'0') }}E{{ String(r.episode).padStart(2,'0') }}</span><span v-if="r.tmdb_id">TMDB #{{ r.tmdb_id }}</span><span v-if="r.identify_status && r.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(r.identify_status) }}</span><span v-if="r.revision">更新 {{ r.revision }} 次</span></div></div>
               <div class="media-actions"><el-button size="small" @click="createShare(r)">分享</el-button><el-button size="small" @click="identify(r,true)">自动识别</el-button><el-button size="small" text @click="identify(r,false)">手动</el-button></div>
             </div>
             <div v-if="!filteredResources.length" class="empty big">没有匹配的资源</div>
@@ -532,6 +733,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <el-table :data="filteredResources" stripe max-height="640">
               <el-table-column prop="name" label="资源名称" min-width="220" show-overflow-tooltip/>
               <el-table-column prop="media_title" label="TMDB 标题" min-width="170" show-overflow-tooltip/>
+              <el-table-column label="类型" width="80"><template #default="s">{{ mediaLabel(s.row.media_type) || '—' }}</template></el-table-column>
+              <el-table-column label="识别" width="100"><template #default="s">{{ identifyLabel(s.row.identify_status) }}</template></el-table-column>
               <el-table-column prop="share_status" label="分享状态" width="110"/>
               <el-table-column prop="revision" label="更新次数" width="90"/>
               <el-table-column label="操作" width="250"><template #default="s"><el-button size="small" @click="createShare(s.row)">分享</el-button><el-button size="small" @click="identify(s.row,true)">自动识别</el-button><el-button size="small" text @click="identify(s.row,false)">手动</el-button></template></el-table-column>
@@ -542,9 +745,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         <section v-else-if="tab === '分发规则'" class="fade">
           <div class="page-head"><div><h2>分发规则</h2><p>Bot → 频道 → 路由规则，三步建立推送链路</p></div></div>
           <div class="three-col">
-            <div class="panel step-panel"><div class="step-head"><span>01</span><h3>添加 Bot</h3></div><el-input v-model="bot.name" placeholder="Bot 名称"/><el-input v-model="bot.token" type="password" show-password placeholder="Bot Token（加密存储）" class="mt"/><el-button type="primary" class="mt" @click="addBot">添加 Bot</el-button><div v-for="b in bots" :key="b.id" class="mini-row"><b>{{ b.name }}</b><span>{{ b.token_masked }}</span></div></div>
-            <div class="panel step-panel"><div class="step-head"><span>02</span><h3>添加频道</h3></div><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select><el-input v-model="channel.name" placeholder="频道名称" class="mt"/><el-input v-model="channel.chat_id" placeholder="频道 ID，如 -100..." class="mt"/><el-button type="primary" class="mt" @click="addChannel">添加频道</el-button><div v-for="c in channels" :key="c.id" class="mini-row"><b>{{ c.name }}</b><span>{{ c.chat_id }}</span></div></div>
-            <div class="panel step-panel"><div class="step-head"><span>03</span><h3>分发规则</h3></div><el-input v-model="rule.name" placeholder="规则名称"/><el-input v-model="rule.directory_id" placeholder="目录 ID（可空）" class="mt"/><el-input v-model="rule.keyword" placeholder="文件名关键词（可空）" class="mt"/><el-select v-model="rule.channel_id" placeholder="目标频道" style="width:100%" class="mt"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select><div class="mt"><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div><el-button type="primary" class="mt" @click="addRule">保存规则</el-button><div v-for="r in rules" :key="r.id" class="mini-row"><b>{{ r.name }}</b><span>{{ r.auto_publish ? '自动' : '审核' }}</span></div></div>
+            <div class="panel step-panel"><div class="step-head"><span>01</span><h3>添加 Bot</h3></div><el-input v-model="bot.name" placeholder="Bot 名称"/><el-input v-model="bot.token" type="password" show-password placeholder="Bot Token（加密存储）" class="mt"/><el-button type="primary" class="mt" @click="addBot">添加 Bot</el-button><div v-for="b in bots" :key="b.id" class="mini-row"><b>{{ b.name }}</b><span>{{ b.token_masked }}</span><span class="row-actions"><button class="row-btn" :disabled="testingBot === b.id" @click="testBot(b)">{{ testingBot === b.id ? '验证中' : '验证' }}</button><button class="row-btn danger" @click="delBot(b)">删除</button></span></div></div>
+            <div class="panel step-panel"><div class="step-head"><span>02</span><h3>添加频道</h3></div><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select><el-input v-model="channel.name" placeholder="频道名称" class="mt"/><el-input v-model="channel.chat_id" placeholder="频道 ID，如 -100..." class="mt"/><el-button type="primary" class="mt" @click="addChannel">添加频道</el-button><div v-for="c in channels" :key="c.id" class="mini-row"><b>{{ c.name }}</b><span>{{ c.chat_id }}</span><span class="row-actions"><button class="row-btn" :disabled="testingChannel === c.id" @click="testChannel(c)">{{ testingChannel === c.id ? '发送中' : '测试推送' }}</button><button class="row-btn danger" @click="delChannel(c)">删除</button></span></div></div>
+            <div class="panel step-panel"><div class="step-head"><span>03</span><h3>分发规则</h3></div><el-input v-model="rule.name" placeholder="规则名称"/><el-input v-model="rule.directory_id" placeholder="目录 ID（可空）" class="mt"/><el-input v-model="rule.keyword" placeholder="文件名关键词（可空）" class="mt"/><el-select v-model="rule.channel_id" placeholder="目标频道" style="width:100%" class="mt"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select><div class="mt"><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div><el-button type="primary" class="mt" @click="addRule">保存规则</el-button><div v-for="r in rules" :key="r.id" class="mini-row"><b>{{ r.name }}</b><span>{{ r.auto_publish ? '自动' : '审核' }}</span><span class="row-actions"><button class="row-btn danger" @click="delRule(r)">删除</button></span></div></div>
           </div>
         </section>
 
@@ -605,10 +808,39 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <p class="hint" style="margin:0 0 8px">未配置或密钥无效时，资源仍会正常入库、创建分享并推送到 Telegram，只是没有海报、简介和 TMDB 链接。配置好之后，回到「资源库」对已有资源点「自动识别」即可补全。</p>
             <p class="hint" style="margin:0">若之前报 <code>HTTP 401 Invalid API key</code>，多半是把 v4 Token 当成 v3 Key 用了，或密钥已失效；重新粘贴后点「测试连接」确认。</p>
           </div>
+
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>AI 辅助识别（可选）</h3>
+              <el-tag :type="aiStatus.active ? 'success' : 'info'" size="small">{{ aiStatus.active ? '已启用' : '未启用' }}</el-tag>
+            </div>
+            <p class="hint" style="margin:0 0 14px">
+              接入任意 <b>OpenAI 兼容</b>接口（OpenAI、DeepSeek、Ollama、各类中转均可）。AI 只用于解析文件名、
+              主搜索失败时提供备用片名、以及电影/剧集候选接近时消歧；<b>不可用时自动降级</b>到本地规则 + TMDB，
+              不影响扫描、建分享、推送。带季集信息的文件仍按剧集处理，AI 不会把它改成电影。
+            </p>
+            <div class="form-grid">
+              <div><small>启用 AI 辅助识别</small><div class="mt"><el-switch v-model="aiForm.enabled" active-text="启用" inactive-text="关闭"/></div></div>
+              <div><small>模型名称</small><el-input v-model="aiForm.model" placeholder="gpt-4o-mini"/></div>
+              <div><small>接口地址 Base URL</small><el-input v-model="aiForm.base_url" placeholder="https://api.openai.com/v1"/></div>
+              <div><small>API Key（加密保存）</small><el-input v-model="aiForm.api_key" type="password" show-password placeholder="sk-..." clearable/></div>
+              <div><small>超时（秒）</small><el-input-number v-model="aiForm.timeout" :min="5" :max="120" style="width:100%"/></div>
+            </div>
+            <div class="field mt"><small>自定义补充要求（可选）</small><el-input v-model="aiForm.prompt" type="textarea" :rows="2" placeholder="例如：片名优先用中文译名；动漫统一按剧集处理"/></div>
+            <div class="connect-actions" style="margin-top:14px">
+              <el-button type="primary" :loading="aiSaving" @click="saveAi">保存 AI 配置</el-button>
+              <el-button plain :loading="aiTesting" @click="testAi">测试连接</el-button>
+            </div>
+            <div class="ai-test">
+              <el-input v-model="aiParseName" placeholder="输入一个文件名，测试 AI 解析结果" @keyup.enter="parseAi"/>
+              <el-button plain @click="parseAi">识别测试</el-button>
+            </div>
+            <div v-if="aiParseResult" class="ai-result"><pre>{{ JSON.stringify(aiParseResult, null, 2) }}</pre></div>
+            <p class="hint">当前：{{ aiStatus.masked || '未配置密钥' }} · {{ aiStatus.model || '—' }} · {{ aiStatus.base_url || '—' }}</p>
+          </div>
         </section>
 
         <section v-else-if="tab === '消息模板'" class="fade">
-          <div class="page-head"><div><h2>消息模板</h2><p>支持双花括号变量与条件块；有海报时自动发送图片</p></div></div>
+          <div class="page-head"><div><h2>消息模板</h2><p>支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 v0.6.0 默认模板</el-button></div>
           <div class="two-col tpl-layout">
             <div class="panel">
               <div class="field"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
@@ -617,7 +849,13 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
               <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></div></div>
             </div>
-            <div class="panel"><div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div><div class="var-grid"><button v-for="v in ['title','overview','filename','year','resolution','size','share_url','tmdb_url']" :key="v" @click="insertVar(v)">{{ v }}</button></div><div class="preview-box"><div class="preview-title">预览效果</div><div class="preview-body">{{ previewText }}</div></div><p class="hint">条件块写法：{{ syntaxHint }}</p></div>
+            <div class="panel">
+              <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>
+              <div class="var-grid"><button v-for="v in templateVars" :key="v" @click="insertVar(v)">{{ v }}</button></div>
+              <p class="hint" style="margin:0 0 12px">{{ tagHint }}</p>
+              <div class="preview-box"><div class="preview-title">预览效果</div><div class="preview-body">{{ previewText }}</div></div>
+              <p class="hint">条件块写法：{{ syntaxHint }}</p>
+            </div>
           </div>
         </section>
 
@@ -626,6 +864,39 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           <div class="panel"><div class="timeline full"><div v-for="a in audit" :key="a.id" class="tl-row"><span class="tl-dot"></span><span class="tl-time">{{ a.ts }}</span><b class="tl-action">{{ a.action }}</b><span class="tl-target">{{ a.target_type }} {{ a.target_id }}</span><span class="tl-detail">{{ a.detail }}</span></div><div v-if="!audit.length" class="empty big">暂无审计记录</div></div></div>
         </section>
       </main>
+
+      <!-- LitePan 风格「重新匹配元数据」：类型 + 片名/ID + 海报候选 + 应用匹配 / 无匹配 -->
+      <el-dialog v-model="matchVisible" title="重新匹配元数据" width="760px" top="7vh" :close-on-click-modal="false">
+        <div class="match-path"><small>作品文件</small><b>{{ matchRow?.name }}</b></div>
+        <div class="match-controls">
+          <el-select v-model="matchType" style="width:112px"><el-option label="剧集" value="tv"/><el-option label="电影" value="movie"/></el-select>
+          <el-input v-model="matchQuery" placeholder="填写片名或 TMDB ID 后点击「搜索」" clearable @keyup.enter="searchMatch(false)"/>
+          <el-button type="primary" :loading="matchBusy" @click="searchMatch(false)">搜索</el-button>
+        </div>
+        <p class="hint" style="margin:8px 0 12px">{{ matchClue }}。可凭海报和类型选择，选中后点「应用匹配」。</p>
+        <div v-if="matchCandidates.length" class="match-grid">
+          <div v-for="c in matchCandidates" :key="c.tmdb_id + '-' + c.media_type" class="match-card" :class="{ on: matchSelected === c }" @click="matchSelected = c">
+            <div class="match-poster">
+              <el-image v-if="c.poster_path" :src="'https://image.tmdb.org/t/p/w185' + c.poster_path" fit="cover" style="width:100%;height:100%"/>
+              <div v-else class="match-no-poster">无海报</div>
+            </div>
+            <div class="match-info">
+              <b :title="c.title">{{ c.title }}</b>
+              <small v-if="c.original_title && c.original_title !== c.title">{{ c.original_title }}</small>
+              <span class="match-type" :class="'type-'+c.media_type">{{ c.media_type === 'tv' ? '剧集' : '电影' }} · {{ c.year || '—' }}</span>
+              <span>TMDB #{{ c.tmdb_id }}</span>
+              <span v-if="c.genres?.length" class="match-genres">{{ c.genres.slice(0,3).join('、') }}</span>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="!matchBusy" class="empty">暂无候选，换个片名、TMDB ID 或类型再试</div>
+        <template #footer>
+          <div class="match-footer">
+            <el-button type="danger" plain @click="markNoMatch">无匹配</el-button>
+            <div><el-button @click="matchVisible = false">取消</el-button><el-button type="primary" :disabled="!matchSelected" :loading="matchBusy" @click="applyMatch">应用匹配</el-button></div>
+          </div>
+        </template>
+      </el-dialog>
     </div>
   </div>
 </template>
@@ -734,7 +1005,10 @@ button{font-family:inherit}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
 .media-actions{display:flex;gap:5px;padding:0 12px 12px;flex-wrap:wrap}
 .step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}
-.mini-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:11px}.mini-row:last-child{border:0}.mini-row b{font-size:12px}.mini-row span{color:var(--yg-muted);max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mini-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:11px}.mini-row:last-child{border:0}.mini-row b{font-size:12px;flex:none}.mini-row>span:not(.row-actions){color:var(--yg-muted);max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row-actions{display:flex;gap:4px;flex:none;max-width:none!important;overflow:visible!important}
+.row-btn{border:1px solid var(--yg-line);background:#fff;border-radius:6px;padding:3px 7px;font-size:10px;color:var(--yg-primary);cursor:pointer;white-space:nowrap}
+.row-btn:hover{background:#eeedff}.row-btn.danger{color:var(--yg-rose)}.row-btn.danger:hover{background:#ffedf0}.row-btn:disabled{opacity:.5;cursor:wait}
 .status-tag{padding:3px 9px;border-radius:14px;font-size:11px;font-weight:600;background:#eef1f7;color:#7e88a8}.st-sent{background:#e5f8f5;color:#129688}.st-pending{background:#fff3e2;color:#cf7f1c}.st-review{background:#f2edff;color:#7a55dd}.st-retry{background:#ffedf0;color:#d63f59}.st-failed{background:#f1f2f6;color:#7e88a8}
 .tpl-layout{align-items:start}.var-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}.var-grid button{border:1px solid var(--yg-line);background:#fafbff;border-radius:8px;padding:8px 4px;font-size:11px;color:var(--yg-primary);cursor:pointer}.var-grid button:hover{background:#eeedff}
 .preview-box{border:1px dashed var(--yg-line);border-radius:12px;padding:14px;background:#fafbff}.preview-title{font-size:11px;color:var(--yg-muted);margin-bottom:8px}.preview-body{font-size:13px;white-space:pre-wrap;line-height:1.7;min-height:60px}
@@ -745,5 +1019,29 @@ button{font-family:inherit}
 .login-brand{display:flex;align-items:center;gap:14px}.login-brand h1{margin:0;font-size:24px;letter-spacing:-.5px}.login-brand p{margin:3px 0 0;color:var(--yg-muted);font-size:12px}
 .login-divider{height:1px;background:var(--yg-line);margin:26px 0}.login-card h3{margin:0 0 5px;font-size:18px}.login-hint{color:var(--yg-muted);font-size:12px;margin:0 0 18px}
 .login-btn{width:100%;margin-top:16px}.login-foot{display:flex;align-items:center;gap:7px;justify-content:center;color:#9aa3bd;font-size:11px;margin-top:20px}
+.type-chip{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;background:#98a1b8}
+.type-tv{background:#8b6cf0}.type-movie{background:#5b5bd6}
+.identify-chip{color:#d8861a;background:#fff3e2;padding:2px 7px;border-radius:10px;font-size:10px}
+.match-path{background:#f2f6ff;border:1px solid #dbe6ff;border-radius:10px;padding:12px 14px;margin-bottom:14px}
+.match-path small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}
+.match-path b{font-size:13px;word-break:break-all}
+.match-controls{display:flex;gap:10px}
+.match-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px;max-height:46vh;overflow-y:auto;margin-top:12px}
+.match-card{display:flex;gap:10px;border:1px solid var(--yg-line);border-radius:12px;padding:10px;cursor:pointer;background:#fff;transition:.18s}
+.match-card:hover{border-color:#a9a4f5;transform:translateY(-2px)}
+.match-card.on{border-color:var(--yg-primary);box-shadow:0 0 0 2px rgba(91,91,214,.18);background:#fafaff}
+.match-poster{width:68px;height:96px;flex:none;border-radius:8px;overflow:hidden;background:#eef0f6}
+.match-no-poster{height:100%;display:grid;place-items:center;color:#aab2c9;font-size:11px}
+.match-info{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
+.match-info b{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.match-info small{font-size:10px;color:var(--yg-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.match-info span{font-size:10px;color:#8a93aa}
+.match-type{font-weight:700;align-self:flex-start;padding:2px 7px;border-radius:9px;color:#fff;background:#98a1b8}
+.match-type.type-tv{background:#8b6cf0}.match-type.type-movie{background:#5b5bd6}
+.match-genres{color:var(--yg-primary)!important}
+.match-footer{display:flex;justify-content:space-between;align-items:center}
+.ai-test{display:flex;gap:10px;margin-top:14px}
+.ai-result{margin-top:10px;background:#f7f8fc;border:1px solid var(--yg-line);border-radius:10px;padding:10px}
+.ai-result pre{margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:#4a5578}
 @media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar{grid-template-columns:1fr}}
 </style>

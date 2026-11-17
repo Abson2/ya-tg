@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Float, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -24,9 +24,17 @@ class Resource(Base):
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     media_type: Mapped[str] = mapped_column(String(16), default="")
     media_title: Mapped[str] = mapped_column(String(512), default="")
+    original_title: Mapped[str] = mapped_column(String(512), default="")
     overview: Mapped[str] = mapped_column(Text, default="")
     poster_path: Mapped[str] = mapped_column(String(512), default="")
+    genres: Mapped[str] = mapped_column(Text, default="")          # JSON 数组，中文类型名
+    origin_country: Mapped[str] = mapped_column(Text, default="")  # JSON 数组，ISO 国家码
+    vote_average: Mapped[float] = mapped_column(Float, default=0)
+    season: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     identify_status: Mapped[str] = mapped_column(String(24), default="unidentified")
+    identify_source: Mapped[str] = mapped_column(String(24), default="")  # id/tmdb/ai/manual/none
+    identify_note: Mapped[str] = mapped_column(Text, default="")
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")

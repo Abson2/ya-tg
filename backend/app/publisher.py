@@ -8,14 +8,14 @@ from sqlalchemy.orm import Session
 
 from . import tmdb
 from .config import settings
-from .db import SessionLocal, json_dumps
+from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import AuditLog, Bot, Channel, MessageTemplate, QueueItem, Resource, utcnow
 from .security import decrypt_secret
 from .utils import backoff_seconds, parse_media_name, plus_seconds, render_template, retry_after_seconds
 
 MAX_ATTEMPTS = 8
-_FALLBACK_TEMPLATE = "<b>{{title}}</b>\n\n{{overview}}\n\n{{filename}}\n\n{{share_url}}"
+_FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
 
 
 def human_size(size: int) -> str:
@@ -59,19 +59,55 @@ def _template(db: Session) -> MessageTemplate | None:
 
 
 def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str]:
+    """构造 Telegram 消息。v0.6.0 增加 TMDB 分类打标变量。
+
+    可用：type / type_label / origin_country / origin_country_code / genres / tags，
+    以及原有 title/overview/filename/year/resolution/size/tmdb_id/tmdb_url/share_url，
+    另有 vote_average/original_title/season/episode/episode_tag/media_type。
+    """
+    esc = lambda v: html.escape(str(v if v is not None else ""), quote=False)
     title = res.media_title or res.name
     hint = parse_media_name(res.name)
     tpl = _template(db)
+
+    genres = tmdb.as_list(res.genres)
+    countries = tmdb.as_list(res.origin_country)
+    genres_text = "、".join(genres)
+    country_text = tmdb.country_label(res.origin_country)
+    type_text = tmdb.type_label(res.media_type) if res.media_type else ""
+    season = res.season if res.season is not None else hint.get("season")
+    episode = res.episode if res.episode is not None else hint.get("episode")
+    episode_tag = f"S{int(season):02d}E{int(episode):02d}" if season and episode else ""
+
+    # 标签串按「片名 · 类型 · 地区 · 分类」打标（示例：#保镖恋人 #电影 #美国 #爱情 #惊悚）
+    tag_parts = [title, type_text]
+    if country_text:
+        tag_parts.append(country_text)
+    tag_parts.extend(genres[:3])
+    tags = " ".join("#" + str(p).replace(" ", "") for p in dict.fromkeys(tag_parts) if p)
+
     ctx = {
-        "title": html.escape(title, quote=False),
-        "overview": html.escape((res.overview or "").strip(), quote=False),
-        "filename": html.escape(res.name, quote=False),
+        "title": esc(title),
+        "overview": esc((res.overview or "").strip()),
+        "filename": esc(res.name),
         "share_url": share_url,
-        "year": html.escape(str(hint.get("year") or ""), quote=False),
-        "resolution": html.escape(str(hint.get("resolution") or ""), quote=False),
+        "year": esc(hint.get("year") or ""),
+        "resolution": esc(hint.get("resolution") or ""),
         "size": human_size(res.size),
         "tmdb_id": res.tmdb_id or "",
-        "tmdb_url": f"https://www.themoviedb.org/{res.media_type}/{res.tmdb_id}" if res.tmdb_id and res.media_type else "",
+        "tmdb_url": tmdb.tmdb_url(res.media_type, res.tmdb_id) if res.tmdb_id and res.media_type else "",
+        "media_type": res.media_type or "",
+        "type": res.media_type or "",
+        "type_label": esc(type_text),
+        "origin_country": esc(country_text),
+        "origin_country_code": esc(", ".join(countries)),
+        "genres": esc(genres_text),
+        "tags": esc(tags),
+        "vote_average": f"{float(res.vote_average or 0):.1f}" if res.vote_average else "",
+        "original_title": esc(res.original_title),
+        "season": season or "",
+        "episode": episode or "",
+        "episode_tag": episode_tag,
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
     return text[:1000], text[:1000]

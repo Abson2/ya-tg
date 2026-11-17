@@ -6,6 +6,60 @@
 
 ---
 
+## v0.6.0 (2026-11-17)
+
+媒体识别重构：电影/剧集分类判定、TMDB 标签打标、AI 辅助识别、手动匹配窗口，并补齐 Bot/频道的测试与删除，顺带修掉「验证连接」的 `code=120`。
+
+### 问题
+- 用户截图：`The.Silent.Storm.S01E04.2026.2160p...` 被识别成 1930 年代电影 `Cavalcade d'amour`（TMDB #279155）。旧逻辑把 `S01E04` 留在搜索词里，`/search/tv` 无结果后回退到 `/search/multi`，把电影候选当第一名直接落库
+- 推送消息没有 TMDB 分类标签；模板变量只有 8 个，条件块不支持嵌套
+- 识别失败只能「输一个 TMDB ID」且强制按 movie 处理，没有按类型搜索、看海报选择、标记无匹配的能力
+- 「分发规则」页添加完 Bot/频道后无法验证是否可用，也没有删除入口
+- 顶栏「验证连接」误调官方 OpenAPI `/openapi/v1/user/get_user_info`，短信登录凭证没有开放平台应用 ID → `code=120 msg=缺少clientId`（v0.5.3 修扫描时漏掉的同类错配）
+
+### 识别策略（借鉴 TgtoDrive，不依赖其运行时）
+来源：[walkingddd/TgtoDrive README](https://github.com/walkingddd/TgtoDrive) 的「根据 TMDB 识别作品与季集」「需要 AI 回退识别时再配置 AI 辅助识别及对应整理开关」，其 OpenAPI 含 `/api/ai-media-parser/config`、`test-connection`、`/api/organize-history/recognize-test`、`/api/media/details/tmdb/tv/{id}/season/{n}`；本地 `tgto plugin.py` 的规则 ID `tmdb_movie_<id>` / `tmdb_tv_<id>_<season>` 与「优先 ProviderIds.Tmdb 精确匹配，兜底按 名称+年份」。
+- `utils.parse_media_name` 重写：输出 `type_hint`（tv/movie/unknown）、`type_source`、`clean_title`、`tmdb_id`、季集号；扩展技术噪声清理（DDP5.1 / 10bit / Season 2 / 第N集 等），兼容传入完整路径与目录线索
+- `tmdb.identify` 决策链：**ID 精确匹配 → 类型硬约束（剧集绝不回退电影）→ 类型未知时 tv/movie 双路搜索 + 片名相似度/年份/热度评分 → 分数接近标 ambiguous 不自动落库 → AI 兜底**
+- 支持 `(tmdb-206484)`、`{tmdb=206484}` 等 ID 标记；`detail()` 补全 `genres` / `origin_country` / `vote_average` / `original_title`
+- 资源新增 `identify_status`（identified / ambiguous / failed / none / unidentified）、`identify_source`、`identify_note`、`season`、`episode`、`genres`、`origin_country`、`vote_average`、`original_title`，SQLite 轻量迁移自动补列
+
+### 消息模板打标
+- 新增模板变量 `type`、`type_label`、`origin_country`、`origin_country_code`、`genres`、`tags`、`vote_average`、`original_title`、`season`、`episode`、`episode_tag`、`media_type`
+- `tags` 按「片名 · 类型 · 地区 · 分类」生成，示例 `#保镖恋人 #电影 #西班牙 #爱情 #惊悚`；默认模板含 `type={{type}} · origin_country={{origin_country}} · genres={{genres}}` 一行
+- 默认模板升级：老用户若没改过 v0.5.x 默认模板，`migrate()` 自动换成新版；也可在「消息模板」页点「载入 v0.6.0 默认模板」
+- `render_template` 改为递归解析，条件块 `{{#if}}...{{/if}}` 支持嵌套
+
+### AI 辅助识别（可选）
+- `ai_assist.py`：任意 OpenAI 兼容 `/chat/completions`，用户自定义 Base URL / API Key / 模型 / 补充提示词 / 超时；密钥加密落库、DB 优先 `.env` 兜底
+- 只用于文件名解析、主搜索失败时提供备用片名、候选接近时消歧；季集硬证据不会被 AI 推翻，任何异常静默降级
+- 端点 `GET /api/ai/status`、`POST /api/ai/config`、`POST /api/ai/test`、`POST /api/ai/parse`（识别测试）；管理页「TMDB 设置 → AI 辅助识别」
+
+### 手动匹配（参考 LitePan）
+来源：[Ponphil/LitePan](https://github.com/Ponphil/LitePan) 与 [LitePan-old](https://github.com/Ponphil/LitePan-old) 的「重新匹配元数据」窗口、按「已刮削/匹配存疑/缺失」与「电影/剧集」双维筛选、目录 `(tmdb-206484)` 标记。
+- 资源库「手动」改为弹窗：类型下拉（剧集/电影）+ 片名或 TMDB ID + 搜索 + 海报候选（标题/年份/类型/TMDB ID/分类）+「应用匹配」/「无匹配」
+- 后端 `GET /api/tmdb/search?q=&media_type=`（纯数字或 `tmdb-123` 按 ID 直取）、`POST /api/resources/{id}/identify`、`POST /api/resources/{id}/match-none`、`GET /api/tmdb/candidates/{id}` 返回结构化决策（含 hint / reason / ai）
+- 自动识别不再瞎猜：ambiguous/failed 时前端引导跳转手动匹配；资源库可按媒体类型与识别状态筛选
+
+### Bot / 频道 / 规则管理
+- `POST /api/bots/{id}/test`：Telegram `getMe` 验证 Bot Token；`POST /api/channels/{id}/test`：真实发一条测试消息，失败给可操作提示（频道 ID / Bot 未入频道 / Token 失效 / 429 限流）
+- `DELETE /api/bots/{id}`、`DELETE /api/channels/{id}`、`DELETE /api/rules/{id}`；删除 Bot/频道级联清理关联频道、分发规则与队列项，返回值明确列出清理数量，前端确认框提前展示，资源本身保留
+
+### 修复：验证连接 code=120
+- `/api/auth/openapi/verify` 按 `AuthToken.flow` 分流：短信登录用网页端 `POST /userres/v1/file/get_file_list`（pageSize=1）做轻量探测；官方 Device/PKCE 才调 `get_user_info`
+- `GuangYaOpenAPI._call` 增加前置防护：网页端凭证且无开放平台 `client_id` 时直接抛带中文说明的 `code=120`，杜绝其余残留调用
+- 返回 `channel` 字段，前端「验证连接」提示区分网页端与官方通道
+
+### 测试
+- 新增 `tests/test_identify_v060.py`、`tests/test_verify_channel.py`、`tests/test_manage_v060.py`；全套 **38 项通过**，前端 `vite build` 通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.6.0
+```
+
+---
+
 ## v0.5.4 (2026-11-17)
 
 修复资源库识别报 `HTTP 401 Invalid API key`，并把 TMDB 密钥改成管理页可配置。登录、扫描、建分享、推送链路不受影响。

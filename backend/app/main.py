@@ -1,4 +1,6 @@
+import html
 import json
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -6,6 +8,7 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,16 +16,16 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import guangya_auth, guangya_sms, runtime_config, tmdb
+from . import ai_assist, guangya_auth, guangya_sms, runtime_config, tmdb
 from .config import VALID_DURATIONS, settings
-from .db import Base, SessionLocal, get_db, json_dumps, migrate, engine
-from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient
+from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
+from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles
 from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, MessageTemplate,
                      QueueItem, Resource, Rule, ScanCursor, ScanTask)
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, mask_secret
-from .utils import as_utc, utcnow
+from .utils import as_utc, parse_media_name, retry_after_seconds, utcnow
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 _last_device_poll = 0.0
@@ -113,13 +116,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.5.4", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.4", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -251,10 +254,34 @@ async def sms_refresh(db: Session = Depends(get_db)):
 
 @app.get("/api/auth/openapi/verify", dependencies=ADMIN)
 async def verify_openapi(db: Session = Depends(get_db)):
-    """用公开文档中的 get_user_info 验证 OpenAPI 授权是否真的可用。"""
+    """验证连接按授权通道分流。
+
+    短信登录（普通用户）拿的是网页端凭证，没有开放平台应用 ID，调官方
+    /openapi/v1/user/get_user_info 必然 code=120 缺少clientId。这里改用网页端
+    文件列表接口做一次轻量探测，真实反映「能不能扫描/建分享」；只有官方
+    Device/PKCE 高级授权才走 get_user_info。
+    """
+    t = db.get(AuthToken, 1)
+    if t and t.flow in ("sms", "tgto"):
+        try:
+            data = await GuangYaWebFiles(db).list_files(page_size=1)
+            items = data.get("list") or []
+            return {"ok": True, "channel": "web", "flow": "sms",
+                    "user_id": guangya_sms.status(db).get("account") or "",
+                    "root_items": len(items),
+                    "message": "光鸭网页端连接正常（短信登录），可扫描与建分享"}
+        except Exception as exc:
+            raise HTTPException(502, f"网页端连接失败：{exc}")
     try:
         info = await GuangYaOpenAPI(db).get_user_info()
-        return {"ok": True, "user_id": info.get("userId", ""), "vip_status": info.get("vipStatus")}
+        return {"ok": True, "channel": "openapi", "user_id": info.get("userId", ""),
+                "vip_status": info.get("vipStatus"), "message": "官方 OpenAPI 授权可用"}
+    except GuangYaError as exc:
+        if exc.code == 120:
+            raise HTTPException(400, "官方 OpenAPI 缺少开放平台应用 ID（x-client-id）。"
+                                     "普通用户用短信登录即可，无需此接口；若坚持官方 Device/PKCE 授权，"
+                                     "需到光鸭开放平台申请应用并配置 GUANGYA_CLIENT_ID。")
+        raise HTTPException(502, str(exc))
     except Exception as exc:
         raise HTTPException(502, str(exc))
 
@@ -311,12 +338,19 @@ async def scan_now(resume: bool = True, db: Session = Depends(get_db)):
 
 # ---------- 资源与分享 ----------
 @app.get("/api/resources", dependencies=ADMIN)
-def resources(q: str = "", limit: int = 100, db: Session = Depends(get_db)):
+def resources(q: str = "", limit: int = 100, media_type: str = "",
+              identify_status: str = "", db: Session = Depends(get_db)):
     stmt = select(Resource).order_by(Resource.id.desc()).limit(min(limit, 500))
     if q:
         stmt = stmt.where(or_(Resource.name.ilike(f"%{q}%"), Resource.media_title.ilike(f"%{q}%")))
-    keys = ["id", "file_id", "name", "size", "ext", "tmdb_id", "media_type", "media_title",
-            "overview", "poster_path", "identify_status", "share_url", "share_status",
+    if media_type in ("movie", "tv"):
+        stmt = stmt.where(Resource.media_type == media_type)
+    if identify_status:
+        stmt = stmt.where(Resource.identify_status == identify_status)
+    keys = ["id", "file_id", "parent_id", "name", "size", "ext", "tmdb_id", "media_type",
+            "media_title", "original_title", "overview", "poster_path", "genres",
+            "origin_country", "vote_average", "season", "episode", "identify_status",
+            "identify_source", "identify_note", "share_url", "share_status",
             "share_duration", "revision", "utime"]
     return [{k: getattr(x, k) for k in keys} for x in db.scalars(stmt).all()]
 
@@ -382,15 +416,49 @@ async def delete_share(rid: int, db: Session = Depends(get_db)):
 class IdentifyInput(BaseModel):
     tmdb_id: int
     media_type: str  # movie / tv
+    note: str = ""
 
 
-def _apply_identification(x: Resource, d: dict) -> None:
-    x.tmdb_id = d["tmdb_id"]
-    x.media_type = d["media_type"]
-    x.media_title = d["title"]
-    x.overview = d["overview"]
-    x.poster_path = d["poster_path"]
+def _apply_identification(x: Resource, d: dict, source: str = "manual",
+                          note: str = "", hint: dict | None = None) -> None:
+    """把 TMDB 详情写入资源：v0.6.0 一并落库分类标签、季集与识别来源。"""
+    x.tmdb_id = d.get("tmdb_id")
+    x.media_type = d.get("media_type") or ""
+    x.media_title = d.get("title") or ""
+    x.original_title = d.get("original_title") or ""
+    x.overview = d.get("overview") or ""
+    x.poster_path = d.get("poster_path") or ""
+    x.genres = json_dumps(d.get("genres") or [])
+    x.origin_country = json_dumps(d.get("origin_country") or [])
+    try:
+        x.vote_average = float(d.get("vote_average") or 0)
+    except (TypeError, ValueError):
+        x.vote_average = 0.0
+    h = hint or {}
+    if h.get("season") is not None:
+        x.season = h["season"]
+    if h.get("episode") is not None:
+        x.episode = h["episode"]
     x.identify_status = "identified"
+    x.identify_source = source
+    x.identify_note = note or ""
+
+
+def _clear_identification(x: Resource, status: str = "none", source: str = "manual",
+                          note: str = "") -> None:
+    """LitePan「无匹配」：清空元数据并标记，不再被自动识别误配。"""
+    x.tmdb_id = None
+    x.media_type = ""
+    x.media_title = ""
+    x.original_title = ""
+    x.overview = ""
+    x.poster_path = ""
+    x.genres = ""
+    x.origin_country = ""
+    x.vote_average = 0.0
+    x.identify_status = status
+    x.identify_source = source
+    x.identify_note = note
 
 
 def _tmdb_error(exc: Exception) -> HTTPException:
@@ -430,18 +498,46 @@ async def tmdb_test(db: Session = Depends(get_db)):
 
 
 @app.get("/api/tmdb/candidates/{rid}", dependencies=ADMIN)
-async def tmdb_candidates(rid: int, db: Session = Depends(get_db)):
+async def tmdb_candidates(rid: int, media_type: str = "", db: Session = Depends(get_db)):
+    """手动匹配窗口打开时先带出候选；指定类型时只搜该类型（不回退）。"""
     x = db.get(Resource, rid)
     if not x:
         raise HTTPException(404, "资源不存在")
+    mt = media_type if media_type in ("movie", "tv") else None
     try:
-        return await tmdb.identify_by_filename(x.name, db)
+        if mt:
+            hint = parse_media_name(x.name)
+            q = hint.get("clean_title") or hint.get("title") or x.name
+            items = await tmdb.search(q, mt, db)
+            label = "电影" if mt == "movie" else "剧集"
+            return {"ok": bool(items), "status": "identified" if items else "failed",
+                    "source": "tmdb", "reason": f"按{label}搜索「{q}」得到 {len(items)} 个候选",
+                    "hint": hint, "ai": None, "candidates": tmdb.rank(items, hint), "best": None}
+        return await tmdb.identify(x.name, db)
+    except Exception as e:
+        raise _tmdb_error(e)
+
+
+@app.get("/api/tmdb/search", dependencies=ADMIN)
+async def tmdb_search(q: str, media_type: str = "", db: Session = Depends(get_db)):
+    """手动匹配：片名或 TMDB ID，可限定 movie / tv。"""
+    raw = (q or "").strip()
+    if not raw:
+        return []
+    mt = media_type if media_type in ("movie", "tv") else None
+    try:
+        m = re.fullmatch(r"(?:tmdb[-_:= ]?)?(\d{2,12})", raw, re.I)
+        if m:
+            d, _ = await tmdb.detail_by_id_any(int(m.group(1)), mt or "movie", db)
+            return [d] if d else []
+        return await tmdb.search(raw, mt, db)
     except Exception as e:
         raise _tmdb_error(e)
 
 
 @app.post("/api/resources/{rid}/identify", dependencies=ADMIN)
 async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
+    """手动「应用匹配」：按指定 TMDB ID + 类型拉详情并补全分类标签。"""
     if p.media_type not in ("movie", "tv"):
         raise HTTPException(400, "media_type 仅支持 movie / tv")
     x = db.get(Resource, rid)
@@ -449,39 +545,110 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
         raise HTTPException(404, "资源不存在")
     try:
         d = await tmdb.detail(p.tmdb_id, p.media_type, db)
-        _apply_identification(x, d)
+        _apply_identification(x, d, source="manual", note=p.note or "手动匹配",
+                              hint=parse_media_name(x.name))
         add_audit(db, "resource_identified", target_type="resource", target_id=str(rid),
-                  detail=json_dumps(d))
+                  detail=json_dumps({"tmdb_id": p.tmdb_id, "media_type": p.media_type,
+                                     "title": x.media_title, "source": "manual"}))
         db.commit()
-        return {"ok": True, "media_title": x.media_title, "poster": tmdb.poster_url(x.poster_path)}
+        return {"ok": True, "media_title": x.media_title, "poster": tmdb.poster_url(x.poster_path),
+                "type": x.media_type, "genres": tmdb.as_list(x.genres),
+                "origin_country": tmdb.country_label(x.origin_country)}
     except Exception as e:
         raise _tmdb_error(e)
+
+
+@app.post("/api/resources/{rid}/match-none", dependencies=ADMIN)
+def match_none(rid: int, db: Session = Depends(get_db)):
+    """LitePan 风格「无匹配」：标记后不再自动识别，等人工处理。"""
+    x = db.get(Resource, rid)
+    if not x:
+        raise HTTPException(404, "资源不存在")
+    _clear_identification(x, note="人工标记无匹配，不再自动识别")
+    add_audit(db, "resource_match_none", target_type="resource", target_id=str(rid))
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/resources/{rid}/auto-identify", dependencies=ADMIN)
 async def auto_identify(rid: int, db: Session = Depends(get_db)):
+    """自动识别：只有决策明确才落库；匹配存疑/失败时标记状态并给出候选。"""
     x = db.get(Resource, rid)
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        candidates = await tmdb.identify_by_filename(x.name, db)
-        if not candidates:
-            return {"ok": False, "candidates": []}
-        _apply_identification(x, candidates[0])
-        add_audit(db, "resource_auto_identified", target_type="resource", target_id=str(rid),
-                  detail=json_dumps({"tmdb_id": x.tmdb_id, "media_type": x.media_type}))
+        r = await tmdb.identify(x.name, db, use_ai=True)
+        if r["ok"] and r.get("best"):
+            _apply_identification(x, r["best"], source=r["source"], note=r["reason"], hint=r["hint"])
+            add_audit(db, "resource_auto_identified", target_type="resource", target_id=str(rid),
+                      detail=json_dumps({"tmdb_id": x.tmdb_id, "media_type": x.media_type,
+                                         "source": r["source"], "reason": r["reason"]}))
+            db.commit()
+            return {"ok": True, "status": "identified", "candidates": r["candidates"][:8],
+                    "applied": r["best"], "reason": r["reason"], "source": r["source"],
+                    "hint": r["hint"], "ai": r.get("ai")}
+        x.identify_status = r["status"]
+        x.identify_source = r["source"]
+        x.identify_note = r["reason"]
+        add_audit(db, "resource_identify_pending", target_type="resource", target_id=str(rid),
+                  detail=json_dumps({"status": r["status"], "reason": r["reason"]}))
         db.commit()
-        return {"ok": True, "candidates": candidates, "applied": candidates[0]}
+        return {"ok": False, "status": r["status"], "reason": r["reason"],
+                "candidates": r["candidates"][:8], "hint": r["hint"], "ai": r.get("ai")}
     except Exception as e:
         raise _tmdb_error(e)
 
 
-@app.get("/api/tmdb/search", dependencies=ADMIN)
-async def tmdb_search(q: str, db: Session = Depends(get_db)):
+# ---------- AI 辅助识别（OpenAI 兼容接口，可选） ----------
+class AiConfigInput(BaseModel):
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    prompt: str = ""
+    timeout: int = 30
+
+
+class AiParseInput(BaseModel):
+    name: str = ""
+
+
+@app.get("/api/ai/status", dependencies=ADMIN)
+def ai_status(db: Session = Depends(get_db)):
+    return ai_assist.status(db)
+
+
+@app.post("/api/ai/config", dependencies=ADMIN)
+def ai_config_save(p: AiConfigInput, db: Session = Depends(get_db)):
+    runtime_config.set_many(db, {
+        "ai_enabled": "true" if p.enabled else "false",
+        "ai_base_url": p.base_url.strip() or "https://api.openai.com/v1",
+        "ai_api_key": p.api_key.strip(),
+        "ai_model": p.model.strip() or "gpt-4o-mini",
+        "ai_prompt": p.prompt.strip(),
+        "ai_timeout": str(max(5, min(120, p.timeout))),
+    })
+    add_audit(db, "ai_config_saved", target_type="config", detail="AI 辅助识别配置已更新（密文存储）")
+    db.commit()
+    return {"ok": True, "status": ai_assist.status(db)}
+
+
+@app.post("/api/ai/test", dependencies=ADMIN)
+async def ai_test(db: Session = Depends(get_db)):
+    return await ai_assist.test_connection(db)
+
+
+@app.post("/api/ai/parse", dependencies=ADMIN)
+async def ai_parse(p: AiParseInput, db: Session = Depends(get_db)):
+    """识别测试：让 AI 解析一个文件名，不写库。未启用时返回提示而非报错。"""
+    if not p.name.strip():
+        return {"ok": False, "message": "请输入文件名"}
+    if not ai_assist.enabled(db):
+        return {"ok": False, "message": "AI 辅助识别未启用或尚未配置 API Key"}
     try:
-        return await tmdb.search(q, None, db)
-    except Exception as e:
-        raise _tmdb_error(e)
+        return await ai_assist.parse_filename(p.name.strip(), db)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 # ---------- Bot / 频道 / 规则 ----------
@@ -519,6 +686,77 @@ def add_bot(p: BotInput, db: Session = Depends(get_db)):
     return {"id": x.id, "name": x.name}
 
 
+async def _telegram_call(token: str, method: str, payload: dict) -> dict:
+    """直接调 Telegram Bot API，不写队列、不建分享。异常由调用方转成结构化提示。"""
+    base = settings.telegram_api_base.rstrip("/")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{base}/bot{token}/{method}", json=payload)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"ok": False, "description": r.text[:300]}
+    return {"http_status": r.status_code, "data": data, "retry_after": r.headers.get("Retry-After")}
+
+
+def _cascade_channel(db: Session, channel_id: int) -> tuple[int, int]:
+    """删除频道前清理引用它的分发规则与队列项，返回清理数量供前端确认框展示。"""
+    rules = list(db.scalars(select(Rule).where(Rule.channel_id == channel_id)).all())
+    queue = list(db.scalars(select(QueueItem).where(QueueItem.channel_id == channel_id)).all())
+    for x in rules:
+        db.delete(x)
+    for x in queue:
+        db.delete(x)
+    return len(rules), len(queue)
+
+
+@app.post("/api/bots/{bid}/test", dependencies=ADMIN)
+async def test_bot(bid: int, db: Session = Depends(get_db)):
+    """验证 Bot Token 是否有效（Telegram getMe），不发消息。"""
+    b = db.get(Bot, bid)
+    if not b:
+        raise HTTPException(404, "Bot 不存在")
+    try:
+        token = decrypt_secret(b.token)
+    except Exception as exc:
+        return {"ok": False, "message": f"Bot Token 解密失败：{exc}"}
+    if not token:
+        return {"ok": False, "message": "Bot Token 为空，请重新添加"}
+    try:
+        r = await _telegram_call(token, "getMe", {})
+    except Exception as exc:
+        return {"ok": False, "message": f"无法连接 Telegram：{exc}"}
+    if r["http_status"] in (401, 403) or not r["data"].get("ok"):
+        return {"ok": False, "message": "Bot Token 无效或已被撤销（Telegram 401/403），请重新添加 Bot"}
+    u = r["data"].get("result") or {}
+    add_audit(db, "bot_tested", target_type="bot", target_id=str(bid), detail=str(u.get("username", "")))
+    db.commit()
+    return {"ok": True, "username": u.get("username", ""), "name": u.get("first_name", ""),
+            "message": f"Bot Token 有效：@{u.get('username') or u.get('first_name') or bid}"}
+
+
+@app.delete("/api/bots/{bid}", dependencies=ADMIN)
+def delete_bot(bid: int, db: Session = Depends(get_db)):
+    """删除 Bot，并级联清理其下频道、关联规则与队列项。"""
+    b = db.get(Bot, bid)
+    if not b:
+        raise HTTPException(404, "Bot 不存在")
+    channels_ = list(db.scalars(select(Channel).where(Channel.bot_id == bid)).all())
+    removed_rules = removed_queue = 0
+    for ch in channels_:
+        nr, nq = _cascade_channel(db, ch.id)
+        removed_rules += nr
+        removed_queue += nq
+        db.delete(ch)
+    name = b.name
+    db.delete(b)
+    add_audit(db, "bot_deleted", target_type="bot", target_id=str(bid),
+              detail=json_dumps({"name": name, "removed_channels": len(channels_),
+                                 "removed_rules": removed_rules, "removed_queue": removed_queue}))
+    db.commit()
+    return {"ok": True, "removed_channels": len(channels_),
+            "removed_rules": removed_rules, "removed_queue": removed_queue}
+
+
 class ChannelInput(BaseModel):
     bot_id: int
     name: str
@@ -542,6 +780,71 @@ def add_channel(p: ChannelInput, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(x)
     return {"id": x.id}
+
+
+@app.post("/api/channels/{cid}/test", dependencies=ADMIN)
+async def test_channel(cid: int, db: Session = Depends(get_db)):
+    """向该频道发一条真实测试消息，验证 Bot Token + 频道 ID + 网络是否联通。"""
+    ch = db.get(Channel, cid)
+    if not ch:
+        raise HTTPException(404, "频道不存在")
+    bot = db.get(Bot, ch.bot_id)
+    if not bot:
+        return {"ok": False, "message": "关联 Bot 不存在，请重新添加"}
+    if not bot.enabled:
+        return {"ok": False, "message": "关联 Bot 已禁用，请先启用后再测试"}
+    if not ch.enabled:
+        return {"ok": False, "message": "该频道已禁用，请先启用后再测试"}
+    try:
+        token = decrypt_secret(bot.token)
+    except Exception as exc:
+        return {"ok": False, "message": f"Bot Token 解密失败：{exc}"}
+    if not token:
+        return {"ok": False, "message": "Bot Token 为空，请重新添加 Bot"}
+    now_bj = (utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    text = (f"<b>Ya-TG 测试推送</b>\n"
+            f"频道：{html.escape(ch.name, quote=False)}\n"
+            f"Bot：{html.escape(bot.name, quote=False)}\n"
+            f"时间：{now_bj}（北京时间）\n\n"
+            "收到这条消息，说明 Bot Token、频道 ID 与网络均正常，可以正式分发。")
+    try:
+        r = await _telegram_call(token, "sendMessage",
+                                 {"chat_id": ch.chat_id, "text": text, "parse_mode": "HTML",
+                                  "disable_web_page_preview": True})
+    except Exception as exc:
+        return {"ok": False, "message": f"无法连接 Telegram：{exc}"}
+    if r["http_status"] == 429:
+        wait = retry_after_seconds(r["retry_after"]) or 60
+        return {"ok": False, "message": f"Telegram 限流（429），请约 {wait} 秒后重试"}
+    if r["http_status"] >= 400 or not r["data"].get("ok"):
+        desc = str(r["data"].get("description") or r["data"])[:300]
+        if "chat not found" in desc.lower() or "chat_id" in desc.lower() or "chat" in desc.lower():
+            desc += "（请检查频道 ID 是否正确、Bot 是否已加入频道并有发送权限）"
+        elif "unauthorized" in desc.lower() or r["http_status"] in (401, 403):
+            desc += "（Bot Token 可能无效，请先点 Bot 的「验证」）"
+        add_audit(db, "channel_test_failed", target_type="channel", target_id=str(cid), detail=desc[:300])
+        db.commit()
+        return {"ok": False, "message": f"测试推送失败：{desc}"}
+    message_id = str((r["data"].get("result") or {}).get("message_id", ""))
+    add_audit(db, "channel_test_sent", target_type="channel", target_id=str(cid), detail=message_id)
+    db.commit()
+    return {"ok": True, "message_id": message_id, "message": "测试消息已发送，请到频道查看"}
+
+
+@app.delete("/api/channels/{cid}", dependencies=ADMIN)
+def delete_channel(cid: int, db: Session = Depends(get_db)):
+    """删除频道，并级联清理引用它的分发规则与队列项。"""
+    ch = db.get(Channel, cid)
+    if not ch:
+        raise HTTPException(404, "频道不存在")
+    removed_rules, removed_queue = _cascade_channel(db, cid)
+    name = ch.name
+    db.delete(ch)
+    add_audit(db, "channel_deleted", target_type="channel", target_id=str(cid),
+              detail=json_dumps({"name": name, "removed_rules": removed_rules,
+                                 "removed_queue": removed_queue}))
+    db.commit()
+    return {"ok": True, "removed_rules": removed_rules, "removed_queue": removed_queue}
 
 
 class RuleInput(BaseModel):
@@ -570,6 +873,18 @@ def add_rule(p: RuleInput, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(x)
     return {"id": x.id}
+
+
+@app.delete("/api/rules/{rid}", dependencies=ADMIN)
+def delete_rule(rid: int, db: Session = Depends(get_db)):
+    r = db.get(Rule, rid)
+    if not r:
+        raise HTTPException(404, "分发规则不存在")
+    name = r.name
+    db.delete(r)
+    add_audit(db, "rule_deleted", target_type="rule", target_id=str(rid), detail=name)
+    db.commit()
+    return {"ok": True}
 
 
 # ---------- 队列与审核 ----------
@@ -655,6 +970,24 @@ def add_template(p: TemplateInput, db: Session = Depends(get_db)):
     add_audit(db, "template_saved", target_type="template", detail=p.name)
     db.commit()
     return {"id": x.id}
+
+
+@app.post("/api/templates/default", dependencies=ADMIN)
+def reset_default_template(db: Session = Depends(get_db)):
+    """一键恢复 v0.6.0 带分类标签的默认模板（老用户升级后可用）。"""
+    x = db.scalar(select(MessageTemplate).where(MessageTemplate.name == "默认图文模板"))
+    if not x:
+        x = MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
+                            enabled=True, is_default=True)
+        db.add(x)
+    else:
+        x.content, x.enabled, x.is_default = DEFAULT_TEMPLATE, True, True
+    db.flush()
+    for y in db.scalars(select(MessageTemplate).where(MessageTemplate.id != x.id)).all():
+        y.is_default = False
+    add_audit(db, "template_default_restored", target_type="template")
+    db.commit()
+    return {"ok": True, "content": DEFAULT_TEMPLATE, "id": x.id}
 
 
 @app.put("/api/templates/{tid}", dependencies=ADMIN)

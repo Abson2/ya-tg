@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     tmdb_bearer_token: str = ""
     tmdb_language: str = "zh-CN"
 
+    # AI 辅助识别（OpenAI 兼容接口，可选；推荐在管理页配置，不用改 .env）
+    ai_enabled: bool = False
+    ai_base_url: str = "https://api.openai.com/v1"
+    ai_api_key: str = ""
+    ai_model: str = "gpt-4o-mini"
+    ai_prompt: str = ""
+    ai_timeout: float = 30.0
+
     # 分发策略
     auto_create_share: bool = True
     share_duration: int = 0            # 0=永久 / 86400 / 604800 / 2592000

@@ -28,6 +28,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tmdb_api_key": ("tmdb_api_key", ""),
     "tmdb_bearer_token": ("tmdb_bearer_token", ""),
     "tmdb_language": ("tmdb_language", "zh-CN"),
+    # AI 辅助识别：OpenAI 兼容接口，用户可自定义服务端与模型
+    "ai_enabled": ("ai_enabled", "false"),
+    "ai_base_url": ("ai_base_url", "https://api.openai.com/v1"),
+    "ai_api_key": ("ai_api_key", ""),
+    "ai_model": ("ai_model", "gpt-4o-mini"),
+    "ai_prompt": ("ai_prompt", ""),
+    "ai_timeout": ("ai_timeout", "30"),
 }
 
 

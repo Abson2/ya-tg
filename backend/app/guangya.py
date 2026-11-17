@@ -42,8 +42,17 @@ class GuangYaOpenAPI:
         limit = _RATE.get(path, 2)
         await _limiter.wait(path, 1.0 / limit)
         from . import runtime_config
-        token = await guangya_auth.get_access_token(self.db)
+        from .models import AuthToken
+        t = self.db.get(AuthToken, 1)
         client_id = runtime_config.get(self.db, "guangya_client_id")
+        # 前置防护：网页端短信登录凭证不属于官方 OpenAPI 体系，硬调必然 code=120 缺少clientId。
+        # v0.5.3 已把扫描切到网页端；这里拦住其余残留调用（如 get_user_info 验证）。
+        if t and t.flow in ("sms", "tgto") and not client_id:
+            raise GuangYaError(
+                "当前使用网页端短信登录凭证，不能调用官方 OpenAPI 业务接口："
+                "官方要求开放平台分配的 x-client-id（应用 ID），错误码 120 缺少clientId。"
+                "扫描、建分享、连接验证已自动改用网页端接口，无需申请应用。", 120)
+        token = await guangya_auth.get_access_token(self.db)
         headers = {
             "Authorization": f"Bearer {token}",
             "traceparent": traceparent(),
