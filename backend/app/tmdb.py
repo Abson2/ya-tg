@@ -442,8 +442,21 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
         elif translated_used:
             rank_hint["clean_title"] = translated_used
         ranked = rank(candidates, rank_hint)
-        if fallback_used:
+        # v0.6.2：发布组/站点目录下只能用文件名认片（如 Tian.Xian.Pei.S01E28.2007），
+        # 这里没有「英文单集名覆盖中文剧名」的风险，文件名命中应自动落库，
+        # 否则整批剧集会因 fallback_used 永远转人工、散落在资源库里。
+        dir_unreliable = bool(hint.get("dir_unreliable"))
+        if fallback_used and not dir_unreliable:
             return _manual_required(hint, ai_info, ranked, query, english_alt)
+        if dir_unreliable:
+            # 文件名作品名就是主线索，用它重排；年份一致额外加分。
+            rank_hint["clean_title"] = english_alt or query
+            ranked = rank(candidates, rank_hint)
+            y = str(hint.get("year") or "")
+            for it in ranked:
+                if y and str(it.get("year") or "") == y:
+                    it["score"] = max(float(it["score"] or 0), 0.62)
+            ranked.sort(key=lambda x: (-x["score"], -(x.get("popularity") or 0)))
         if (not translated_used and hint.get("has_chinese")
                 and hint.get("title_source") == "directory"):
             # TMDB 已按中文剧名语义命中；中英标题字符串相似度天然接近 0，
@@ -489,8 +502,12 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
     elif translated_used:
         rank_hint["clean_title"] = translated_used
     ranked = rank(candidates, rank_hint)
-    if fallback_used:
+    dir_unreliable = bool(hint.get("dir_unreliable"))
+    if fallback_used and not dir_unreliable:
         return _manual_required(hint, ai_info, ranked, query, english_alt)
+    if dir_unreliable:
+        rank_hint["clean_title"] = english_alt or query
+        ranked = rank(candidates, rank_hint)
     ranked = [_localize_best(x, hint) for x in ranked]
     top1 = ranked[0]
     top2 = ranked[1] if len(ranked) > 1 else None

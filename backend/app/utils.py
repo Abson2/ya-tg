@@ -86,9 +86,21 @@ _SEASON_DIR = re.compile(
 _GENERIC_DIR = re.compile(
     r"^(?:电影|影片|电视剧|剧集|连续剧|动漫|动画|番剧|纪录片|综艺|合集|资源|下载|媒体|"
     r"媒体库|影视|4K|2160p|1080p|Movies?|Films?|TV|TVShows?|Series|Shows?|Media|"
-    r"Downloads?|Videos?|Anime|Documentar(?:y|ies))$", re.I)
+    r"Downloads?|Videos?|Anime|Documentar(?:y|ies)|"
+    # v0.6.2：网盘常见用途/推广目录，不是作品名
+    r"推广|推广专用|专用|分享|发布|资源分享|影视分享|我的分享|收藏|归档|待整理)$", re.I)
 _SEASON_NUM = re.compile(r"(?:season|series|s)\s*[._\- ]?(\d{1,2})|第\s*(\d{1,2})\s*[季部]", re.I)
 _CN = re.compile(r"[\u4e00-\u9fff]")
+
+# v0.6.2：发布组 / 资源站目录不是作品名。
+# 用户真实场景：文件在「[高清剧集网发布 www.THDT...]」目录下，文件名 Tian.Xian.Pei.S01E28.2007
+# 才是真剧名。旧逻辑把站点名当作品名搜 TMDB，必然失败，整批剧集散落未识别。
+_SITE_DIR = re.compile(
+    r"(?:www\s*\.|https?://|[\w-]+\.(?:com|net|org|cc|tv|me|xyz|info|biz)\b|"
+    r"发布|出品|压制|字幕组|资源站|影视网|剧集网|电影网|高清|蓝光|WEB\s*-?DL|"
+    r"\b(?:pub|release|upload|team|group|sub)\b)", re.I)
+_GENERIC_OR_SITE = re.compile(
+    r"^[\s\[\(\{【「]*[^\]]{0,40}(?:www\.|发布|剧集网|影视网|电影网|资源站|字幕组|出品|压制|\.com|\.net|\.cc|\.tv|THDT|满血|咩雪)", re.I)
 
 
 def _clean_dir(segment: str) -> tuple[str, str]:
@@ -132,6 +144,10 @@ def _dir_clues(path_hint: str) -> tuple[str, str, int | None, bool]:
                 season = int(m.group(1) or m.group(2) or 1)
             continue
         if _GENERIC_DIR.match(seg):
+            continue
+        # v0.6.2：跳过发布组/资源站目录（如「[高清剧集网发布 www.THDT]」）。
+        # 这类目录不是作品名，拿去 TMDB 搜只会全军覆没；跳过后再用文件名作品名。
+        if _GENERIC_OR_SITE.match(seg) or _SITE_DIR.search(seg):
             continue
         cleaned, y = _clean_dir(seg)
         if y and not year:
@@ -211,6 +227,10 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
     if season is None and dir_season is not None:
         season = dir_season
     primary_title = dir_title or file_title
+    # v0.6.2：目录被判定为发布组/站点垃圾而回退到文件名时，标记 dir_unreliable。
+    # 此时文件名是唯一可靠作品名（如 Tian.Xian.Pei），命中候选应允许自动落库；
+    # 只有真实「目录剧名 + 英文单集文件名」的组合才需要转人工防误配。
+    dir_unreliable = bool(path_hint and not dir_title and bool(file_title))
     has_chinese = bool(_CN.search(primary_title))
 
     type_hint, type_source = "unknown", "none"
@@ -235,6 +255,7 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
         "alt_title": file_title if dir_title and file_title != dir_title else "",
         "file_title": file_title,
         "dir_title": dir_title,
+        "dir_unreliable": dir_unreliable,
         "title_source": "directory" if dir_title else "filename",
         "has_chinese": has_chinese,
         "original": raw,

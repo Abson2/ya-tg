@@ -282,23 +282,32 @@ async function scan() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function addBot() {
-  try { await api('/bots', { method: 'POST', body: JSON.stringify(bot.value) }); bot.value = { name: '', token: '' }; ElMessage.success('Bot 已添加'); await load() }
+  try { await api('/bots', { method: 'POST', body: JSON.stringify(bot.value) }); bot.value = { name: '', token: '' }; manageDialog.value = ''; ElMessage.success('Bot 已添加'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function addChannel() {
-  try { await api('/channels', { method: 'POST', body: JSON.stringify(channel.value) }); channel.value = { bot_id: null, name: '', chat_id: '' }; ElMessage.success('频道已添加'); await load() }
+  try { await api('/channels', { method: 'POST', body: JSON.stringify(channel.value) }); channel.value = { bot_id: null, name: '', chat_id: '' }; manageDialog.value = ''; ElMessage.success('频道已添加'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function addRule() {
-  if (!channels.value.length) { ElMessage.warning('请先在「02 添加频道」里添加一个频道'); return }
+  if (!channels.value.length) { ElMessage.warning('请先在「频道管理」里添加一个频道'); return }
   if (!rule.value.channel_id) { ElMessage.warning('请选择「目标频道」'); return }
   if (!String(rule.value.name || '').trim()) { ElMessage.warning('请填写规则名称'); return }
   try {
     const d = await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) })
     ElMessage.success(d.message || '规则已保存')
     rule.value = { name: '', directory_id: '', keyword: '', channel_id: rule.value.channel_id, auto_publish: true }
+    manageDialog.value = ''
     await load()
   } catch (e) { ElMessage.error(e.message) }
+}
+// v0.6.2：三个管理卡片的「新增」弹窗
+const manageDialog = ref('')
+function openManage(kind) {
+  manageDialog.value = kind
+  if (kind === 'bot') bot.value = { name: '', token: '' }
+  if (kind === 'channel') channel.value = { bot_id: bots.value[0]?.id || null, name: '', chat_id: '' }
+  if (kind === 'rule') rule.value = { name: '', directory_id: '', keyword: '', channel_id: channels.value[0]?.id || null, auto_publish: true }
 }
 // ---------- v0.6.1：独立启停、真实测试消息、立即推送、反代地址 ----------
 async function toggleBot(b) {
@@ -344,7 +353,13 @@ async function publishResource(row) {
   publishing.value = row.id
   try {
     const d = await api(`/resources/${row.id}/publish`, { method: 'POST' })
-    ElMessage.success(`已入队 ${d.queued || 0} 条，发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条${d.failed ? '（详见推送队列错误列）' : ''}`)
+    const base = `已入队 ${d.queued || 0} 条，发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条`
+    if (d.detail?.length) {
+      ElMessageBox.alert(d.detail.map(x => `频道 #${x.channel_id}：${x.error}`).join('\n'),
+        `${base}（失败原因）`, { confirmButtonText: '知道了', type: 'warning' })
+    } else {
+      ElMessage.success(base + (d.queued ? '， Telegram 频道稍后即可收到' : ''))
+    }
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { publishing.value = 0 }
@@ -875,15 +890,50 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <div class="cursor-box"><div><small>启用 Bot</small><b>{{ diagnostics.bots?.enabled ?? 0 }} / {{ diagnostics.bots?.total ?? 0 }}</b></div><div><small>启用频道</small><b>{{ diagnostics.channels?.enabled ?? 0 }} / {{ diagnostics.channels?.total ?? 0 }}</b></div><div><small>启用规则</small><b>{{ diagnostics.rules_enabled ?? 0 }}</b></div><div><small>待推送</small><b>{{ diagnostics.queue?.pending ?? 0 }}</b></div><div><small>待审核</small><b>{{ diagnostics.queue?.review ?? 0 }}</b></div><div><small>已推送</small><b>{{ diagnostics.queue?.sent ?? 0 }}</b></div></div>
             <p v-if="diagnostics.blockers?.length" class="hint" style="color:#c0392b;margin:8px 0">待处理：{{ diagnostics.blockers.join('；') }}</p>
             <p v-else class="hint" style="margin:8px 0">链路完整：Bot / 频道 / 规则均已启用，队列每 30 秒自动推送一次；也可点「立即推送队列」马上验证。</p>
+            <p v-if="diagnostics.last_error" class="hint" style="color:#c0392b;margin:8px 0">最近失败：{{ diagnostics.last_error }}</p>
             <div class="match-controls"><el-input v-model="telegramBase" placeholder="Telegram API 地址，默认 https://api.telegram.org（国内网络可填反代）"/><el-button :loading="telegramSaving" @click="saveTelegramBase">保存地址</el-button></div>
           </div>
-          <div class="three-col">
-            <div class="panel step-panel"><div class="step-head"><span>01</span><h3>添加 Bot</h3></div><el-input v-model="bot.name" placeholder="Bot 名称"/><el-input v-model="bot.token" type="password" show-password placeholder="Bot Token（加密存储）" class="mt"/><el-button type="primary" class="mt" @click="addBot">添加 Bot</el-button><div v-for="b in bots" :key="b.id" class="mini-row"><b>{{ b.name }}{{ b.enabled ? '' : '（已停用）' }}</b><span>{{ b.token_masked }}</span><span class="row-actions"><button class="row-btn" :disabled="testingBot === b.id" @click="testBot(b)">{{ testingBot === b.id ? '验证中' : '验证 Token' }}</button><button class="row-btn" :disabled="testingBotMsg === b.id" @click="sendBotTestMessage(b)">{{ testingBotMsg === b.id ? '发送中' : '测试推送' }}</button><button class="row-btn" @click="toggleBot(b)">{{ b.enabled ? '停用' : '启用' }}</button><button class="row-btn danger" @click="delBot(b)">删除</button></span></div><p v-if="!bots.length" class="hint">未配置 Bot 时该链路不启用</p></div>
-            <div class="panel step-panel"><div class="step-head"><span>02</span><h3>添加频道</h3></div><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select><el-input v-model="channel.name" placeholder="频道名称" class="mt"/><el-input v-model="channel.chat_id" placeholder="频道 ID，如 -100..." class="mt"/><el-button type="primary" class="mt" @click="addChannel">添加频道</el-button><div v-for="c in channels" :key="c.id" class="mini-row"><b>{{ c.name }}{{ c.enabled ? '' : '（已停用）' }}</b><span>{{ c.chat_id }}</span><span class="row-actions"><button class="row-btn" :disabled="testingChannel === c.id" @click="testChannel(c)">{{ testingChannel === c.id ? '发送中' : '测试推送' }}</button><button class="row-btn" @click="toggleChannel(c)">{{ c.enabled ? '停用' : '启用' }}</button><button class="row-btn danger" @click="delChannel(c)">删除</button></span></div><p v-if="!channels.length" class="hint">未配置频道时该链路不启用</p></div>
-            <div class="panel step-panel"><div class="step-head"><span>03</span><h3>分发规则</h3></div><el-input v-model="rule.name" placeholder="规则名称"/><el-input v-model="rule.directory_id" placeholder="目录 ID（可空）" class="mt"/><el-input v-model="rule.keyword" placeholder="文件名关键词（可空）" class="mt"/><el-select v-model="rule.channel_id" placeholder="目标频道" style="width:100%" class="mt"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select><div class="mt"><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div><el-button type="primary" class="mt" @click="addRule">保存规则</el-button><div v-for="r in rules" :key="r.id" class="mini-row"><b>{{ r.name }}</b><span>{{ r.auto_publish ? '自动' : '审核' }}{{ r.enabled ? '' : ' · 停用' }}</span><span class="row-actions"><button class="row-btn danger" @click="delRule(r)">删除</button></span></div><p v-if="!rules.length" class="hint">保存规则后会自动把已扫描的资源补入分发队列</p></div>
+          <div class="manage-grid">
+            <!-- Bot 管理卡片 -->
+            <div class="panel manage-card">
+              <div class="panel-head"><div><h3>Bot 管理</h3><span class="hint">{{ bots.filter(b => b.enabled).length }} / {{ bots.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('bot')">+ 添加 Bot</el-button></div>
+              <el-table :data="bots" size="small" empty-text="还没有 Bot，点右上角添加"><el-table-column label="名称" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="210"><template #default="s"><el-button size="small" text :loading="testingBot === s.row.id" @click="testBot(s.row)">验证 Token</el-button><el-button size="small" text :loading="testingBotMsg === s.row.id" @click="sendBotTestMessage(s.row)">测试推送</el-button><el-button size="small" text @click="toggleBot(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delBot(s.row)">删除</el-button></template></el-table-column></el-table>
+            </div>
+            <!-- 频道管理卡片 -->
+            <div class="panel manage-card">
+              <div class="panel-head"><div><h3>频道管理</h3><span class="hint">{{ channels.filter(c => c.enabled).length }} / {{ channels.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('channel')">+ 添加频道</el-button></div>
+              <el-table :data="channels" size="small" empty-text="还没有频道，点右上角添加"><el-table-column label="频道" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="210"><template #default="s"><el-button size="small" text :loading="testingChannel === s.row.id" @click="testChannel(s.row)">测试推送</el-button><el-button size="small" text @click="toggleChannel(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delChannel(s.row)">删除</el-button></template></el-table-column></el-table>
+            </div>
+            <!-- 规则管理卡片 -->
+            <div class="panel manage-card">
+              <div class="panel-head"><div><h3>规则管理</h3><span class="hint">{{ rules.filter(r => r.enabled).length }} / {{ rules.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('rule')">+ 添加规则</el-button></div>
+              <el-table :data="rules" size="small" empty-text="还没有规则，点右上角添加"><el-table-column label="规则名" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="模式" width="72"><template #default="s"><el-tag :type="s.row.auto_publish ? 'success' : 'warning'" size="small">{{ s.row.auto_publish ? '自动' : '审核' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="210"><template #default="s"><el-button size="small" text type="danger" @click="delRule(s.row)">删除</el-button></template></el-table-column></el-table>
+              <p class="hint" style="margin:10px 0 0">保存规则时会自动把已扫描资源补入分发队列；规则未启用时不参与推送。</p>
+            </div>
           </div>
-        </section>
 
+          <!-- v0.6.2：新增统一管理弹窗 -->
+        <el-dialog v-model="manageDialog" width="460px" destroy-on-close>
+          <template #header><h3 style="margin:0">{{ manageDialog === 'bot' ? '添加 Bot' : (manageDialog === 'channel' ? '添加频道' : '添加分发规则') }}</h3></template>
+          <div v-if="manageDialog === 'bot'">
+            <div class="field"><label>Bot 名称</label><el-input v-model="bot.name" placeholder="例如：我的机器人"/></div>
+            <div class="field"><label>Bot Token</label><el-input v-model="bot.token" type="password" show-password placeholder="@BotFather 给的 token，加密存储"/></div>
+          </div>
+          <div v-if="manageDialog === 'channel'">
+            <div class="field"><label>所属 Bot</label><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select></div>
+            <div class="field"><label>频道名称</label><el-input v-model="channel.name" placeholder="例如：影视发布"/></div>
+            <div class="field"><label>频道 ID</label><el-input v-model="channel.chat_id" placeholder="形如 -1001234567890"/></div>
+          </div>
+          <div v-if="manageDialog === 'rule'">
+            <div class="field"><label>规则名称</label><el-input v-model="rule.name" placeholder="例如：全部资源"/></div>
+            <div class="field"><label>目标频道</label><el-select v-model="rule.channel_id" placeholder="选择频道" style="width:100%"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select></div>
+            <div class="field"><label>目录 ID（可空）</label><el-input v-model="rule.directory_id" placeholder="只推送该目录下的资源"/></div>
+            <div class="field"><label>文件名关键词（可空）</label><el-input v-model="rule.keyword" placeholder="只推送文件名含此关键词的资源"/></div>
+            <div class="field"><label>发布模式</label><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div>
+          </div>
+          <template #footer><el-button @click="manageDialog = ''">取消</el-button><el-button type="primary" @click="manageDialog === 'bot' ? addBot() : (manageDialog === 'channel' ? addChannel() : addRule())">保存</el-button></template>
+        </el-dialog>
+        </section>
         <section v-else-if="tab === '审核中心'" class="fade">
           <div class="page-head"><div><h2>审核中心</h2><p>通过后的条目将自动建分享并进入推送队列</p></div><el-tag type="warning">{{ reviews.length }} 条待审</el-tag></div>
           <div class="panel">
@@ -1140,6 +1190,8 @@ button{font-family:inherit}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
 .media-actions{display:flex;gap:5px;padding:0 12px 12px;flex-wrap:wrap}
 .step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}
+/* v0.6.2：分发规则三卡片管理布局 */
+.manage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;align-items:start}.manage-card{margin-bottom:0;min-width:0}.manage-card .panel-head h3{font-size:15px}.manage-card .panel-head .hint{display:block;font-size:11px;color:var(--yg-muted);margin-top:3px}.manage-card .el-table{font-size:12px}.manage-card .el-table .el-button+.el-button{margin-left:2px}
 .mini-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:11px}.mini-row:last-child{border:0}.mini-row b{font-size:12px;flex:none}.mini-row>span:not(.row-actions){color:var(--yg-muted);max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row-actions{display:flex;gap:4px;flex:none;max-width:none!important;overflow:visible!important}
 .row-btn{border:1px solid var(--yg-line);background:#fff;border-radius:6px;padding:3px 7px;font-size:10px;color:var(--yg-primary);cursor:pointer;white-space:nowrap}
@@ -1179,5 +1231,5 @@ button{font-family:inherit}
 .ai-test{display:flex;gap:10px;margin-top:14px}
 .ai-result{margin-top:10px;background:#f7f8fc;border:1px solid var(--yg-line);border-radius:10px;padding:10px}
 .ai-result pre{margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:#4a5578}
-@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar{grid-template-columns:1fr}}
+@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}}
 </style>

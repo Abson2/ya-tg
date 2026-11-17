@@ -116,13 +116,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.2", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -1170,7 +1170,14 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         added += 1
     db.commit()
     result = await process_queue(limit=50)
-    return {"ok": True, "queued": added, **result}
+    # v0.6.2：把本次入队项的即时结果带回前端，避免"点了没反应"的错觉。
+    # 用户常在资源未建分享或 Telegram 未通时点推送，队列项立即进入 retry，
+    # 若不回显错误，界面只显示"已入队 1 条"却收不到消息。
+    recent = list(db.scalars(select(QueueItem).where(
+        QueueItem.resource_id == x.id).order_by(QueueItem.id.desc()).limit(len(rules) or 1)).all())
+    detail = [{"channel_id": q.channel_id, "status": q.status,
+               "error": str(q.error or "")[:300]} for q in recent if q.error]
+    return {"ok": True, "queued": added, "detail": detail, **result}
 
 
 @app.put("/api/bots/{bid}", dependencies=ADMIN)
@@ -1287,13 +1294,21 @@ def diagnostics(db: Session = Depends(get_db)):
         blockers.append("还没有启用的分发规则，扫描到的资源不会入队")
     if review:
         blockers.append(f"{review} 条待人工审核，需到「审核中心」点「通过」才会推送")
+    if retry:
+        blockers.append(f"{retry} 条等待重试（建分享或 Telegram 失败），到「推送队列」看错误列")
     if failed:
         blockers.append(f"{failed} 条推送失败，请到「推送队列」查看错误列")
+    # v0.6.2：最近失败原因直接暴露，避免用户看到「链路完整」却收不到消息
+    last_error = ""
+    for q in db.scalars(select(QueueItem).where(QueueItem.error != "")
+                        .order_by(QueueItem.id.desc()).limit(1)).all():
+        last_error = str(q.error or "")[:300]
     return {"ok": not blockers, "blockers": blockers,
             "bots": {"total": bots_all, "enabled": bots_on},
             "channels": {"total": chs_all, "enabled": chs_on},
             "rules_enabled": rules_on, "queue": {"pending": pending, "review": review,
                                                   "retry": retry, "failed": failed, "sent": sent},
+            "last_error": last_error,
             "telegram_base": runtime_config.get(db, "telegram_api_base")}
 
 
