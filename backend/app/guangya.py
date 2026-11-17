@@ -41,12 +41,15 @@ class GuangYaOpenAPI:
                     body: dict | None = None, allow_117_retry: bool = True) -> dict:
         limit = _RATE.get(path, 2)
         await _limiter.wait(path, 1.0 / limit)
+        from . import runtime_config
         token = await guangya_auth.get_access_token(self.db)
+        client_id = runtime_config.get(self.db, "guangya_client_id")
         headers = {
-            "x-client-id": settings.guangya_client_id,
             "Authorization": f"Bearer {token}",
             "traceparent": traceparent(),
         }
+        if client_id:
+            headers["x-client-id"] = client_id
         if body is not None:
             headers["Content-Type"] = "application/json"
         for attempt in range(2):
@@ -101,31 +104,58 @@ GuangYaClient = GuangYaOpenAPI
 
 
 class GuangYaShareClient:
-    """网页端抓包分享接口。公开 OpenAPI 文档不提供建分享接口，故认证体系独立。"""
+    """网页端分享接口。凭证来自运行时配置（管理页一键登录优先，.env 兜底）。"""
 
-    def __init__(self):
-        if not settings.guangya_share_authorization:
-            raise GuangYaError("请配置 GUANGYA_SHARE_AUTHORIZATION（网页会话凭证）")
+    def __init__(self, db: Session | None = None):
+        from . import runtime_config
+
+        if db is not None:
+            authorization = runtime_config.get(db, "guangya_share_authorization")
+            did = runtime_config.get(db, "guangya_share_did")
+            dt = runtime_config.get(db, "guangya_share_dt") or "4"
+            smid = runtime_config.get(db, "guangya_share_smid")
+        else:
+            authorization = settings.guangya_share_authorization
+            did = settings.guangya_share_did
+            dt = settings.guangya_share_dt or "4"
+            smid = settings.guangya_share_smid
+        if not authorization:
+            raise GuangYaError("尚未配置光鸭网页会话凭证，请在管理页用「一键连接光鸭」短信登录")
         self.base = settings.guangya_share_base.rstrip("/")
         self.headers = {
-            "Authorization": settings.guangya_share_authorization,
-            "did": settings.guangya_share_did,
-            "dt": settings.guangya_share_dt,
+            "Authorization": authorization,
+            "did": did,
+            "dt": dt,
             "Content-Type": "application/json",
             "Origin": "https://www.guangyapan.com",
             "Referer": "https://www.guangyapan.com/",
         }
-        if settings.guangya_share_smid:
-            self.headers["smid"] = settings.guangya_share_smid
+        if smid:
+            self.headers["smid"] = smid
 
     @staticmethod
-    def config_status() -> dict:
+    def config_status(db: Session | None = None) -> dict:
+        from . import runtime_config
+
+        if db is not None:
+            authorization = runtime_config.get(db, "guangya_share_authorization")
+            did = runtime_config.get(db, "guangya_share_did")
+            smid = runtime_config.get(db, "guangya_share_smid")
+            sources = runtime_config.source_map(db)
+            source = sources.get("guangya_share_authorization", "empty")
+        else:
+            authorization = settings.guangya_share_authorization
+            did = settings.guangya_share_did
+            smid = settings.guangya_share_smid
+            source = "env" if authorization else "empty"
+        source_label = {"db": "管理页一键登录", "env": ".env 手工配置", "empty": "未配置"}.get(source, source)
         return {
-            "configured": bool(settings.guangya_share_authorization),
+            "configured": bool(authorization),
             "base": settings.guangya_share_base,
-            "did_set": bool(settings.guangya_share_did),
-            "smid_set": bool(settings.guangya_share_smid),
-            "note": "网页端接口未列入公开 OpenAPI 文档；凭证需自行在 NAS 本机更新，勿写入仓库",
+            "did_set": bool(did),
+            "smid_set": bool(smid),
+            "source": source_label,
+            "note": "推荐在管理页用手机号短信登录自动获取；无需手工抓包",
         }
 
     async def post(self, endpoint: str, payload: dict) -> dict:

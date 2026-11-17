@@ -6,7 +6,7 @@
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
-- 当前版本：v0.3.0
+- 当前版本：v0.4.0
 - 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
 ---
@@ -15,7 +15,7 @@
 
 | 步骤 | 说明 |
 | --- | --- |
-| 光鸭授权 | 用官方 Device Code 或网页 PKCE 登录你的光鸭账号， token 加密保存，自动刷新 |
+| 光鸭授权 | 管理页手机号+短信验证码一键登录（经 TgtoDrive），凭证加密保存、自动刷新；也支持官方 Device/PKCE |
 | 定时扫描 | 按 Cron（默认每 30 分钟）递归扫描指定目录，用 fileId 去重，只处理新文件 |
 | TMDB 识别 | 从文件名解析片名/年份/集数，搜索 TMDB 补全海报、简介，区分电影和电视剧 |
 | 自动建分享 | 推送前自动创建光鸭分享链接（永久/1天/7天/30天可选），保存链接 |
@@ -36,21 +36,17 @@
    - 需要能执行 `docker` 和 `docker compose` 命令（新版本 Docker 用 `docker compose`，旧版用 `docker-compose`）。
    - 验证：执行 `docker --version`，能显示版本号即可。
 
-2. **一个光鸭网盘账号，并且拿到开放平台应用凭证**
-   - 到光鸭开放平台申请接入，拿到 `client_id`。
-   - 想用 Device 授权：还要 `project_id` 和 `sign_secret`，并报备机器出口 IP。
-   - 想用网页 PKCE 授权：只要 `client_id`，并在平台登记一个回调网址。
-   - 官方文档：https://app.guangyapan.com/pan/docs/open-api
+2. **一个光鸭网盘账号 + 本机已部署 TgtoDrive（一键登录，推荐）**
+   - Ya-TG 通过 [TgtoDrive](https://github.com/walkingddd/TgtoDrive) 完成光鸭登录：**你只需在 Ya-TG 管理页输入手机号、收短信验证码**，程序就会自动获取并保存全部光鸭凭证。
+   - 前提：同一台机器上已装好 TgtoDrive（默认地址 `http://127.0.0.1:12366`），并在其「开放接口」页生成一个 Bearer 项目令牌。
+   - 这样你**完全不用**去光鸭开放平台申请应用，也不用 `client_id` / `project_id` / `sign_secret`，更不用从浏览器抓包。凭证到期后程序自动刷新。
+   - 备用方案：如果你已有光鸭开放平台应用，也可在管理页用官方 Device Code / PKCE 授权（见「高级」说明）。
 
-3. **分享接口会话凭证（用于自动建分享）**
-   - 光鸭官方 OpenAPI **没有**创建分享的接口。程序里的建分享走的是网页端接口，需要你从浏览器抓包拿到 4 个值：`share_authorization`、`did`、`dt`、`smid`。
-   - 这些值会过期，过期后需重新抓包更新。
-
-4. **Telegram Bot 和 TMDB（可选但推荐）**
+3. **Telegram Bot 和 TMDB（可选但推荐）**
    - 在 Telegram 找 @BotFather 创建 Bot，拿到 token；把 Bot 拉进目标频道并给它发消息权限。
    - TMDB API：到 https://www.themoviedb.org/settings/api 申请，用于识别海报和简介。不填也能推送，但没有海报和简介。
 
-> 只想先跑起来看看界面？第 3、4 项可以先留空，部署成功后在管理后台慢慢补。
+> 只想先跑起来看看界面？第 2、3 项都可以等部署成功后，在管理后台慢慢补。光鸭凭证从未配置到配置完成，全程在网页里点，不用改 `.env`、不用命令行。
 
 ---
 
@@ -84,6 +80,8 @@ services:
     environment:
       TZ: Asia/Shanghai
       DATABASE_URL: sqlite:////app/data/ya-tg.db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./ya-tg-data:/app/data
       - ./ya-tg-logs:/app/logs
@@ -177,14 +175,21 @@ http://你的机器IP:8787
 
 按这个顺序点，一般不会错：
 
-1. **光鸭授权**
-   - 进入「光鸭授权」页。
-   - 推荐点「Device Code 授权」→ 复制授权码 → 打开授权链接 → 在光鸭 App 里确认。系统会自动轮询完成。
-   - 或者点「Web PKCE 授权」→ 在打开的页面登录确认。
-   - 完成后点右上角「验证连接」，能看到用户 ID 就说明授权成功。
+1. **一键连接光鸭（最重要的一步）**
+   - 进入「光鸭授权」页，最上方的「一键连接光鸭」卡片：
+   - ① 填入 TgtoDrive 地址和它的项目令牌，点「保存连接设置」。
+     - 项目令牌来源：TgtoDrive → 开放接口 → 复制 Bearer 令牌。只需填一次。
+     - **地址要注意**：Ya-TG 跑在容器里，容器内的 `127.0.0.1` 指容器自己，**不是** NAS 本机。请填 NAS 的局域网 IP（如 `http://192.168.1.10:12366`），或在 `docker-compose.yml` 里给 ya-tg 服务加一行 `extra_hosts: ["host.docker.internal:host-gateway"]` 后用 `http://host.docker.internal:12366`。若 TgtoDrive 也用 compose 且在同一网络，可填服务名。
+   - ② 填入你的**光鸭账号手机号**，点「获取验证码」。
+   - ③ 收到短信后填入**验证码**，点「登录并连接」。
+   - 看到「光鸭已连接」即成功。授权、`token`、分享会话凭证全部自动配置好，无需改 `.env`，到期自动刷新。
+   - 下方「网页分享会话」显示来源为「管理页一键登录」即为正常。
 
-2. **配置分享会话**
-   - 同一页下方「网页分享会话」应显示「已配置」。如果显示未配置，回到 `.env` 补上 4 个分享凭证，然后 `docker compose restart`。
+   > 高级用户：如果你已有光鸭开放平台应用，可用页面下方「高级方式」里的 Device Code / Web PKCE 授权，无需 TgtoDrive。
+
+2. **（可跳过）手动配置分享会话**
+   - 用上面的一键登录时，这一步会自动完成，不用管。
+   - 只有坚持手工方式时，才需要到 `.env` 补 `GUANGYA_SHARE_*` 凭证并 `docker compose restart`。
 
 3. **设置扫描范围**
    - 进入「扫描设置」页。建议第一次先填一个**测试目录 ID**，不要直接全盘。

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import guangya_auth, tmdb
+from . import guangya_auth, runtime_config, tgto_bridge, tmdb
 from .config import VALID_DURATIONS, settings
 from .db import Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient
@@ -61,7 +61,17 @@ async def _job_token_refresh():
     db = SessionLocal()
     try:
         t = db.get(AuthToken, 1)
-        if not t or not t.refresh_token_enc or not t.expires_at:
+        if not t or not t.access_token_enc:
+            return
+        # TgtoDrive 短信登录通道：经网关刷新（网关内部保管刷新凭据）
+        if t.flow == "tgto":
+            if not t.expires_at or t.expires_at <= utcnow() + timedelta(minutes=10):
+                await tgto_bridge.refresh(db)
+                add_audit(db, "token_refreshed", target_type="auth", detail="TgtoDrive 网关定时刷新成功")
+                db.commit()
+            return
+        # 官方 Device/PKCE 通道：refresh_token 刷新
+        if not t.refresh_token_enc or not t.expires_at:
             return
         if t.expires_at <= utcnow() + timedelta(minutes=10):
             await guangya_auth.refresh(db)
@@ -103,13 +113,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.4.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.3.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.4.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -188,8 +198,74 @@ async def auth_pkce_callback(code: str = "", state: str = "", error: str = "",
 
 
 @app.get("/api/share/status", dependencies=ADMIN)
-def share_status():
-    return GuangYaShareClient.config_status()
+def share_status(db: Session = Depends(get_db)):
+    return GuangYaShareClient.config_status(db)
+
+
+# ---------- 一键连接光鸭（TgtoDrive 短信登录网关） ----------
+class _TgtoTokenIn(BaseModel):
+    tgto_base_url: str = ""
+    tgto_api_token: str = ""
+
+
+class _PhoneIn(BaseModel):
+    phone: str = ""
+
+
+class _CodeIn(BaseModel):
+    code: str = ""
+
+
+@app.get("/api/tgto/status", dependencies=ADMIN)
+async def tgto_status(db: Session = Depends(get_db)):
+    return await tgto_bridge.status(db)
+
+
+@app.post("/api/tgto/connect", dependencies=ADMIN)
+def tgto_connect(payload: _TgtoTokenIn, db: Session = Depends(get_db)):
+    """保存 TgtoDrive 连接设置（项目令牌加密落库）。"""
+    values = {}
+    if payload.tgto_base_url:
+        values["tgto_base_url"] = payload.tgto_base_url
+    if payload.tgto_api_token:
+        values["tgto_api_token"] = payload.tgto_api_token
+    runtime_config.set_many(db, values)
+    add_audit(db, "tgto_connect_configured", target_type="auth")
+    db.commit()
+    return {"ok": True, "status": {"bridge_configured": tgto_bridge.configured(db)}}
+
+
+@app.post("/api/tgto/sms/send", dependencies=ADMIN)
+async def tgto_sms_send(payload: _PhoneIn, db: Session = Depends(get_db)):
+    try:
+        result = await tgto_bridge.send_code(db, payload.phone)
+        add_audit(db, "tgto_sms_sent", target_type="auth", detail=str(payload.phone)[:20])
+        db.commit()
+        return result
+    except tgto_bridge.TgtoError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/tgto/sms/verify", dependencies=ADMIN)
+async def tgto_sms_verify(payload: _CodeIn, db: Session = Depends(get_db)):
+    try:
+        result = await tgto_bridge.verify_code(db, payload.code)
+        add_audit(db, "tgto_login_success", target_type="auth")
+        db.commit()
+        return result
+    except tgto_bridge.TgtoError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/tgto/refresh", dependencies=ADMIN)
+async def tgto_refresh(db: Session = Depends(get_db)):
+    try:
+        token = await tgto_bridge.refresh(db)
+        add_audit(db, "tgto_token_refreshed_manual", target_type="auth")
+        db.commit()
+        return {"ok": True, "status": {"local_token": bool(token)}}
+    except tgto_bridge.TgtoError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.get("/api/auth/openapi/verify", dependencies=ADMIN)
@@ -276,7 +352,7 @@ async def create_share(rid: int, duration: int = 0, db: Session = Depends(get_db
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        result = await GuangYaShareClient().create(x.file_id, x.media_title or x.name, duration)
+        result = await GuangYaShareClient(db).create(x.file_id, x.media_title or x.name, duration)
         data = result.get("data") or {}
         x.share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
         x.share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
@@ -297,7 +373,7 @@ async def update_share(rid: int, duration: int = 0, db: Session = Depends(get_db
     if not x or not x.share_id:
         raise HTTPException(404, "分享记录不存在")
     try:
-        await GuangYaShareClient().update(x.share_id, x.media_title or x.name, duration)
+        await GuangYaShareClient(db).update(x.share_id, x.media_title or x.name, duration)
         x.share_duration = duration
         add_audit(db, "share_updated", target_type="resource", target_id=str(rid))
         db.commit()
@@ -312,7 +388,7 @@ async def delete_share(rid: int, db: Session = Depends(get_db)):
     if not x or not x.share_id:
         raise HTTPException(404, "分享记录不存在")
     try:
-        await GuangYaShareClient().delete(x.share_id)
+        await GuangYaShareClient(db).delete(x.share_id)
         x.share_status = "cancelled"
         add_audit(db, "share_cancelled", target_type="resource", target_id=str(rid))
         db.commit()

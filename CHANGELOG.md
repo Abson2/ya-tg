@@ -6,6 +6,32 @@
 
 ---
 
+## v0.4.0 (2026-11-17)
+
+新增**光鸭一键连接**：普通用户不用再申请/填写开放平台应用凭证或抓包会话凭证，在管理页用手机号+短信验证码即可自动完成全部光鸭配置。
+
+### 新增
+- 「一键连接光鸭」向导：管理页填手机号 → 收短信验证码 → 登录，自动获取并加密保存光鸭凭证
+- 接入 TgtoDrive 作为光鸭认证网关（`TGTO_BASE_URL` / `TGTO_API_TOKEN`），复用其成熟的短信登录与 Token 刷新能力
+- 运行时凭证配置层（`app_config` 表）：页面注入的凭证加密落库，优先级高于 `.env`，业务模块自动读取
+- 光鸭凭证到期由定时任务经网关自动刷新，失败记入审计；`flow=tgto` 与官方 Device/PKCE 通道自动分流
+- 新增 API：`/api/tgto/status`、`/api/tgto/connect`、`/api/tgto/sms/send`、`/api/tgto/sms/verify`、`/api/tgto/refresh`
+- 原 Device Code / PKCE 直连方式保留为「高级方式」，供已有开放平台应用的进阶用户使用
+
+### 变更
+- `auth/status`、`share/status` 增加凭证来源标识（管理页一键登录 / `.env` 手工配置）
+- 网页分享会话、扫描接口的 client_id 均改为从运行时配置读取，页面改配置即时生效
+- 新增依赖无：复用现有 httpx / cryptography
+
+### 说明
+- 一键连接需在 NAS 上已部署 TgtoDrive（默认 `http://127.0.0.1:12366`）并在其「开放接口」页生成项目令牌，填入管理页一次即可
+- 凭证全程加密落库、不写日志、不写仓库；管理页仅展示配置来源与掩码
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.4.0
+```
+
 ## v0.3.0 (2026-11-16)
 
 品牌由 GuangYa TG Publisher 统一为 **Ya-TG**，管理界面重做，发布链路补齐。

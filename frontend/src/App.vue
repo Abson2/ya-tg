@@ -14,6 +14,33 @@ const overview = ref({}), task = ref({ cron: '*/30 * * * *', root_id: '', enable
 const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
+const tgto = ref({}), tgtoConn = ref({ tgto_base_url: 'http://host.docker.internal:12366', tgto_api_token: '' })
+const smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
+
+async function loadTgto() { try { tgto.value = await api('/tgto/status') } catch (e) {} }
+async function saveTgtoConn() {
+  try { await api('/tgto/connect', { method: 'POST', body: JSON.stringify(tgtoConn.value) }); ElMessage.success('连接设置已保存'); await loadTgto() }
+  catch (e) { ElMessage.error(e.message) }
+}
+async function sendSms() {
+  if (!smsPhone.value.trim()) { ElMessage.warning('请输入手机号'); return }
+  smsBusy.value = true
+  try { await api('/tgto/sms/send', { method: 'POST', body: JSON.stringify({ phone: smsPhone.value }) }); smsStep.value = 2; ElMessage.success('验证码已发送') }
+  catch (e) { ElMessage.error(e.message) }
+  finally { smsBusy.value = false }
+}
+async function verifySms() {
+  if (!smsCode.value.trim()) { ElMessage.warning('请输入验证码'); return }
+  smsBusy.value = true
+  try { await api('/tgto/sms/verify', { method: 'POST', body: JSON.stringify({ code: smsCode.value }) }); smsStep.value = 3; ElMessage.success('光鸭已连接，凭证已加密保存'); await load(); await loadTgto() }
+  catch (e) { ElMessage.error(e.message) }
+  finally { smsBusy.value = false }
+}
+async function refreshTgto() {
+  try { await api('/tgto/refresh', { method: 'POST' }); ElMessage.success('光鸭凭证已刷新'); await loadTgto() }
+  catch (e) { ElMessage.error(e.message) }
+}
+function resetSms() { smsStep.value = 1; smsCode.value = '' }
 const bot = ref({ name: '', token: '' })
 const channel = ref({ bot_id: null, name: '', chat_id: '' })
 const rule = ref({ name: '', directory_id: '', keyword: '', channel_id: null, auto_publish: false })
@@ -79,7 +106,7 @@ const filteredResources = computed(() => resources.value.filter(r => {
 
 const healthChecks = computed(() => [
   { label: '光鸭 OpenAPI 授权', ok: overview.value.auth === 'ok', hint: auth.value.authenticated ? (auth.value.flow || '已授权') : '尚未完成授权' },
-  { label: '网页分享会话', ok: !!shareStatus.value.configured, hint: shareStatus.value.configured ? '已配置会话凭证' : '需在 .env 配置' },
+  { label: '网页分享会话', ok: !!shareStatus.value.configured, hint: shareStatus.value.configured ? ('已配置 · ' + (shareStatus.value.source || '')) : '请到「光鸭授权」一键登录' },
   { label: 'TMDB 识别', ok: true, hint: '搜索与详情接口已接入' },
   { label: '队列 Worker', ok: true, hint: '每 30 秒轮询一次' }
 ])
@@ -105,7 +132,7 @@ async function load() {
   await loadAuth()
 }
 async function loadAuth() {
-  try { auth.value = await api('/auth/status'); shareStatus.value = await api('/share/status') } catch (e) {}
+  try { auth.value = await api('/auth/status'); shareStatus.value = await api('/share/status'); await loadTgto() } catch (e) {}
 }
 async function login() {
   try { await load(); authed.value = true; localStorage.setItem('ya_tg_password', password.value) }
@@ -311,13 +338,45 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '光鸭授权'" class="fade">
-          <div class="page-head"><div><h2>光鸭授权</h2><p>官方 OpenAPI 使用 x-client-id + Bearer Token；网页分享会话独立配置</p></div><el-button plain @click="loadAuth">刷新状态</el-button></div>
+          <div class="page-head"><div><h2>光鸭授权</h2><p>推荐用短信一键登录，自动完成全部凭证；下方为高级备用方式</p></div><el-button plain @click="loadAuth">刷新状态</el-button></div>
+
+          <div class="panel connect-hero">
+            <div class="connect-head">
+              <div><h3>一键连接光鸭</h3><p>手机号 + 短信验证码，自动获取并定期刷新全部凭证，无需理解任何技术字段</p></div>
+              <el-tag :type="tgto.logged_in ? 'success' : 'info'" size="small">{{ tgto.logged_in ? '已连接' : '待连接' }}</el-tag>
+            </div>
+            <div class="connect-steps">
+              <div class="cstep" :class="{active: smsStep===1, done: smsStep>1}"><b>1</b><span>填写手机号</span></div>
+              <div class="cstep" :class="{active: smsStep===2, done: smsStep>2}"><b>2</b><span>输入验证码</span></div>
+              <div class="cstep" :class="{active: smsStep===3, done: smsStep===3}"><b>3</b><span>连接完成</span></div>
+            </div>
+            <div v-if="smsStep===1" class="connect-form">
+              <el-input v-model="tgtoConn.tgto_base_url" placeholder="TgtoDrive 地址（默认 http://host.docker.internal:12366）"/>
+              <el-input v-model="tgtoConn.tgto_api_token" type="password" placeholder="TgtoDrive 项目令牌（开放接口页复制，仅需一次）" show-password/>
+              <el-input v-model="smsPhone" placeholder="光鸭账号手机号" maxlength="20"/>
+              <div class="connect-actions"><el-button @click="saveTgtoConn">保存连接设置</el-button><el-button type="primary" :loading="smsBusy" :disabled="!tgto.bridge_configured" @click="sendSms">获取验证码</el-button></div>
+              <p class="hint">先用同一行的「保存连接设置」保存 TgtoDrive 令牌，再获取验证码。令牌来源：TgtoDrive → 开放接口 → Bearer 令牌。</p>
+            </div>
+            <div v-else-if="smsStep===2" class="connect-form">
+              <el-input v-model="smsCode" placeholder="短信验证码" maxlength="10"/>
+              <div class="connect-actions"><el-button :loading="smsBusy" type="primary" @click="verifySms">登录并连接</el-button><el-button plain @click="resetSms">上一步</el-button></div>
+              <p class="hint">验证码将提交给 TgtoDrive 完成光鸭登录，凭证加密保存在本机数据库。</p>
+            </div>
+            <div v-else class="connect-done">
+              <el-result icon="success" title="光鸭已连接" sub-title="凭证已加密保存，系统会自动定期刷新；扫描与建分享无需再配置。">
+                <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshTgto">立即刷新凭证</el-button></template>
+              </el-result>
+            </div>
+            <div class="connect-foot"><span>网关状态：{{ tgto.message || '—' }}</span><span v-if="tgto.account">账号：{{ tgto.account }}</span></div>
+          </div>
+
           <div class="auth-summary">
             <div class="auth-summary-item"><small>授权状态</small><b :class="auth.authenticated ? 'good' : 'bad'">{{ auth.authenticated ? '已授权' : '未授权' }}</b></div>
             <div class="auth-summary-item"><small>授权方式</small><b>{{ auth.flow || '—' }}</b></div>
             <div class="auth-summary-item"><small>用户 ID</small><b>{{ auth.sub || '—' }}</b></div>
             <div class="auth-summary-item"><small>过期时间</small><b>{{ auth.expires_at || '—' }}</b></div>
           </div>
+          <div class="sub-head"><span>高级方式 · 直连光鸭开放平台（需自行申请应用凭证）</span></div>
           <div class="two-col">
             <div class="method-card">
               <div class="method-top"><span class="method-icon indigo"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('shield')"/></svg></span><div><h3>Device Code 授权</h3><p>适合 NAS / 无浏览器跳转场景，需报备出口 IP</p></div></div>
@@ -338,7 +397,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
           <div class="panel">
             <div class="panel-head"><h3>网页分享会话</h3><el-tag :type="shareStatus.configured ? 'success' : 'warning'" size="small">{{ shareStatus.configured ? '已配置' : '未配置' }}</el-tag></div>
-            <div class="kv-grid"><div><small>Base</small><b>{{ shareStatus.base }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>Token 刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="refreshToken">立即刷新</el-button></div></div>
+            <div class="kv-grid"><div><small>来源</small><b>{{ shareStatus.source || '—' }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="auth.flow==='tgto' ? refreshTgto() : refreshToken()">立即刷新</el-button></div></div>
             <p class="hint">{{ shareStatus.note }}</p>
           </div>
         </section>
@@ -491,6 +550,20 @@ button{font-family:inherit}
 .timeline .tl-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:12px}.timeline .tl-row:last-child{border:0}
 .tl-dot{width:7px;height:7px;border-radius:50%;background:var(--yg-primary-2);flex:none}.tl-time{color:var(--yg-muted);font-variant-numeric:tabular-nums;min-width:70px}.tl-action{color:var(--yg-primary);min-width:150px}.tl-detail{color:var(--yg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tl-target{color:#8a93aa}
 .empty{text-align:center;color:var(--yg-muted);padding:24px}.empty.big{padding:60px;font-size:13px}
+.sub-head{margin:4px 0 12px;padding-left:10px;border-left:3px solid #4f7cff;color:var(--yg-muted);font-size:12px}
+.connect-hero{background:linear-gradient(135deg,#f0f7ff,#f7fbff);border:1px solid #d5e6ff;margin-bottom:18px}
+.connect-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.connect-head h3{margin:0 0 4px;font-size:17px;color:#1b2b4b}
+.connect-head p{margin:0;color:var(--yg-muted);font-size:12px}
+.connect-steps{display:flex;gap:8px;margin:18px 0}
+.cstep{flex:1;display:flex;align-items:center;gap:9px;padding:10px 12px;border-radius:10px;background:#fff;border:1px solid var(--yg-line);color:var(--yg-muted);font-size:12px}
+.cstep b{width:22px;height:22px;border-radius:50%;background:#e8edf5;color:#8a97ad;display:flex;align-items:center;justify-content:center;font-size:12px;flex:none}
+.cstep.active{border-color:#4f7cff;color:#2a5bd7}.cstep.active b{background:#4f7cff;color:#fff}
+.cstep.done{border-color:#19b3a6;color:#12897f}.cstep.done b{background:#19b3a6;color:#fff}
+.connect-form{display:flex;flex-direction:column;gap:10px;max-width:560px}
+.connect-actions{display:flex;gap:10px}
+.connect-done .el-result{padding:6px 0}
+.connect-foot{display:flex;gap:20px;margin-top:14px;font-size:12px;color:var(--yg-muted);flex-wrap:wrap}
 .auth-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.auth-summary-item{background:#fff;border:1px solid var(--yg-line);border-radius:14px;padding:15px 18px}.auth-summary-item small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px}.auth-summary-item b{font-size:14px;word-break:break-all}.auth-summary-item .good{color:#19b3a6}.auth-summary-item .bad{color:var(--yg-rose)}
 .method-card{background:#fff;border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px;box-shadow:var(--yg-shadow);margin-bottom:18px}
 .method-top{display:flex;gap:14px;align-items:center;margin-bottom:16px}.method-top h3{margin:0 0 4px;font-size:16px}.method-top p{margin:0;color:var(--yg-muted);font-size:12px}

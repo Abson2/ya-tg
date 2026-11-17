@@ -33,7 +33,7 @@ async def ensure_share(db: Session, res: Resource) -> str:
         return res.share_url
     if not settings.auto_create_share:
         raise GuangYaError("AUTO_CREATE_SHARE=false，且该资源尚无分享链接")
-    client = GuangYaShareClient()
+    client = GuangYaShareClient(db)
     result = await client.create(res.file_id, res.name or res.media_title or "", settings.share_duration)
     data = result.get("data") or {}
     share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")

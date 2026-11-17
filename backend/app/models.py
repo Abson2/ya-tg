@@ -149,6 +149,14 @@ class MessageTemplate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AppConfig(Base):
+    """运行时凭证配置（key -> 密文值）。页面「一键连接」写入，优先于 .env。"""
+    __tablename__ = "app_config"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value_enc: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -32,16 +32,21 @@ def _session(db: Session) -> AuthSession:
 
 
 def status(db: Session) -> dict:
+    from . import runtime_config
     t = _token(db)
     s = _session(db)
     now = utcnow()
     expires = t.expires_at if t else None
+    flow = t.flow if t else ""
+    client_id = runtime_config.get(db, "guangya_client_id")
+    share_configured = bool(runtime_config.get(db, "guangya_share_authorization"))
     return {
-        "configured": bool(settings.guangya_client_id),
+        "configured": bool(client_id) or flow == "tgto",
         "authenticated": bool(t and t.access_token_enc),
-        "has_refresh_token": bool(t and t.refresh_token_enc),
-        "client_id": settings.guangya_client_id,
-        "flow": t.flow if t else "",
+        "has_refresh_token": bool(t and t.refresh_token_enc) or flow == "tgto",
+        "client_id": client_id,
+        "flow": flow,
+        "share_configured": share_configured,
         "sub": t.sub if t else "",
         "expires_at": expires.isoformat() if expires else None,
         "expired": bool(expires and expires <= now),
@@ -235,8 +240,14 @@ async def exchange_pkce(db: Session, code: str, state: str, error: str = "", err
 
 
 async def refresh(db: Session, force: bool = False) -> str:
-    """§4.5：refresh_token 换 Token，若返回新 refresh_token 则一并替换。"""
+    """刷新 Token。TgtoDrive 短信登录通道走网关；官方通道走 refresh_token。"""
     t = _token(db)
+    if t and t.flow == "tgto":
+        from . import tgto_bridge
+        try:
+            return await tgto_bridge.refresh(db)
+        except tgto_bridge.TgtoError as exc:
+            raise AuthError(str(exc), "tgto_refresh_failed") from exc
     if not t or not t.refresh_token_enc:
         raise AuthError("没有可用 Refresh Token，请重新授权", "no_refresh_token")
     if not force and t.expires_at and t.expires_at > utcnow() + timedelta(minutes=5):

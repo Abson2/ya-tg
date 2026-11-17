@@ -11,6 +11,9 @@ services:
     environment:
       TZ: Asia/Shanghai
       DATABASE_URL: sqlite:////app/data/ya-tg.db
+    # 让容器可用 host.docker.internal 访问宿主机上的 TgtoDrive（一键连接光鸭）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

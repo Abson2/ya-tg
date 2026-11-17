@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     guangya_share_smid: str = ""
     guangya_share_base: str = "https://api.guangyapan.com"
 
+    # TgtoDrive 光鸭认证网关（可选）：管理页手机号短信登录，自动获取并定期刷新光鸭凭证。
+    # 适合普通用户零配置；不填则保留 Device/PKCE 直连授权方式。
+    tgto_base_url: str = "http://host.docker.internal:12366"
+    tgto_api_token: str = ""
+
     # TMDB。v3 api_key 或 v4 read access token 二选一，优先 bearer。
     tmdb_api_key: str = ""
     tmdb_bearer_token: str = ""
