@@ -14,30 +14,25 @@ const overview = ref({}), task = ref({ cron: '*/30 * * * *', root_id: '', enable
 const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
-const tgto = ref({}), tgtoConn = ref({ tgto_base_url: 'http://host.docker.internal:12366', tgto_api_token: '' })
-const smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
+const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 
-async function loadTgto() { try { tgto.value = await api('/tgto/status') } catch (e) {} }
-async function saveTgtoConn() {
-  try { await api('/tgto/connect', { method: 'POST', body: JSON.stringify(tgtoConn.value) }); ElMessage.success('连接设置已保存'); await loadTgto() }
-  catch (e) { ElMessage.error(e.message) }
-}
+async function loadSms() { try { smsStatus.value = await api('/sms/status') } catch (e) {} }
 async function sendSms() {
   if (!smsPhone.value.trim()) { ElMessage.warning('请输入手机号'); return }
   smsBusy.value = true
-  try { await api('/tgto/sms/send', { method: 'POST', body: JSON.stringify({ phone: smsPhone.value }) }); smsStep.value = 2; ElMessage.success('验证码已发送') }
+  try { await api('/sms/send', { method: 'POST', body: JSON.stringify({ phone: smsPhone.value }) }); smsStep.value = 2; ElMessage.success('验证码已发送') }
   catch (e) { ElMessage.error(e.message) }
   finally { smsBusy.value = false }
 }
 async function verifySms() {
   if (!smsCode.value.trim()) { ElMessage.warning('请输入验证码'); return }
   smsBusy.value = true
-  try { await api('/tgto/sms/verify', { method: 'POST', body: JSON.stringify({ code: smsCode.value }) }); smsStep.value = 3; ElMessage.success('光鸭已连接，凭证已加密保存'); await load(); await loadTgto() }
+  try { await api('/sms/verify', { method: 'POST', body: JSON.stringify({ code: smsCode.value }) }); smsStep.value = 3; ElMessage.success('光鸭已连接，凭证已加密保存'); await load(); await loadSms() }
   catch (e) { ElMessage.error(e.message) }
   finally { smsBusy.value = false }
 }
-async function refreshTgto() {
-  try { await api('/tgto/refresh', { method: 'POST' }); ElMessage.success('光鸭凭证已刷新'); await loadTgto() }
+async function refreshSms() {
+  try { await api('/sms/refresh', { method: 'POST' }); ElMessage.success('光鸭凭证已刷新'); await loadSms() }
   catch (e) { ElMessage.error(e.message) }
 }
 function resetSms() { smsStep.value = 1; smsCode.value = '' }
@@ -132,7 +127,7 @@ async function load() {
   await loadAuth()
 }
 async function loadAuth() {
-  try { auth.value = await api('/auth/status'); shareStatus.value = await api('/share/status'); await loadTgto() } catch (e) {}
+  try { auth.value = await api('/auth/status'); shareStatus.value = await api('/share/status'); await loadSms() } catch (e) {}
 }
 async function login() {
   try { await load(); authed.value = true; localStorage.setItem('ya_tg_password', password.value) }
@@ -342,8 +337,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
 
           <div class="panel connect-hero">
             <div class="connect-head">
-              <div><h3>一键连接光鸭</h3><p>手机号 + 短信验证码，自动获取并定期刷新全部凭证，无需理解任何技术字段</p></div>
-              <el-tag :type="tgto.logged_in ? 'success' : 'info'" size="small">{{ tgto.logged_in ? '已连接' : '待连接' }}</el-tag>
+              <div><h3>一键连接光鸭</h3><p>手机号 + 短信验证码，自动获取并定期刷新全部凭证；内置实现，不依赖任何第三方项目</p></div>
+              <el-tag :type="smsStatus.logged_in ? 'success' : 'info'" size="small">{{ smsStatus.logged_in ? '已连接' : '待连接' }}</el-tag>
             </div>
             <div class="connect-steps">
               <div class="cstep" :class="{active: smsStep===1, done: smsStep>1}"><b>1</b><span>填写手机号</span></div>
@@ -351,23 +346,21 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="cstep" :class="{active: smsStep===3, done: smsStep===3}"><b>3</b><span>连接完成</span></div>
             </div>
             <div v-if="smsStep===1" class="connect-form">
-              <el-input v-model="tgtoConn.tgto_base_url" placeholder="TgtoDrive 地址（默认 http://host.docker.internal:12366）"/>
-              <el-input v-model="tgtoConn.tgto_api_token" type="password" placeholder="TgtoDrive 项目令牌（开放接口页复制，仅需一次）" show-password/>
-              <el-input v-model="smsPhone" placeholder="光鸭账号手机号" maxlength="20"/>
-              <div class="connect-actions"><el-button @click="saveTgtoConn">保存连接设置</el-button><el-button type="primary" :loading="smsBusy" :disabled="!tgto.bridge_configured" @click="sendSms">获取验证码</el-button></div>
-              <p class="hint">先用同一行的「保存连接设置」保存 TgtoDrive 令牌，再获取验证码。令牌来源：TgtoDrive → 开放接口 → Bearer 令牌。</p>
+              <el-input v-model="smsPhone" placeholder="光鸭账号手机号（如 13800138000）" maxlength="20"/>
+              <div class="connect-actions"><el-button type="primary" :loading="smsBusy" @click="sendSms">获取验证码</el-button></div>
+              <p class="hint">验证码由光鸭官方账号服务发送。只需手机号，无需申请应用、无需抓包。</p>
             </div>
             <div v-else-if="smsStep===2" class="connect-form">
               <el-input v-model="smsCode" placeholder="短信验证码" maxlength="10"/>
               <div class="connect-actions"><el-button :loading="smsBusy" type="primary" @click="verifySms">登录并连接</el-button><el-button plain @click="resetSms">上一步</el-button></div>
-              <p class="hint">验证码将提交给 TgtoDrive 完成光鸭登录，凭证加密保存在本机数据库。</p>
+              <p class="hint">验证码验证后将自动登录，凭证加密保存在本机数据库。</p>
             </div>
             <div v-else class="connect-done">
               <el-result icon="success" title="光鸭已连接" sub-title="凭证已加密保存，系统会自动定期刷新；扫描与建分享无需再配置。">
-                <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshTgto">立即刷新凭证</el-button></template>
+                <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshSms">立即刷新凭证</el-button></template>
               </el-result>
             </div>
-            <div class="connect-foot"><span>网关状态：{{ tgto.message || '—' }}</span><span v-if="tgto.account">账号：{{ tgto.account }}</span></div>
+            <div class="connect-foot"><span>状态：{{ smsStatus.message || '—' }}</span><span v-if="smsStatus.account">账号：{{ smsStatus.account }}</span><span v-if="smsStatus.expires_at">到期：{{ smsStatus.expires_at }}</span></div>
           </div>
 
           <div class="auth-summary">
@@ -397,7 +390,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
           <div class="panel">
             <div class="panel-head"><h3>网页分享会话</h3><el-tag :type="shareStatus.configured ? 'success' : 'warning'" size="small">{{ shareStatus.configured ? '已配置' : '未配置' }}</el-tag></div>
-            <div class="kv-grid"><div><small>来源</small><b>{{ shareStatus.source || '—' }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="auth.flow==='tgto' ? refreshTgto() : refreshToken()">立即刷新</el-button></div></div>
+            <div class="kv-grid"><div><small>来源</small><b>{{ shareStatus.source || '—' }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="auth.flow==='sms' ? refreshSms() : refreshToken()">立即刷新</el-button></div></div>
             <p class="hint">{{ shareStatus.note }}</p>
           </div>
         </section>

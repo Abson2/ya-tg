@@ -11,9 +11,9 @@ services:
     env_file: [.env]
     environment:
       TZ: Asia/Shanghai
-      DATABASE_URL: sqlite:////app/data/ya-tg.db
+      DATABASE_URL: sqlite:////app/db/ya-tg.db
     volumes:
-      - ./data:/app/data
+      - ./db:/app/db
       - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health')"]

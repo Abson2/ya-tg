@@ -73,6 +73,7 @@ class AuthToken(Base):
     refresh_token_enc: Mapped[str] = mapped_column(Text, default="")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sub: Mapped[str] = mapped_column(String(128), default="")
+    device_id: Mapped[str] = mapped_column(String(64), default="")
     flow: Mapped[str] = mapped_column(String(24), default="")
     granted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

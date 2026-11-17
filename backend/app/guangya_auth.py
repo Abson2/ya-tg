@@ -41,9 +41,9 @@ def status(db: Session) -> dict:
     client_id = runtime_config.get(db, "guangya_client_id")
     share_configured = bool(runtime_config.get(db, "guangya_share_authorization"))
     return {
-        "configured": bool(client_id) or flow == "tgto",
+        "configured": bool(client_id) or flow in ("sms", "tgto"),
         "authenticated": bool(t and t.access_token_enc),
-        "has_refresh_token": bool(t and t.refresh_token_enc) or flow == "tgto",
+        "has_refresh_token": bool(t and t.refresh_token_enc) or flow in ("sms", "tgto"),
         "client_id": client_id,
         "flow": flow,
         "share_configured": share_configured,
@@ -240,14 +240,14 @@ async def exchange_pkce(db: Session, code: str, state: str, error: str = "", err
 
 
 async def refresh(db: Session, force: bool = False) -> str:
-    """刷新 Token。TgtoDrive 短信登录通道走网关；官方通道走 refresh_token。"""
+    """刷新 Token。短信登录通道走光鸭账号服务；官方 Device/PKCE 通道走 refresh_token。"""
     t = _token(db)
-    if t and t.flow == "tgto":
-        from . import tgto_bridge
+    if t and t.flow in ("sms", "tgto"):
+        from . import guangya_sms
         try:
-            return await tgto_bridge.refresh(db)
-        except tgto_bridge.TgtoError as exc:
-            raise AuthError(str(exc), "tgto_refresh_failed") from exc
+            return await guangya_sms.refresh(db)
+        except guangya_sms.SmsError as exc:
+            raise AuthError(str(exc), "sms_refresh_failed") from exc
     if not t or not t.refresh_token_enc:
         raise AuthError("没有可用 Refresh Token，请重新授权", "no_refresh_token")
     if not force and t.expires_at and t.expires_at > utcnow() + timedelta(minutes=5):

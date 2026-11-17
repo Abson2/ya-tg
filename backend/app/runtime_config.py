@@ -25,8 +25,6 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "guangya_share_did": ("guangya_share_did", ""),
     "guangya_share_dt": ("guangya_share_dt", "4"),
     "guangya_share_smid": ("guangya_share_smid", ""),
-    "tgto_base_url": ("tgto_base_url", "http://host.docker.internal:12366"),
-    "tgto_api_token": ("tgto_api_token", ""),
 }
 
 

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import guangya_auth, runtime_config, tgto_bridge, tmdb
+from . import guangya_auth, guangya_sms, runtime_config, tmdb
 from .config import VALID_DURATIONS, settings
 from .db import Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient
@@ -63,11 +63,11 @@ async def _job_token_refresh():
         t = db.get(AuthToken, 1)
         if not t or not t.access_token_enc:
             return
-        # TgtoDrive 短信登录通道：经网关刷新（网关内部保管刷新凭据）
-        if t.flow == "tgto":
+        # 短信登录通道：用 refresh_token 经光鸭账号服务刷新
+        if t.flow in ("sms", "tgto"):
             if not t.expires_at or t.expires_at <= utcnow() + timedelta(minutes=10):
-                await tgto_bridge.refresh(db)
-                add_audit(db, "token_refreshed", target_type="auth", detail="TgtoDrive 网关定时刷新成功")
+                await guangya_sms.refresh(db)
+                add_audit(db, "token_refreshed", target_type="auth", detail="短信登录通道定时刷新成功")
                 db.commit()
             return
         # 官方 Device/PKCE 通道：refresh_token 刷新
@@ -113,13 +113,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.5.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.4.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -202,12 +202,7 @@ def share_status(db: Session = Depends(get_db)):
     return GuangYaShareClient.config_status(db)
 
 
-# ---------- 一键连接光鸭（TgtoDrive 短信登录网关） ----------
-class _TgtoTokenIn(BaseModel):
-    tgto_base_url: str = ""
-    tgto_api_token: str = ""
-
-
+# ---------- 一键连接光鸭（自研短信登录，无外部依赖） ----------
 class _PhoneIn(BaseModel):
     phone: str = ""
 
@@ -216,55 +211,41 @@ class _CodeIn(BaseModel):
     code: str = ""
 
 
-@app.get("/api/tgto/status", dependencies=ADMIN)
-async def tgto_status(db: Session = Depends(get_db)):
-    return await tgto_bridge.status(db)
+@app.get("/api/sms/status", dependencies=ADMIN)
+def sms_status(db: Session = Depends(get_db)):
+    return guangya_sms.status(db)
 
 
-@app.post("/api/tgto/connect", dependencies=ADMIN)
-def tgto_connect(payload: _TgtoTokenIn, db: Session = Depends(get_db)):
-    """保存 TgtoDrive 连接设置（项目令牌加密落库）。"""
-    values = {}
-    if payload.tgto_base_url:
-        values["tgto_base_url"] = payload.tgto_base_url
-    if payload.tgto_api_token:
-        values["tgto_api_token"] = payload.tgto_api_token
-    runtime_config.set_many(db, values)
-    add_audit(db, "tgto_connect_configured", target_type="auth")
-    db.commit()
-    return {"ok": True, "status": {"bridge_configured": tgto_bridge.configured(db)}}
-
-
-@app.post("/api/tgto/sms/send", dependencies=ADMIN)
-async def tgto_sms_send(payload: _PhoneIn, db: Session = Depends(get_db)):
+@app.post("/api/sms/send", dependencies=ADMIN)
+async def sms_send(payload: _PhoneIn, db: Session = Depends(get_db)):
     try:
-        result = await tgto_bridge.send_code(db, payload.phone)
-        add_audit(db, "tgto_sms_sent", target_type="auth", detail=str(payload.phone)[:20])
+        result = await guangya_sms.send_code(db, payload.phone)
+        add_audit(db, "sms_code_sent", target_type="auth", detail=result.get("masked_phone", ""))
         db.commit()
         return result
-    except tgto_bridge.TgtoError as exc:
+    except guangya_sms.SmsError as exc:
         raise HTTPException(400, str(exc))
 
 
-@app.post("/api/tgto/sms/verify", dependencies=ADMIN)
-async def tgto_sms_verify(payload: _CodeIn, db: Session = Depends(get_db)):
+@app.post("/api/sms/verify", dependencies=ADMIN)
+async def sms_verify(payload: _CodeIn, db: Session = Depends(get_db)):
     try:
-        result = await tgto_bridge.verify_code(db, payload.code)
-        add_audit(db, "tgto_login_success", target_type="auth")
+        result = await guangya_sms.verify_code(db, payload.code)
+        add_audit(db, "sms_login_success", target_type="auth")
         db.commit()
         return result
-    except tgto_bridge.TgtoError as exc:
+    except guangya_sms.SmsError as exc:
         raise HTTPException(400, str(exc))
 
 
-@app.post("/api/tgto/refresh", dependencies=ADMIN)
-async def tgto_refresh(db: Session = Depends(get_db)):
+@app.post("/api/sms/refresh", dependencies=ADMIN)
+async def sms_refresh(db: Session = Depends(get_db)):
     try:
-        token = await tgto_bridge.refresh(db)
-        add_audit(db, "tgto_token_refreshed_manual", target_type="auth")
+        await guangya_sms.refresh(db)
+        add_audit(db, "sms_token_refreshed_manual", target_type="auth")
         db.commit()
-        return {"ok": True, "status": {"local_token": bool(token)}}
-    except tgto_bridge.TgtoError as exc:
+        return {"ok": True, "status": guangya_sms.status(db)}
+    except guangya_sms.SmsError as exc:
         raise HTTPException(400, str(exc))
 
 

@@ -6,6 +6,31 @@
 
 ---
 
+## v0.5.0 (2026-11-17)
+
+把短信登录**改为 Ya-TG 自研实现**，彻底移除对外部项目 TgtoDrive 的运行时依赖；同时按用户习惯统一数据库目录为 `db`。两个项目从此完全独立、互不干扰。
+
+### 变更
+- 短信登录不再经 TgtoDrive 网关：内置光鸭网页端账号服务接口（captcha/init → verification → verify → signin），借鉴开源客户端契约自行实现，零外部依赖
+- 移除 `tgto_bridge.py`、`TGTO_BASE_URL` / `TGTO_API_TOKEN` 配置、`extra_hosts` 与全部 `/api/tgto/*` 端点
+- 新增 `/api/sms/status`、`/api/sms/send`、`/api/sms/verify`、`/api/sms/refresh`
+- 短信登录的 Token、Refresh Token、设备 ID（did）加密落库；到期/401 经 `/v1/auth/token` 自动刷新
+- 建分享自动复用短信登录的 Token + did + dt，无需单独抓包会话凭证
+- 数据库目录由 `./data` 统一为 `./db`：`DATABASE_URL=sqlite:////app/db/ya-tg.db`、卷 `./db:/app/db`，README/.env/.gitignore 同步
+
+### 新增
+- `AuthToken.device_id` 字段与轻量迁移
+- `guangya_sms.py` 自研短信登录模块与 mock 单测
+
+### 升级注意
+- 从 v0.4.x 升级：若此前数据在 `./data/ya-tg.db`，请先复制到 `./db/ya-tg.db` 再启动；全新安装无此问题
+- 已短信登录用户需重新登录一次（登录方式变更，flow 从 tgto 改为 sms）
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.5.0
+```
+
 ## v0.4.0 (2026-11-17)
 
 新增**光鸭一键连接**：普通用户不用再申请/填写开放平台应用凭证或抓包会话凭证，在管理页用手机号+短信验证码即可自动完成全部光鸭配置。

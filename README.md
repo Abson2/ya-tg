@@ -6,7 +6,7 @@
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
-- 当前版本：v0.4.0
+- 当前版本：v0.5.0
 - 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
 ---
@@ -15,7 +15,7 @@
 
 | 步骤 | 说明 |
 | --- | --- |
-| 光鸭授权 | 管理页手机号+短信验证码一键登录（经 TgtoDrive），凭证加密保存、自动刷新；也支持官方 Device/PKCE |
+| 光鸭授权 | 管理页手机号+短信验证码一键登录（Ya-TG 内置实现，不依赖任何第三方项目），凭证加密保存、自动刷新；也支持官方 Device/PKCE |
 | 定时扫描 | 按 Cron（默认每 30 分钟）递归扫描指定目录，用 fileId 去重，只处理新文件 |
 | TMDB 识别 | 从文件名解析片名/年份/集数，搜索 TMDB 补全海报、简介，区分电影和电视剧 |
 | 自动建分享 | 推送前自动创建光鸭分享链接（永久/1天/7天/30天可选），保存链接 |
@@ -36,9 +36,8 @@
    - 需要能执行 `docker` 和 `docker compose` 命令（新版本 Docker 用 `docker compose`，旧版用 `docker-compose`）。
    - 验证：执行 `docker --version`，能显示版本号即可。
 
-2. **一个光鸭网盘账号 + 本机已部署 TgtoDrive（一键登录，推荐）**
-   - Ya-TG 通过 [TgtoDrive](https://github.com/walkingddd/TgtoDrive) 完成光鸭登录：**你只需在 Ya-TG 管理页输入手机号、收短信验证码**，程序就会自动获取并保存全部光鸭凭证。
-   - 前提：同一台机器上已装好 TgtoDrive（默认地址 `http://127.0.0.1:12366`），并在其「开放接口」页生成一个 Bearer 项目令牌。
+2. **一个光鸭网盘账号（一键登录，推荐）**
+   - **只需在 Ya-TG 管理页输入手机号、收短信验证码**，程序就会自动登录光鸭并保存全部凭证。登录逻辑内置在 Ya-TG 里，**不依赖 TgtoDrive 或任何外部项目**，两个项目完全独立。
    - 这样你**完全不用**去光鸭开放平台申请应用，也不用 `client_id` / `project_id` / `sign_secret`，更不用从浏览器抓包。凭证到期后程序自动刷新。
    - 备用方案：如果你已有光鸭开放平台应用，也可在管理页用官方 Device Code / PKCE 授权（见「高级」说明）。
 
@@ -57,8 +56,8 @@
 在 NAS 或服务器上新建一个文件夹，例如飞牛 NAS 的 `/vol1/1000/docker/ya-tg`：
 
 ```bash
-mkdir -p /vol1/1000/docker/ya-tg/ya-tg-data
-mkdir -p /vol1/1000/docker/ya-tg/ya-tg-logs
+mkdir -p /vol1/1000/docker/ya-tg/db
+mkdir -p /vol1/1000/docker/ya-tg/logs
 cd /vol1/1000/docker/ya-tg
 ```
 
@@ -79,12 +78,10 @@ services:
     env_file: [.env]
     environment:
       TZ: Asia/Shanghai
-      DATABASE_URL: sqlite:////app/data/ya-tg.db
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      DATABASE_URL: sqlite:////app/db/ya-tg.db
     volumes:
-      - ./ya-tg-data:/app/data
-      - ./ya-tg-logs:/app/logs
+      - ./db:/app/db
+      - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health')"]
       interval: 30s
@@ -93,7 +90,7 @@ services:
       start_period: 20s
 ```
 
-**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.3.0`，详见第六节。
+**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.5.0`，详见第六节。
 
 **.env** —— 把下面内容复制进去，至少改掉 `ADMIN_PASSWORD` 和 `APP_SECRET`：
 
@@ -177,15 +174,12 @@ http://你的机器IP:8787
 
 1. **一键连接光鸭（最重要的一步）**
    - 进入「光鸭授权」页，最上方的「一键连接光鸭」卡片：
-   - ① 填入 TgtoDrive 地址和它的项目令牌，点「保存连接设置」。
-     - 项目令牌来源：TgtoDrive → 开放接口 → 复制 Bearer 令牌。只需填一次。
-     - **地址要注意**：Ya-TG 跑在容器里，容器内的 `127.0.0.1` 指容器自己，**不是** NAS 本机。请填 NAS 的局域网 IP（如 `http://192.168.1.10:12366`），或在 `docker-compose.yml` 里给 ya-tg 服务加一行 `extra_hosts: ["host.docker.internal:host-gateway"]` 后用 `http://host.docker.internal:12366`。若 TgtoDrive 也用 compose 且在同一网络，可填服务名。
-   - ② 填入你的**光鸭账号手机号**，点「获取验证码」。
-   - ③ 收到短信后填入**验证码**，点「登录并连接」。
-   - 看到「光鸭已连接」即成功。授权、`token`、分享会话凭证全部自动配置好，无需改 `.env`，到期自动刷新。
-   - 下方「网页分享会话」显示来源为「管理页一键登录」即为正常。
+   - ① 填入你的**光鸭账号手机号**（如 `13800138000`），点「获取验证码」。
+   - ② 收到短信后填入**验证码**，点「登录并连接」。
+   - 看到「光鸭已连接」即成功。访问 Token、刷新 Token、设备 ID 全部自动获取并加密保存，无需改 `.env`、无需第三方项目，到期自动刷新。
+   - 下方「网页分享会话」显示来源为「短信登录（自动）」即为正常——扫描和建分享会自动共用这套凭证。
 
-   > 高级用户：如果你已有光鸭开放平台应用，可用页面下方「高级方式」里的 Device Code / Web PKCE 授权，无需 TgtoDrive。
+   > 高级用户：如果你已有光鸭开放平台应用，可用页面下方「高级方式」里的 Device Code / Web PKCE 授权。
 
 2. **（可跳过）手动配置分享会话**
    - 用上面的一键登录时，这一步会自动完成，不用管。
@@ -240,10 +234,10 @@ http://你的机器IP:8787
 
 ### 部署指定版本
 
-在 `.env` 里加一行（例如锁定 v0.3.0）：
+在 `.env` 里加一行（例如锁定 v0.5.0）：
 
 ```env
-IMAGE_TAG=v0.3.0
+IMAGE_TAG=v0.5.0
 ```
 
 然后：
@@ -256,14 +250,14 @@ docker compose up -d
 也可以用一键脚本切换：
 
 ```bash
-bash scripts/update.sh v0.3.0
+bash scripts/update.sh v0.5.0
 ```
 
 ### 回滚到上一版
 
-把 `IMAGE_TAG` 改成旧版本号，再执行 `docker compose pull && docker compose up -d`。数据库文件在 `./ya-tg-data` 里，不会被删除，回滚后数据还在。
+把 `IMAGE_TAG` 改成旧版本号，再执行 `docker compose pull && docker compose up -d`。数据库文件在 `./db` 里，不会被删除，回滚后数据还在。
 
-> 如果旧版本的数据结构不兼容，请先备份 `ya-tg-data` 目录再回滚。
+> 如果旧版本的数据结构不兼容，请先备份 `db` 目录再回滚。
 
 ---
 
@@ -305,7 +299,7 @@ A：在资源库点「手动识别」，输入正确的 TMDB ID。文件名越�
 A：需要重建容器：`docker compose up -d --force-recreate`。
 
 **Q：数据会丢吗？**
-A：数据库和配置都在 `./ya-tg-data`，只要不删这个目录，升级/回滚数据都在。建议定期备份。
+A：数据库和配置都在 `./db`，只要不删这个目录，升级/回滚数据都在。建议定期备份。
 
 ---
 
@@ -314,7 +308,7 @@ A：数据库和配置都在 `./ya-tg-data`，只要不删这个目录，升级/
 - `.env` 含密码和 token，权限设为 `chmod 600`，不要提交 Git、不要发聊天。
 - 首次部署建议只在局域网访问；外网访问请叠加 VPN 或 Cloudflare Access。
 - 不要用已经泄露过的会话凭证，撤销旧会话后重新登录。
-- 定期备份 `ya-tg-data` 目录。
+- 定期备份 `db` 目录。
 
 ---
 

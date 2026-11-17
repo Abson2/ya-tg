@@ -108,24 +108,33 @@ class GuangYaShareClient:
 
     def __init__(self, db: Session | None = None):
         from . import runtime_config
+        from .security import decrypt_secret
 
         if db is not None:
-            authorization = runtime_config.get(db, "guangya_share_authorization")
+            from .models import AuthToken
+            t = db.get(AuthToken, 1)
+            # 短信登录用户的 token 就是网页会话凭证，优先使用（手工 .env 凭证可能已过期）
+            sms_authorization = ""
+            if t and t.access_token_enc and t.flow in ("sms", "tgto"):
+                sms_authorization = "Bearer " + decrypt_secret(t.access_token_enc)
+            authorization = sms_authorization or runtime_config.get(db, "guangya_share_authorization")
             did = runtime_config.get(db, "guangya_share_did")
             dt = runtime_config.get(db, "guangya_share_dt") or "4"
             smid = runtime_config.get(db, "guangya_share_smid")
+            if sms_authorization:
+                did = did or getattr(t, "device_id", "") or ""
         else:
             authorization = settings.guangya_share_authorization
             did = settings.guangya_share_did
             dt = settings.guangya_share_dt or "4"
             smid = settings.guangya_share_smid
         if not authorization:
-            raise GuangYaError("尚未配置光鸭网页会话凭证，请在管理页用「一键连接光鸭」短信登录")
+            raise GuangYaError("尚未登录光鸭，请在管理页用「一键连接光鸭」短信登录")
         self.base = settings.guangya_share_base.rstrip("/")
         self.headers = {
             "Authorization": authorization,
             "did": did,
-            "dt": dt,
+            "dt": dt or "4",
             "Content-Type": "application/json",
             "Origin": "https://www.guangyapan.com",
             "Referer": "https://www.guangyapan.com/",
@@ -136,6 +145,7 @@ class GuangYaShareClient:
     @staticmethod
     def config_status(db: Session | None = None) -> dict:
         from . import runtime_config
+        from .models import AuthToken
 
         if db is not None:
             authorization = runtime_config.get(db, "guangya_share_authorization")
@@ -143,19 +153,24 @@ class GuangYaShareClient:
             smid = runtime_config.get(db, "guangya_share_smid")
             sources = runtime_config.source_map(db)
             source = sources.get("guangya_share_authorization", "empty")
+            t = db.get(AuthToken, 1)
+            if t and t.access_token_enc and t.flow in ("sms", "tgto"):
+                source = "sms"  # 短信登录凭证优先
+                authorization = "Bearer ***"
+                did = did or getattr(t, "device_id", "")
         else:
             authorization = settings.guangya_share_authorization
             did = settings.guangya_share_did
             smid = settings.guangya_share_smid
             source = "env" if authorization else "empty"
-        source_label = {"db": "管理页一键登录", "env": ".env 手工配置", "empty": "未配置"}.get(source, source)
+        source_label = {"db": "页面配置", "env": ".env 手工配置", "sms": "短信登录（自动）", "empty": "未配置"}.get(source, source)
         return {
             "configured": bool(authorization),
             "base": settings.guangya_share_base,
             "did_set": bool(did),
             "smid_set": bool(smid),
             "source": source_label,
-            "note": "推荐在管理页用手机号短信登录自动获取；无需手工抓包",
+            "note": "在管理页用手机号短信登录后，扫描与建分享自动共用凭证，无需抓包",
         }
 
     async def post(self, endpoint: str, payload: dict) -> dict:

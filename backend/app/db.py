@@ -32,6 +32,9 @@ _COLUMNS = {
     "push_queue": {
         "next_retry_at": "DATETIME",
     },
+    "auth_tokens": {
+        "device_id": "TEXT DEFAULT ''",
+    },
 }
 
 
