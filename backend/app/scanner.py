@@ -19,9 +19,12 @@ def _cursor(db: Session) -> ScanCursor:
 
 
 def _save_cursor(c: ScanCursor, visited: list[str], stack: list[str], page: int,
-                 files: int, dirs: int, status: str = "running", error: str = "") -> None:
+                 files: int, dirs: int, status: str = "running", error: str = "",
+                 dir_paths: dict | None = None) -> None:
     c.visited_json = json_dumps(visited)
     c.stack_json = json_dumps(stack)
+    if dir_paths is not None:
+        c.dir_paths_json = json_dumps(dir_paths)
     c.next_page = page
     c.files_count = files
     c.dirs_count = dirs
@@ -34,16 +37,35 @@ def _save_cursor(c: ScanCursor, visited: list[str], stack: list[str], page: int,
         c.finished_at = utcnow()
 
 
-def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule]) -> tuple[Resource, bool]:
-    """返回 (资源, 是否新增)。同一 fileId 只保留一行；utime/size 变化记入 revision。"""
+def _dir_name(item: dict) -> str:
+    """网页端与官方接口的目录名可能落在不同字段，统一兼容。"""
+    for key in ("fileName", "name", "file_name", "folderName"):
+        value = item.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _upsert_resource(db: Session, item: dict, parent: str, rules: list[Rule],
+                     path_hint: str = "") -> tuple[Resource, bool]:
+    """返回 (资源, 是否新增)。同一 fileId 只保留一行；utime/size 变化记入 revision。
+
+    v0.6.1：path_hint 保存「作品目录/Season 1」这类目录显示名链。剧集单集文件名
+    往往只是英文译名（The.Silent.Storm.S01E04），真正的作品名在父目录（谷雨 (2026)），
+    识别必须拿得到这层线索，否则会误命中同名英文作品。
+    """
     fid = str(item.get("fileId", ""))
     name = item.get("fileName", "")
     ext = (item.get("ext") or ("." + name.rsplit(".", 1)[-1] if "." in name else "")).lower()
     utime = int(item.get("utime", 0) or 0)
     size = int(item.get("fileSize", 0) or 0)
     row = db.scalar(select(Resource).where(Resource.file_id == fid))
+    raw_parent = str(item.get("parentId") or "")
+    if not raw_parent or raw_parent == "*":
+        raw_parent = parent
     values = dict(
-        parent_id=str(item.get("parentId", parent) or parent),
+        parent_id=raw_parent,
+        path_hint=path_hint,
         name=name, size=size,
         file_type=int(item.get("fileType", 0) or 0),
         res_type=1, ext=ext,
@@ -89,6 +111,8 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
         api = GuangYaWebFiles(db)
     else:
         api = GuangYaOpenAPI(db)
+    # 目录 fileId -> 从根到该目录的显示名路径；根目录在网页端是 "*"，官方是 ""
+    dir_paths: dict[str, str] = {"": "", "*": ""}
     try:
         c = _cursor(db)
         can_resume = resume and c.status == "running" and (not root_id or c.root_id == root_id)
@@ -97,9 +121,16 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
             stack = list(json.loads(c.stack_json or "[]"))
             page = int(c.next_page or 0)
             files, dirs = int(c.files_count or 0), int(c.dirs_count or 0)
+            try:
+                saved = json.loads(c.dir_paths_json or "{}")
+                if isinstance(saved, dict):
+                    dir_paths.update({str(k): str(v) for k, v in saved.items()})
+            except Exception:
+                pass
         else:
             visited, stack, page, files, dirs = [], [str(root_id or "")], 0, 0, 0
             c.root_id = str(root_id or "")
+            c.dir_paths_json = json_dumps(dir_paths)
         c.status = "running"
         db.commit()
 
@@ -118,10 +149,14 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                     if not fid:
                         continue
                     if int(item.get("resType", 1) or 1) == 2:
+                        dir_name = _dir_name(item)
+                        if dir_name:
+                            base = dir_paths.get(parent, "")
+                            dir_paths[fid] = (base + "/" + dir_name).strip("/") if base else dir_name
                         if fid not in visited:
                             stack.append(fid)
                         continue
-                    _upsert_resource(db, item, parent, rules)
+                    _upsert_resource(db, item, parent, rules, dir_paths.get(parent, ""))
                     files += 1
                 db.commit()
                 total = int(result.get("total", 0) or 0)
@@ -129,12 +164,12 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                 if not items or page * 100 >= total:
                     page = 0
                     break
-                _save_cursor(c, visited, stack, page, files, dirs)
+                _save_cursor(c, visited, stack, page, files, dirs, dir_paths=dir_paths)
                 db.commit()
-            _save_cursor(c, visited, stack, 0, files, dirs)
+            _save_cursor(c, visited, stack, 0, files, dirs, dir_paths=dir_paths)
             db.commit()
 
-        _save_cursor(c, visited, stack, 0, files, dirs, status="done")
+        _save_cursor(c, visited, stack, 0, files, dirs, status="done", dir_paths=dir_paths)
         task = db.scalar(select(ScanTask).limit(1))
         if task:
             task.last_run = utcnow()
@@ -150,7 +185,7 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
             c = _cursor(db)
             _save_cursor(c, json.loads(c.visited_json or "[]"), json.loads(c.stack_json or "[]"),
                          int(c.next_page or 0), int(c.files_count or 0), int(c.dirs_count or 0),
-                         status="failed", error=str(exc))
+                         status="failed", error=str(exc), dir_paths=dir_paths)
             task = db.scalar(select(ScanTask).limit(1))
             if task:
                 task.last_run = utcnow()

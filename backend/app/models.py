@@ -13,6 +13,9 @@ class Resource(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     file_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     parent_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    # v0.6.1：扫描时记录的目录显示名链，如「谷雨 (2026)(1)/Season 1」。
+    # 剧集单集文件名往往是英文译名，作品名要靠父目录，识别必须带上它。
+    path_hint: Mapped[str] = mapped_column(Text, default="")
     name: Mapped[str] = mapped_column(String(512))
     size: Mapped[int] = mapped_column(BigInteger, default=0)
     file_type: Mapped[int] = mapped_column(Integer, default=0)
@@ -63,6 +66,8 @@ class ScanCursor(Base):
     status: Mapped[str] = mapped_column(String(24), default="never")  # running/done/failed
     visited_json: Mapped[str] = mapped_column(Text, default="[]")
     stack_json: Mapped[str] = mapped_column(Text, default="[]")
+    # v0.6.1：目录 fileId -> 显示名路径，断点续扫后仍能给资源补上目录线索
+    dir_paths_json: Mapped[str] = mapped_column(Text, default="{}")
     next_page: Mapped[int] = mapped_column(Integer, default=0)
     files_count: Mapped[int] = mapped_column(Integer, default=0)
     dirs_count: Mapped[int] = mapped_column(Integer, default=0)

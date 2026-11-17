@@ -116,13 +116,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.6.1", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.1", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -347,7 +347,7 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
         stmt = stmt.where(Resource.media_type == media_type)
     if identify_status:
         stmt = stmt.where(Resource.identify_status == identify_status)
-    keys = ["id", "file_id", "parent_id", "name", "size", "ext", "tmdb_id", "media_type",
+    keys = ["id", "file_id", "parent_id", "path_hint", "name", "size", "ext", "tmdb_id", "media_type",
             "media_title", "original_title", "overview", "poster_path", "genres",
             "origin_country", "vote_average", "season", "episode", "identify_status",
             "identify_source", "identify_note", "share_url", "share_status",
@@ -506,14 +506,14 @@ async def tmdb_candidates(rid: int, media_type: str = "", db: Session = Depends(
     mt = media_type if media_type in ("movie", "tv") else None
     try:
         if mt:
-            hint = parse_media_name(x.name)
-            q = hint.get("clean_title") or hint.get("title") or x.name
+            hint = parse_media_name(x.name, x.path_hint or "")
+            q = hint.get("primary_title") or hint.get("clean_title") or x.name
             items = await tmdb.search(q, mt, db)
             label = "电影" if mt == "movie" else "剧集"
             return {"ok": bool(items), "status": "identified" if items else "failed",
                     "source": "tmdb", "reason": f"按{label}搜索「{q}」得到 {len(items)} 个候选",
                     "hint": hint, "ai": None, "candidates": tmdb.rank(items, hint), "best": None}
-        return await tmdb.identify(x.name, db)
+        return await tmdb.identify(x.name, db, path_hint=x.path_hint or "")
     except Exception as e:
         raise _tmdb_error(e)
 
@@ -546,7 +546,7 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
     try:
         d = await tmdb.detail(p.tmdb_id, p.media_type, db)
         _apply_identification(x, d, source="manual", note=p.note or "手动匹配",
-                              hint=parse_media_name(x.name))
+                              hint=parse_media_name(x.name, x.path_hint or ""))
         add_audit(db, "resource_identified", target_type="resource", target_id=str(rid),
                   detail=json_dumps({"tmdb_id": p.tmdb_id, "media_type": p.media_type,
                                      "title": x.media_title, "source": "manual"}))
@@ -577,7 +577,7 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        r = await tmdb.identify(x.name, db, use_ai=True)
+        r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
         if r["ok"] and r.get("best"):
             _apply_identification(x, r["best"], source=r["source"], note=r["reason"], hint=r["hint"])
             add_audit(db, "resource_auto_identified", target_type="resource", target_id=str(rid),
@@ -597,6 +597,41 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
                 "candidates": r["candidates"][:8], "hint": r["hint"], "ai": r.get("ai")}
     except Exception as e:
         raise _tmdb_error(e)
+
+
+@app.post("/api/resources/identify-all", dependencies=ADMIN)
+async def identify_all(force: bool = False, limit: int = 50, db: Session = Depends(get_db)):
+    """按目录名批量重识别。升级到 v0.6.1 后旧资源缺 path_hint，先重新扫描一次补全线索。
+
+    force=true 会连已经识别过的资源一起重算（用于修正「寂静之噪」这类误配）。
+    """
+    stmt = select(Resource).order_by(Resource.id.desc()).limit(min(limit, 200))
+    if not force:
+        stmt = stmt.where(Resource.identify_status.in_(
+            ["unidentified", "ambiguous", "failed", "none", ""]))
+    rows = list(db.scalars(stmt).all())
+    done = pending = 0
+    for x in rows:
+        try:
+            r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+            if r["ok"] and r.get("best"):
+                _apply_identification(x, r["best"], source=r["source"],
+                                      note=r["reason"], hint=r["hint"])
+                done += 1
+            else:
+                x.identify_status = r["status"]
+                x.identify_source = r["source"]
+                x.identify_note = r["reason"]
+                pending += 1
+        except Exception as exc:
+            x.identify_status = "failed"
+            x.identify_note = str(exc)[:500]
+            pending += 1
+    add_audit(db, "identify_all", target_type="resource",
+              detail=json_dumps({"scanned": len(rows), "identified": done,
+                                 "pending": pending, "force": force}))
+    db.commit()
+    return {"ok": True, "scanned": len(rows), "identified": done, "pending": pending}
 
 
 # ---------- AI 辅助识别（OpenAI 兼容接口，可选） ----------
@@ -686,16 +721,27 @@ def add_bot(p: BotInput, db: Session = Depends(get_db)):
     return {"id": x.id, "name": x.name}
 
 
-async def _telegram_call(token: str, method: str, payload: dict) -> dict:
+async def _telegram_call(token: str, method: str, payload: dict,
+                         db: Session | None = None) -> dict:
     """直接调 Telegram Bot API，不写队列、不建分享。异常由调用方转成结构化提示。"""
-    base = settings.telegram_api_base.rstrip("/")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(f"{base}/bot{token}/{method}", json=payload)
+    base = (runtime_config.telegram_base(db) if db is not None
+            else (settings.telegram_api_base or "https://api.telegram.org").rstrip("/"))
+    url = f"{base}/bot{token}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"连接 Telegram 超时（{base}）。若在国内网络，请在「分发规则」页把 "
+            "Telegram API 地址改成可用的反向代理后重试") from exc
+    except Exception as exc:
+        raise RuntimeError(f"无法连接 Telegram（{base}）：{exc}") from exc
     try:
         data = r.json()
     except Exception:
         data = {"ok": False, "description": r.text[:300]}
-    return {"http_status": r.status_code, "data": data, "retry_after": r.headers.get("Retry-After")}
+    return {"http_status": r.status_code, "data": data,
+            "retry_after": r.headers.get("Retry-After")}
 
 
 def _cascade_channel(db: Session, channel_id: int) -> tuple[int, int]:
@@ -722,16 +768,17 @@ async def test_bot(bid: int, db: Session = Depends(get_db)):
     if not token:
         return {"ok": False, "message": "Bot Token 为空，请重新添加"}
     try:
-        r = await _telegram_call(token, "getMe", {})
+        r = await _telegram_call(token, "getMe", {}, db)
     except Exception as exc:
-        return {"ok": False, "message": f"无法连接 Telegram：{exc}"}
+        return {"ok": False, "message": str(exc)}
     if r["http_status"] in (401, 403) or not r["data"].get("ok"):
         return {"ok": False, "message": "Bot Token 无效或已被撤销（Telegram 401/403），请重新添加 Bot"}
     u = r["data"].get("result") or {}
     add_audit(db, "bot_tested", target_type="bot", target_id=str(bid), detail=str(u.get("username", "")))
     db.commit()
     return {"ok": True, "username": u.get("username", ""), "name": u.get("first_name", ""),
-            "message": f"Bot Token 有效：@{u.get('username') or u.get('first_name') or bid}"}
+            "message": (f"Bot Token 有效：@{u.get('username') or u.get('first_name') or bid}。"
+                        "验证只检查 Token、不会发消息；要收到测试消息请点「测试推送」")}
 
 
 @app.delete("/api/bots/{bid}", dependencies=ADMIN)
@@ -810,9 +857,9 @@ async def test_channel(cid: int, db: Session = Depends(get_db)):
     try:
         r = await _telegram_call(token, "sendMessage",
                                  {"chat_id": ch.chat_id, "text": text, "parse_mode": "HTML",
-                                  "disable_web_page_preview": True})
+                                  "disable_web_page_preview": True}, db)
     except Exception as exc:
-        return {"ok": False, "message": f"无法连接 Telegram：{exc}"}
+        return {"ok": False, "message": str(exc)}
     if r["http_status"] == 429:
         wait = retry_after_seconds(r["retry_after"]) or 60
         return {"ok": False, "message": f"Telegram 限流（429），请约 {wait} 秒后重试"}
@@ -851,8 +898,8 @@ class RuleInput(BaseModel):
     name: str
     directory_id: str = ""
     keyword: str = ""
-    channel_id: int
-    auto_publish: bool = False
+    channel_id: int | None = None  # 允许缺省，后端给中文提示而不是 422 对象错误
+    auto_publish: bool = True     # 默认自动发布；关闭时队列项停在「人工审核」
     enabled: bool = True
 
 
@@ -865,14 +912,21 @@ def rules(db: Session = Depends(get_db)):
 
 @app.post("/api/rules", dependencies=ADMIN)
 def add_rule(p: RuleInput, db: Session = Depends(get_db)):
+    if not p.channel_id:
+        raise HTTPException(400, "请先添加频道并选择「目标频道」")
     if not db.get(Channel, p.channel_id):
-        raise HTTPException(404, "频道不存在")
+        raise HTTPException(404, "频道不存在，请刷新页面重新选择")
     x = Rule(**p.model_dump())
     db.add(x)
-    add_audit(db, "rule_added", target_type="rule", detail=p.name)
+    db.flush()
+    queued = _enqueue_existing(db, x)
+    add_audit(db, "rule_added", target_type="rule",
+              detail=json_dumps({"name": p.name, "channel_id": p.channel_id,
+                                 "auto_publish": p.auto_publish, "queued": queued}))
     db.commit()
-    db.refresh(x)
-    return {"id": x.id}
+    mode = "自动发布" if p.auto_publish else "人工审核（需到审核中心逐条通过）"
+    return {"id": x.id, "queued": queued,
+            "message": f"规则已保存（{mode}），已把 {queued} 个已扫描资源补入分发队列"}
 
 
 @app.delete("/api/rules/{rid}", dependencies=ADMIN)
@@ -1011,6 +1065,236 @@ def audit(limit: int = 200, db: Session = Depends(get_db)):
     return [{"id": x.id, "ts": x.ts.isoformat() if x.ts else "", "action": x.action,
              "target_type": x.target_type, "target_id": x.target_id, "detail": x.detail, "actor": x.actor}
             for x in rows]
+
+
+# ---------- v0.6.1：分发链路修复 ----------
+class ToggleInput(BaseModel):
+    enabled: bool
+
+
+class TestMessageInput(BaseModel):
+    chat_id: str = ""
+
+
+class TelegramConfigInput(BaseModel):
+    base_url: str = ""
+
+
+class TranslateSearchInput(BaseModel):
+    title: str
+    media_type: str = ""
+    year: str = ""
+
+
+def _enqueue_existing(db: Session, rule: Rule) -> int:
+    """保存规则后回溯已入库资源。
+
+    用户常「先扫描、再识别、最后才加规则」，旧逻辑只在扫描瞬间入队，
+    这些老资源永远没有队列项，表现为「识别后并没有推送到 TG」。
+    """
+    rows = list(db.scalars(select(Resource)).all())
+    added = 0
+    for r in rows:
+        if rule.directory_id and rule.directory_id != r.parent_id:
+            continue
+        if rule.keyword and rule.keyword.lower() not in r.name.lower():
+            continue
+        exists = db.scalar(select(QueueItem).where(
+            QueueItem.resource_id == r.id, QueueItem.channel_id == rule.channel_id))
+        if exists:
+            continue
+        db.add(QueueItem(resource_id=r.id, channel_id=rule.channel_id,
+                         status="pending" if rule.auto_publish else "review"))
+        added += 1
+    return added
+
+
+async def _send_test_message(token: str, chat_id: str, bot_name: str,
+                             channel_label: str, db: Session | None = None) -> dict:
+    """发一条真实的 Telegram 测试消息，错误转成可操作的中文提示。"""
+    now_bj = (utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    text = (f"<b>Ya-TG 测试推送</b>\n"
+            f"频道：{html.escape(channel_label, quote=False)}\n"
+            f"Bot：{html.escape(bot_name, quote=False)}\n"
+            f"时间：{now_bj}（北京时间）\n\n"
+            "收到这条消息，说明 Bot Token、频道 ID 与网络均正常，可以正式分发。")
+    try:
+        r = await _telegram_call(token, "sendMessage",
+                                 {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                                  "disable_web_page_preview": True}, db)
+    except Exception as exc:
+        return {"ok": False, "message": str(exc)}
+    if r["http_status"] == 429:
+        wait = retry_after_seconds(r["retry_after"]) or 60
+        return {"ok": False, "message": f"Telegram 限流（429），请约 {wait} 秒后重试"}
+    if r["http_status"] >= 400 or not r["data"].get("ok"):
+        desc = str(r["data"].get("description") or r["data"])[:300]
+        if "chat not found" in desc.lower() or "chat_id" in desc.lower() or "chat" in desc.lower():
+            desc += "（请检查频道 ID 是否正确、Bot 是否已加入频道并有发送权限）"
+        elif "unauthorized" in desc.lower() or r["http_status"] in (401, 403):
+            desc += "（Bot Token 可能无效，请先点 Bot 的「验证 Token」）"
+        return {"ok": False, "message": f"测试推送失败：{desc}"}
+    return {"ok": True, "message_id": str((r["data"].get("result") or {}).get("message_id", "")),
+            "message": "测试消息已发送，请到频道查看"}
+
+
+@app.post("/api/queue/run", dependencies=ADMIN)
+async def queue_run():
+    """立即处理一次队列（默认 worker 每 30 秒一轮），配置完可马上验证。"""
+    return await process_queue(limit=50)
+
+
+@app.post("/api/resources/{rid}/publish", dependencies=ADMIN)
+async def publish_resource(rid: int, db: Session = Depends(get_db)):
+    """把单个资源按所有启用规则入队并立即推送一次。"""
+    x = db.get(Resource, rid)
+    if not x:
+        raise HTTPException(404, "资源不存在")
+    rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))).all())
+    if not rules:
+        raise HTTPException(400, "还没有启用的分发规则：请先在「分发规则」页完成 Bot → 频道 → 规则")
+    added = 0
+    for r in rules:
+        if r.directory_id and r.directory_id != x.parent_id:
+            continue
+        if r.keyword and r.keyword.lower() not in x.name.lower():
+            continue
+        q = db.scalar(select(QueueItem).where(
+            QueueItem.resource_id == x.id, QueueItem.channel_id == r.channel_id))
+        if q:
+            if q.status in ("review", "failed"):
+                q.status, q.error, q.next_retry_at = "pending", "", None
+                added += 1
+            continue
+        db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
+        added += 1
+    db.commit()
+    result = await process_queue(limit=50)
+    return {"ok": True, "queued": added, **result}
+
+
+@app.put("/api/bots/{bid}", dependencies=ADMIN)
+def toggle_bot(bid: int, p: ToggleInput, db: Session = Depends(get_db)):
+    """Bot 独立启停：停用只影响它自己的频道链路，不拖累其它 Bot。"""
+    b = db.get(Bot, bid)
+    if not b:
+        raise HTTPException(404, "Bot 不存在")
+    b.enabled = bool(p.enabled)
+    add_audit(db, "bot_toggled", target_type="bot", target_id=str(bid),
+              detail=json_dumps({"enabled": b.enabled}))
+    db.commit()
+    return {"ok": True, "id": bid, "enabled": b.enabled}
+
+
+@app.put("/api/channels/{cid}", dependencies=ADMIN)
+def toggle_channel(cid: int, p: ToggleInput, db: Session = Depends(get_db)):
+    """频道独立启停：停用只影响该频道自己的队列项。"""
+    ch = db.get(Channel, cid)
+    if not ch:
+        raise HTTPException(404, "频道不存在")
+    ch.enabled = bool(p.enabled)
+    add_audit(db, "channel_toggled", target_type="channel", target_id=str(cid),
+              detail=json_dumps({"enabled": ch.enabled}))
+    db.commit()
+    return {"ok": True, "id": cid, "enabled": ch.enabled}
+
+
+@app.post("/api/bots/{bid}/test-message", dependencies=ADMIN)
+async def test_bot_message(bid: int, p: TestMessageInput, db: Session = Depends(get_db)):
+    """Bot 行「测试推送」：真正发一条 Telegram 消息。
+
+    用户反馈：原来的「验证」只调 getMe，频道里收不到任何消息。chat_id 留空时
+    自动取该 Bot 下第一个频道；没有频道时要求用户手填 chat_id。
+    """
+    b = db.get(Bot, bid)
+    if not b:
+        raise HTTPException(404, "Bot 不存在")
+    if not b.enabled:
+        return {"ok": False, "message": "该 Bot 已停用，请先点「启用」"}
+    chat_id = (p.chat_id or "").strip()
+    label = chat_id
+    if not chat_id:
+        ch = db.scalar(select(Channel).where(Channel.bot_id == bid)
+                       .order_by(Channel.id).limit(1))
+        if ch:
+            chat_id, label = ch.chat_id, ch.name
+    if not chat_id:
+        return {"ok": False, "message": "请填写频道 chat_id（如 -1001234567890），或先在「02 添加频道」里添加频道"}
+    try:
+        token = decrypt_secret(b.token)
+    except Exception as exc:
+        return {"ok": False, "message": f"Bot Token 解密失败：{exc}"}
+    if not token:
+        return {"ok": False, "message": "Bot Token 为空，请重新添加 Bot"}
+    r = await _send_test_message(token, chat_id, b.name, label or chat_id, db)
+    add_audit(db, "bot_test_message", target_type="bot", target_id=str(bid),
+              detail=json_dumps({"ok": r["ok"], "chat_id": chat_id,
+                                 "message": r.get("message", "")[:200]}))
+    db.commit()
+    return r
+
+
+@app.get("/api/telegram/config", dependencies=ADMIN)
+def telegram_config_get(db: Session = Depends(get_db)):
+    return {"base_url": runtime_config.get(db, "telegram_api_base"),
+            "default": settings.telegram_api_base}
+
+
+@app.post("/api/telegram/config", dependencies=ADMIN)
+def telegram_config_save(p: TelegramConfigInput, db: Session = Depends(get_db)):
+    runtime_config.set_many(db, {"telegram_api_base": p.base_url.strip()})
+    add_audit(db, "telegram_config_saved", target_type="config", detail=p.base_url.strip()[:200])
+    db.commit()
+    return {"ok": True, "base_url": runtime_config.get(db, "telegram_api_base")}
+
+
+@app.post("/api/tmdb/translate-search", dependencies=ADMIN)
+async def tmdb_translate_search(p: TranslateSearchInput, db: Session = Depends(get_db)):
+    """手动识别：中文标题自动翻译成英/日/韩标题后多语搜索，返回带海报候选。"""
+    try:
+        return await tmdb.search_multilingual(
+            p.title.strip(), p.media_type if p.media_type in ("movie", "tv") else None,
+            p.year, None, db)
+    except Exception as e:
+        raise _tmdb_error(e)
+
+
+@app.get("/api/diagnostics", dependencies=ADMIN)
+def diagnostics(db: Session = Depends(get_db)):
+    """链路自检：一眼看出卡在 Bot / 频道 / 规则 / 审核 / 队列哪一步。"""
+    def count(model, *conds):
+        stmt = select(func.count(model.id))
+        for cond in conds:
+            stmt = stmt.where(cond)
+        return int(db.scalar(stmt) or 0)
+
+    bots_on = count(Bot, Bot.enabled.is_(True))
+    bots_all = count(Bot)
+    chs_on = count(Channel, Channel.enabled.is_(True))
+    chs_all = count(Channel)
+    rules_on = count(Rule, Rule.enabled.is_(True))
+    pending = count(QueueItem, QueueItem.status == "pending")
+    review = count(QueueItem, QueueItem.status == "review")
+    retry = count(QueueItem, QueueItem.status == "retry")
+    failed = count(QueueItem, QueueItem.status == "failed")
+    sent = count(QueueItem, QueueItem.status == "sent")
+    blockers = []
+    if not bots_on:
+        blockers.append("还没有启用的 Bot：" + ("已添加但全部停用" if bots_all else "请先添加 Bot"))
+    if not chs_on:
+        blockers.append("还没有启用的频道：" + ("已添加但全部停用" if chs_all else "请先添加频道"))
+    if not rules_on:
+        blockers.append("还没有启用的分发规则，扫描到的资源不会入队")
+    if review:
+        blockers.append(f"{review} 条待人工审核，需到「审核中心」点「通过」才会推送")
+    if failed:
+        blockers.append(f"{failed} 条推送失败，请到「推送队列」查看错误列")
+    return {"ok": not blockers, "blockers": blockers,
+            "bots": {"total": bots_all, "enabled": bots_on},
+            "channels": {"total": chs_all, "enabled": chs_on},
+            "rules_enabled": rules_on, "queue": {"pending": pending, "review": review,
+                                                  "retry": retry, "failed": failed, "sent": sent},
+            "telegram_base": runtime_config.get(db, "telegram_api_base")}
 
 
 static = Path("/app/static")

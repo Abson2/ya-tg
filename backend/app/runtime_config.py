@@ -35,7 +35,15 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "ai_model": ("ai_model", "gpt-4o-mini"),
     "ai_prompt": ("ai_prompt", ""),
     "ai_timeout": ("ai_timeout", "30"),
+    # Telegram API 反代地址：国内网络直连 api.telegram.org 常超时，允许管理页配置
+    "telegram_api_base": ("telegram_api_base", "https://api.telegram.org"),
 }
+
+
+def telegram_base(db: Session) -> str:
+    """Telegram Bot API 根地址：管理页配置优先、.env 兜底；main 与 publisher 共用。"""
+    return (get(db, "telegram_api_base") or settings.telegram_api_base
+            or "https://api.telegram.org").rstrip("/")
 
 
 def _env_value(key: str) -> str:

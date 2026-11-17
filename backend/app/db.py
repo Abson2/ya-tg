@@ -37,12 +37,17 @@ _COLUMNS = {
         "episode": "INTEGER",
         "identify_source": "TEXT DEFAULT ''",
         "identify_note": "TEXT DEFAULT ''",
+        # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
+        "path_hint": "TEXT DEFAULT ''",
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
     },
     "auth_tokens": {
         "device_id": "TEXT DEFAULT ''",
+    },
+    "scan_cursors": {
+        "dir_paths_json": "TEXT DEFAULT '{}'",
     },
 }
 

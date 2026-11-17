@@ -47,6 +47,21 @@ COUNTRY_NAMES = {
     "VN": "越南", "ZA": "南非", "EG": "埃及", "CZ": "捷克", "HU": "匈牙利",
 }
 
+_CN = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _prefer_chinese(*values) -> str:
+    """剧名优先中文：从多个标题字段里挑第一个含中文的；都没有则取第一个非空。"""
+    for v in values:
+        s = str(v or "").strip()
+        if s and _CN.search(s):
+            return s
+    for v in values:
+        s = str(v or "").strip()
+        if s:
+            return s
+    return ""
+
 
 class TmdbAuthError(RuntimeError):
     """TMDB 凭证缺失或无效，携带可直接展示给用户的中文提示。"""
@@ -123,6 +138,8 @@ async def _get(path: str, params: dict, db: Session | None = None) -> dict:
     c = credentials(db)
     if not (c["bearer"] or c["key"]):
         raise TmdbAuthError("尚未配置 TMDB 密钥。请到「TMDB 设置」页填入 v3 API Key 或 v4 Read Access Token。")
+    # 剧名优先中文：所有端点统一带 language，避免漏传时 TMDB 返回英文原名
+    params = {**params, "language": params.get("language") or c["language"] or "zh-CN"}
     headers = {"accept": "application/json"}
     if c["bearer"]:
         headers["Authorization"] = f"Bearer {c['bearer']}"
@@ -175,7 +192,10 @@ def country_label(value) -> str:
 
 
 def _normalize(item: dict, media_type: str) -> dict:
-    title = item.get("title") or item.get("name") or ""
+    localized = item.get("name") or item.get("title") or ""
+    original = item.get("original_title") or item.get("original_name") or ""
+    # zh-CN 下 name 通常已是中文译名；若接口仍给英文，取其它字段里含中文的值兜底
+    title = _prefer_chinese(localized, original) or localized
     date = item.get("release_date") or item.get("first_air_date") or ""
     genres: list[str] = []
     for g in item.get("genres") or []:
@@ -201,7 +221,7 @@ def _normalize(item: dict, media_type: str) -> dict:
         "type": media_type,
         "type_label": type_label(media_type),
         "title": title,
-        "original_title": item.get("original_title") or item.get("original_name") or "",
+        "original_title": original,
         "year": date[:4],
         "poster_path": item.get("poster_path") or "",
         "backdrop_path": item.get("backdrop_path") or "",
@@ -322,6 +342,25 @@ async def _search_with_retry(query: str, media_type: str, alt_query: str,
     return c
 
 
+def _localize_best(d: dict, hint: dict) -> dict:
+    """剧名优先中文：TMDB 仍返回英文标题时，用中文目录名作为展示名。"""
+    out = dict(d)
+    if not _CN.search(str(out.get("title") or "")) and hint.get("has_chinese"):
+        zh = str(hint.get("dir_title") or hint.get("primary_title") or "")
+        if zh and _CN.search(zh):
+            out["title"] = zh
+            out["title_source"] = "directory"
+    return out
+
+
+def _manual_required(hint: dict, ai_info, ranked: list, query: str, english_alt: str) -> dict:
+    """中文剧名没搜到、只有英文文件名候选时，绝不自动套一个相近的英文作品。"""
+    return {"ok": False, "status": "ambiguous", "source": "tmdb",
+            "reason": (f"按目录剧名「{query}」未命中；英文文件名「{english_alt}」找到 {len(ranked)} 个候选。"
+                       "为避免把剧集单集认成其它作品，请点「手动匹配」按海报确认，或直接搜中文剧名。"),
+            "hint": hint, "ai": ai_info, "candidates": ranked, "best": None}
+
+
 async def identify(name: str, db: Session | None = None, path_hint: str = "",
                    use_ai: bool = True) -> dict:
     """识别决策，返回结构化结果；不直接写库。
@@ -360,37 +399,99 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
                     hint["year"] = str(ai_info["year"])
                 alt_query = str(ai_info.get("title") or "")
 
-    query = hint.get("clean_title") or hint.get("title") or ""
+    # v0.6.1：主查询用目录里的作品名（通常中文），英文单集文件名只作备用，
+    # 且备用命中绝不自动落库——这正是「谷雨/Season 1/The.Silent.Storm.S01E04」
+    # 被误认成「寂静之噪」的根因。
+    query = hint.get("primary_title") or hint.get("clean_title") or hint.get("title") or ""
+    english_alt = str(hint.get("alt_title") or "").strip()
     label = type_label(hint["type_hint"]) if hint["type_hint"] != "unknown" else "影视"
+
+    # 中文剧名先自动翻译成英/日/韩标题再搜 TMDB：TMDB 中文索引不全，
+    # 用作品官方外语名比拿英文单集文件名去搜可靠得多。
+    translated_queries: list[str] = []
+    translated_used = ""
+    if use_ai and hint.get("has_chinese"):
+        try:
+            from . import ai_assist
+            tr = await ai_assist.translate_title(query, str(hint.get("year") or ""), db)
+            translated_queries = list(tr.get("queries") or [])[:3]
+        except Exception:
+            translated_queries = []
 
     # 3) 类型明确：只搜该类型。剧集绝不回退电影（修复 S01E04 被识别成电影）
     if hint["type_hint"] in ("tv", "movie"):
         mt = hint["type_hint"]
         candidates = await _search_with_retry(query, mt, alt_query, db)
+        if not candidates and translated_queries:
+            for tq in translated_queries:
+                candidates = await _search_with_retry(tq, mt, "", db)
+                if candidates:
+                    translated_used = tq
+                    break
+        fallback_used = False
+        if not candidates and english_alt:
+            candidates = await _search_with_retry(english_alt, mt, "", db)
+            fallback_used = bool(candidates)
         if not candidates:
             return {"ok": False, "status": "failed", "source": "none",
                     "reason": f"按{label}搜索「{query}」没有结果，请用「手动匹配」指定片名或 TMDB ID",
                     "hint": hint, "ai": ai_info, "candidates": [], "best": None}
-        ranked = rank(candidates, hint)
+        rank_hint = dict(hint)
+        if fallback_used:
+            rank_hint["clean_title"] = english_alt
+        elif translated_used:
+            rank_hint["clean_title"] = translated_used
+        ranked = rank(candidates, rank_hint)
+        if fallback_used:
+            return _manual_required(hint, ai_info, ranked, query, english_alt)
+        if (not translated_used and hint.get("has_chinese")
+                and hint.get("title_source") == "directory"):
+            # TMDB 已按中文剧名语义命中；中英标题字符串相似度天然接近 0，
+            # 不能因此判成「匹配存疑」。年份一致给更高信任分。
+            y = str(hint.get("year") or "")
+            for it in ranked:
+                boost = 0.60 if (y and str(it.get("year") or "") == y) else 0.42
+                it["score"] = max(float(it["score"] or 0), boost)
+            ranked.sort(key=lambda x: (-x["score"], -(x.get("popularity") or 0)))
+        ranked = [_localize_best(x, hint) for x in ranked]
         best = ranked[0]
-        if best["score"] < 0.22:
+        if best["score"] < (0.45 if translated_used else 0.30):
             return {"ok": False, "status": "ambiguous", "source": "tmdb",
                     "reason": f"按{label}找到 {len(ranked)} 个候选，但匹配度偏低，建议手动确认",
                     "hint": hint, "ai": ai_info, "candidates": ranked, "best": None}
+        why = f"（中文剧名译为「{translated_used}」）" if translated_used else ""
         return {"ok": True, "status": "identified",
-                "source": "ai" if hint["type_source"] == "ai" else "tmdb",
-                "reason": f"按{label}匹配「{best['title']}」（相似度 {best['score']:.2f}）",
+                "source": "ai" if translated_used or hint["type_source"] == "ai" else "tmdb",
+                "reason": f"按{label}匹配「{best['title']}」{why}（相似度 {best['score']:.2f}）",
                 "hint": hint, "ai": ai_info, "candidates": ranked, "best": best}
 
     # 4) 类型未知：双路搜索 + 评分，分数接近就转人工，绝不乱猜
     candidates = await search_both(query, db)
+    fallback_used = False
     if not candidates and alt_query and alt_query.strip() != query:
         candidates = await search_both(alt_query.strip(), db)
+    if not candidates and translated_queries:
+        for tq in translated_queries:
+            candidates = await search_both(tq, db)
+            if candidates:
+                translated_used = tq
+                break
+    if not candidates and english_alt:
+        candidates = await search_both(english_alt, db)
+        fallback_used = bool(candidates)
     if not candidates:
         return {"ok": False, "status": "failed", "source": "none",
                 "reason": f"电影/剧集双路搜索「{query}」都没有结果，请用「手动匹配」",
                 "hint": hint, "ai": ai_info, "candidates": [], "best": None}
-    ranked = rank(candidates, hint)
+    rank_hint = dict(hint)
+    if fallback_used:
+        rank_hint["clean_title"] = english_alt
+    elif translated_used:
+        rank_hint["clean_title"] = translated_used
+    ranked = rank(candidates, rank_hint)
+    if fallback_used:
+        return _manual_required(hint, ai_info, ranked, query, english_alt)
+    ranked = [_localize_best(x, hint) for x in ranked]
     top1 = ranked[0]
     top2 = ranked[1] if len(ranked) > 1 else None
     gap = top1["score"] - (top2["score"] if top2 else 0.0)
@@ -451,6 +552,62 @@ def poster_url(path: str, size: str = "w500") -> str:
 
 def tmdb_url(media_type: str, tmdb_id: int) -> str:
     return f"https://www.themoviedb.org/{media_type}/{tmdb_id}"
+
+
+async def search_multilingual(title: str, media_type: str | None = None, year: str = "",
+                              translations: list[str] | None = None,
+                              db: Session | None = None) -> dict:
+    """手动识别：中文标题 + 自动翻译出的英/日/韩标题分别搜 TMDB，合并去重复选。
+
+    返回带 poster_url 的候选（电影/剧集海报墙）、翻译出的外语标题与实际尝试过的查询词。
+    AI 未配置时仍用中文原名直搜，不影响手动匹配可用性。
+    """
+    from . import ai_assist
+
+    q0 = (title or "").strip()
+    if not q0:
+        return {"ok": False, "query": "", "translated": [], "tried": [], "candidates": [],
+                "message": "请输入中文片名或 TMDB ID"}
+    trans: list[str] = []
+    note = ""
+    if _CN.search(q0):
+        try:
+            tr = await ai_assist.translate_title(q0, year, db)
+            trans = list(tr.get("queries") or [])
+            note = str(tr.get("message") or "")
+        except Exception:
+            trans = []
+    queries: list[tuple[str, str]] = [(q0, "中文")]
+    for q in trans + list(translations or []):
+        q = (q or "").strip()
+        if q and q != q0 and q not in [x[0] for x in queries]:
+            queries.append((q, "外语"))
+    merged: dict[tuple, dict] = {}
+    tried: list[dict] = []
+    for q, lang in queries[:5]:
+        try:
+            rows = (await search(q, media_type, db) if media_type in ("movie", "tv")
+                    else await search_both(q, db))
+        except TmdbAuthError:
+            raise
+        except Exception:
+            rows = []
+        tried.append({"query": q, "language": lang, "count": len(rows)})
+        for it in rows:
+            key = (it.get("media_type"), int(it.get("tmdb_id") or 0))
+            if key in merged:
+                continue
+            d = dict(it)
+            d["poster_url"] = poster_url(d.get("poster_path") or "")
+            d["matched_by"] = q
+            merged[key] = d
+    candidates = list(merged.values())[:20]
+    tried_text = "、".join(dict.fromkeys(x["query"] for x in tried))
+    message = (f"已用「{tried_text}」搜索，找到 {len(candidates)} 个候选"
+               + (f"；{note}" if note else "")) if candidates else \
+              "中文标题及外语译名均未找到结果，请检查片名或直接输入 TMDB ID"
+    return {"ok": bool(candidates), "query": q0, "translated": trans,
+            "tried": tried, "candidates": candidates, "message": message}
 
 
 def escape(value) -> str:

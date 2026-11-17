@@ -19,6 +19,10 @@ const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', lang
 const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
 const aiParseName = ref(''), aiParseResult = ref(null)
 const typeFilter = ref(''), identifyFilter = ref('')
+// v0.6.1：链路自检、Telegram 反代地址、批量重识别/立即推送状态
+const diagnostics = ref({ blockers: [] }), telegramBase = ref(''), telegramSaving = ref(false)
+const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
+const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 
 async function loadTmdb() {
   try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
@@ -133,7 +137,7 @@ async function refreshSms() {
 function resetSms() { smsStep.value = 1; smsCode.value = '' }
 const bot = ref({ name: '', token: '' })
 const channel = ref({ bot_id: null, name: '', chat_id: '' })
-const rule = ref({ name: '', directory_id: '', keyword: '', channel_id: null, auto_publish: false })
+const rule = ref({ name: '', directory_id: '', keyword: '', channel_id: null, auto_publish: true })
 const tpl = ref({ name: '', content: '', enabled: true, is_default: false })
 
 let pollTimer = null, clockTimer = null
@@ -227,10 +231,18 @@ const healthChecks = computed(() => [
 ])
 
 const headers = () => ({ 'X-Admin-Password': password.value, 'Content-Type': 'application/json' })
+// FastAPI 的 detail 可能是字符串、dict 或 422 校验数组；直接 Error(obj) 会显示 [object Object]
+function errText(value, fallback = '请求失败') {
+  if (value == null || value === '') return fallback
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(x => x?.msg || x?.message || JSON.stringify(x)).join('；')
+  if (typeof value === 'object') return value.message || value.msg || value.detail || JSON.stringify(value)
+  return String(value)
+}
 async function api(path, opt = {}) {
   const r = await fetch('/api' + path, { ...opt, headers: { ...headers(), ...(opt.headers || {}) } })
   const d = await r.json().catch(() => ({}))
-  if (!r.ok) throw Error(d.detail || r.statusText)
+  if (!r.ok) throw Error(errText(d.detail ?? d.message, r.statusText))
   return d
 }
 async function load() {
@@ -244,6 +256,8 @@ async function load() {
   queue.value = await api('/queue')
   templates.value = await api('/templates')
   audit.value = await api('/audit')
+  try { diagnostics.value = await api('/diagnostics') } catch (e) { diagnostics.value = { blockers: [] } }
+  try { const t = await api('/telegram/config'); telegramBase.value = t.base_url || t.default || '' } catch (e) {}
   await loadAuth()
   await loadTmdb()
   await loadAi()
@@ -276,8 +290,87 @@ async function addChannel() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function addRule() {
-  try { await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) }); ElMessage.success('规则已保存'); await load() }
-  catch (e) { ElMessage.error(e.message) }
+  if (!channels.value.length) { ElMessage.warning('请先在「02 添加频道」里添加一个频道'); return }
+  if (!rule.value.channel_id) { ElMessage.warning('请选择「目标频道」'); return }
+  if (!String(rule.value.name || '').trim()) { ElMessage.warning('请填写规则名称'); return }
+  try {
+    const d = await api('/rules', { method: 'POST', body: JSON.stringify(rule.value) })
+    ElMessage.success(d.message || '规则已保存')
+    rule.value = { name: '', directory_id: '', keyword: '', channel_id: rule.value.channel_id, auto_publish: true }
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+// ---------- v0.6.1：独立启停、真实测试消息、立即推送、反代地址 ----------
+async function toggleBot(b) {
+  try {
+    const d = await api(`/bots/${b.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !b.enabled }) })
+    ElMessage.success(d.enabled ? `Bot「${b.name}」已启用` : `Bot「${b.name}」已停用（其下频道暂停推送）`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function toggleChannel(c) {
+  try {
+    const d = await api(`/channels/${c.id}`, { method: 'PUT', body: JSON.stringify({ enabled: !c.enabled }) })
+    ElMessage.success(d.enabled ? `频道「${c.name}」已启用` : `频道「${c.name}」已停用（其它频道不受影响）`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function sendBotTestMessage(b) {
+  let chatId = ''
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '留空则自动发给该 Bot 下第一个频道；也可直接填频道 ID（如 -1001234567890）',
+      `向 Bot「${b.name}」发送测试消息`, { inputPlaceholder: '可留空', inputValue: '' })
+    chatId = value || ''
+  } catch (e) { return }
+  testingBotMsg.value = b.id
+  try {
+    const d = await api(`/bots/${b.id}/test-message`, { method: 'POST', body: JSON.stringify({ chat_id: chatId }) })
+    if (d.ok) ElMessage.success(d.message + (d.message_id ? `（消息 #${d.message_id}）` : ''))
+    else ElMessage.error(d.message)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { testingBotMsg.value = 0 }
+}
+async function runQueue() {
+  runningQueue.value = true
+  try {
+    const d = await api('/queue/run', { method: 'POST' })
+    ElMessage.success(`已处理队列：发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条，新建分享 ${d.shares_created || 0} 个`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { runningQueue.value = false }
+}
+async function publishResource(row) {
+  publishing.value = row.id
+  try {
+    const d = await api(`/resources/${row.id}/publish`, { method: 'POST' })
+    ElMessage.success(`已入队 ${d.queued || 0} 条，发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条${d.failed ? '（详见推送队列错误列）' : ''}`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { publishing.value = 0 }
+}
+async function reidentifyAll() {
+  try {
+    await ElMessageBox.confirm(
+      '按目录剧名重新识别库中资源（含已识别项，用于修正误配）。升级后请先到「扫描设置」执行一次「立即扫描」补全目录线索。',
+      '按目录重识别', { confirmButtonText: '开始', cancelButtonText: '取消', type: 'warning' })
+  } catch (e) { return }
+  reidentifying.value = true
+  try {
+    const d = await api('/resources/identify-all?force=true&limit=50', { method: 'POST' })
+    ElMessage.success(`已重扫 ${d.scanned} 项：识别 ${d.identified} 项，需人工确认 ${d.pending} 项`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { reidentifying.value = false }
+}
+async function saveTelegramBase() {
+  telegramSaving.value = true
+  try {
+    await api('/telegram/config', { method: 'POST', body: JSON.stringify({ base_url: telegramBase.value.trim() }) })
+    ElMessage.success('Telegram API 地址已保存，留空恢复默认 api.telegram.org')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { telegramSaving.value = false }
 }
 // ---------- Bot / 频道 / 规则：测试与删除 ----------
 const testingBot = ref(0), testingChannel = ref(0)
@@ -364,24 +457,57 @@ function cleanName(name) {
     .replace(/\s+/g, ' ')
     .trim()
 }
+// v0.6.1：从「谷雨 (2026)(1)/Season 1」里取中文剧名，作为手动匹配默认搜索词
+function dirTitle(path) {
+  const season = /^(season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$/i
+  const generic = /^(电影|影片|电视剧|剧集|连续剧|动漫|动画|番剧|纪录片|综艺|合集|资源|下载|媒体|媒体库|影视|4K|2160p|1080p|movies?|films?|tv|tvshows?|series|shows?|media|downloads?|videos?|anime)$/i
+  let title = ''
+  for (const s of String(path || '').split(/[\\/]+/).map(x => x.trim()).filter(Boolean)) {
+    if (season.test(s) || generic.test(s)) continue
+    title = s.replace(/[（(]\s*\d{1,2}\s*[)）]\s*$/, ' ')
+             .replace(/[（(]?\s*(19|20)\d{2}\s*[)）]?/g, ' ')
+             .replace(/tmdb[-_:= ]?\d+/gi, ' ')
+             .replace(/[._]+/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+  return title
+}
 async function openMatch(row) {
   matchRow.value = row
   matchType.value = (row.media_type === 'movie' || row.media_type === 'tv') ? row.media_type : guessType(row.name)
-  matchQuery.value = cleanName(row.media_title || row.name)
+  matchQuery.value = dirTitle(row.path_hint) || cleanName(row.media_title || row.name)
   matchCandidates.value = []
+  matchTried.value = []
+  matchTranslated.value = []
   matchSelected.value = null
   matchVisible.value = true
   await searchMatch(true)
 }
 async function searchMatch(silent = false) {
-  const q = (matchQuery.value || '').trim() || cleanName(matchRow.value?.name || '')
-  if (!q) { if (!silent) ElMessage.warning('请填写片名或 TMDB ID'); return }
+  const q = (matchQuery.value || '').trim() || dirTitle(matchRow.value?.path_hint) || cleanName(matchRow.value?.name || '')
+  if (!q) { if (!silent) ElMessage.warning('请填写中文片名或 TMDB ID'); return }
   matchBusy.value = true
   matchSelected.value = null
+  matchTried.value = []
+  matchTranslated.value = []
   try {
-    const d = await api(`/tmdb/search?q=${encodeURIComponent(q)}&media_type=${matchType.value}`)
-    matchCandidates.value = Array.isArray(d) ? d : (d.candidates || [])
-    if (!silent && !matchCandidates.value.length) ElMessage.warning('没有找到候选，换个片名或类型再试')
+    let d
+    if (/^\d{2,12}$/.test(q) || /^tmdb[-_:= ]?\d+/i.test(q)) {
+      const raw = await api(`/tmdb/search?q=${encodeURIComponent(q)}&media_type=${matchType.value}`)
+      d = { candidates: Array.isArray(raw) ? raw : (raw.candidates || []), message: '' }
+    } else {
+      // 中文标题自动翻译成英/日/韩标题后多语搜索，返回带海报的候选
+      d = await api('/tmdb/translate-search', {
+        method: 'POST',
+        body: JSON.stringify({ title: q, media_type: matchType.value })
+      })
+    }
+    matchCandidates.value = d.candidates || []
+    matchTried.value = d.tried || []
+    matchTranslated.value = d.translated || []
+    if (!silent) {
+      if (!matchCandidates.value.length) ElMessage.warning(d.message || '没有找到候选，换个片名或类型再试')
+      else ElMessage.success(d.message || `找到 ${matchCandidates.value.length} 个候选`)
+    }
   } catch (e) { if (!silent) ElMessage.error(e.message) }
   finally { matchBusy.value = false }
 }
@@ -485,7 +611,7 @@ async function restoreDefaultTpl() {
   try {
     const d = await api('/templates/default', { method: 'POST' })
     tpl.value = { name: '默认图文模板', content: d.content, enabled: true, is_default: true }
-    ElMessage.success('已载入 v0.6.0 默认模板（含分类标签），保存后生效')
+    ElMessage.success('已载入 默认模板（含分类标签），保存后生效')
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -535,7 +661,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.6.0 · Asia/Shanghai</div>
+        <div class="foot-version">v0.6.1 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -720,12 +846,12 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>fileId 去重 · TMDB 识别 · 分享链接管理</p></div><div class="head-tools"><el-input v-model="keyword" placeholder="搜索资源名或 TMDB 标题" clearable style="width:260px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:140px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="typeFilter" placeholder="媒体类型" clearable style="width:120px"><el-option label="电影" value="movie"/><el-option label="剧集" value="tv"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:130px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select><div class="view-switch"><button :class="{on:viewMode==='grid'}" @click="viewMode='grid'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('grid')"/></svg></button><button :class="{on:viewMode==='list'}" @click="viewMode='list'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('file')"/></svg></button></div></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>fileId 去重 · TMDB 识别 · 分享链接管理</p></div><div class="head-tools"><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-input v-model="keyword" placeholder="搜索资源名或 TMDB 标题" clearable style="width:260px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:140px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="typeFilter" placeholder="媒体类型" clearable style="width:120px"><el-option label="电影" value="movie"/><el-option label="剧集" value="tv"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:130px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select><div class="view-switch"><button :class="{on:viewMode==='grid'}" @click="viewMode='grid'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('grid')"/></svg></button><button :class="{on:viewMode==='list'}" @click="viewMode='list'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('file')"/></svg></button></div></div></div>
           <div v-if="viewMode === 'grid'" class="media-grid">
             <div v-for="r in filteredResources" :key="r.id" class="media-card">
               <div class="media-poster"><el-image v-if="r.poster_path" :src="'https://image.tmdb.org/t/p/w342'+r.poster_path" fit="cover" style="width:100%;height:100%"/><div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ (r.ext||'FILE').toUpperCase() }}</span></div><span class="media-badge" :class="'badge-'+r.share_status">{{ r.share_status }}</span></div>
-              <div class="media-body"><b :title="r.name">{{ r.media_title || r.name }}</b><small>{{ r.name }}</small><div class="media-meta"><span v-if="r.media_type" class="type-chip" :class="'type-'+r.media_type">{{ mediaLabel(r.media_type) }}</span><span v-if="r.season && r.episode">S{{ String(r.season).padStart(2,'0') }}E{{ String(r.episode).padStart(2,'0') }}</span><span v-if="r.tmdb_id">TMDB #{{ r.tmdb_id }}</span><span v-if="r.identify_status && r.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(r.identify_status) }}</span><span v-if="r.revision">更新 {{ r.revision }} 次</span></div></div>
-              <div class="media-actions"><el-button size="small" @click="createShare(r)">分享</el-button><el-button size="small" @click="identify(r,true)">自动识别</el-button><el-button size="small" text @click="identify(r,false)">手动</el-button></div>
+              <div class="media-body"><b :title="r.name">{{ r.media_title || r.name }}</b><small>{{ r.name }}</small><small v-if="r.path_hint" class="dir-clue">目录：{{ r.path_hint }}</small><div class="media-meta"><span v-if="r.media_type" class="type-chip" :class="'type-'+r.media_type">{{ mediaLabel(r.media_type) }}</span><span v-if="r.season && r.episode">S{{ String(r.season).padStart(2,'0') }}E{{ String(r.episode).padStart(2,'0') }}</span><span v-if="r.tmdb_id">TMDB #{{ r.tmdb_id }}</span><span v-if="r.identify_status && r.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(r.identify_status) }}</span><span v-if="r.revision">更新 {{ r.revision }} 次</span></div></div>
+              <div class="media-actions"><el-button size="small" @click="createShare(r)">分享</el-button><el-button size="small" @click="identify(r,true)">自动识别</el-button><el-button size="small" text @click="identify(r,false)">手动</el-button><el-button size="small" type="primary" plain :loading="publishing === r.id" @click="publishResource(r)">立即推送</el-button></div>
             </div>
             <div v-if="!filteredResources.length" class="empty big">没有匹配的资源</div>
           </div>
@@ -737,17 +863,24 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column label="识别" width="100"><template #default="s">{{ identifyLabel(s.row.identify_status) }}</template></el-table-column>
               <el-table-column prop="share_status" label="分享状态" width="110"/>
               <el-table-column prop="revision" label="更新次数" width="90"/>
-              <el-table-column label="操作" width="250"><template #default="s"><el-button size="small" @click="createShare(s.row)">分享</el-button><el-button size="small" @click="identify(s.row,true)">自动识别</el-button><el-button size="small" text @click="identify(s.row,false)">手动</el-button></template></el-table-column>
+              <el-table-column label="操作" width="320"><template #default="s"><el-button size="small" @click="createShare(s.row)">分享</el-button><el-button size="small" @click="identify(s.row,true)">自动识别</el-button><el-button size="small" text @click="identify(s.row,false)">手动</el-button><el-button size="small" type="primary" plain :loading="publishing === s.row.id" @click="publishResource(s.row)">立即推送</el-button></template></el-table-column>
             </el-table>
           </div>
         </section>
 
         <section v-else-if="tab === '分发规则'" class="fade">
           <div class="page-head"><div><h2>分发规则</h2><p>Bot → 频道 → 路由规则，三步建立推送链路</p></div></div>
+          <div class="panel" style="margin-bottom:14px">
+            <div class="panel-head"><h3>链路自检</h3><el-button size="small" type="primary" :loading="runningQueue" @click="runQueue">立即推送队列</el-button></div>
+            <div class="cursor-box"><div><small>启用 Bot</small><b>{{ diagnostics.bots?.enabled ?? 0 }} / {{ diagnostics.bots?.total ?? 0 }}</b></div><div><small>启用频道</small><b>{{ diagnostics.channels?.enabled ?? 0 }} / {{ diagnostics.channels?.total ?? 0 }}</b></div><div><small>启用规则</small><b>{{ diagnostics.rules_enabled ?? 0 }}</b></div><div><small>待推送</small><b>{{ diagnostics.queue?.pending ?? 0 }}</b></div><div><small>待审核</small><b>{{ diagnostics.queue?.review ?? 0 }}</b></div><div><small>已推送</small><b>{{ diagnostics.queue?.sent ?? 0 }}</b></div></div>
+            <p v-if="diagnostics.blockers?.length" class="hint" style="color:#c0392b;margin:8px 0">待处理：{{ diagnostics.blockers.join('；') }}</p>
+            <p v-else class="hint" style="margin:8px 0">链路完整：Bot / 频道 / 规则均已启用，队列每 30 秒自动推送一次；也可点「立即推送队列」马上验证。</p>
+            <div class="match-controls"><el-input v-model="telegramBase" placeholder="Telegram API 地址，默认 https://api.telegram.org（国内网络可填反代）"/><el-button :loading="telegramSaving" @click="saveTelegramBase">保存地址</el-button></div>
+          </div>
           <div class="three-col">
-            <div class="panel step-panel"><div class="step-head"><span>01</span><h3>添加 Bot</h3></div><el-input v-model="bot.name" placeholder="Bot 名称"/><el-input v-model="bot.token" type="password" show-password placeholder="Bot Token（加密存储）" class="mt"/><el-button type="primary" class="mt" @click="addBot">添加 Bot</el-button><div v-for="b in bots" :key="b.id" class="mini-row"><b>{{ b.name }}</b><span>{{ b.token_masked }}</span><span class="row-actions"><button class="row-btn" :disabled="testingBot === b.id" @click="testBot(b)">{{ testingBot === b.id ? '验证中' : '验证' }}</button><button class="row-btn danger" @click="delBot(b)">删除</button></span></div></div>
-            <div class="panel step-panel"><div class="step-head"><span>02</span><h3>添加频道</h3></div><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select><el-input v-model="channel.name" placeholder="频道名称" class="mt"/><el-input v-model="channel.chat_id" placeholder="频道 ID，如 -100..." class="mt"/><el-button type="primary" class="mt" @click="addChannel">添加频道</el-button><div v-for="c in channels" :key="c.id" class="mini-row"><b>{{ c.name }}</b><span>{{ c.chat_id }}</span><span class="row-actions"><button class="row-btn" :disabled="testingChannel === c.id" @click="testChannel(c)">{{ testingChannel === c.id ? '发送中' : '测试推送' }}</button><button class="row-btn danger" @click="delChannel(c)">删除</button></span></div></div>
-            <div class="panel step-panel"><div class="step-head"><span>03</span><h3>分发规则</h3></div><el-input v-model="rule.name" placeholder="规则名称"/><el-input v-model="rule.directory_id" placeholder="目录 ID（可空）" class="mt"/><el-input v-model="rule.keyword" placeholder="文件名关键词（可空）" class="mt"/><el-select v-model="rule.channel_id" placeholder="目标频道" style="width:100%" class="mt"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select><div class="mt"><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div><el-button type="primary" class="mt" @click="addRule">保存规则</el-button><div v-for="r in rules" :key="r.id" class="mini-row"><b>{{ r.name }}</b><span>{{ r.auto_publish ? '自动' : '审核' }}</span><span class="row-actions"><button class="row-btn danger" @click="delRule(r)">删除</button></span></div></div>
+            <div class="panel step-panel"><div class="step-head"><span>01</span><h3>添加 Bot</h3></div><el-input v-model="bot.name" placeholder="Bot 名称"/><el-input v-model="bot.token" type="password" show-password placeholder="Bot Token（加密存储）" class="mt"/><el-button type="primary" class="mt" @click="addBot">添加 Bot</el-button><div v-for="b in bots" :key="b.id" class="mini-row"><b>{{ b.name }}{{ b.enabled ? '' : '（已停用）' }}</b><span>{{ b.token_masked }}</span><span class="row-actions"><button class="row-btn" :disabled="testingBot === b.id" @click="testBot(b)">{{ testingBot === b.id ? '验证中' : '验证 Token' }}</button><button class="row-btn" :disabled="testingBotMsg === b.id" @click="sendBotTestMessage(b)">{{ testingBotMsg === b.id ? '发送中' : '测试推送' }}</button><button class="row-btn" @click="toggleBot(b)">{{ b.enabled ? '停用' : '启用' }}</button><button class="row-btn danger" @click="delBot(b)">删除</button></span></div><p v-if="!bots.length" class="hint">未配置 Bot 时该链路不启用</p></div>
+            <div class="panel step-panel"><div class="step-head"><span>02</span><h3>添加频道</h3></div><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select><el-input v-model="channel.name" placeholder="频道名称" class="mt"/><el-input v-model="channel.chat_id" placeholder="频道 ID，如 -100..." class="mt"/><el-button type="primary" class="mt" @click="addChannel">添加频道</el-button><div v-for="c in channels" :key="c.id" class="mini-row"><b>{{ c.name }}{{ c.enabled ? '' : '（已停用）' }}</b><span>{{ c.chat_id }}</span><span class="row-actions"><button class="row-btn" :disabled="testingChannel === c.id" @click="testChannel(c)">{{ testingChannel === c.id ? '发送中' : '测试推送' }}</button><button class="row-btn" @click="toggleChannel(c)">{{ c.enabled ? '停用' : '启用' }}</button><button class="row-btn danger" @click="delChannel(c)">删除</button></span></div><p v-if="!channels.length" class="hint">未配置频道时该链路不启用</p></div>
+            <div class="panel step-panel"><div class="step-head"><span>03</span><h3>分发规则</h3></div><el-input v-model="rule.name" placeholder="规则名称"/><el-input v-model="rule.directory_id" placeholder="目录 ID（可空）" class="mt"/><el-input v-model="rule.keyword" placeholder="文件名关键词（可空）" class="mt"/><el-select v-model="rule.channel_id" placeholder="目标频道" style="width:100%" class="mt"><el-option v-for="c in channels" :key="c.id" :label="c.name" :value="c.id"/></el-select><div class="mt"><el-switch v-model="rule.auto_publish" active-text="自动发布" inactive-text="人工审核"/></div><el-button type="primary" class="mt" @click="addRule">保存规则</el-button><div v-for="r in rules" :key="r.id" class="mini-row"><b>{{ r.name }}</b><span>{{ r.auto_publish ? '自动' : '审核' }}{{ r.enabled ? '' : ' · 停用' }}</span><span class="row-actions"><button class="row-btn danger" @click="delRule(r)">删除</button></span></div><p v-if="!rules.length" class="hint">保存规则后会自动把已扫描的资源补入分发队列</p></div>
           </div>
         </section>
 
@@ -840,7 +973,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '消息模板'" class="fade">
-          <div class="page-head"><div><h2>消息模板</h2><p>支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 v0.6.0 默认模板</el-button></div>
+          <div class="page-head"><div><h2>消息模板</h2><p>支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
           <div class="two-col tpl-layout">
             <div class="panel">
               <div class="field"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
@@ -867,17 +1000,19 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
 
       <!-- LitePan 风格「重新匹配元数据」：类型 + 片名/ID + 海报候选 + 应用匹配 / 无匹配 -->
       <el-dialog v-model="matchVisible" title="重新匹配元数据" width="760px" top="7vh" :close-on-click-modal="false">
-        <div class="match-path"><small>作品文件</small><b>{{ matchRow?.name }}</b></div>
+        <div class="match-path"><small>作品文件</small><b>{{ matchRow?.name }}</b><small v-if="matchRow?.path_hint" style="margin-top:6px">目录线索：{{ matchRow.path_hint }} · 默认按中文剧名搜索</small></div>
         <div class="match-controls">
           <el-select v-model="matchType" style="width:112px"><el-option label="剧集" value="tv"/><el-option label="电影" value="movie"/></el-select>
-          <el-input v-model="matchQuery" placeholder="填写片名或 TMDB ID 后点击「搜索」" clearable @keyup.enter="searchMatch(false)"/>
+          <el-input v-model="matchQuery" placeholder="填中文片名 / 外语片名 / TMDB ID 后点「搜索」" clearable @keyup.enter="searchMatch(false)"/>
           <el-button type="primary" :loading="matchBusy" @click="searchMatch(false)">搜索</el-button>
         </div>
-        <p class="hint" style="margin:8px 0 12px">{{ matchClue }}。可凭海报和类型选择，选中后点「应用匹配」。</p>
+        <p class="hint" style="margin:8px 0 4px">{{ matchClue }}。可凭海报和类型选择，选中后点「应用匹配」。</p>
+        <p v-if="matchTranslated.length" class="hint" style="margin:0 0 10px">已自动译成外语标题：{{ matchTranslated.join(' / ') }}；依次尝试：{{ matchTried.map(t => t.query).join(' / ') }}</p>
+        <p v-else class="hint" style="margin:0 0 10px">输入中文片名后会自动译成英/日/韩等外语标题一起搜索；未启用 AI 时仍按中文原名搜索，或直接填 TMDB ID。</p>
         <div v-if="matchCandidates.length" class="match-grid">
           <div v-for="c in matchCandidates" :key="c.tmdb_id + '-' + c.media_type" class="match-card" :class="{ on: matchSelected === c }" @click="matchSelected = c">
             <div class="match-poster">
-              <el-image v-if="c.poster_path" :src="'https://image.tmdb.org/t/p/w185' + c.poster_path" fit="cover" style="width:100%;height:100%"/>
+              <el-image v-if="c.poster_path || c.poster_url" :src="c.poster_url || ('https://image.tmdb.org/t/p/w185' + c.poster_path)" fit="cover" style="width:100%;height:100%"/>
               <div v-else class="match-no-poster">无海报</div>
             </div>
             <div class="match-info">
@@ -889,7 +1024,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             </div>
           </div>
         </div>
-        <div v-else-if="!matchBusy" class="empty">暂无候选，换个片名、TMDB ID 或类型再试</div>
+        <div v-else-if="!matchBusy" class="empty">暂无候选，换个中文/外语片名、TMDB ID 或类型再试</div>
         <template #footer>
           <div class="match-footer">
             <el-button type="danger" plain @click="markNoMatch">无匹配</el-button>
@@ -1025,6 +1160,7 @@ button{font-family:inherit}
 .match-path{background:#f2f6ff;border:1px solid #dbe6ff;border-radius:10px;padding:12px 14px;margin-bottom:14px}
 .match-path small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}
 .match-path b{font-size:13px;word-break:break-all}
+.dir-clue{display:block;margin-top:3px;color:#6b74a8;font-size:11px;word-break:break-all}
 .match-controls{display:flex;gap:10px}
 .match-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px;max-height:46vh;overflow-y:auto;margin-top:12px}
 .match-card{display:flex;gap:10px;border:1px solid var(--yg-line);border-radius:12px;padding:10px;cursor:pointer;background:#fff;transition:.18s}

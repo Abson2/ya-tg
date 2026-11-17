@@ -209,3 +209,43 @@ async def test_connection(db: Session | None) -> dict:
         return {"ok": True, "message": "连接成功，模型可用", "reply": content[:80], **st}
     except Exception as exc:
         return {"ok": False, "message": str(exc), **st}
+
+
+TRANSLATE_SYSTEM = (
+    "你是影视作品名翻译助手。把用户给的中文片名翻译成该作品在 TMDB 上通用的外语标题。"
+    "只输出一个 JSON 对象，不要解释、不要 Markdown："
+    '{"en":"英文标题","ja":"日文标题","ko":"韩文标题","original":"作品原始语言标题"}。'
+    "规则：某语言没有通用官方译名就留空字符串，不要硬编；"
+    "英文优先用该作品在 TMDB 的英文名/原名（如《谷雨》对应 The Silent Storm）；"
+    "只给作品本名，不要年份、季集号、画质或说明文字。"
+)
+
+
+async def translate_title(title: str, year: str = "", db: Session | None = None) -> dict:
+    """中文剧名 → 英/日/韩等外语标题，供 TMDB 多语搜索。
+
+    AI 未启用或未配置时静默降级（返回空列表），调用方仍会用中文原名直接搜 TMDB，
+    绝不因为翻译不可用而阻断识别或手动匹配。
+    """
+    t = (title or "").strip()
+    if not t:
+        return {"ok": False, "queries": [], "message": "标题为空"}
+    if not enabled(db):
+        return {"ok": False, "queries": [], "message": "AI 辅助识别未启用，仅按中文标题搜索"}
+    c = _cfg(db)
+    user = f"中文片名：{t}\n" + (f"年份：{year}\n" if year else "")
+    if c["custom_prompt"]:
+        user += f"补充要求：{c['custom_prompt']}\n"
+    try:
+        content = await _chat([{"role": "system", "content": TRANSLATE_SYSTEM},
+                               {"role": "user", "content": user}], db, max_tokens=200)
+        d = _extract_json(content)
+    except Exception as exc:
+        return {"ok": False, "queries": [], "message": str(exc)}
+    queries: list[str] = []
+    for key in ("en", "ja", "ko", "original"):
+        v = str(d.get(key) or "").strip()
+        if v and v != t and v not in queries:
+            queries.append(v)
+    return {"ok": True, "queries": queries, "titles": d,
+            "message": "已生成外语标题" if queries else "模型未给出可用外语标题"}

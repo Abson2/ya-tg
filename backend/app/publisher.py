@@ -6,7 +6,7 @@ import httpx
 from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 
-from . import tmdb
+from . import runtime_config, tmdb
 from .config import settings
 from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
@@ -119,15 +119,21 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
         return False, "", "Bot Token 为空", None
     caption, _ = _build_message(db, res, res.share_url)
     poster = tmdb.poster_url(res.poster_path) if res.poster_path else ""
-    base = settings.telegram_api_base.rstrip("/")
+    base = runtime_config.telegram_base(db)
     method = "sendPhoto" if poster else "sendMessage"
     payload = {"chat_id": channel.chat_id, "caption" if poster else "text": caption,
                "parse_mode": "HTML", "disable_web_page_preview": False}
     if poster:
         payload["photo"] = poster
     retry_after = None
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{base}/bot{token}/{method}", json=payload)
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"{base}/bot{token}/{method}", json=payload)
+    except httpx.TimeoutException:
+        return False, "", (f"连接 Telegram 超时（{base}）。若在国内网络，请在「分发规则」页"
+                           "把 Telegram API 地址改成可用的反向代理"), None
+    except Exception as exc:
+        return False, "", f"无法连接 Telegram（{base}）：{exc}", None
     try:
         data = r.json()
     except Exception:
@@ -154,9 +160,15 @@ async def process_queue(limit: int = 20) -> dict:
             res = db.get(Resource, q.resource_id)
             channel = db.get(Channel, q.channel_id)
             bot = db.get(Bot, channel.bot_id) if channel else None
-            if not res or not channel or not bot or not bot.enabled or not channel.enabled:
-                q.status, q.error = "failed", "资源、频道或 Bot 不可用/已禁用"
+            if not res or not channel or not bot:
+                q.status, q.error = "failed", "资源、频道或 Bot 已不存在（可能被删除）"
                 failed += 1
+                continue
+            if not bot.enabled or not channel.enabled:
+                # v0.6.1：Bot 与频道各自独立启停。停用不算失败、不消耗重试次数，
+                # 重新启用后下一轮 worker 会自动继续，且不影响其它链路。
+                q.error = "Bot 或频道已停用，暂不推送；启用后自动继续"
+                q.next_retry_at = None
                 continue
             need_share = not res.share_url
             try:

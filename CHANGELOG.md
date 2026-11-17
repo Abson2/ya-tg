@@ -6,6 +6,54 @@
 
 ---
 
+## v0.6.1 (2026-11-17)
+
+修复 4 个实测 bug，并按追加需求补齐「目录剧名识别 / 中文剧名 / 多语翻译搜索 / Bot 与频道独立启停」。
+
+### 问题（用户截图与反馈）
+- `谷雨 (2026)(1) > Season 1 > The.Silent.Storm.S01E04.2026.2160p...` 被识别成「寂静之噪」TMDB #314531：旧版只拿英文单集文件名去搜 TMDB，父目录里的中文剧名完全没用上
+- 识别后没有推送到 TG Bot/频道：规则保存失败 → 无队列项；且保存规则不会回溯已入库资源、`auto_publish` 默认关闭会停在「人工审核」
+- 「分发规则」保存弹出 `[object Object]`：前端把 FastAPI 422 的 `detail`（数组）直接 `Error()` 字符串化；真实原因是未选目标频道
+- Bot 的「验证」只调 `getMe`，不发送任何 Telegram 消息；频道行在未添加频道时根本不存在
+- 追加：频道、Bot 均独立运行，未配置则不启用，两者要有启用/关闭按钮
+- 追加：手动识别支持输入中文标题，自动译成英/日/韩等外语标题搜索并返回带海报的电影/剧集；识别剧名优先中文
+
+### 识别：目录名优先 + 中文剧名
+- 扫描时把目录显示名链写入 `Resource.path_hint`（如 `谷雨 (2026)(1)/Season 1`），并存入 `ScanCursor.dir_paths_json` 支持断点续扫；兼容网页端/官方接口的多种目录名字段
+- `parse_media_name` 新增 `_dir_clues()`：跳过 `Season 1` / `第1季` 等季目录与「电影/剧集/影视」等通用目录，取最后一个作品目录；清洗网盘重名后缀 `(1)`、年份与 TMDB 标记
+- 新增输出 `primary_title` / `dir_title` / `file_title` / `alt_title` / `title_source` / `has_chinese`；季目录同样是 tv 硬线索
+- TMDB 所有请求统一带 `language=zh-CN`；`_normalize` 与 `_localize_best` 优先中文展示名。中文剧名主搜命中但 TMDB 返回英文标题时做分数补偿，避免误判成「匹配存疑」
+- **英文文件名只作备用且绝不自动落库**：中文剧名搜不到时，英文候选一律标 `ambiguous` 转人工，不再把剧集单集认成别的作品
+- 新增 `POST /api/resources/identify-all?force=true`：批量按目录重识别，用于修正升级前已经误配的资源
+
+### 中文标题多语翻译搜索
+- `ai_assist.translate_title()`：用已配置的 OpenAI 兼容接口把中文剧名译成英/日/韩/原名；未启用 AI 或调用失败静默降级，仍按中文原名搜索
+- `tmdb.search_multilingual()`：中文 + 外语标题依次搜索，按 `(类型, TMDB ID)` 去重，候选带 `poster_url`，并返回 `translated` 与 `tried`
+- 新增 `POST /api/tmdb/translate-search`；手动匹配窗口默认填入中文目录剧名，展示翻译结果与尝试过的查询词，可直接凭海报选择
+- 自动识别在中文剧名未命中时，先尝试 AI 译出的外语标题，最后才考虑英文文件名
+
+### 分发链路：从「识别」走到「推送」
+- `POST /api/rules` 保存规则时**回溯已入库资源**补建队列项并返回 `queued`；`auto_publish` 默认改为 `true`，关闭时明确提示需到审核中心逐条通过
+- `RuleInput.channel_id` 允许缺省，后端给中文 400；前端 `api()` 新增 `errText()` 规范化 dict/数组 `detail`，不再出现 `[object Object]`；保存前校验 Bot/频道/目标频道并给引导
+- 新增 `POST /api/queue/run`（立即处理队列）、`POST /api/resources/{id}/publish`（单资源入队并立即推送）、`GET /api/diagnostics`（链路自检：Bot/频道/规则/待审/失败/已推送数量与阻塞原因）
+- 「分发规则」页新增链路自检面板与「立即推送队列」按钮；资源库新增「按目录重识别」「立即推送」按钮并显示目录线索
+
+### Telegram 测试推送与独立启停
+- 新增 `POST /api/bots/{id}/test-message`：Bot 行「测试推送」真实发一条 `sendMessage`；chat_id 留空自动取该 Bot 下第一个频道，未配置频道时提示手填。原「验证」改名「验证 Token」并说明不发消息
+- 新增 `PUT /api/bots/{id}` / `PUT /api/channels/{id}`：Bot 与频道各自独立启停，未配置/停用即不启用该链路
+- `process_queue` 遇到停用的 Bot/频道跳过队列项、不计失败、不消耗重试次数、不影响其它链路；重新启用后下一轮自动继续
+- Telegram API 地址改为运行时配置（管理页「分发规则 → 链路自检」可填反代），`main` 与 `publisher` 共用；连接超时/失败给出「国内网络请配置反向代理」等可操作中文提示
+
+### 测试
+- 新增 `tests/test_v061_fixes.py`（8 项）；全套 **46 项通过**，前端 `vite build` 通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.6.1
+```
+
+---
+
 ## v0.6.0 (2026-11-17)
 
 媒体识别重构：电影/剧集分类判定、TMDB 标签打标、AI 辅助识别、手动匹配窗口，并补齐 Bot/频道的测试与删除，顺带修掉「验证连接」的 `code=120`。

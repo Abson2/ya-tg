@@ -80,13 +80,74 @@ _TV_DIR = re.compile(r"电视剧|剧集|连续剧|动漫剧|动画剧|番剧|追
 _MOVIE_DIR = re.compile(r"电影|影片|剧场版|\bMovies?\b|\bFilms?\b", re.I)
 _MOVIE_WORD = re.compile(r"剧场版|\bMovie\b|\bOVA\b|\bOAD\b", re.I)
 
+# v0.6.1：季目录与「通用分类目录」不是作品名，必须跳过才能取到真正的剧名
+_SEASON_DIR = re.compile(
+    r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$|^S\d{1,2}$", re.I)
+_GENERIC_DIR = re.compile(
+    r"^(?:电影|影片|电视剧|剧集|连续剧|动漫|动画|番剧|纪录片|综艺|合集|资源|下载|媒体|"
+    r"媒体库|影视|4K|2160p|1080p|Movies?|Films?|TV|TVShows?|Series|Shows?|Media|"
+    r"Downloads?|Videos?|Anime|Documentar(?:y|ies))$", re.I)
+_SEASON_NUM = re.compile(r"(?:season|series|s)\s*[._\- ]?(\d{1,2})|第\s*(\d{1,2})\s*[季部]", re.I)
+_CN = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _clean_dir(segment: str) -> tuple[str, str]:
+    """清洗目录名为作品名：去年份、去重名后缀 (1)、去压制噪音。"""
+    text = _TMDB_TAG.sub(" ", segment or "")
+    year = ""
+    m = re.search(r"[\[\(\{]\s*((?:19|20)\d{2})\s*[\]\)\}]", text)
+    if m:
+        year = m.group(1)
+    else:
+        m = _YEAR.search(text)
+        if m:
+            year = m.group(0)
+    text = _RELEASE_NOISE.sub(" ", text)
+    text = _EP_NOISE.sub(" ", text)
+    # 网盘重名目录会自动补 (1)/(2)/（1），不是片名的一部分
+    text = re.sub(r"[\(（]\s*\d{1,2}\s*[\)）]\s*$", " ", text)
+    text = re.sub(r"[._]+", " ", text)
+    text = re.sub(r"[\(\)\[\]\{\}]", " ", text)
+    if year:
+        text = re.sub(rf"\b{year}\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -–_")
+    return text, year
+
+
+def _dir_clues(path_hint: str) -> tuple[str, str, int | None, bool]:
+    """从「作品目录/Season 1」里取作品名、年份、季号与季目录标记。
+
+    取最后一个非「季目录」、非「通用分类目录」的段作为作品名——剧集目录结构里
+    它才是剧名，单集文件名往往只是英文译名或发布组命名。
+    """
+    title, year, season, has_season_dir = "", "", None, False
+    for seg in re.split(r"[/\\]+", path_hint or ""):
+        seg = (seg or "").strip()
+        if not seg:
+            continue
+        if _SEASON_DIR.match(seg):
+            has_season_dir = True
+            m = _SEASON_NUM.search(seg)
+            if m and season is None:
+                season = int(m.group(1) or m.group(2) or 1)
+            continue
+        if _GENERIC_DIR.match(seg):
+            continue
+        cleaned, y = _clean_dir(seg)
+        if y and not year:
+            year = y
+        if cleaned:
+            title = cleaned
+    return title, year, season, has_season_dir
+
 
 def parse_media_name(name: str, path_hint: str = "") -> dict:
     """从文件名（可附父目录/路径）抽取识别线索。
 
-    v0.6.0：显式输出 type_hint / clean_title / tmdb_id / type_source，把「剧集单集」
-    与「电影」分开。判断顺序：季集 > 目录分类 > 剧集关键词 > 未知（交给双路搜索评分）。
-    旧字段 title/year/season/episode/resolution/is_tv_hint 保持不变，调用方无需改动。
+    v0.6.1：目录名优先。剧集单集文件名常是英文译名（The.Silent.Storm.S01E04），
+    真正作品名在父目录（谷雨 (2026)(1)/Season 1）。primary_title 取目录名，
+    alt_title 保留英文文件名备用；季目录既是 tv 硬线索，也不能被当成剧名。
+    旧字段 title/year/season/episode/resolution/is_tv_hint 保持不变。
     """
     raw = (name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
     stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", raw)
@@ -143,9 +204,20 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
         clean = re.sub(rf"\s*{year}\b", " ", clean).strip(" -–_")
     clean = re.sub(r"\s+", " ", clean).strip(" -–_")
 
+    file_title = clean or stem
+    dir_title, dir_year, dir_season, has_season_dir = _dir_clues(path_hint)
+    if dir_year and not year:
+        year = dir_year
+    if season is None and dir_season is not None:
+        season = dir_season
+    primary_title = dir_title or file_title
+    has_chinese = bool(_CN.search(primary_title))
+
     type_hint, type_source = "unknown", "none"
     if season is not None or episode is not None:
         type_hint, type_source = "tv", "episode"
+    elif has_season_dir:
+        type_hint, type_source = "tv", "season_dir"
     elif _TV_DIR.search(path_hint or ""):
         type_hint, type_source = "tv", "directory"
     elif _MOVIE_WORD.search(stem):
@@ -156,8 +228,15 @@ def parse_media_name(name: str, path_hint: str = "") -> dict:
         type_hint, type_source = "tv", "keyword"
 
     return {
-        "title": clean or stem,
-        "clean_title": clean or stem,
+        "title": primary_title,
+        "clean_title": primary_title,
+        # v0.6.1：目录名为主、英文文件名为备用，供中文优先搜索
+        "primary_title": primary_title,
+        "alt_title": file_title if dir_title and file_title != dir_title else "",
+        "file_title": file_title,
+        "dir_title": dir_title,
+        "title_source": "directory" if dir_title else "filename",
+        "has_chinese": has_chinese,
         "original": raw,
         "year": year,
         "season": season,
