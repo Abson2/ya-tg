@@ -51,8 +51,11 @@ services:
     ports:
       - "8787:8787"
     env_file: [.env]
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_URL: sqlite:////app/db/ya-tg.db
     volumes:
-      - ./data:/app/data
+      - ./db:/app/db
       - ./logs:/app/logs
 ```
 

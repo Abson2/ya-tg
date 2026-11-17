@@ -6,7 +6,7 @@
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
-- 当前版本：v0.5.0
+- 当前版本：v0.5.1
 - 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
 ---
@@ -90,7 +90,7 @@ services:
       start_period: 20s
 ```
 
-**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.5.0`，详见第六节。
+**注意**：如果你想部署指定历史版本（而不是最新版），在 `.env` 里加一行 `IMAGE_TAG=v0.5.1`，详见第六节。
 
 **.env** —— 把下面内容复制进去，至少改掉 `ADMIN_PASSWORD` 和 `APP_SECRET`：
 
@@ -104,18 +104,11 @@ APP_SECRET=请改成32位以上随机字符串
 # 网页访问端口，默认 8787
 WEB_PORT=8787
 
-# 光鸭官方 OpenAPI 凭证
-GUANGYA_CLIENT_ID=
-GUANGYA_PROJECT_ID=
-GUANGYA_SIGN_SECRET=
+# 光鸭账号不用在这里配置！
+# 部署完成后打开管理网页，用手机号+短信验证码一键登录，凭证自动获取并加密保存。
+# 不需要申请开放平台应用，也不需要抓包。
 
-# 网页分享会话凭证（自动建分享用）
-GUANGYA_SHARE_AUTHORIZATION=
-GUANGYA_SHARE_DID=
-GUANGYA_SHARE_DT=4
-GUANGYA_SHARE_SMID=
-
-# TMDB（识别海报和简介）
+# TMDB（识别海报和简介，可选）
 TMDB_BEARER_TOKEN=
 TMDB_LANGUAGE=zh-CN
 
@@ -210,11 +203,8 @@ http://你的机器IP:8787
 | 配置项 | 作用 | 建议 |
 | --- | --- | --- |
 | `ADMIN_PASSWORD` | 管理后台登录密码 | 必须修改，用强密码 |
-| `APP_SECRET` | 加密 token 的主密钥 | 必须修改；**改了之后要重新授权和重新添加 Bot** |
-| `GUANGYA_CLIENT_ID` | 光鸭开放平台应用 ID | 必填 |
-| `GUANGYA_PROJECT_ID` / `GUANGYA_SIGN_SECRET` | Device 授权用 | 用 Device 授权时必填 |
-| `GUANGYA_OAUTH_REDIRECT_URI` | PKCE 回调地址 | 用网页授权时必填，需和平台登记一致 |
-| `GUANGYA_SHARE_AUTHORIZATION` 等 4 项 | 自动建分享的网页会话 | 要用自动分享就必填，过期需更新 |
+| `APP_SECRET` | 加密 token 的主密钥 | 必须修改；**改了之后要重新短信登录和重新添加 Bot** |
+| 光鸭凭证（全部） | 扫描与建分享的登录凭证 | **不用在 .env 填**：管理页手机号+短信验证码一键登录，自动获取并刷新 |
 | `TMDB_BEARER_TOKEN` | TMDB v4 令牌 | 推荐填，用于海报和简介 |
 | `SCAN_CRON` | 扫描频率 | 默认每 30 分钟；5 段 Cron，北京时间 |
 | `SCAN_ROOT_ID` | 从哪个目录开始扫 | 留空=全盘；测试时填小目录 |
@@ -234,10 +224,10 @@ http://你的机器IP:8787
 
 ### 部署指定版本
 
-在 `.env` 里加一行（例如锁定 v0.5.0）：
+在 `.env` 里加一行（例如锁定 v0.5.1）：
 
 ```env
-IMAGE_TAG=v0.5.0
+IMAGE_TAG=v0.5.1
 ```
 
 然后：
@@ -250,7 +240,7 @@ docker compose up -d
 也可以用一键脚本切换：
 
 ```bash
-bash scripts/update.sh v0.5.0
+bash scripts/update.sh v0.5.1
 ```
 
 ### 回滚到上一版
@@ -287,10 +277,10 @@ A：Device 授权申请设备码时校验出口 IP。到你光鸭开放平台后
 A：Token 失效，程序会自动刷新重试。如果反复失败，去授权页重新授权一次。
 
 **Q：推送一直失败，队列里显示错误？**
-A：常见原因：Bot token 错、Bot 没在频道里、频道 ID 写错（要带负号）、建分享的网页会话过期。看队列页的 `error` 字段定位。
+A：常见原因：Bot token 错、Bot 没在频道里、频道 ID 写错（要带负号）、光鸭登录凭证过期。看队列页的 `error` 字段定位。
 
-**Q：分享创建失败？**
-A：网页会话凭证（`GUANGYA_SHARE_AUTHORIZATION` 等）会过期。重新抓包后更新 `.env`，`docker compose restart`。这是网页端接口，不是官方 OpenAPI，属于已知限制。
+**Q：分享创建失败 / 提示未登录？**
+A：到「光鸭授权」页用手机号+短信验证码重新登录一次即可。登录凭证到期后一般会自动刷新；若短信登录失效（如长时间未用），重新登录会把新凭证加密保存，扫描和建分享自动恢复。无需抓包、无需改 `.env`。
 
 **Q：TMDB 识别不准？**
 A：在资源库点「手动识别」，输入正确的 TMDB ID。文件名越规范（含年份、SxxEexx），自动识别越准。

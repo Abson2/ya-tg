@@ -113,13 +113,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.5.1", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.5.1", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
