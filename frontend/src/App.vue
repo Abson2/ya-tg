@@ -33,6 +33,15 @@ const diagnostics = ref({ blockers: [] }), telegramBase = ref(''), telegramSavin
 const queueSchedule = ref({ interval_seconds: 30, cron: '', send_delay: 2 }), scheduleSaving = ref(false)
 const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
+// v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
+const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
+const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, interval_presets: [], unverified_endpoints: [], note: '' })
+const mirrorStatus = ref({ counts: {}, media: [], tasks: [], rule: {}, unverified_endpoints: [] })
+const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
+const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持' })
+const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
+const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
+const finishChecks = ref([]), finishChecking = ref(false)
 
 async function loadTmdb() {
   try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
@@ -157,6 +166,7 @@ const navGroups = [
   { label: '光鸭资源', items: [
     { key: '光鸭授权', icon: 'key', label: '光鸭授权' },
     { key: '扫描设置', icon: 'scan', label: '扫描设置' },
+    { key: '镜像同步', icon: 'copy', label: '镜像同步' },
     { key: '资源库', icon: 'folder', label: '资源库' }
   ] },
   { label: '分发中心', items: [
@@ -167,6 +177,7 @@ const navGroups = [
   { label: '系统', items: [
     { key: 'TMDB 设置', icon: 'image', label: 'TMDB 设置' },
     { key: '消息模板', icon: 'file', label: '消息模板' },
+    { key: '互动中心', icon: 'link', label: '互动中心' },
     { key: '操作审计', icon: 'clock', label: '操作审计' }
   ] }
 ]
@@ -319,6 +330,15 @@ async function load() {
   try { await loadTgExtra() } catch (e) {}
   try { const t = await api('/telegram/config'); telegramBase.value = t.base_url || t.default || '' } catch (e) {}
   try { queueSchedule.value = await api('/queue/schedule') } catch (e) {}
+  // v0.8.0：每个新模块独立加载，任一接口异常不影响主界面（沿用既有约定）
+  try { scanInterval.value = task.value.interval_minutes || 0; scanCustom.value = !task.value.interval_minutes } catch (e) {}
+  try { mirrorCfg.value = await api('/mirror/config') } catch (e) {}
+  try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
+  try { scanBatches.value = await api('/scan/batches?limit=5') } catch (e) {}
+  try { interactionCfg.value = await api('/interaction/config') } catch (e) {}
+  try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
+  try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
+  try { mediaRequests.value = await api('/media-requests?limit=50') } catch (e) {}
   await loadAuth()
   await loadTmdb()
   await loadAi()
@@ -335,12 +355,82 @@ async function login() {
 }
 function logout() { authed.value = false; password.value = ''; localStorage.removeItem('ya_tg_password') }
 async function saveTask() {
-  try { await api('/scan-task', { method: 'PUT', body: JSON.stringify(task.value) }); ElMessage.success('扫描计划已保存'); await load() }
+  // v0.8.0：默认用预设间隔按钮，只有开启「自定义 Cron」才提交表达式
+  const body = { interval_minutes: scanCustom.value ? 0 : Number(scanInterval.value || 0),
+    cron: scanCustom.value ? (task.value.cron || '') : '',
+    root_id: task.value.root_id || '', enabled: !!task.value.enabled }
+  try { await api('/scan-task', { method: 'PUT', body: JSON.stringify(body) }); ElMessage.success('扫描计划已保存'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
+function pickScanInterval(v) { scanInterval.value = v; scanCustom.value = false }
+const intervalLabel = v => v >= 1440 ? '每天' : (v >= 60 ? `每 ${v / 60} 小时` : `每 ${v} 分钟`)
 async function scan() {
-  try { const d = await api('/scan-now', { method: 'POST' }); ElMessage.success(`扫描完成：${d.files} 个文件（${d.resumed ? '断点续扫' : '全新扫描'}）`); await load() }
+  try { const d = await api('/scan-now', { method: 'POST' }, 180000); ElMessage.success(`扫描完成：${d.files} 个文件（${d.resumed ? '断点续扫' : '全新扫描'}）`); await load() }
   catch (e) { ElMessage.error(e.message) }
+}
+// ---------- A/B 镜像 ----------
+async function saveMirror() {
+  mirrorSaving.value = true
+  try {
+    await api('/mirror/config', { method: 'POST', body: JSON.stringify(mirrorCfg.value) })
+    ElMessage.success('镜像设置已保存')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorSaving.value = false }
+}
+async function runMirror(postIdentify = false) {
+  mirrorBusy.value = true
+  try {
+    const d = await api(`/mirror/run?post_identify=${postIdentify ? 'true' : 'false'}`, { method: 'POST' }, 300000)
+    ElMessage.success(`同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}`)
+    if (d.errors?.length) ElMessage.warning(d.errors[0])
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+async function pollMirrorTasks() {
+  mirrorBusy.value = true
+  try { const d = await api('/mirror/tasks/poll', { method: 'POST' }, 120000); ElMessage.success(`轮询 ${d.tasks} 个任务，确认完成 ${d.done} 个`); await load() }
+  catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// ---------- 用户互动 ----------
+async function saveInteraction() {
+  interactionSaving.value = true
+  try {
+    const c = interactionCfg.value
+    const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
+      tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
+      donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
+      donation_button_text: c.donation_button_text || '打赏支持' }
+    // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
+    if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
+    if (c.contribution_bot_token) body.contribution_bot_token = c.contribution_bot_token
+    await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
+    ElMessage.success('互动设置已保存（密钥加密存储）')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { interactionSaving.value = false }
+}
+async function testTgto() {
+  tgtoTesting.value = true
+  try { const d = await api('/tgto/test', { method: 'POST' }, 30000); ElMessage.success(`${d.message}（现有规则 ${d.rules} 条，未写入）`) }
+  catch (e) { ElMessage.error(e.message) }
+  finally { tgtoTesting.value = false }
+}
+async function handleContribution(id, status) {
+  try { await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note: '' }) }); await load() }
+  catch (e) { ElMessage.error(e.message) }
+}
+async function addWant() {
+  const t = String(wantTitle.value || '').trim()
+  if (!t) { ElMessage.warning('请填写影视名称'); return }
+  try {
+    const d = await api('/media-requests', { method: 'POST', body: JSON.stringify({ title: t, media_type: 'tv' }) }, 60000)
+    ElMessage[d.status === 'synced' ? 'success' : 'warning'](`${t}：${d.status === 'synced' ? '关键词已生效' : (d.note || '仅登记，未同步')}`)
+    wantTitle.value = ''
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
 }
 async function addBot() {
   try { await api('/bots', { method: 'POST', body: JSON.stringify(bot.value) }); bot.value = { name: '', token: '' }; manageDialog.value = false; ElMessage.success('Bot 已添加'); await load() }
@@ -755,23 +845,41 @@ function insertVar(key) { tpl.value.content = (tpl.value.content || '') + '{{' +
 function selectedRepIds() {
   return filteredSeries.value.filter(g => selectedSeries.value.includes(g.key)).map(g => g.representative_id)
 }
-async function batchAction(action) {
+async function batchAction(action, finish = '') {
   const ids = selectedRepIds()
   if (!ids.length) { ElMessage.warning('请先勾选作品'); return }
   let duration = 0
   if (action === 'set_duration' || action === 're_share') {
     duration = Number(batchDuration.value || 0)
   }
-  const labels = { set_duration: '设置效期', cancel_share: '取消分享', re_share: '重新分享', identify: '批量重识别' }
+  const labels = { set_duration: '设置效期', cancel_share: '取消分享', re_share: '重新分享', identify: '批量重识别', set_finish: '修正完结状态' }
   if (action === 'cancel_share' && !await confirmBox(`确定取消勾选的 ${ids.length} 部作品的分享？`)) return
   batchBusy.value = true
   try {
-    const r = await api('/library/batch', { method: 'POST', body: JSON.stringify({ ids, action, duration }) })
+    const r = await api('/library/batch', { method: 'POST', body: JSON.stringify({ ids, action, duration, finish }) })
     ElMessage.success(`${labels[action]}完成：成功 ${r.succeeded}，失败 ${r.failed}${r.errors?.length ? '（' + r.errors[0] + '）' : ''}`)
     selectedSeries.value = []
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { batchBusy.value = false }
+}
+// v0.8.0：完结剧识别错误时手动打标，整部作品同步并锁定，TMDB 回填不再覆盖
+async function setFinish(g, finish) {
+  try {
+    await api('/library/batch', { method: 'POST', body: JSON.stringify({ ids: [g.representative_id], action: 'set_finish', finish }) })
+    const hint = finish === 'ended' ? '已标记完结' : finish === 'returning' ? '已标记追更' : finish === 'auto' ? '已恢复自动判断' : '已清除状态'
+    ElMessage.success(`${g.title} ${hint}`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function loadFinishCheck() {
+  finishChecking.value = true
+  try {
+    const d = await api('/library/finish-check?limit=30', {}, 120000)
+    finishChecks.value = d.items || []
+    ElMessage.success(`已核对 ${d.checked} 部剧（只读，不自动改状态）`)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { finishChecking.value = false }
 }
 async function confirmBox(msg) {
   try { await ElMessageBox.confirm(msg, '确认操作', { type: 'warning' }); return true }
@@ -834,7 +942,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.7.1 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.0 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1001,13 +1109,22 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '扫描设置'" class="fade">
-          <div class="page-head"><div><h2>扫描设置</h2><p>五段式 Cron，固定 Asia/Shanghai（UTC+8）</p></div></div>
+          <div class="page-head"><div><h2>扫描设置</h2><p>点击选择扫描间隔，固定 Asia/Shanghai（UTC+8）；高级用户可展开自定义 Cron</p></div></div>
           <div class="panel narrow">
+            <div class="panel-head"><h3>扫描计划</h3><el-tag size="small">Asia/Shanghai · UTC+8</el-tag></div>
+            <div class="field"><label>扫描间隔</label>
+              <div class="preset-row">
+                <button v-for="v in scanPresets" :key="v" class="preset-btn" :class="{on: !scanCustom && scanInterval === v}" @click="pickScanInterval(v)">{{ intervalLabel(v) }}</button>
+              </div>
+              <small>点选即可，无需手写 Cron。当前表达式：{{ task.cron || '未设置' }}</small>
+            </div>
+            <div class="field"><label class="inline-label"><input type="checkbox" v-model="scanCustom"/> 自定义 Cron 表达式</label>
+              <el-input v-if="scanCustom" v-model="task.cron" placeholder="*/30 * * * *"/>
+              <small v-if="scanCustom">例：*/10 * * * * 每 10 分钟；0 3 * * * 每天 03:00</small>
+            </div>
             <div class="form-grid">
-              <div class="field"><label>Cron 表达式</label><el-input v-model="task.cron" placeholder="*/30 * * * *"/><small>例：*/10 * * * * 每 10 分钟；0 3 * * * 每天 03:00</small></div>
-              <div class="field"><label>扫描根目录 ID</label><el-input v-model="task.root_id" placeholder="留空为根目录"/></div>
+              <div class="field"><label>扫描根目录 ID（B 镜像库）</label><el-input v-model="task.root_id" placeholder="留空为根目录"/></div>
               <div class="field inline"><label>启用定时扫描</label><el-switch v-model="task.enabled"/></div>
-              <div class="field inline"><label>时区</label><el-tag>Asia/Shanghai · UTC+8</el-tag></div>
             </div>
             <div class="panel-foot"><el-button type="primary" @click="saveTask">保存计划</el-button><el-button @click="scan"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('play')"/></svg> 立即扫描</el-button></div>
           </div>
@@ -1016,10 +1133,112 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <div class="cursor-box"><div><small>游标状态</small><b>{{ task.cursor_status }}</b></div><div><small>已处理文件</small><b>{{ task.cursor_files }}</b></div><div><small>遍历目录</small><b>{{ task.cursor_dirs }}</b></div></div>
             <p class="hint">{{ task.last_message || '尚未执行扫描' }}{{ task.cursor_error ? ' · 错误：' + task.cursor_error : '' }}</p>
           </div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>扫描批次保护</h3><el-tag size="small" type="info">仅完整全量批次允许对账删除</el-tag></div>
+            <div class="table-scroll"><el-table :data="scanBatches" size="small">
+              <el-table-column prop="id" label="#" width="60"/>
+              <el-table-column prop="status" label="状态" width="100"/>
+              <el-table-column prop="files" label="文件" width="80"/>
+              <el-table-column prop="seen_count" label="本轮见到" width="100"/>
+              <el-table-column label="完整" width="80"><template #default="s">{{ s.row.complete ? '是' : '否' }}</template></el-table-column>
+              <el-table-column label="允许对账" width="100"><template #default="s">{{ s.row.reconcile_allowed ? '是' : '否' }}</template></el-table-column>
+            </el-table></div>
+            <p class="hint">分页不完整、断点续扫、空结果或接口异常时，一律跳过对账，不会误删资源或取消分享。</p>
+          </div>
+        </section>
+
+        <section v-else-if="tab === '镜像同步'" class="fade">
+          <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；增量复制、身份保护、完成不自动推送 Telegram</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>A / B 库设置</h3></div>
+            <div class="form-grid">
+              <div class="field"><label>A 源头库目录 ID（只读）</label><el-input v-model="mirrorCfg.source_root_id" placeholder="光鸭网页端目录 fileId"/></div>
+              <div class="field"><label>B 镜像库目录 ID（用于分享与推送）</label><el-input v-model="mirrorCfg.target_root_id" placeholder="光鸭网页端目录 fileId"/></div>
+            </div>
+            <div class="field"><label>同步间隔</label>
+              <div class="preset-row">
+                <button v-for="v in (mirrorCfg.interval_presets || [])" :key="v" class="preset-btn" :class="{on: mirrorCfg.interval_minutes === v}" @click="mirrorCfg.interval_minutes = v">{{ intervalLabel(v) }}</button>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div class="field inline"><label>启用定时同步</label><el-switch v-model="mirrorCfg.enabled"/></div>
+              <div class="field inline"><label>B 库主目录带 * 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
+            </div>
+            <p class="hint">{{ mirrorCfg.note }}</p>
+            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button :loading="mirrorBusy" @click="runMirror(false)">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror(true)">同步并识别（不推送）</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
+          </div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
+            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>内容变化事件</small><b>{{ mirrorStatus.counts?.change_events || 0 }}</b></div></div>
+            <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
+            <p class="hint">已确认接口：<span v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}；</span></p>
+            <p class="hint">待验证接口（未实现，不猜测参数）：<span v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}、</span></p>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>影视映射清单</h3></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.media || []" size="small">
+              <el-table-column prop="title" label="标准影视名" min-width="180"/>
+              <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
+              <el-table-column prop="media_type" label="类型" width="90"/>
+              <el-table-column prop="files" label="文件" width="80"/>
+              <el-table-column prop="status" label="状态" width="110"/>
+            </el-table></div>
+            <p class="hint">B 库目录名里的 * 只存在于网盘；资源库、分享标题与 Telegram 推送一律使用标准影视名。</p>
+          </div>
+        </section>
+
+        <section v-else-if="tab === '互动中心'" class="fade">
+          <div class="page-head"><div><h2>互动中心</h2><p>用户投稿 · 我想看关键词监控 · TgtoDrive OpenAPI · 打赏设置</p></div><el-tag size="small">待审 {{ interactionStatus.contributions_pending || 0 }}</el-tag></div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>TgtoDrive 与投稿 Bot</h3></div>
+            <div class="form-grid">
+              <div class="field"><label>TgtoDrive 地址</label><el-input v-model="interactionCfg.tgto_base_url" placeholder="http://127.0.0.1:端口"/></div>
+              <div class="field"><label>场景名</label><el-input v-model="interactionCfg.tgto_scene" placeholder="ENV_FILTER_GUANGYA"/></div>
+              <div class="field"><label>OpenAPI Token（留空保持原值）</label><el-input v-model="interactionCfg.tgto_api_key" placeholder="已配置则留空" show-password/></div>
+              <div class="field"><label>投稿 Bot Token（留空保持原值）</label><el-input v-model="interactionCfg.contribution_bot_token" placeholder="已配置则留空" show-password/></div>
+            </div>
+            <div class="form-grid">
+              <div class="field inline"><label>启用投稿 / 想看监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
+              <div class="field inline"><label>启用打赏</label><el-switch v-model="interactionCfg.donation_enabled"/></div>
+            </div>
+            <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存设置</el-button><el-button :loading="tgtoTesting" @click="testTgto">测试连接（只读）</el-button></div>
+            <p class="hint">关键词规则采用「读取全量 → 合并 → 回写 → 回读校验」，只新增/更新本项目幂等 id 的规则，绝不覆盖原有关键词或其它项目规则。用户指令：/want、/contribute、/donate、/help。</p>
+          </div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>打赏设置</h3></div>
+            <div class="form-grid">
+              <div class="field"><label>二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
+              <div class="field"><label>按钮文字</label><el-input v-model="interactionCfg.donation_button_text"/></div>
+            </div>
+            <div class="field"><label>打赏说明</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2"/></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>添加「我想看」关键词</h3></div>
+            <div class="inline-form"><el-input v-model="wantTitle" placeholder="影视名称" style="width:260px"/><el-button type="primary" @click="addWant">加入监控</el-button></div>
+            <div class="table-scroll"><el-table :data="mediaRequests" size="small">
+              <el-table-column prop="title" label="影视名称" min-width="180"/>
+              <el-table-column prop="keyword_id" label="规则 ID" min-width="150"/>
+              <el-table-column prop="status" label="状态" width="110"/>
+              <el-table-column prop="note" label="备注" min-width="180"/>
+            </el-table></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>用户投稿</h3></div>
+            <div class="table-scroll"><el-table :data="contributions" size="small">
+              <el-table-column prop="title" label="标题" min-width="180"/>
+              <el-table-column prop="tg_username" label="用户" width="120"/>
+              <el-table-column prop="status" label="状态" width="110"/>
+              <el-table-column label="操作" width="200"><template #default="s">
+                <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
+                <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
+              </template></el-table-column>
+            </el-table></div>
+            <p class="hint">投稿转存到光鸭所用的接口在需求文档 8.6 仍待抓包验证，当前仅登记与审核，不自动入库、不自动推送。</p>
+          </div>
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">
@@ -1046,8 +1265,24 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <el-button size="small" type="primary" plain :loading="batchBusy" @click="batchAction('set_duration')">设置效期</el-button>
             <el-button size="small" :loading="batchBusy" @click="batchAction('re_share')">重新分享</el-button>
             <el-button size="small" :loading="batchBusy" @click="batchAction('identify')">批量重识别</el-button>
+            <el-button size="small" :loading="batchBusy" @click="batchAction('set_finish', 'ended')">标记完结</el-button>
+            <el-button size="small" :loading="batchBusy" @click="batchAction('set_finish', 'returning')">标记追更</el-button>
             <el-button size="small" type="danger" plain :loading="batchBusy" @click="batchAction('cancel_share')">取消分享</el-button>
             <el-button size="small" text @click="selectedSeries=[]">清空选择</el-button>
+          </div>
+
+          <div v-if="finishChecks.length" class="panel narrow">
+            <div class="panel-head"><h3>完结校验（TMDB 集数 vs 本地文件）</h3><el-button size="small" text @click="finishChecks=[]">收起</el-button></div>
+            <div class="table-scroll"><el-table :data="finishChecks" size="small">
+              <el-table-column prop="title" label="影视" min-width="160"/>
+              <el-table-column prop="tmdb_status" label="TMDB 状态" width="110"/>
+              <el-table-column prop="expected_episodes" label="应有集" width="90"/>
+              <el-table-column prop="local_episodes" label="本地集" width="90"/>
+              <el-table-column prop="current_finish" label="当前标记" width="100"/>
+              <el-table-column prop="verdict" label="结论" width="100"/>
+              <el-table-column prop="suggestion" label="建议" min-width="200"/>
+            </el-table></div>
+            <p class="hint">只读核对，不自动改状态；TMDB 状态滞后时用卡片上的「完结状态」手动修正并锁定。</p>
           </div>
 
           <!-- 作品视图：整部剧/电影一张海报卡，支持勾选批量管理 -->
@@ -1060,8 +1295,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
                 <input type="checkbox" class="card-check" :checked="selectedSeries.includes(g.key)" @click.stop="toggleSelect(g.key)"/>
                 <span v-if="g.share_status === 'active'" class="scrape-ok">✓</span>
                 <span class="media-badge" :class="'badge-'+g.share_status">{{ g.share_status === 'active' ? '已分享' : (g.share_status === 'not_created' ? '未分享' : g.share_status) }}</span>
-                <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结</span>
-                <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更</span>
+                <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结<span v-if="g.finish_locked">·手动</span></span>
+                <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更<span v-if="g.finish_locked">·手动</span></span>
                 <span v-if="g.share_duration" class="dur-badge">{{ durLabel(g.share_duration) }}</span>
                 <span class="ep-count">{{ g.count }} 集</span>
               </div>
@@ -1072,6 +1307,15 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
                 <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
                 <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
                 <el-button size="small" text @click="openMatch(seriesRepresentative(g) || {id:g.representative_id, name:g.title, path_hint:''})">手动修正</el-button>
+                <el-dropdown size="small" trigger="click" @command="c => setFinish(g, c)">
+                  <el-button size="small" text>完结状态 ▾</el-button>
+                  <template #dropdown><el-dropdown-menu>
+                    <el-dropdown-item command="ended">标记完结（锁定）</el-dropdown-item>
+                    <el-dropdown-item command="returning">标记追更（锁定）</el-dropdown-item>
+                    <el-dropdown-item command="">清除状态（锁定）</el-dropdown-item>
+                    <el-dropdown-item command="auto">恢复 TMDB 自动判断</el-dropdown-item>
+                  </el-dropdown-menu></template>
+                </el-dropdown>
               </div>
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
@@ -1480,6 +1724,13 @@ button{font-family:inherit}
 .fin-ended{background:rgba(25,179,166,.92)}.fin-returning{background:rgba(242,163,60,.95)}
 .dur-badge{position:absolute;top:8px;right:8px;padding:2px 7px;border-radius:9px;background:rgba(20,24,40,.72);color:#fff;font-size:9px;z-index:4}
 .tg-extra-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+/* ============ v0.8.0：间隔按钮 / 镜像 / 互动 ============ */
+.preset-row{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px}
+.preset-btn{border:1px solid var(--yg-line);background:var(--yg-surface);color:var(--yg-ink);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;transition:.15s}
+.preset-btn:hover{border-color:var(--yg-primary)}
+.preset-btn.on{background:var(--yg-primary);border-color:var(--yg-primary);color:#fff;font-weight:600}
+.inline-label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:400}
+.inline-form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 @media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}}
 
 /* ============ v0.6.5 手机 / 触屏适配 ============ */

@@ -128,9 +128,51 @@ def normalize_work_name(s: str) -> str:
     v = re.sub(r"[\[(（【{][^\])）】}]*[\])）】}]", "", str(s))
     # 兜底：裸 tmdb-/imdb- 标记（无括号包裹时）也去掉，避免同剧裂卡
     v = re.sub(r"\b(?:tmdb|imdb)[-_:：]?\d+\b", "", v, flags=re.I)
+    # v0.8.0：B 库影视主目录按约定插入 *（如「大*醉*侠 *(2002)」）。
+    # 归一化必须剥掉 *，否则 A 库「大醉侠」与 B 库「大*醉*侠」会算成两部剧，
+    # 镜像映射、资源库聚合、TG 整剧统计全部错位。
+    v = v.replace("*", "")
     v = re.sub(r"[\s\-_.,·:：]+", "", v).lower()
     v = re.sub(r"(19|20)\d{2}$", "", v)
     return v
+
+
+def standard_media_name(s: str) -> str:
+    """B 库带 * 目录名 → 展示/管理/TG 推送使用的标准影视名。
+
+    只去掉 *，保留年份与 {tmdb-} 标记（它们携带识别信息）。重命名接口未验证前，
+    系统不改动网盘里的真实目录名，仅在展示层做标准化。
+    """
+    return str(s or "").replace("*", "").strip()
+
+
+def star_media_name(s: str) -> str:
+    """按 B 库命名约定生成带 * 的期望目录名（每个字符间插入 *，保留年份/标记）。
+
+    仅用于对照与提示；由于重命名接口未验证，系统不会自动执行改名。
+    """
+    text = str(s or "").strip()
+    if not text:
+        return ""
+    # 只给主标题段加 *，年份与 {tmdb-} 标记保持可识别
+    m = re.match(r"^(.*?)(\s*[\(（\[【].*)?$", text)
+    head, tail = (m.group(1), m.group(2) or "") if m else (text, "")
+    if "*" in head:
+        return text
+    return "*".join(head.strip()) + ("*" + tail.strip().lstrip("*") if tail.strip() else "")
+
+
+def media_identity(tmdb_id, media_type: str, season, episode, file_name: str = "") -> tuple[str, bool]:
+    """文件身份：优先 TMDB ID + 类型 + 季 + 集；不足时退化为文件名键并标记「不明确」。
+
+    返回 (identity, confident)。identity 不明确时调用方只允许新增，禁止替换 B 库已有文件，
+    对应最终版需求文档的「身份不明确禁止自动替换」。
+    """
+    if tmdb_id and media_type:
+        return f"tmdb:{tmdb_id}:{media_type}:S{int(season or 0)}:E{int(episode or 0)}", True
+    if tmdb_id:
+        return f"tmdb:{tmdb_id}:unknown:S{int(season or 0)}:E{int(episode or 0)}", False
+    return "name:" + normalize_work_name(file_name), False
 
 
 def work_group_key(x) -> str:
@@ -142,6 +184,11 @@ def work_group_key(x) -> str:
     x 只需具备同名属性（SQLAlchemy 模型或简单对象皆可），避免反向 import models。
     """
     work_name = str(getattr(x, "share_dir_name", "") or "").strip()
+    # v0.8.0：识别成功后 series_dir_info() 在缺 dir_chain 时会用父目录兜底，
+    # 可能把「Season 1」这种季目录名写进 share_dir_name。季目录/通用目录不是作品名，
+    # 若直接拿它当作品键，已识别单集会与未识别单集裂成两张卡，连带整剧集数统计失真。
+    if work_name and (_SEASON_DIR.match(work_name) or _GENERIC_DIR.search(work_name)):
+        work_name = ""
     parts = [s for s in re.split(r"[/\\]+", getattr(x, "path_hint", "") or "") if s.strip()]
     parent_name = ""
     if parts:

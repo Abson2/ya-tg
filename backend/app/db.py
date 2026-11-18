@@ -39,6 +39,8 @@ _COLUMNS = {
         "identify_note": "TEXT DEFAULT ''",
         # v0.7.0：完结/追更状态（TMDB status 推断）
         "finish_status": "TEXT DEFAULT ''",
+        # v0.8.0：手动修正完结/追更后锁定，TMDB 自动回填不得覆盖
+        "finish_locked": "BOOLEAN DEFAULT 0",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
         # v0.6.3：目录 fileId 链 + 剧集目录级分享

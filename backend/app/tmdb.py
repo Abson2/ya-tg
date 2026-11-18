@@ -230,6 +230,12 @@ def _normalize(item: dict, media_type: str) -> dict:
         "type": media_type,
         "type_label": type_label(media_type),
         "finish_status": finish_status,
+        # v0.8.0：完结/追更校验需要 TMDB 的季数、已播出集数与原始 status。
+        # 结合 B 库实际文件判断是否真的收齐，避免只信一个 status 字段。
+        "tmdb_status": str(item.get("status") or ""),
+        "number_of_seasons": int(item.get("number_of_seasons") or 0),
+        "number_of_episodes": int(item.get("number_of_episodes") or 0),
+        "next_episode_to_air": bool(item.get("next_episode_to_air")),
         "title": title,
         "original_title": original,
         "year": date[:4],

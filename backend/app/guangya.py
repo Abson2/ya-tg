@@ -128,6 +128,11 @@ class GuangYaWebFiles:
     """
 
     LIST_PATH = "/userres/v1/file/get_file_list"
+    # v0.8.0：A→B 镜像复制。以下两个路径与请求/响应结构来自《tg-gy 最终版项目开发需求文档》
+    # 第八章「已确认光鸭接口」，按原样实现，不推测参数。其余写接口（建目录/重命名/删除/
+    # 转存）在 8.6 仍标为待验证，未在此实现。
+    COPY_PATH = "/userres/v1/file/copy_file"
+    TASK_PATH = "/userres/v1/get_task_status"
 
     def __init__(self, db: Session):
         from .models import AuthToken
@@ -176,6 +181,51 @@ class GuangYaWebFiles:
                 continue
             break
         raise WebFileError(last_error)
+
+    async def _post_web(self, path: str, body: dict) -> dict:
+        """网页端写接口统一 POST，返回 data 段；沿用 list_files 的鉴权与重试约定。"""
+        last_error = ""
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+                r = await client.post(f"{self.base}{path}", json=body, headers=self.headers)
+            data = self._json(r)
+            code = data.get("code")
+            if r.status_code == 200 and (code == 0 or data.get("msg") == "success"):
+                return data.get("data") or {}
+            msg = str(data.get("msg") or data.get("message") or r.text[:200])
+            last_error = f"网页端 {path} 失败 code={code} msg={msg}"
+            if code in (401, 116, 117) or any(k in msg.lower() for k in
+                                             ("login", "登录", "unauthor", "token")):
+                raise WebFileError(last_error, code)
+            if r.status_code >= 500 or r.status_code == 429:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            break
+        raise WebFileError(last_error)
+
+    async def copy_file(self, file_ids: list[str], parent_id: str) -> str:
+        """把 A 库文件复制到 B 库目录，返回光鸭 taskId。
+
+        已确认请求：{"fileIds": ["..."], "parentId": "..."}
+        已确认响应：{"msg":"success","data":{"taskId":"..."}}
+        A 库本身不被修改；复制目标 parentId 必须是 B 库目录 fileId。
+        """
+        ids = [str(x) for x in file_ids if str(x).strip()]
+        if not ids or not str(parent_id or "").strip():
+            raise WebFileError("复制需要至少一个 fileId 和目标目录 parentId")
+        data = await self._post_web(self.COPY_PATH, {"fileIds": ids, "parentId": str(parent_id)})
+        task_id = str(data.get("taskId") or data.get("task_id") or data.get("id") or "")
+        if not task_id:
+            raise WebFileError("复制接口未返回 taskId，无法查询任务状态，本次同步不标记完成")
+        return task_id
+
+    async def get_task_status(self, task_id: str) -> dict:
+        """查询复制任务。只原样返回 status，含义判断交给调用方。
+
+        已确认 status=2 表示完成；其它取值含义未验证，不得猜测成成功或失败。
+        """
+        data = await self._post_web(self.TASK_PATH, {"taskId": str(task_id)})
+        return {"status": data.get("status"), "raw": data}
 
     @staticmethod
     def _json(r: httpx.Response) -> dict:

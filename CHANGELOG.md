@@ -8,6 +8,57 @@
 
 ---
 
+## v0.8.0 (2026-11-18)
+
+按《tg-gy 最终版项目开发需求文档》的全局架构推进第二批：A/B 镜像同步、扫描批次表、内容变化检测、完结校验与手动打标、用户互动/TgtoDrive 对接。同时把扫描设置页改成文档要求的时间间隔按钮。
+
+### 需求2：A 源头库 → B 镜像库
+- 新增 `mirror_rules` / `mirror_media` / `mirror_files` / `mirror_tasks` 四张映射表；A/B fileId 不同，映射单独保存，绝不把 A 的目录链或 `share_dir_id` 搬到 B。
+- `GuangYaWebFiles` 实现文档第八章**已确认**的两个接口，URL 与请求体按原文实现并有契约测试锁死：
+  ```http
+  POST /userres/v1/file/copy_file      {"fileIds":["..."],"parentId":"..."} → data.taskId
+  POST /userres/v1/get_task_status    {"taskId":"..."}                     → data.status
+  ```
+  只把 `status=2` 当完成；其它取值原样记录 `raw_status` 并标记 `unknown`，不猜成功/失败，可继续轮询。
+- 增量同步：只读遍历 A 库 → 按作品主目录分组 → 用 `size:utime` 指纹比对 → 只复制新增/变化文件 → 轮询任务 → **单部影视完成即提交入库**。身份用 `TMDB ID + 类型 + 季 + 集`，不明确时只允许新增、禁止自动替换。
+- 禁止「先删旧再复制」：内容变化时旧 B 文件保留并标记 `superseded`，只新增复制记录。
+- **B 库带 `*` 命名**：`normalize_work_name()` 剥掉 `*` 与 `{tmdb-}` 标记，A/B 同剧归一到同一作品键；`standard_media_name()` 保证资源库、分享标题、TG 推送一律用标准影视名。带 `*` 的目录名只存在于网盘。
+- **镜像完成禁止自动推 TG**：镜像模块不写 `push_queue`、不调用任何入队函数；`POST /api/mirror/run?post_identify=true` 可额外做 B 库扫描+识别，但强制 `publish_after_identify=False`。
+- 管理页新增「镜像同步」：A/B 目录 ID、间隔按钮、启停、立即同步、继续轮询、同步状态与影视映射清单。
+
+### 扫描批次保护与扫描设置
+- 新增 `resource_scan_batches` 表；`run_scan()` 每轮写批次（`complete` / `resumed` / `seen_json` / `reconcile_allowed`）。`_reconcile_library()` 传入 `batch_id` 时以批次表为**唯一权威信号**，批次未授权一律跳过。管理页新增批次列表。
+- 扫描周期改成按钮预设（10/15/30 分钟、1/2/6/12 小时、每天），保留可折叠的高级自定义 Cron。
+
+### 需求3：完结/追更手动修正与内容变化
+- `Resource.finish_locked` + `POST /api/library/batch` 新 action `set_finish`：按整部作品标记 `ended` / `returning` / 清空 / `auto`（恢复自动）。手动标记后 TMDB 自动回填与手动重新识别都不得覆盖，卡片角标显示「·手动」。批量操作条与作品卡下拉均可操作。
+- 新增 `GET /api/library/finish-check`：TMDB 季数/已播出集数与本地实际文件比对，给出「应有集/本地集/缺集/建议」，只读核对不自动改状态。`tmdb._normalize()` 补回 `number_of_seasons` / `number_of_episodes` / `tmdb_status`。
+- 修复一个会导致裂卡的真实缺陷：`_apply_identification()` 在缺目录链时会把「Season 1」写进 `share_dir_name`，旧作品键直接拿它当作品名，导致识别前后同一部剧裂成两张卡。`work_group_key()` 现跳过季目录/通用目录名。
+- 新增 `resource_versions` / `distribution_events`：扫描发现 `size/utime` 变化时只留版本，**不重建分享、不取消再创建**；同一批变化按作品合并成唯一一条「内容更新」事件，只重置一条队列项为待发送，不逐集重复推送。无变化不产生事件。
+
+### 需求4：用户互动 / TgtoDrive
+- 新增 `user_contributions` / `media_requests`；新增 Bot `getUpdates` 轮询（Telegram 官方 API，无需抓包）：`/want`、`/contribute`、`/donate`、`/help`。管理页「互动中心」可配置、测试连接、审核投稿、手工添加想看关键词、设置打赏。
+- TgtoDrive OpenAPI 按本地实证结构实现「GET 全量 → 内存合并 → POST 回写 → 回读校验」，Bearer 鉴权；只按幂等 id `kw_<tmdb>_<season>` 新增/更新 `source=ya-tg` 的规则，同 id 属其它来源直接返回 `conflict` 且一次都不写回，绝不覆盖原有关键词与其它项目规则。
+- 凭证类配置继续走运行时加密落库（`tgto_*` / `contribution_*` / `donation_*`），已登记到 `DEFAULTS`，不会出现保存被静默忽略。
+
+### 明确边界：仍待验证的光鸭接口（文档 8.6，未实现、未猜测）
+创建文件夹、重命名文件夹（B 库自动加 `*`）、删除 B 库文件、删除/批量删除目录、投稿分享转存。因此：B 库影视目录需先在光鸭网页端手工建立；镜像不会自动改名或删旧文件；投稿只登记与审核，不自动转存入库。管理页会直接列出这份待验证清单。
+
+### 升级提示
+- 升级后在「镜像同步」填 A/B 目录 ID 并保存，再到「资源库」点一次「重新扫描库」补齐批次与目录链。
+- 「完结校验」是只读的；确认识别有误后在作品卡「完结状态」下拉里手动标记并锁定。
+
+### 测试
+- 新增 `tests/test_v080_mirror_and_interaction.py`（15 项）：带 `*` 归一化、身份置信度、间隔预设往返、复制接口契约、增量/无变化/变化/未知状态/缺少目标目录、镜像不推 TG、手动完结锁定与解锁、批次权威、变化事件合并与分享复用、完结校验、TgtoDrive 合并与冲突、Bot 投稿/想看。
+- 全套 **110 项通过**，前端 `vite build` 通过。
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.8.0
+```
+
+---
+
 ## v0.7.1 (2026-11-18)
 
 需求3 补漏修复版：把 v0.7.0 里「代码写了但链路没通」的四项真正接起来，并按最终版需求文档第 12.2 节补齐扫描批次保护。**本版仍不含** A/B 镜像同步（需求2）与投稿/TgtoDrive 对接（需求4第二批），这两项按全局架构分阶段推进，不因本版发版而标记为完成。

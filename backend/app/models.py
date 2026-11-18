@@ -47,6 +47,8 @@ class Resource(Base):
     identify_note: Mapped[str] = mapped_column(Text, default="")
     # v0.7.0：完结/追更状态（来自 TMDB status），用于资源库角标与一级状态栏筛选
     finish_status: Mapped[str] = mapped_column(String(16), default="")  # ended/returning/""
+    # v0.8.0：用户在资源库手动修正完结/追更后锁定，禁止 TMDB 自动回填覆盖人工判断
+    finish_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")
@@ -191,3 +193,165 @@ class AuditLog(Base):
     target_id: Mapped[str] = mapped_column(String(64), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
     actor: Mapped[str] = mapped_column(String(48), default="admin")
+
+
+# ============================================================================
+# v0.8.0：A/B 镜像同步 + 扫描批次 + 内容变化 + 用户互动
+# 设计原则（最终版需求文档）：
+#   - A 源头库只读，B 镜像库才进入扫描/资源库/分享/TG 分发。
+#   - A/B fileId 不同，必须落映射表，禁止把 A 的 dir_chain/share_dir_id 搬到 B。
+#   - 身份以 TMDB ID + media_type + season + episode 为准，身份不明确禁止替换。
+#   - 镜像完成不得自动触发 TG 推送，业务状态独立保存。
+# ============================================================================
+
+class ResourceScanBatch(Base):
+    """全量扫描批次。只有 complete=1 且非断点续扫的批次才允许做对账删除（12.2）。"""
+    __tablename__ = "resource_scan_batches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    root_id: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(24), default="running")  # running/success/failed
+    files: Mapped[int] = mapped_column(Integer, default=0)
+    directories: Mapped[int] = mapped_column(Integer, default=0)
+    seen_count: Mapped[int] = mapped_column(Integer, default=0)
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    resumed: Mapped[bool] = mapped_column(Boolean, default=False)
+    reconcile_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    seen_json: Mapped[str] = mapped_column(Text, default="[]")
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MirrorRule(Base):
+    """一条 A→B 镜像规则。A 只读，B 用于后续全部分发链路。"""
+    __tablename__ = "mirror_rules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="默认镜像")
+    source_root_id: Mapped[str] = mapped_column(String(64), default="")   # A 源头库目录
+    target_root_id: Mapped[str] = mapped_column(String(64), default="")   # B 镜像库目录
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=60)    # 按钮式间隔，非手写 Cron
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    star_naming: Mapped[bool] = mapped_column(Boolean, default=True)      # B 库主目录插入 * 的约定
+    auto_identify: Mapped[bool] = mapped_column(Boolean, default=True)    # 镜像后自动识别（不推送）
+    last_run: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str] = mapped_column(String(24), default="never")
+    last_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MirrorMedia(Base):
+    """一部影视的 A/B 目录映射。work_key 与资源库作品键共用同一归一化规则。"""
+    __tablename__ = "mirror_media"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    title_standard: Mapped[str] = mapped_column(String(512), default="")   # 展示/推送用标准名
+    title_mirror: Mapped[str] = mapped_column(String(512), default="")     # B 库带 * 的真实目录名
+    tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    source_dir_id: Mapped[str] = mapped_column(String(64), default="")     # A 目录 fileId
+    target_dir_id: Mapped[str] = mapped_column(String(64), default="")     # B 目录 fileId
+    status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/syncing/synced/failed
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("rule_id", "work_key", name="uq_mirror_rule_work"),)
+
+
+class MirrorFile(Base):
+    """单个文件的 A→B 映射与身份指纹。替换只在同一 identity 内进行。"""
+    __tablename__ = "mirror_files"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    media_id: Mapped[int] = mapped_column(ForeignKey("mirror_media.id"), index=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
+    identity: Mapped[str] = mapped_column(String(128), default="", index=True)  # tmdb:type:S:E 或 文件名兜底
+    source_file_id: Mapped[str] = mapped_column(String(64), default="")
+    target_file_id: Mapped[str] = mapped_column(String(64), default="")
+    file_name: Mapped[str] = mapped_column(String(512), default="")
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    utime: Mapped[int] = mapped_column(BigInteger, default=0)
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")      # size + utime
+    status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/copying/synced/superseded/failed
+    task_id: Mapped[str] = mapped_column(String(64), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 同一 identity 允许保留历史版本（superseded）与当前版本，靠 source_file_id 区分。
+    # 内容变化时只新增复制，不删除 B 库旧文件（删除接口 8.6 待验证）。
+    __table_args__ = (UniqueConstraint("media_id", "source_file_id", "fingerprint",
+                                       name="uq_mirror_media_source_fingerprint"),)
+
+
+class MirrorTask(Base):
+    """光鸭复制任务轮询记录。只把 status=2 视为完成，其它取值原样记录不猜。"""
+    __tablename__ = "mirror_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
+    media_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    task_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/running/done/failed/unknown
+    raw_status: Mapped[str] = mapped_column(String(32), default="")
+    polls: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ResourceVersion(Base):
+    """B 库文件内容变化留痕。已分享影视内容变化时只记版本，不重建分享。"""
+    __tablename__ = "resource_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    resource_id: Mapped[int] = mapped_column(Integer, index=True)
+    file_id: Mapped[str] = mapped_column(String(64), default="")
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    old_fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    utime: Mapped[int] = mapped_column(BigInteger, default=0)
+    change_type: Mapped[str] = mapped_column(String(24), default="updated")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DistributionEvent(Base):
+    """作品级分发事件：同一批文件变化合并为一次「内容更新」推送，不逐集重复。"""
+    __tablename__ = "distribution_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    event_type: Mapped[str] = mapped_column(String(24), default="updated")
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    changed_files: Mapped[int] = mapped_column(Integer, default=0)
+    queue_id: Mapped[int] = mapped_column(Integer, default=0)
+    share_reused: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("work_key", "fingerprint", name="uq_event_work_fingerprint"),)
+
+
+class UserContribution(Base):
+    """Telegram 用户投稿。转存接口未验证前只登记，不落 B 库。"""
+    __tablename__ = "user_contributions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tg_user_id: Mapped[str] = mapped_column(String(64), default="")
+    tg_username: Mapped[str] = mapped_column(String(128), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    share_url: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/approved/rejected/transferred
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MediaRequest(Base):
+    """用户「我想看」→ TgtoDrive 关键词监控规则（幂等 id，不覆盖原有规则）。"""
+    __tablename__ = "media_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tg_user_id: Mapped[str] = mapped_column(String(64), default="")
+    tg_username: Mapped[str] = mapped_column(String(128), default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    season: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    keyword_id: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/synced/failed
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

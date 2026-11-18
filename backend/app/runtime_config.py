@@ -50,6 +50,18 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tg_link_style": ("tg_link_style", "button"),         # button/plain：分享链接按钮化
     "tg_detail_level": ("tg_detail_level", "compact"),    # compact/full：精简详情
     "reward_code": ("reward_code", ""),                    # 赞赏码（图片 URL 或文本）
+    # v0.8.0：TgtoDrive OpenAPI（独立外部系统，只读配置+关键词合并，不集成源码/数据库）
+    "tgto_base_url": ("tgto_base_url", ""),
+    "tgto_api_key": ("tgto_api_key", ""),
+    "tgto_scene": ("tgto_scene", "ENV_FILTER_GUANGYA"),
+    # v0.8.0：用户互动 / 打赏
+    "contribution_enabled": ("contribution_enabled", "false"),
+    "contribution_bot_token": ("contribution_bot_token", ""),
+    "contribution_update_offset": ("contribution_update_offset", "0"),
+    "donation_enabled": ("donation_enabled", "false"),
+    "donation_image_url": ("donation_image_url", ""),
+    "donation_text": ("donation_text", ""),
+    "donation_button_text": ("donation_button_text", "打赏支持"),
 }
 
 

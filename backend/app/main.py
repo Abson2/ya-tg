@@ -8,6 +8,7 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
@@ -16,17 +17,21 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import ai_assist, guangya_auth, guangya_sms, runtime_config, tmdb
+from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, mirror,
+               runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
-from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles
-from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, MessageTemplate,
-                     QueueItem, Resource, Rule, ScanCursor, ScanTask)
+from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
+from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, DistributionEvent,
+                     MediaRequest, MessageTemplate, MirrorFile, MirrorMedia, MirrorRule,
+                     MirrorTask, QueueItem, Resource, ResourceScanBatch, ResourceVersion, Rule,
+                     ScanCursor, ScanTask, UserContribution)
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, mask_secret
-from .utils import (as_utc, normalize_work_name, parse_media_name, retry_after_seconds,
-                    utcnow, work_group_key)
+from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name,
+                    retry_after_seconds, standard_media_name, star_media_name, utcnow,
+                    work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 _last_device_poll = 0.0
@@ -88,6 +93,15 @@ async def _job_token_refresh():
         db.close()
 
 
+async def _job_bot_poll():
+    """v0.8.0：投稿/我想看 Bot 消息轮询（Telegram 官方 getUpdates）。"""
+    with SessionLocal() as db:
+        try:
+            await bot_listener.poll_once(db)
+        except Exception:
+            db.rollback()
+
+
 def _queue_trigger(db: Session):
     """v0.6.4：按管理页配置生成队列推送触发器。cron 优先（5 段），否则用间隔秒数。"""
     cron = (runtime_config.get(db, "queue_cron") or "").strip()
@@ -122,8 +136,9 @@ async def _scheduled_scan(root: str) -> None:
     """
     with SessionLocal() as db:
         try:
-            data = await run_scan(root, resume=False)
+            await run_scan(root, resume=False)
             await _post_scan_identify(db, publish_after_identify=True)
+            process_change_events(db, publish=True)
             db.commit()
         except Exception:
             db.rollback()
@@ -141,6 +156,15 @@ async def lifespan(app: FastAPI):
             task = db.scalar(select(ScanTask).limit(1))
         cron, root, enabled = task.cron, task.root_id, task.enabled
         queue_trigger = _queue_trigger(db)
+        mr = db.scalar(select(MirrorRule).limit(1))
+        mirror_minutes, mirror_enabled = ((mr.interval_minutes, mr.enabled)
+                                          if mr else (60, False))
+    # v0.8.0：镜像定时任务热注册；只同步，不注册任何自动推送任务
+    if mirror_enabled:
+        try:
+            _schedule_mirror_job(mirror_minutes, True)
+        except Exception:
+            pass
     if enabled:
         try:
             scheduler.add_job(_scheduled_scan, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
@@ -153,18 +177,20 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_token_refresh, "interval", seconds=60, id="token_refresh",
                       max_instances=1, coalesce=True)
+    scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
+                      max_instances=1, coalesce=True)
     scheduler.start()
     yield
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.7.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.7.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -329,20 +355,66 @@ async def verify_openapi(db: Session = Depends(get_db)):
 
 
 # ---------- 扫描 ----------
+# v0.8.0：文档要求扫描周期用「时间间隔按钮」，不再让用户手写 Cron。
+# 仍保留高级自定义 Cron 输入（前端折叠），但默认与常用选项均由预设生成。
+SCAN_INTERVAL_PRESETS = [10, 15, 30, 60, 120, 360, 720, 1440]
+MIRROR_INTERVAL_PRESETS = [15, 30, 60, 120, 360, 720, 1440]
+
+
+def _interval_to_cron(minutes: int) -> str:
+    if minutes <= 0:
+        return ""
+    if minutes < 60:
+        return f"*/{minutes} * * * *"
+    if minutes < 1440 and minutes % 60 == 0:
+        return f"0 */{minutes // 60} * * *"
+    if minutes == 1440:
+        return "0 0 * * *"
+    raise ValueError("不支持的间隔，请选择预设值或使用自定义 Cron")
+
+
+def _cron_to_interval(cron: str) -> int:
+    parts = (cron or "").split()
+    if len(parts) != 5:
+        return 0
+    m, h = parts[0], parts[1]
+    if m.startswith("*/") and h == "*" and all(p == "*" for p in parts[2:]):
+        try:
+            return int(m[2:]) if int(m[2:]) in SCAN_INTERVAL_PRESETS else 0
+        except ValueError:
+            return 0
+    if m == "0" and h.startswith("*/") and all(p == "*" for p in parts[2:]):
+        try:
+            v = int(h[2:]) * 60
+            return v if v in SCAN_INTERVAL_PRESETS else 0
+        except ValueError:
+            return 0
+    if m == "0" and h == "0" and all(p == "*" for p in parts[2:]):
+        return 1440
+    return 0
+
+
 @app.get("/api/scan-task", dependencies=ADMIN)
 def scan_task(db: Session = Depends(get_db)):
     t = db.scalar(select(ScanTask).limit(1))
     c = db.get(ScanCursor, 1)
+    last = db.scalar(select(ResourceScanBatch).order_by(ResourceScanBatch.id.desc()).limit(1))
     return {k: getattr(t, k) for k in ["id", "name", "cron", "root_id", "enabled", "last_run", "last_status", "last_message"]} | {
+        "interval_minutes": _cron_to_interval(t.cron),
+        "interval_presets": SCAN_INTERVAL_PRESETS,
         "cursor_status": c.status if c else "never",
         "cursor_files": c.files_count if c else 0,
         "cursor_dirs": c.dirs_count if c else 0,
         "cursor_error": c.error if c else "",
+        "last_batch": ({"id": last.id, "status": last.status, "complete": last.complete,
+                        "reconcile_allowed": last.reconcile_allowed, "seen_count": last.seen_count}
+                       if last else None),
     }
 
 
 class ScanConfig(BaseModel):
-    cron: str
+    cron: str = ""                    # 高级自定义；interval_minutes>0 时由预设生成
+    interval_minutes: int = 0
     root_id: str = ""
     enabled: bool = True
 
@@ -350,19 +422,193 @@ class ScanConfig(BaseModel):
 @app.put("/api/scan-task", dependencies=ADMIN)
 def save_scan_task(p: ScanConfig, db: Session = Depends(get_db)):
     try:
-        trigger = CronTrigger.from_crontab(p.cron, timezone="Asia/Shanghai")
+        cron = _interval_to_cron(p.interval_minutes) if p.interval_minutes else (p.cron or "").strip()
+        if not cron:
+            raise ValueError("请选择扫描间隔，或填写自定义 Cron")
+        trigger = CronTrigger.from_crontab(cron, timezone="Asia/Shanghai")
     except Exception as e:
-        raise HTTPException(400, f"Cron 表达式无效：{e}")
+        raise HTTPException(400, f"扫描计划无效：{e}")
     t = db.scalar(select(ScanTask).limit(1))
-    t.cron, t.root_id, t.enabled = p.cron, p.root_id, p.enabled
-    add_audit(db, "scan_task_updated", target_type="scan", detail=json_dumps({"cron": p.cron, "root_id": p.root_id, "enabled": p.enabled}))
+    t.cron, t.root_id, t.enabled = cron, p.root_id, p.enabled
+    add_audit(db, "scan_task_updated", target_type="scan", detail=json_dumps({"cron": cron, "root_id": p.root_id, "enabled": p.enabled}))
     db.commit()
     if scheduler.get_job("global_scan"):
         scheduler.remove_job("global_scan")
     if p.enabled:
         scheduler.add_job(_scheduled_scan, trigger, args=[p.root_id], id="global_scan", replace_existing=True,
                           max_instances=1, coalesce=True)
-    return {"ok": True, "timezone": "Asia/Shanghai"}
+    return {"ok": True, "cron": cron, "interval_minutes": _cron_to_interval(cron),
+            "timezone": "Asia/Shanghai"}
+
+
+# ---------- v0.8.0：A 源头库 → B 镜像库 ----------
+def _mirror_rule(db: Session, create: bool = False) -> MirrorRule | None:
+    r = db.scalar(select(MirrorRule).limit(1))
+    if not r and create:
+        r = MirrorRule(name="默认镜像", enabled=False)
+        db.add(r)
+        db.flush()
+    return r
+
+
+def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
+    if scheduler.get_job("mirror_sync"):
+        scheduler.remove_job("mirror_sync")
+    if enabled:
+        scheduler.add_job(_scheduled_mirror,
+                          IntervalTrigger(minutes=max(5, int(minutes)), timezone="Asia/Shanghai"),
+                          id="mirror_sync", replace_existing=True, max_instances=1, coalesce=True)
+
+
+async def _scheduled_mirror() -> None:
+    """定时镜像：只同步 + 补映射，绝不触发 Telegram 推送。"""
+    with SessionLocal() as db:
+        try:
+            r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
+            if r and r.source_root_id and r.target_root_id:
+                await mirror.sync_rule(db, r)
+                await mirror.backfill_target_file_ids(db, r)
+        except Exception as exc:
+            db.rollback()
+            try:
+                r = db.scalar(select(MirrorRule).limit(1))
+                if r:
+                    r.last_status, r.last_message = "failed", str(exc)[:1000]
+                    db.commit()
+            except Exception:
+                pass
+
+
+class MirrorConfigInput(BaseModel):
+    name: str = "默认镜像"
+    source_root_id: str = ""     # A 源头库目录（只读）
+    target_root_id: str = ""     # B 镜像库目录
+    interval_minutes: int = 60
+    enabled: bool = False
+    star_naming: bool = True
+    auto_identify: bool = True
+
+
+@app.get("/api/mirror/config", dependencies=ADMIN)
+def mirror_config_get(db: Session = Depends(get_db)):
+    r = _mirror_rule(db)
+    return {
+        "name": r.name if r else "默认镜像",
+        "source_root_id": r.source_root_id if r else "",
+        "target_root_id": r.target_root_id if r else "",
+        "interval_minutes": r.interval_minutes if r else 60,
+        "enabled": bool(r.enabled) if r else False,
+        "star_naming": bool(r.star_naming) if r else True,
+        "auto_identify": bool(r.auto_identify) if r else True,
+        "interval_presets": MIRROR_INTERVAL_PRESETS,
+        "last_run": r.last_run if r else None,
+        "last_status": r.last_status if r else "never",
+        "last_message": r.last_message if r else "",
+        "confirmed_endpoints": [
+            "POST /userres/v1/file/copy_file",
+            "POST /userres/v1/get_task_status（status=2 为完成）",
+        ],
+        "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
+        "note": ("B 库影视主目录可带 * 命名，展示与推送一律用标准影视名；"
+                 "创建目录/重命名/删除接口未验证，系统不会自动改名或删文件，"
+                 "请在光鸭网页端手工建立对应目录。镜像完成不会自动推送 Telegram。"),
+    }
+
+
+@app.post("/api/mirror/config", dependencies=ADMIN)
+def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
+    if p.interval_minutes not in MIRROR_INTERVAL_PRESETS:
+        raise HTTPException(400, "同步间隔请选择预设值")
+    r = _mirror_rule(db, create=True)
+    r.name = (p.name or "默认镜像").strip()
+    r.source_root_id, r.target_root_id = p.source_root_id.strip(), p.target_root_id.strip()
+    r.interval_minutes, r.enabled = p.interval_minutes, p.enabled
+    r.star_naming, r.auto_identify = p.star_naming, p.auto_identify
+    add_audit(db, "mirror_config_saved", target_type="mirror",
+              detail=json_dumps({"source": r.source_root_id, "target": r.target_root_id,
+                                 "interval": r.interval_minutes, "enabled": r.enabled}))
+    db.commit()
+    _schedule_mirror_job(r.interval_minutes, r.enabled)
+    return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
+
+
+@app.post("/api/mirror/run", dependencies=ADMIN)
+async def mirror_run(post_identify: bool = False, db: Session = Depends(get_db)):
+    """立即同步一次。post_identify=True 时额外做 B 库扫描+识别，但强制不推 TG。"""
+    r = _mirror_rule(db, create=True)
+    if not r.source_root_id or not r.target_root_id:
+        raise HTTPException(400, "请先在镜像设置里填写 A 源头库目录 ID 与 B 镜像库目录 ID")
+    try:
+        stats = await mirror.sync_rule(db, r)
+        stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+        if post_identify:
+            scan = await run_scan(r.target_root_id, resume=False)
+            stats["scan"] = {k: v for k, v in scan.items() if k != "seen_file_ids"}
+            # 关键：镜像链路的识别绝不入队推送（V2.0 第十章）
+            stats["identify"] = await _post_scan_identify(db, publish_after_identify=False)
+        add_audit(db, "mirror_run", target_type="mirror",
+                  detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
+                                     "done": stats.get("done"), "unknown": stats.get("unknown")}))
+        db.commit()
+        return stats
+    except WebFileError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"镜像同步失败：{exc}")
+
+
+@app.post("/api/mirror/tasks/poll", dependencies=ADMIN)
+async def mirror_poll_tasks(db: Session = Depends(get_db)):
+    r = _mirror_rule(db)
+    if not r:
+        return {"tasks": 0, "done": 0, "still_unknown": 0}
+    try:
+        out = await mirror.poll_pending_tasks(db, r)
+        if out["done"]:
+            out["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+        return out
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+@app.get("/api/mirror/status", dependencies=ADMIN)
+def mirror_status(db: Session = Depends(get_db)):
+    r = _mirror_rule(db)
+    media = list(db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc()).limit(200)).all())
+    tasks = list(db.scalars(select(MirrorTask).order_by(MirrorTask.id.desc()).limit(30)).all())
+    return {
+        "rule": {"enabled": bool(r.enabled) if r else False,
+                 "last_run": r.last_run if r else None,
+                 "last_status": r.last_status if r else "never",
+                 "last_message": r.last_message if r else ""},
+        "counts": {
+            "media": db.query(MirrorMedia).count(),
+            "files": db.query(MirrorFile).count(),
+            "synced": db.query(MirrorFile).filter(MirrorFile.status == "synced").count(),
+            "superseded": db.query(MirrorFile).filter(MirrorFile.status == "superseded").count(),
+            "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
+            "scan_batches": db.query(ResourceScanBatch).count(),
+            "change_events": db.query(DistributionEvent).count(),
+        },
+        "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
+                   "media_type": m.media_type, "status": m.status,
+                   "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
+                   "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
+                  for m in media],
+        "tasks": [{"id": t.id, "task_id": t.task_id, "status": t.status,
+                   "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
+        "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
+    }
+
+
+@app.get("/api/scan/batches", dependencies=ADMIN)
+def scan_batches(limit: int = 20, db: Session = Depends(get_db)):
+    rows = list(db.scalars(select(ResourceScanBatch).order_by(
+        ResourceScanBatch.id.desc()).limit(min(limit, 100))).all())
+    return [{"id": b.id, "status": b.status, "files": b.files, "directories": b.directories,
+             "seen_count": b.seen_count, "complete": b.complete, "resumed": b.resumed,
+             "reconcile_allowed": b.reconcile_allowed, "error": b.error,
+             "started_at": b.started_at, "finished_at": b.finished_at} for b in rows]
 
 
 async def _post_scan_identify(db: Session, *, publish_after_identify: bool = True,
@@ -405,7 +651,9 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     stale = list(db.scalars(select(Resource).where(
         Resource.media_type == "tv", Resource.tmdb_id.isnot(None),
         Resource.identify_status == "identified",
-        or_(Resource.finish_status.is_(None), Resource.finish_status == "")
+        or_(Resource.finish_status.is_(None), Resource.finish_status == ""),
+        # v0.8.0：手动修正过（含手动清空）的资源不再被 TMDB 自动回填覆盖
+        or_(Resource.finish_locked.is_(None), Resource.finish_locked.is_(False))
     ).limit(60)).all())
     seen_tmdb: dict[int, str] = {}
     for x in stale:
@@ -424,7 +672,7 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
 
 async def _reconcile_library(db: Session, seen_file_ids: list[str],
                              cancel_shares: bool = True, scan_complete: bool = True,
-                             resumed: bool = False) -> dict:
+                             resumed: bool = False, batch_id: int | None = None) -> dict:
     """v0.7.1：B 库对账——本轮没扫到的影视移除看板并取消分享（需求3-1）。
 
     V2.0 第 12.2 节扫描批次保护：必须同时满足
@@ -432,6 +680,22 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     否则一律跳过对账。宁可保留旧数据，也绝不能因接口抖动把整个资源库清空。
     """
     skipped = ""
+    # v0.8.0：批次表是「是否允许对账删除」的唯一权威信号。传入 batch_id 时，
+    # 即使调用方声称 complete=True，只要批次未标记 reconcile_allowed 就一律跳过。
+    if batch_id:
+        b = db.get(ResourceScanBatch, batch_id)
+        if not b:
+            return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
+                    "skipped": "batch_missing"}
+        if b.status != "success" or not b.complete or b.resumed or not b.reconcile_allowed:
+            return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
+                    "skipped": "batch_not_allowed"}
+        try:
+            saved = json.loads(b.seen_json or "[]")
+            if saved:
+                seen_file_ids = saved
+        except Exception:
+            pass
     if resumed:
         skipped = "resumed_incomplete_seen"
     elif not scan_complete:
@@ -464,6 +728,62 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     return {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q}
 
 
+def process_change_events(db: Session, *, publish: bool = True) -> dict:
+    """v0.8.0：把扫描批次产生的「内容更新」事件转成一次作品级更新推送。
+
+    - 同一 (作品, 变化指纹) 只处理一次；一批多集同时变化只推一条。
+    - 已分享影视内容变化**复用原分享链接**，不重建分享、不取消再创建。
+    - publish=False 时只保留事件不处理（镜像链路禁止完成后自动推 TG）。
+    """
+    events = list(db.scalars(select(DistributionEvent).where(
+        DistributionEvent.queue_id == 0)).all())
+    stats = {"events": len(events), "queued": 0, "share_reused": 0, "skipped": 0,
+             "deferred": 0}
+    if not events:
+        return stats
+    if not publish:
+        stats["deferred"] = len(events)
+        return stats
+    grouped: dict[str, list[Resource]] = {}
+    for r in db.scalars(select(Resource)).all():
+        grouped.setdefault(work_group_key(r), []).append(r)
+    for ev in events:
+        members = grouped.get(ev.work_key, [])
+        if not members:
+            stats["skipped"] += 1
+            continue
+        rep = next((m for m in members if m.identify_status == "identified"
+                    and m.poster_path and m.share_url), None)
+        rep = rep or next((m for m in members if m.identify_status == "identified"
+                           and m.poster_path), None)
+        if not rep:
+            stats["skipped"] += 1
+            continue
+        if rep.share_url:
+            ev.share_reused = True
+            stats["share_reused"] += 1
+        ids = [m.id for m in members]
+        q = db.scalar(select(QueueItem).where(
+            QueueItem.resource_id.in_(ids)).order_by(QueueItem.id).limit(1))
+        if q:
+            # 复用原队列项并重置为待发送 = 一次「内容更新」推送，不新增第二条
+            q.status, q.attempts, q.error = "pending", 0, ""
+            q.next_retry_at, q.sent_at = None, None
+            ev.queue_id = q.id
+            stats["queued"] += 1
+        else:
+            _enqueue_after_identify(db, rep)
+            db.flush()
+            q = db.scalar(select(QueueItem).where(
+                QueueItem.resource_id.in_(ids)).order_by(QueueItem.id.desc()).limit(1))
+            if q:
+                ev.queue_id = q.id
+                stats["queued"] += 1
+            else:
+                stats["skipped"] += 1
+    return stats
+
+
 @app.post("/api/scan-now", dependencies=ADMIN)
 async def scan_now(resume: bool = True, auto_identify: bool = True,
                    db: Session = Depends(get_db)):
@@ -474,6 +794,10 @@ async def scan_now(resume: bool = True, auto_identify: bool = True,
         out = {k: v for k, v in data.items() if k != "seen_file_ids"}
         if auto_identify:
             out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+        try:
+            out["changes"] = process_change_events(db, publish=True)
+        except Exception as exc:
+            out["changes"] = {"error": str(exc)[:200]}
         add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(out))
         db.commit()
         return out
@@ -498,9 +822,14 @@ async def rescan_library(auto_identify: bool = True, reconcile: bool = True,
             out["reconcile"] = await _reconcile_library(
                 db, data.get("seen_file_ids") or [],
                 scan_complete=bool(data.get("complete", False)),
-                resumed=bool(data.get("resumed", False)))
+                resumed=bool(data.get("resumed", False)),
+                batch_id=data.get("batch_id") or None)
         if auto_identify:
             out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+        try:
+            out["changes"] = process_change_events(db, publish=True)
+        except Exception as exc:
+            out["changes"] = {"error": str(exc)[:200]}
         add_audit(db, "library_rescan", target_type="library", detail=json_dumps(out))
         db.commit()
         return {"ok": True, **out}
@@ -578,6 +907,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "share_status": "not_created",
                 "share_duration": 0,
                 "finish_status": x.finish_status or "",
+                "finish_locked": bool(getattr(x, "finish_locked", False)),
                 "count": 0, "identified_count": 0,
                 "seasons": set(), "episodes": [],
                 "ids": [], "representative_id": x.id,
@@ -604,7 +934,12 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         # v0.7.0：效期/完结状态取任一成员的有效值（同一作品应一致）
         if getattr(x, "share_duration", 0) and not g["share_duration"]:
             g["share_duration"] = int(x.share_duration or 0)
-        if getattr(x, "finish_status", "") and not g["finish_status"]:
+        # v0.8.0：手动锁定的完结/追更优先于任何自动推断值
+        locked = bool(getattr(x, "finish_locked", False))
+        if locked and not g["finish_locked"]:
+            g["finish_status"] = x.finish_status or ""
+            g["finish_locked"] = True
+        elif not g["finish_locked"] and getattr(x, "finish_status", "") and not g["finish_status"]:
             g["finish_status"] = x.finish_status
         if x.media_type == "tv" and (x.season or x.episode):
             if x.season:
@@ -647,6 +982,67 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     return out
 
 
+@app.get("/api/library/finish-check", dependencies=ADMIN)
+async def finish_check(limit: int = 30, db: Session = Depends(get_db)):
+    """v0.8.0：追新/完结校验——TMDB 季数/已播出集数 vs B 库实际文件。
+
+    只做只读核对，不自动改状态：TMDB 的 status 经常滞后或被误标，
+    最终以用户手动打标为准（手动锁定的作品会标注出来）。
+    """
+    grouped: dict[str, list[Resource]] = {}
+    for r in db.scalars(select(Resource)).all():
+        grouped.setdefault(work_group_key(r), []).append(r)
+    cache: dict[int, dict] = {}
+    items: list[dict] = []
+    for key, members in grouped.items():
+        rep = next((m for m in members if m.tmdb_id and m.media_type == "tv"), None)
+        if not rep:
+            continue
+        videos = [m for m in members if is_video_file(m)] or members
+        eps = set()
+        for m in videos:
+            se, ep = work_episode_numbers(m)
+            if ep is not None:
+                eps.add((int(se or 0), int(ep)))
+        local_count = len(eps) or len(videos)
+        tid = int(rep.tmdb_id)
+        if tid not in cache:
+            try:
+                cache[tid] = await tmdb.detail(tid, "tv", db)
+            except Exception as exc:
+                cache[tid] = {"error": str(exc)[:160]}
+        d = cache[tid] or {}
+        expected = int(d.get("number_of_episodes") or 0)
+        seasons = int(d.get("number_of_seasons") or 0)
+        tmdb_status = str(d.get("finish_status") or d.get("tmdb_status") or "")
+        manual = any(bool(getattr(m, "finish_locked", False)) for m in members)
+        current = next((m.finish_status for m in members if m.finish_status), "") or ""
+        if d.get("error"):
+            verdict = "unknown"
+        elif not expected:
+            verdict = "unknown"
+        elif local_count >= expected:
+            verdict = "complete"
+        else:
+            verdict = "missing"
+        items.append({
+            "work_key": key, "title": rep.media_title or rep.name,
+            "tmdb_id": tid, "tmdb_status": tmdb_status,
+            "expected_episodes": expected, "expected_seasons": seasons,
+            "local_episodes": local_count, "missing": max(expected - local_count, 0),
+            "current_finish": current, "manual_locked": manual,
+            "verdict": verdict,
+            "suggestion": ("TMDB 标完结但本地缺集，建议手动标追更" if verdict == "missing" and
+                           tmdb_status == "ended" else
+                           "本地集数已齐，可标记完结" if verdict == "complete" and
+                           current != "ended" else ""),
+            "error": d.get("error", ""),
+        })
+        if len(items) >= min(limit, 100):
+            break
+    return {"ok": True, "checked": len(items), "items": items}
+
+
 @app.post("/api/library/clear", dependencies=ADMIN)
 def clear_library(db: Session = Depends(get_db)):
     """v0.6.4：清空当前扫描结果（资源 + 队列 + 审核 + 扫描断点），保留 Bot/频道/规则/模板/凭证。
@@ -659,6 +1055,9 @@ def clear_library(db: Session = Depends(get_db)):
     db.query(QueueItem).delete(synchronize_session=False)
     db.query(Resource).delete(synchronize_session=False)
     db.query(ScanCursor).delete(synchronize_session=False)
+    # v0.8.0：变化留痕与未处理的更新事件一并清掉，避免清库后旧事件触发误推送
+    db.query(ResourceVersion).delete(synchronize_session=False)
+    db.query(DistributionEvent).delete(synchronize_session=False)
     add_audit(db, "library_cleared", detail=json_dumps({"resources": resources,
                                                           "queue": queue, "cursors": cursors}))
     db.commit()
@@ -667,8 +1066,9 @@ def clear_library(db: Session = Depends(get_db)):
 
 class BatchLibraryInput(BaseModel):
     ids: list[int] = []           # 作品代表资源 id
-    action: str = ""              # set_duration / cancel_share / re_share / identify
+    action: str = ""              # set_duration / cancel_share / re_share / identify / set_finish
     duration: int = 0             # set_duration / re_share 使用
+    finish: str = ""              # set_finish：ended / returning / 空串(清空并锁定) / auto(恢复自动)
 
 
 async def _cancel_share_one(db: Session, x: Resource) -> bool:
@@ -693,10 +1093,12 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
     单个失败不影响其余。identify 走自动识别（TMDB 决策链），存疑的不落库。
     """
     action = (p.action or "").strip()
-    if action not in ("set_duration", "cancel_share", "re_share", "identify"):
-        raise HTTPException(400, "action 仅支持 set_duration/cancel_share/re_share/identify")
+    if action not in ("set_duration", "cancel_share", "re_share", "identify", "set_finish"):
+        raise HTTPException(400, "action 仅支持 set_duration/cancel_share/re_share/identify/set_finish")
     if action in ("set_duration", "re_share"):
         _check_duration(p.duration)
+    if action == "set_finish" and p.finish not in ("ended", "returning", "", "auto"):
+        raise HTTPException(400, "finish 仅支持 ended / returning / 空串(清空) / auto(恢复自动)")
     ok = fail = 0
     errors: list[str] = []
     for rid in p.ids:
@@ -705,7 +1107,23 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
             fail += 1
             continue
         try:
-            if action == "identify":
+            if action == "set_finish":
+                # v0.8.0：完结剧识别有误时手动修正。按整部作品同步所有单集，
+                # 并锁定状态，避免下次扫描/TMDB 回填又把人工判断改回去。
+                key = work_group_key(x)
+                targets = [r for r in db.scalars(select(Resource)).all()
+                           if work_group_key(r) == key] or [x]
+                if p.finish == "auto":
+                    for r in targets:
+                        r.finish_status, r.finish_locked = "", False
+                else:
+                    for r in targets:
+                        r.finish_status, r.finish_locked = p.finish, True
+                add_audit(db, "finish_marked", target_type="library", target_id=str(rid),
+                          detail=json_dumps({"work_key": key, "finish": p.finish,
+                                             "members": len(targets)}))
+                ok += 1
+            elif action == "identify":
                 r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
                 if r.get("ok") and r.get("best"):
                     _apply_identification(x, r["best"], source=r["source"],
@@ -881,7 +1299,9 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     x.identify_source = source
     x.identify_note = note or ""
     # v0.7.0：完结/追更状态落库（TMDB tv.status 推断，电影为空）
-    x.finish_status = str(d.get("finish_status") or "")
+    # v0.8.0：用户在资源库手动修正过的状态锁定，重新识别/回填都不得覆盖人工判断
+    if not bool(getattr(x, "finish_locked", False)):
+        x.finish_status = str(d.get("finish_status") or "")
     # v0.6.3：剧集按「剧集目录」分享而非单集。未整理取父目录，已整理取上上层。
     if x.media_type == "tv":
         from .utils import series_dir_info
@@ -1933,6 +2353,148 @@ def diagnostics(db: Session = Depends(get_db)):
                                                   "retry": retry, "failed": failed, "sent": sent},
             "last_error": last_error,
             "telegram_base": runtime_config.get(db, "telegram_api_base")}
+
+
+# ---------- v0.8.0：用户互动 / TgtoDrive / 打赏 ----------
+class InteractionConfigInput(BaseModel):
+    contribution_enabled: bool = False
+    donation_enabled: bool = False
+    # 以下字段传 None 表示「保持原值」；返回给前端的是掩码值，避免把掩码写回凭证
+    tgto_base_url: str | None = None
+    tgto_scene: str | None = None
+    tgto_api_key: str | None = None
+    contribution_bot_token: str | None = None
+    donation_image_url: str | None = None
+    donation_text: str | None = None
+    donation_button_text: str | None = None
+
+
+@app.get("/api/interaction/config", dependencies=ADMIN)
+def interaction_config_get(db: Session = Depends(get_db)):
+    plain = ["tgto_base_url", "tgto_scene", "donation_image_url", "donation_text",
+             "donation_button_text"]
+    out = {k: runtime_config.get(db, k) for k in plain}
+    out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
+    out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
+    out["donation_enabled"] = (runtime_config.get(db, "donation_enabled") or "").lower() == "true"
+    out["scene_default"] = "ENV_FILTER_GUANGYA"
+    out["unverified_endpoints"] = ["投稿分享转存（光鸭接口，8.6 待验证）"]
+    return out
+
+
+@app.post("/api/interaction/config", dependencies=ADMIN)
+def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get_db)):
+    values = {"contribution_enabled": "true" if p.contribution_enabled else "false",
+              "donation_enabled": "true" if p.donation_enabled else "false"}
+    for k in ("tgto_base_url", "tgto_scene", "tgto_api_key", "contribution_bot_token",
+              "donation_image_url", "donation_text", "donation_button_text"):
+        v = getattr(p, k)
+        if v is not None:
+            values[k] = v.strip()
+    runtime_config.set_many(db, values)
+    add_audit(db, "interaction_config_saved", target_type="interaction",
+              detail=json_dumps({"keys": sorted(values)}))
+    db.commit()
+    return {"ok": True, "saved": sorted(values)}
+
+
+@app.post("/api/tgto/test", dependencies=ADMIN)
+async def tgto_test(db: Session = Depends(get_db)):
+    try:
+        return await tgto.test_connection(db)
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/bot/poll", dependencies=ADMIN)
+async def bot_poll_now(db: Session = Depends(get_db)):
+    return await bot_listener.poll_once(db)
+
+
+@app.get("/api/contributions", dependencies=ADMIN)
+def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_db)):
+    stmt = select(UserContribution).order_by(UserContribution.id.desc()).limit(min(limit, 500))
+    if status:
+        stmt = stmt.where(UserContribution.status == status)
+    return [{"id": c.id, "title": c.title, "content": c.content, "share_url": c.share_url,
+             "tg_username": c.tg_username, "status": c.status, "note": c.note,
+             "created_at": c.created_at, "handled_at": c.handled_at}
+            for c in db.scalars(stmt).all()]
+
+
+class ContributionHandleInput(BaseModel):
+    status: str = "approved"     # approved / rejected / transferred
+    note: str = ""
+
+
+@app.post("/api/contributions/{cid}/handle", dependencies=ADMIN)
+def handle_contribution(cid: int, p: ContributionHandleInput, db: Session = Depends(get_db)):
+    if p.status not in ("approved", "rejected", "transferred", "pending"):
+        raise HTTPException(400, "status 仅支持 approved/rejected/transferred/pending")
+    c = db.get(UserContribution, cid)
+    if not c:
+        raise HTTPException(404, "投稿不存在")
+    c.status, c.note, c.handled_at = p.status, p.note[:1000], utcnow()
+    add_audit(db, "contribution_handled", target_type="contribution", target_id=str(cid),
+              detail=json_dumps({"status": p.status, "note": p.note[:200]}))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/media-requests", dependencies=ADMIN)
+def media_requests(limit: int = 100, db: Session = Depends(get_db)):
+    rows = db.scalars(select(MediaRequest).order_by(
+        MediaRequest.id.desc()).limit(min(limit, 500))).all()
+    return [{"id": r.id, "title": r.title, "tmdb_id": r.tmdb_id, "media_type": r.media_type,
+             "season": r.season, "keyword_id": r.keyword_id, "status": r.status,
+             "note": r.note, "tg_username": r.tg_username, "created_at": r.created_at}
+            for r in rows]
+
+
+class MediaRequestInput(BaseModel):
+    title: str
+    tmdb_id: int | None = None
+    media_type: str = "tv"
+    season: int | None = None
+
+
+@app.post("/api/media-requests", dependencies=ADMIN)
+async def add_media_request(p: MediaRequestInput, db: Session = Depends(get_db)):
+    title = (p.title or "").strip()
+    if not title:
+        raise HTTPException(400, "请填写影视名称")
+    kid = tgto.keyword_id(p.tmdb_id, p.season, title)
+    row = MediaRequest(title=title, tmdb_id=p.tmdb_id, media_type=p.media_type,
+                       season=p.season, keyword_id=kid, status="pending")
+    db.add(row)
+    db.flush()
+    try:
+        r = await tgto.upsert_keyword(db, title=title, tmdb_id=p.tmdb_id,
+                                      media_type=p.media_type, season=p.season)
+        row.status = "synced" if r.get("ok") else "failed"
+        row.note = r.get("message") or r.get("status") or ""
+        if r.get("ok"):
+            row.synced_at = utcnow()
+    except Exception as exc:
+        row.status, row.note = "failed", str(exc)[:300]
+    db.commit()
+    return {"ok": True, "id": row.id, "status": row.status, "keyword_id": kid,
+            "note": row.note}
+
+
+@app.get("/api/interaction/status", dependencies=ADMIN)
+def interaction_status(db: Session = Depends(get_db)):
+    return {
+        "contributions": db.query(UserContribution).count(),
+        "contributions_pending": db.query(UserContribution).filter(
+            UserContribution.status == "pending").count(),
+        "media_requests": db.query(MediaRequest).count(),
+        "keyword_synced": db.query(MediaRequest).filter(MediaRequest.status == "synced").count(),
+        "contribution_enabled": (runtime_config.get(db, "contribution_enabled") or "").lower() == "true",
+        "tgto_configured": bool(runtime_config.get(db, "tgto_base_url") and
+                                runtime_config.get(db, "tgto_api_key")),
+        "unverified_endpoints": ["投稿分享转存（光鸭接口，8.6 待验证）"],
+    }
 
 
 static = Path("/app/static")

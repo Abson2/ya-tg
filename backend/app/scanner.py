@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -6,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from .db import SessionLocal, json_dumps
 from .guangya import GuangYaOpenAPI, GuangYaWebFiles
-from .models import AuditLog, AuthToken, Resource, ScanCursor, ScanTask, utcnow
+from .models import (AuditLog, AuthToken, DistributionEvent, Resource, ResourceScanBatch,
+                     ResourceVersion, ScanCursor, ScanTask, utcnow)
+from .utils import work_group_key
 
 
 def _cursor(db: Session) -> ScanCursor:
@@ -49,8 +52,13 @@ def _dir_name(item: dict) -> str:
 
 
 def _upsert_resource(db: Session, item: dict, parent: str,
-                     path_hint: str = "", dir_chain: list[str] | None = None) -> tuple[Resource, bool]:
-    """返回 (资源, 是否新增)。同一 fileId 只保留一行；utime/size 变化记入 revision。
+                     path_hint: str = "", dir_chain: list[str] | None = None
+                     ) -> tuple[Resource, bool, dict | None]:
+    """返回 (资源, 是否新增, 变化信息)。同一 fileId 只保留一行；utime/size 变化记入 revision。
+
+    v0.8.0：内容变化时返回指纹变更信息，交给 _record_change_events 按作品合并成
+    一次「内容更新」事件。这里**不重建分享、不入推送队列**——已分享影视内容变化
+    只同步文件，分享链接保持不变。
 
     v0.6.1：path_hint 保存「作品目录/Season 1」这类目录显示名链。剧集单集文件名
     往往只是英文译名（The.Silent.Storm.S01E04），真正的作品名在父目录（谷雨 (2026)），
@@ -80,20 +88,58 @@ def _upsert_resource(db: Session, item: dict, parent: str,
         scanned_at=utcnow(),
     )
     created = row is None
+    change = None
     if created:
         row = Resource(file_id=fid, **values)
         db.add(row)
     else:
-        changed = row.utime != utime or row.size != size
+        old_fp = f"{int(row.size or 0)}:{int(row.utime or 0)}"
+        new_fp = f"{size}:{utime}"
         for k, v in values.items():
             setattr(row, k, v)
-        if changed:
+        if old_fp != new_fp:
             row.revision += 1
             db.add(AuditLog(action="resource_updated", target_type="resource", target_id=str(row.id),
                             detail=json_dumps({"file_id": fid, "utime": utime, "size": size})))
+            change = {"resource_id": int(row.id), "file_id": fid,
+                      "work_key": "", "old": old_fp, "new": new_fp,
+                      "size": size, "utime": utime}
     db.flush()
+    if change:
+        # 作品键在 flush 后计算：取更新后的目录链，未识别单集也能正确归到整部剧
+        change["work_key"] = work_group_key(row)
+    return row, created, change
 
-    return row, created
+
+def _record_change_events(db: Session, changes: list[dict]) -> int:
+    """按作品合并同一批文件变化，生成唯一一条「内容更新」分发事件。
+
+    同一 (work_key, 变化指纹) 只落一次：一批 36 个文件同时被替换也只触发一次推送，
+    而不是逐集 36 条。share_reused=True 表示不重建分享（需求3-5）。
+    """
+    if not changes:
+        return 0
+    grouped: dict[str, list[dict]] = {}
+    for c in changes:
+        db.add(ResourceVersion(resource_id=c["resource_id"], file_id=c["file_id"],
+                               work_key=c["work_key"], fingerprint=c["new"],
+                               old_fingerprint=c["old"], size=c["size"], utime=c["utime"],
+                               change_type="updated"))
+        grouped.setdefault(c["work_key"], []).append(c)
+    created = 0
+    for wk, group in grouped.items():
+        digest = hashlib.md5("|".join(sorted(
+            f"{c['file_id']}:{c['new']}" for c in group)).encode("utf-8")).hexdigest()[:32]
+        exists = db.scalar(select(DistributionEvent).where(
+            DistributionEvent.work_key == wk, DistributionEvent.fingerprint == digest))
+        if exists:
+            continue
+        db.add(DistributionEvent(work_key=wk, event_type="updated", fingerprint=digest,
+                                 changed_files=len(group), share_reused=True))
+        # autoflush=False：必须显式 flush，否则同一 Session 内后续查重看不到刚落的事件
+        db.flush()
+        created += 1
+    return created
 
 
 async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = None) -> dict:
@@ -106,6 +152,9 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
     own_db = db is None
     db = db or SessionLocal()
     seen_file_ids: set[str] = set()
+    changes: list[dict] = []
+    batch: ResourceScanBatch | None = None
+    batch_id = 0
     # V2.0 第 12.2 节「扫描批次保护」：只有本轮全部分页读取成功，才允许清理缺失资源。
     # 接口在 total 未读完时提前返回空页，属于不完整批次，绝不能据此对账删数据。
     scan_complete = True
@@ -148,6 +197,12 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
             c.dir_chains_json = json_dumps(dir_chains)
         c.status = "running"
         db.commit()
+        # v0.8.0：每轮扫描落一条批次记录，作为「是否允许对账删除」的唯一权威信号
+        batch = ResourceScanBatch(root_id=str(root_id or ""), status="running",
+                                  resumed=bool(can_resume))
+        db.add(batch)
+        db.flush()
+        batch_id = int(batch.id)
 
         # v0.6.5：扫描只入库，不再读取规则入队；推送由识别成功触发
         while stack:
@@ -176,8 +231,10 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                         if fid not in visited:
                             stack.append(fid)
                         continue
-                    _upsert_resource(db, item, parent, dir_paths.get(parent, ""),
-                                     dir_chains.get(parent, []))
+                    _, _, changed = _upsert_resource(db, item, parent, dir_paths.get(parent, ""),
+                                                     dir_chains.get(parent, []))
+                    if changed:
+                        changes.append(changed)
                     seen_file_ids.add(fid)
                     files += 1
                 db.commit()
@@ -202,14 +259,33 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
             task.last_run = utcnow()
             task.last_status = "success"
             task.last_message = f"扫描完成：{files} 个文件，遍历 {dirs} 个目录"
+        # v0.8.0：同批文件变化按作品合并成一次「内容更新」事件，不逐集触发推送
+        events = _record_change_events(db, changes)
+        seen = sorted(seen_file_ids)
+        if batch:
+            batch.status = "success"
+            batch.files, batch.directories = files, dirs
+            batch.seen_count = len(seen)
+            batch.complete = bool(scan_complete)
+            batch.reconcile_allowed = bool(scan_complete and not can_resume and seen)
+            batch.seen_json = json_dumps(seen)
+            batch.finished_at = utcnow()
         db.add(AuditLog(action="scan_done", target_type="scan", target_id=str(c.id),
-                        detail=json_dumps({"files": files, "directories": dirs, "resumed": can_resume})))
+                        detail=json_dumps({"files": files, "directories": dirs,
+                                           "resumed": can_resume, "complete": scan_complete,
+                                           "change_events": events})))
         db.commit()
         return {"files": files, "directories": dirs, "resumed": can_resume,
-                "complete": scan_complete, "seen_file_ids": sorted(seen_file_ids)}
+                "complete": scan_complete, "seen_file_ids": seen,
+                "batch_id": batch_id, "change_events": events}
     except Exception as exc:
         db.rollback()
         try:
+            if batch_id:
+                b = db.get(ResourceScanBatch, batch_id)
+                if b:
+                    b.status, b.error, b.finished_at = "failed", str(exc)[:1000], utcnow()
+                    db.commit()
             c = _cursor(db)
             _save_cursor(c, json.loads(c.visited_json or "[]"), json.loads(c.stack_json or "[]"),
                          int(c.next_page or 0), int(c.files_count or 0), int(c.dirs_count or 0),
