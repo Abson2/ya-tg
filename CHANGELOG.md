@@ -8,6 +8,41 @@
 
 ---
 
+## v0.7.0 (2026-11-18)
+
+四大需求分批交付的第一批：授权脱敏、资源库重构与批量管理、TG 分发配置升级（纯本地功能）。镜像库复制（需求2）与投稿/TgtoDrive 对接（需求4第二批）按计划放下一版。
+
+### 需求1：光鸭授权账号脱敏
+- 新增 `utils.mask_account()`：`/api/sms/status` 的 `account`、`/api/auth/status` 的 `sub` 返回前已打码（手机号 `138****5678`，其它 ID 保留头尾）
+- 前端「用户 ID」标注「已脱敏」。Token 本就加密落库，本次堵住展示层泄露
+
+### 需求3：资源库重构与批量管理
+- TMDB `_normalize()` 补 `finish_status`（剧集 status → ended/returning），`Resource` 加 `finish_status` 列并随识别落库；`library_series()` 返回 finish_status/share_duration，并支持 `finish/identify_status/share_status` 筛选参数
+- 资源库加一级状态栏（识别：全部/已识别/待识别；类型：全部/电影/剧集/完结/追更），参考用户海报墙布局；分享状态/效期/完结追更作角标
+- 新增 `POST /api/library/batch`：批量设置效期（1/7/30天/永久）、取消分享、重新分享、批量重识别；按作品代表资源整剧处理，单个失败不影响其余
+- 前端作品卡支持勾选/全选、批量操作条；**移除单集卡片/单集列表视图**，统一为整部作品海报墙
+
+### 需求4第一批：TG 分发配置升级（纯本地）
+- 新增运行时配置与端点：`GET/POST /api/tg/extra-config`（推送模式 channel/bot_channel/custom_bot_group、自定义 bot token+群聊、福袋 bot 用户名、链接样式、详情篇幅）、`GET/POST /api/reward/config`（赞赏码）
+- 分享链接按钮化：`tg_link_style=button` 时用 Telegram inline_keyboard 显示「📥 获取资源」按钮 + 可选「🎁 福袋/入库」跳转（福袋 bot `?start=library`），并从正文去掉纯文本链接
+- 精简详情：`tg_detail_level=compact` 时简介压到 110 字
+- `custom_bot_group` 模式用自定义 bot token/群聊覆盖发送；新增模板变量 `{{reward_code}}`
+
+### 下一版待办（需求2 + 需求4第二批）
+- 需求2 镜像库复制：光鸭官方 OpenAPI 无 copy 接口、写接口默认关闭(123)且需 VIP(430)+开放平台应用；用户选择抓包网页端复制接口后实现
+- 需求4 投稿模块（投稿转存/我想增加关键词监控）依赖 TgtoDrive（用户确认已配光鸭）+ 新增 bot 接收消息(getUpdates)模块；关键词监控复刻 embyhub 的 `kw_<tmdb>_<season>` 幂等方案，不覆盖原有规则
+
+### 测试
+- 新增 `tests/test_v070_features.py`（8 项）：脱敏、TMDB 完结状态、落库、批量取消/设效期、状态筛选、TG 配置、消息精简
+- 全套 **86 项通过**，前端 `vite build` 通过
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.7.0
+```
+
+---
+
 ## v0.6.5 (2026-11-18)
 
 重构推送触发链路：扫描只入库，识别成功且有 TMDB 海报后才入队；同一作品（整剧）只推一条，不再一集一条；资源库展示与推送共用同一作品键；补齐整剧大小/集数与逐条发送节流。

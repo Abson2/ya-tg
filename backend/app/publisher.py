@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import re
 from datetime import timedelta
 
 import httpx
@@ -92,6 +93,11 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     title = res.media_title or res.name
     hint = parse_media_name(res.name)
     tpl = _template(db)
+    # v0.7.0：精简详情——compact 模式把简介压到 110 字，缩短消息篇幅
+    detail_level = (runtime_config.get(db, "tg_detail_level") or "compact").strip()
+    overview_text = (res.overview or "").strip()
+    if detail_level == "compact" and len(overview_text) > 110:
+        overview_text = overview_text[:110].rstrip("，。、；：,;: ") + "…"
 
     genres = tmdb.as_list(res.genres)
     countries = tmdb.as_list(res.origin_country)
@@ -138,7 +144,7 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
 
     ctx = {
         "title": esc(title),
-        "overview": esc((res.overview or "").strip()),
+        "overview": esc(overview_text),
         "filename": esc(res.name),
         "share_url": share_url,
         "year": esc(hint.get("year") or ""),
@@ -160,24 +166,42 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "episode_tag": episode_tag,
         "season_label": esc(season_label),
         "episode_count": esc(episode_count),
+        "reward_code": esc(runtime_config.get(db, "reward_code") or ""),  # v0.7.0：赞赏码
         "version": esc(version),
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
     return text[:1000], text[:1000]
 
 
-async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Channel, bot: Bot) -> tuple[bool, str, str]:
-    token = decrypt_secret(bot.token)
+async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Channel, bot: Bot,
+                         override_token: str = "", override_chat: str = "") -> tuple[bool, str, str]:
+    # v0.7.0：custom_bot_group 模式下用配置的自定义 bot token / 群聊覆盖
+    token = override_token or decrypt_secret(bot.token)
+    chat_id = override_chat or channel.chat_id
     if not token:
         return False, "", "Bot Token 为空", None
     caption, _ = _build_message(db, res, res.share_url)
     poster = tmdb.poster_url(res.poster_path) if res.poster_path else ""
     base = runtime_config.telegram_base(db)
     method = "sendPhoto" if poster else "sendMessage"
-    payload = {"chat_id": channel.chat_id, "caption" if poster else "text": caption,
+    payload = {"chat_id": chat_id, "caption" if poster else "text": caption,
                "parse_mode": "HTML", "disable_web_page_preview": False}
     if poster:
         payload["photo"] = poster
+    # v0.7.0：分享链接按钮化 + 福袋 bot 跳转入口（inline keyboard）
+    link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
+    if link_style == "button" and res.share_url:
+        buttons = [{"text": "📥 获取资源", "url": res.share_url}]
+        fubao = (runtime_config.get(db, "tg_fubao_bot") or "").strip().lstrip("@")
+        if fubao:
+            buttons.append({"text": "🎁 福袋/入库", "url": f"https://t.me/{fubao}?start=library"})
+        payload["reply_markup"] = {"inline_keyboard": [buttons]}
+        # 按钮模式下去掉正文末行的纯文本链接，避免重复
+        caption = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
+        if poster:
+            payload["caption"] = caption
+        else:
+            payload["text"] = caption
     retry_after = None
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -216,6 +240,12 @@ async def process_queue(limit: int = 20) -> dict:
         delay = max(0, min(int(runtime_config.get(db, "telegram_send_delay") or 2), 60))
     except ValueError:
         delay = 2
+    # v0.7.0：推送模式。custom_bot_group 时用自定义 bot/群聊覆盖，其余用频道自身 bot
+    push_mode = (runtime_config.get(db, "tg_push_mode") or "channel").strip()
+    ov_token = ov_chat = ""
+    if push_mode == "custom_bot_group":
+        ov_token = (runtime_config.get(db, "tg_custom_bot_token") or "").strip()
+        ov_chat = (runtime_config.get(db, "tg_custom_chat_id") or "").strip()
     try:
         now = utcnow()
         rows = list(db.scalars(
@@ -271,7 +301,10 @@ async def process_queue(limit: int = 20) -> dict:
                 q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
                 continue
-            ok, message_id, error, retry_after = await _send_telegram(db, q, res, channel, bot)
+            use_token = ov_token if (ov_token and ov_chat) else ""
+            use_chat = ov_chat if (ov_token and ov_chat) else ""
+            ok, message_id, error, retry_after = await _send_telegram(
+                db, q, res, channel, bot, override_token=use_token, override_chat=use_chat)
             if ok:
                 q.status = "sent"
                 q.telegram_message_id = message_id

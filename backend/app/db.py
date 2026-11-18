@@ -37,6 +37,8 @@ _COLUMNS = {
         "episode": "INTEGER",
         "identify_source": "TEXT DEFAULT ''",
         "identify_note": "TEXT DEFAULT ''",
+        # v0.7.0：完结/追更状态（TMDB status 推断）
+        "finish_status": "TEXT DEFAULT ''",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
         # v0.6.3：目录 fileId 链 + 剧集目录级分享

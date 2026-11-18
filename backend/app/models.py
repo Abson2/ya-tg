@@ -45,6 +45,8 @@ class Resource(Base):
     identify_status: Mapped[str] = mapped_column(String(24), default="unidentified")
     identify_source: Mapped[str] = mapped_column(String(24), default="")  # id/tmdb/ai/manual/none
     identify_note: Mapped[str] = mapped_column(Text, default="")
+    # v0.7.0：完结/追更状态（来自 TMDB status），用于资源库角标与一级状态栏筛选
+    finish_status: Mapped[str] = mapped_column(String(16), default="")  # ended/returning/""
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")

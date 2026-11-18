@@ -42,6 +42,14 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "queue_cron": ("queue_cron", ""),
     # v0.6.5：每条 TG 消息发送后的节流秒数，避免短时间连发触发 Telegram 风控
     "telegram_send_delay": ("telegram_send_delay", "2"),
+    # v0.7.0：TG 分发配置升级
+    "tg_push_mode": ("tg_push_mode", "channel"),          # channel/bot_channel/custom_bot_group
+    "tg_custom_bot_token": ("tg_custom_bot_token", ""),   # 自定义 bot 推送的 token
+    "tg_custom_chat_id": ("tg_custom_chat_id", ""),       # 自定义 bot 推送的群聊
+    "tg_fubao_bot": ("tg_fubao_bot", ""),                  # 福袋 bot 用户名（跳转入口）
+    "tg_link_style": ("tg_link_style", "button"),         # button/plain：分享链接按钮化
+    "tg_detail_level": ("tg_detail_level", "compact"),    # compact/full：精简详情
+    "reward_code": ("reward_code", ""),                    # 赞赏码（图片 URL 或文本）
 }
 
 

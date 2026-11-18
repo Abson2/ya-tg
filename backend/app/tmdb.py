@@ -215,11 +215,21 @@ def _normalize(item: dict, media_type: str) -> dict:
         code = str((c.get("iso_3166_1") or c.get("name") or "") if isinstance(c, dict) else c).strip()
         if code:
             countries.append(code)
+    # v0.7.0：剧集完结状态。电影没有连载概念，置空。
+    finish_status = ""
+    if media_type == "tv":
+        raw_status = str(item.get("status") or "")
+        low = raw_status.lower()
+        if "returning" in low or "in production" in low or "planned" in low:
+            finish_status = "returning"
+        elif "ended" in low or "canceled" in low or "cancelled" in low:
+            finish_status = "ended"
     return {
         "tmdb_id": item.get("id"),
         "media_type": media_type,
         "type": media_type,
         "type_label": type_label(media_type),
+        "finish_status": finish_status,
         "title": title,
         "original_title": original,
         "year": date[:4],

@@ -182,7 +182,7 @@ async def refresh(db: Session) -> str:
 
 
 def status(db: Session) -> dict:
-    from .utils import as_utc, utcnow
+    from .utils import as_utc, mask_account, utcnow
     t = db.get(AuthToken, 1)
     flow = t.flow if t else ""
     expires = as_utc(t.expires_at) if (t and t.expires_at) else None
@@ -211,7 +211,7 @@ def status(db: Session) -> dict:
         "logged_in": logged_in,
         "flow": flow,
         "sms_mode": flow in ("sms", "tgto"),  # 兼容旧 tgto 通道已有 token
-        "account": t.sub if t else "",
+        "account": mask_account(t.sub) if t else "",  # v0.7.0：账号脱敏，避免手机号明文泄露
         # 带 Z 的 UTC 时间，前端 Date 解析无歧义（naive 会被当成本地时间）
         "expires_at": expires.isoformat().replace("+00:00", "Z") if expires else None,
         "expires_in_seconds": max(0, seconds_left) if seconds_left is not None else None,

@@ -141,13 +141,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.6.5", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.7.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.6.5", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.7.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -416,7 +416,9 @@ _SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{
 
 
 @app.get("/api/library/series", dependencies=ADMIN)
-def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_db)):
+def library_series(q: str = "", media_type: str = "", finish: str = "",
+                   identify_status: str = "", share_status: str = "",
+                   db: Session = Depends(get_db)):
     """v0.6.4：按作品聚合的资源库视图，参考 STRM 刮削海报墙。
 
     每个作品返回海报、标题、年份、类型、集数范围、识别/分享汇总，并带成员单集 id 列表，
@@ -445,6 +447,8 @@ def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_
                 "identify_status": x.identify_status,
                 "share_url": "",
                 "share_status": "not_created",
+                "share_duration": 0,
+                "finish_status": x.finish_status or "",
                 "count": 0, "identified_count": 0,
                 "seasons": set(), "episodes": [],
                 "ids": [], "representative_id": x.id,
@@ -468,6 +472,11 @@ def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_
             g["share_status"] = "active"
         elif g["share_status"] != "active":
             g["share_status"] = x.share_status
+        # v0.7.0：效期/完结状态取任一成员的有效值（同一作品应一致）
+        if getattr(x, "share_duration", 0) and not g["share_duration"]:
+            g["share_duration"] = int(x.share_duration or 0)
+        if getattr(x, "finish_status", "") and not g["finish_status"]:
+            g["finish_status"] = x.finish_status
         if x.media_type == "tv" and (x.season or x.episode):
             if x.season:
                 g["seasons"].add(int(x.season))
@@ -498,6 +507,13 @@ def library_series(q: str = "", media_type: str = "", db: Session = Depends(get_
             member_hit = any(q.lower() in (db.get(Resource, i).name or "").lower() for i in g["ids"])
             if not member_hit:
                 continue
+        # v0.7.0：一级状态栏筛选（完结/追更、识别状态、分享状态）
+        if finish in ("ended", "returning") and g["finish_status"] != finish:
+            continue
+        if identify_status and g["identify_status"] != identify_status:
+            continue
+        if share_status and g["share_status"] != share_status:
+            continue
         out.append(g)
     return out
 
@@ -518,6 +534,101 @@ def clear_library(db: Session = Depends(get_db)):
                                                           "queue": queue, "cursors": cursors}))
     db.commit()
     return {"ok": True, "resources": resources, "queue": queue, "cursors": cursors}
+
+
+class BatchLibraryInput(BaseModel):
+    ids: list[int] = []           # 作品代表资源 id
+    action: str = ""              # set_duration / cancel_share / re_share / identify
+    duration: int = 0             # set_duration / re_share 使用
+
+
+async def _cancel_share_one(db: Session, x: Resource) -> bool:
+    """取消单条分享并按 share_id 同步清空所有共用该分享的剧集单集。返回是否成功。"""
+    if not x.share_id:
+        return False
+    try:
+        await GuangYaShareClient(db).delete(x.share_id)
+    except Exception:
+        return False
+    for item in db.scalars(select(Resource).where(Resource.share_id == x.share_id)).all():
+        item.share_status = "cancelled"
+        item.share_url, item.share_id = "", ""
+    return True
+
+
+@app.post("/api/library/batch", dependencies=ADMIN)
+async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
+    """v0.7.0：批量管理勾选作品——设置效期 / 取消分享 / 重新分享 / 批量重识别。
+
+    所有操作落到作品代表资源，剧集按整剧目录处理；逐个执行并汇总成功/失败，
+    单个失败不影响其余。identify 走自动识别（TMDB 决策链），存疑的不落库。
+    """
+    action = (p.action or "").strip()
+    if action not in ("set_duration", "cancel_share", "re_share", "identify"):
+        raise HTTPException(400, "action 仅支持 set_duration/cancel_share/re_share/identify")
+    if action in ("set_duration", "re_share"):
+        _check_duration(p.duration)
+    ok = fail = 0
+    errors: list[str] = []
+    for rid in p.ids:
+        x = db.get(Resource, rid)
+        if not x:
+            fail += 1
+            continue
+        try:
+            if action == "identify":
+                r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+                if r.get("ok") and r.get("best"):
+                    _apply_identification(x, r["best"], source=r["source"],
+                                          note=r["reason"], hint=r["hint"])
+                    ok += 1
+                else:
+                    fail += 1
+                    errors.append(f"#{rid} {r.get('status', '存疑')}")
+            elif action == "cancel_share":
+                if await _cancel_share_one(db, x):
+                    ok += 1
+                else:
+                    fail += 1
+                    errors.append(f"#{rid} 无分享或取消失败")
+            elif action == "set_duration":
+                if not x.share_id:
+                    fail += 1
+                    errors.append(f"#{rid} 尚无分享")
+                    continue
+                await GuangYaShareClient(db).update(x.share_id, x.media_title or x.name, p.duration)
+                for item in db.scalars(select(Resource).where(Resource.share_id == x.share_id)).all():
+                    item.share_duration = p.duration
+                ok += 1
+            elif action == "re_share":
+                await _cancel_share_one(db, x)
+                db.flush()
+                dir_id = str(getattr(x, "share_dir_id", "") or "")
+                is_series = x.media_type == "tv" and bool(dir_id)
+                target_id = dir_id if is_series else x.file_id
+                title = x.media_title or x.name or ""
+                if is_series and x.season:
+                    title = f"{title} 第{int(x.season)}季"
+                result = await GuangYaShareClient(db).create(target_id, title, p.duration)
+                data = result.get("data") or {}
+                share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
+                share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
+                targets = list(db.scalars(select(Resource).where(Resource.share_dir_id == dir_id)).all()) if is_series else [x]
+                for item in (targets or [x]):
+                    item.share_id, item.share_url = share_id, share_url
+                    item.share_status = "active" if share_url else "failed"
+                    item.share_duration = p.duration
+                ok += 1 if share_url else 0
+                if not share_url:
+                    fail += 1
+        except Exception as exc:
+            fail += 1
+            errors.append(f"#{rid} {str(exc)[:80]}")
+    add_audit(db, "library_batch", target_type="library",
+              detail=json_dumps({"action": action, "ids": p.ids, "duration": p.duration,
+                                 "ok": ok, "fail": fail}))
+    db.commit()
+    return {"ok": True, "action": action, "succeeded": ok, "failed": fail, "errors": errors[:20]}
 
 
 def _check_duration(duration: int):
@@ -640,6 +751,8 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     x.identify_status = "identified"
     x.identify_source = source
     x.identify_note = note or ""
+    # v0.7.0：完结/追更状态落库（TMDB tv.status 推断，电影为空）
+    x.finish_status = str(d.get("finish_status") or "")
     # v0.6.3：剧集按「剧集目录」分享而非单集。未整理取父目录，已整理取上上层。
     if x.media_type == "tv":
         from .utils import series_dir_info
@@ -1536,6 +1649,65 @@ def telegram_config_save(p: TelegramConfigInput, db: Session = Depends(get_db)):
     add_audit(db, "telegram_config_saved", target_type="config", detail=p.base_url.strip()[:200])
     db.commit()
     return {"ok": True, "base_url": runtime_config.get(db, "telegram_api_base")}
+
+
+class TgExtraConfigInput(BaseModel):
+    push_mode: str = "channel"
+    custom_bot_token: str = ""
+    custom_chat_id: str = ""
+    fubao_bot: str = ""
+    link_style: str = "button"
+    detail_level: str = "compact"
+
+
+_TG_EXTRA_KEYS = {
+    "push_mode": "tg_push_mode",
+    "custom_bot_token": "tg_custom_bot_token",
+    "custom_chat_id": "tg_custom_chat_id",
+    "fubao_bot": "tg_fubao_bot",
+    "link_style": "tg_link_style",
+    "detail_level": "tg_detail_level",
+}
+
+
+@app.get("/api/tg/extra-config", dependencies=ADMIN)
+def tg_extra_config_get(db: Session = Depends(get_db)):
+    """v0.7.0：TG 分发扩展配置（推送模式/自定义 bot/福袋入口/消息样式）。"""
+    return {k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()}
+
+
+@app.post("/api/tg/extra-config", dependencies=ADMIN)
+def tg_extra_config_save(p: TgExtraConfigInput, db: Session = Depends(get_db)):
+    if p.push_mode not in ("channel", "bot_channel", "custom_bot_group"):
+        raise HTTPException(400, "推送模式仅支持 channel/bot_channel/custom_bot_group")
+    if p.link_style not in ("button", "plain"):
+        raise HTTPException(400, "链接样式仅支持 button/plain")
+    if p.detail_level not in ("compact", "full"):
+        raise HTTPException(400, "详情级别仅支持 compact/full")
+    vals = {key: str(getattr(p, k) or "").strip() for k, key in _TG_EXTRA_KEYS.items()}
+    runtime_config.set_many(db, vals)
+    add_audit(db, "tg_extra_config_saved", target_type="config",
+              detail=json_dumps({"push_mode": p.push_mode, "link_style": p.link_style}))
+    db.commit()
+    return {"ok": True, **{k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()}}
+
+
+class RewardConfigInput(BaseModel):
+    code: str = ""
+
+
+@app.get("/api/reward/config", dependencies=ADMIN)
+def reward_config_get(db: Session = Depends(get_db)):
+    """v0.7.0：赞赏码配置（图片 URL 或文本）。"""
+    return {"code": runtime_config.get(db, "reward_code")}
+
+
+@app.post("/api/reward/config", dependencies=ADMIN)
+def reward_config_save(p: RewardConfigInput, db: Session = Depends(get_db)):
+    runtime_config.set_many(db, {"reward_code": (p.code or "").strip()})
+    add_audit(db, "reward_config_saved", target_type="config")
+    db.commit()
+    return {"ok": True, "code": runtime_config.get(db, "reward_code")}
 
 
 @app.get("/api/queue/schedule", dependencies=ADMIN)

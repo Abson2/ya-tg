@@ -7,6 +7,23 @@ from datetime import datetime, timedelta, timezone
 from .config import settings
 
 
+def mask_account(value: str) -> str:
+    """v0.7.0：账号/用户 ID 脱敏，避免手机号、sub 在管理页与 API 明文泄露。
+
+    手机号（11 位数字）：保留前 3 后 4，中间打码（138****5678）。
+    其它 ID：长度 ≤6 全部打码；否则保留前 2 后 2，中间用固定 4 个 *（长度不泄露）。
+    空值原样返回。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"1\d{10}", s):  # 中国大陆手机号
+        return s[:3] + "****" + s[-4:]
+    if len(s) <= 6:
+        return "*" * len(s)
+    return s[:2] + "****" + s[-2:]
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 

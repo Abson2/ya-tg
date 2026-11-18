@@ -20,6 +20,13 @@ const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', lang
 const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
 const aiParseName = ref(''), aiParseResult = ref(null)
 const typeFilter = ref(''), identifyFilter = ref('')
+// v0.7.0：一级状态栏（识别状态 / 媒体类型 / 完结追更）、勾选批量管理
+const finishFilter = ref(''), statusTab = ref('all'), typeTab = ref('all')
+const selectedSeries = ref([]), batchBusy = ref(false)
+const batchDuration = ref(0)
+// v0.7.0：TG 分发扩展配置 + 赞赏码
+const tgExtra = ref({ push_mode: 'channel', custom_bot_token: '', custom_chat_id: '', fubao_bot: '', link_style: 'button', detail_level: 'compact' })
+const tgExtraSaving = ref(false), rewardCfg = ref({ code: '' }), rewardSaving = ref(false)
 // v0.6.1：链路自检、Telegram 反代地址、批量重识别/立即推送状态
 const diagnostics = ref({ blockers: [] }), telegramBase = ref(''), telegramSaving = ref(false)
 // v0.6.4：队列推送调度（间隔秒 / Cron 二选一）
@@ -191,7 +198,7 @@ const icon = name => paths[name] || paths.grid
 const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件块支持嵌套')
 // 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
 const tagHint = computed(() => 'TMDB 分类打标：{{type}}=movie/tv，{{type_label}}=电影/剧集，{{origin_country}}=制片地区，{{genres}}=类型，{{tags}}=组合标签（示例 #保镖恋人 #电影 #爱情 #惊悚）。按示例打标可写：type={{type}} · origin_country={{origin_country}} · genres={{genres}}')
-const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'size', 'share_url',
+const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'reward_code', 'size', 'share_url',
   'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
   'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename']
 const previewDemo = {
@@ -230,10 +237,40 @@ const filteredResources = computed(() => resources.value.filter(r => {
 const filteredSeries = computed(() => seriesGroups.value.filter(g => {
   const hitKey = !keyword.value || String(g.title || '').toLowerCase().includes(keyword.value.toLowerCase())
   const hitStatus = !statusFilter.value || g.share_status === statusFilter.value
-  const hitType = !typeFilter.value || g.media_type === typeFilter.value
-  const hitIdentify = !identifyFilter.value || g.identify_status === identifyFilter.value
-  return hitKey && hitStatus && hitType && hitIdentify
+  // v0.7.0：一级状态栏——媒体类型 tab 支持 全部/剧集/电影/完结/追更
+  let hitType = true
+  if (typeTab.value === 'tv' || typeTab.value === 'movie') hitType = g.media_type === typeTab.value
+  else if (typeTab.value === 'ending') hitType = g.finish_status === 'ended'
+  else if (typeTab.value === 'returning') hitType = g.finish_status === 'returning'
+  // 识别状态 tab（all / identified / unidentified）
+  let hitIdentifyTab = true
+  if (statusTab.value === 'identified') hitIdentifyTab = g.identify_status === 'identified'
+  else if (statusTab.value === 'unidentified') hitIdentifyTab = g.identify_status !== 'identified'
+  // 下拉筛选（保留）
+  const hitTypeSel = !typeFilter.value || g.media_type === typeFilter.value
+  const hitIdentifySel = !identifyFilter.value || g.identify_status === identifyFilter.value
+  const hitFinish = !finishFilter.value || g.finish_status === finishFilter.value
+  return hitKey && hitStatus && hitType && hitIdentifyTab && hitTypeSel && hitIdentifySel && hitFinish
 }))
+// v0.7.0：全选/全不选（作用于当前筛选结果）
+const allSelected = computed(() => filteredSeries.value.length > 0 && filteredSeries.value.every(g => selectedSeries.value.includes(g.key)))
+function toggleSelectAll() {
+  selectedSeries.value = allSelected.value ? [] : filteredSeries.value.map(g => g.key)
+}
+function toggleSelect(key) {
+  selectedSeries.value = selectedSeries.value.includes(key)
+    ? selectedSeries.value.filter(k => k !== key)
+    : [...selectedSeries.value, key]
+}
+function repIdOf(g) { return g.representative_id }
+function durLabel(sec) {
+  const n = Number(sec || 0)
+  if (n === 0) return '永久'
+  if (n === 86400) return '1天'
+  if (n === 604800) return '7天'
+  if (n === 2592000) return '30天'
+  return Math.round(n / 86400) + '天'
+}
 
 const healthChecks = computed(() => [
   { label: '光鸭 OpenAPI 授权', ok: overview.value.auth === 'ok', hint: auth.value.authenticated ? (auth.value.flow || '已授权') : '尚未完成授权' },
@@ -270,6 +307,7 @@ async function load() {
   templates.value = await api('/templates')
   audit.value = await api('/audit')
   try { diagnostics.value = await api('/diagnostics') } catch (e) { diagnostics.value = { blockers: [] } }
+  try { await loadTgExtra() } catch (e) {}
   try { const t = await api('/telegram/config'); telegramBase.value = t.base_url || t.default || '' } catch (e) {}
   try { queueSchedule.value = await api('/queue/schedule') } catch (e) {}
   await loadAuth()
@@ -688,6 +726,49 @@ async function copyCode() {
   catch (e) { ElMessage.error('复制失败，请手动选择') }
 }
 function insertVar(key) { tpl.value.content = (tpl.value.content || '') + '{{' + key + '}}' }
+
+// ============ v0.7.0：批量管理 + TG 配置 ============
+function selectedRepIds() {
+  return filteredSeries.value.filter(g => selectedSeries.value.includes(g.key)).map(g => g.representative_id)
+}
+async function batchAction(action) {
+  const ids = selectedRepIds()
+  if (!ids.length) { ElMessage.warning('请先勾选作品'); return }
+  let duration = 0
+  if (action === 'set_duration' || action === 're_share') {
+    duration = Number(batchDuration.value || 0)
+  }
+  const labels = { set_duration: '设置效期', cancel_share: '取消分享', re_share: '重新分享', identify: '批量重识别' }
+  if (action === 'cancel_share' && !await confirmBox(`确定取消勾选的 ${ids.length} 部作品的分享？`)) return
+  batchBusy.value = true
+  try {
+    const r = await api('/library/batch', { method: 'POST', body: JSON.stringify({ ids, action, duration }) })
+    ElMessage.success(`${labels[action]}完成：成功 ${r.succeeded}，失败 ${r.failed}${r.errors?.length ? '（' + r.errors[0] + '）' : ''}`)
+    selectedSeries.value = []
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { batchBusy.value = false }
+}
+async function confirmBox(msg) {
+  try { await ElMessageBox.confirm(msg, '确认操作', { type: 'warning' }); return true }
+  catch (e) { return false }
+}
+async function loadTgExtra() {
+  try { tgExtra.value = await api('/tg/extra-config') } catch (e) {}
+  try { rewardCfg.value = await api('/reward/config') } catch (e) {}
+}
+async function saveTgExtra() {
+  tgExtraSaving.value = true
+  try { tgExtra.value = await api('/tg/extra-config', { method: 'POST', body: JSON.stringify(tgExtra.value) }); ElMessage.success('TG 分发配置已保存') }
+  catch (e) { ElMessage.error(e.message) }
+  finally { tgExtraSaving.value = false }
+}
+async function saveReward() {
+  rewardSaving.value = true
+  try { rewardCfg.value = await api('/reward/config', { method: 'POST', body: JSON.stringify(rewardCfg.value) }); ElMessage.success('赞赏码已保存') }
+  catch (e) { ElMessage.error(e.message) }
+  finally { rewardSaving.value = false }
+}
 function tick() {
   clock.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   if (authed.value && smsStatus.value && smsStatus.value.logged_in) updateCountdown()
@@ -729,7 +810,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.6.5 · Asia/Shanghai</div>
+        <div class="foot-version">v0.7.0 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -866,7 +947,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           <div class="auth-summary">
             <div class="auth-summary-item"><small>授权状态</small><b :class="smsStatus.logged_in || auth.authenticated ? 'good' : 'bad'">{{ smsStatus.logged_in ? '已授权（短信登录）' : (auth.authenticated ? '已授权' : '未授权') }}</b></div>
             <div class="auth-summary-item"><small>授权方式</small><b>{{ smsStatus.logged_in ? '短信验证码（自研）' : (auth.flow || '—') }}</b></div>
-            <div class="auth-summary-item"><small>用户 ID</small><b>{{ smsStatus.account || auth.sub || '—' }}</b></div>
+            <div class="auth-summary-item"><small>用户 ID（已脱敏）</small><b>{{ smsStatus.account || auth.sub || '—' }}</b></div>
             <div class="auth-summary-item"><small>过期时间</small><b>{{ fmtBj(smsStatus.expires_at) || auth.expires_at || '—' }}</b></div>
           </div>
           <div class="sub-head"><span>高级方式 · 直连光鸭开放平台（需自行申请应用凭证）</span></div>
@@ -914,21 +995,55 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 剧集目录级分享 · TMDB 识别</p></div><div class="head-tools"><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品或文件名" clearable style="width:220px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:130px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="typeFilter" placeholder="媒体类型" clearable style="width:110px"><el-option label="电影" value="movie"/><el-option label="剧集" value="tv"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select><div class="view-switch"><button :class="{on:viewMode==='series'}" title="作品视图" @click="viewMode='series'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('grid')"/></svg></button><button :class="{on:viewMode==='grid'}" title="单集卡片" @click="viewMode='grid'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg></button><button :class="{on:viewMode==='list'}" title="单集列表" @click="viewMode='list'"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('file')"/></svg></button></div></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
-          <!-- v0.6.4：作品视图（默认）——一部剧/一部电影一张海报卡，单集聚合不散落 -->
-          <div v-if="viewMode === 'series'" class="media-grid">
-            <div v-for="g in filteredSeries" :key="g.key" class="media-card series-card">
+          <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
+          <div class="status-tabs">
+            <div class="status-tab-group">
+              <span class="stab-label">识别</span>
+              <button :class="{on:statusTab==='all'}" @click="statusTab='all'">全部状态</button>
+              <button :class="{on:statusTab==='identified'}" @click="statusTab='identified'">已识别</button>
+              <button :class="{on:statusTab==='unidentified'}" @click="statusTab='unidentified'">待识别</button>
+            </div>
+            <div class="status-tab-group">
+              <span class="stab-label">类型</span>
+              <button :class="{on:typeTab==='all'}" @click="typeTab='all'">全部类型</button>
+              <button :class="{on:typeTab==='movie'}" @click="typeTab='movie'">电影</button>
+              <button :class="{on:typeTab==='tv'}" @click="typeTab='tv'">剧集</button>
+              <button :class="{on:typeTab==='ending'}" @click="typeTab='ending'">完结</button>
+              <button :class="{on:typeTab==='returning'}" @click="typeTab='returning'">追更</button>
+            </div>
+          </div>
+
+          <!-- v0.7.0：批量操作条（勾选作品后出现） -->
+          <div v-if="selectedSeries.length" class="batch-bar">
+            <span>已选 <b>{{ selectedSeries.length }}</b> 部</span>
+            <el-select v-model="batchDuration" placeholder="分享效期" style="width:120px"><el-option label="永久" :value="0"/><el-option label="1 天" :value="86400"/><el-option label="7 天" :value="604800"/><el-option label="30 天" :value="2592000"/></el-select>
+            <el-button size="small" type="primary" plain :loading="batchBusy" @click="batchAction('set_duration')">设置效期</el-button>
+            <el-button size="small" :loading="batchBusy" @click="batchAction('re_share')">重新分享</el-button>
+            <el-button size="small" :loading="batchBusy" @click="batchAction('identify')">批量重识别</el-button>
+            <el-button size="small" type="danger" plain :loading="batchBusy" @click="batchAction('cancel_share')">取消分享</el-button>
+            <el-button size="small" text @click="selectedSeries=[]">清空选择</el-button>
+          </div>
+
+          <!-- 作品视图：整部剧/电影一张海报卡，支持勾选批量管理 -->
+          <div class="grid-toolbar"><label class="select-all"><input type="checkbox" :checked="allSelected" @change="toggleSelectAll"/> 全选本页（{{ filteredSeries.length }}）</label></div>
+          <div class="media-grid">
+            <div v-for="g in filteredSeries" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
               <div class="media-poster">
                 <el-image v-if="g.poster_path" :src="'https://image.tmdb.org/t/p/w342'+g.poster_path" fit="cover" style="width:100%;height:100%"/>
                 <div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ mediaLabel(g.media_type) || 'MEDIA' }}</span></div>
+                <input type="checkbox" class="card-check" :checked="selectedSeries.includes(g.key)" @click.stop="toggleSelect(g.key)"/>
                 <span v-if="g.share_status === 'active'" class="scrape-ok">✓</span>
                 <span class="media-badge" :class="'badge-'+g.share_status">{{ g.share_status === 'active' ? '已分享' : (g.share_status === 'not_created' ? '未分享' : g.share_status) }}</span>
+                <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结</span>
+                <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更</span>
+                <span v-if="g.share_duration" class="dur-badge">{{ durLabel(g.share_duration) }}</span>
                 <span class="ep-count">{{ g.count }} 集</span>
               </div>
               <div class="media-body"><b :title="g.title">{{ g.title }}</b><small>{{ mediaLabel(g.media_type) }}{{ g.year ? ' · ' + g.year : '' }}{{ g.episode_label ? ' · ' + g.episode_label : '' }}</small><div class="media-meta"><span v-if="g.tmdb_id">TMDB #{{ g.tmdb_id }}</span><span v-if="g.vote_average">评分 {{ Number(g.vote_average).toFixed(1) }}</span><span v-if="g.identified_count && g.identified_count < g.count" class="identify-chip">{{ g.identified_count }}/{{ g.count }} 已识别</span><span v-else-if="g.identify_status && g.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(g.identify_status) }}</span></div></div>
-              <div class="media-actions">
-                <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="seriesRepresentative(g) && publishResource(seriesRepresentative(g))">立即推送</el-button>
+              <div class="media-actions" @click.stop>
+                <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="seriesRepresentative(g) && publishResource(seriesRepresentative(g))">推送</el-button>
                 <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">取消分享</el-button>
                 <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
                 <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
@@ -936,26 +1051,6 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               </div>
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
-          </div>
-
-          <div v-else-if="viewMode === 'grid'" class="media-grid">
-            <div v-for="r in filteredResources" :key="r.id" class="media-card">
-              <div class="media-poster"><el-image v-if="r.poster_path" :src="'https://image.tmdb.org/t/p/w342'+r.poster_path" fit="cover" style="width:100%;height:100%"/><div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ (r.ext||'FILE').toUpperCase() }}</span></div><span class="media-badge" :class="'badge-'+r.share_status">{{ r.share_status }}</span></div>
-              <div class="media-body"><b :title="r.name">{{ r.media_title || r.name }}</b><small>{{ r.name }}</small><small v-if="r.path_hint" class="dir-clue">目录：{{ r.path_hint }}</small><div class="media-meta"><span v-if="r.media_type" class="type-chip" :class="'type-'+r.media_type">{{ mediaLabel(r.media_type) }}</span><span v-if="r.season && r.episode">S{{ String(r.season).padStart(2,'0') }}E{{ String(r.episode).padStart(2,'0') }}</span><span v-if="r.tmdb_id">TMDB #{{ r.tmdb_id }}</span><span v-if="r.identify_status && r.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(r.identify_status) }}</span><span v-if="r.revision">更新 {{ r.revision }} 次</span></div></div>
-              <div class="media-actions"><el-button size="small" @click="createShare(r)">分享</el-button><el-button v-if="r.share_url" size="small" text @click="cancelShare(r)">取消分享</el-button><el-button size="small" @click="identify(r,true)">自动识别</el-button><el-button size="small" text @click="identify(r,false)">手动</el-button><el-button size="small" type="primary" plain :loading="publishing === r.id" @click="publishResource(r)">立即推送</el-button></div>
-            </div>
-            <div v-if="!filteredResources.length" class="empty big">没有匹配的资源</div>
-          </div>
-          <div v-else-if="viewMode === 'list'" class="panel">
-            <el-table :data="filteredResources" stripe max-height="640">
-              <el-table-column prop="name" label="资源名称" min-width="220" show-overflow-tooltip/>
-              <el-table-column prop="media_title" label="TMDB 标题" min-width="170" show-overflow-tooltip/>
-              <el-table-column label="类型" width="80"><template #default="s">{{ mediaLabel(s.row.media_type) || '—' }}</template></el-table-column>
-              <el-table-column label="识别" width="100"><template #default="s">{{ identifyLabel(s.row.identify_status) }}</template></el-table-column>
-              <el-table-column prop="share_status" label="分享状态" width="110"/>
-              <el-table-column prop="revision" label="更新次数" width="90"/>
-              <el-table-column label="操作" width="360"><template #default="s"><el-button size="small" @click="createShare(s.row)">分享</el-button><el-button v-if="s.row.share_url" size="small" text @click="cancelShare(s.row)">取消分享</el-button><el-button size="small" @click="identify(s.row,true)">自动识别</el-button><el-button size="small" text @click="identify(s.row,false)">手动</el-button><el-button size="small" type="primary" plain :loading="publishing === s.row.id" @click="publishResource(s.row)">立即推送</el-button></template></el-table-column>
-            </el-table>
           </div>
         </section>
 
@@ -971,6 +1066,29 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <div class="match-controls schedule-controls"><span class="schedule-label">检查队列</span><el-input-number v-model="queueSchedule.interval_seconds" :min="5" :max="86400" controls-position="right" style="width:110px"/><span class="schedule-label">秒 · 或 Cron</span><el-input v-model="queueSchedule.cron" placeholder="留空用间隔；如 */1 * * * * 每分钟" style="max-width:230px"/><span class="schedule-label">每条间隔</span><el-input-number v-model="queueSchedule.send_delay" :min="0" :max="60" controls-position="right" style="width:100px"/><span class="schedule-label">秒</span><el-button type="primary" :loading="scheduleSaving" @click="saveQueueSchedule">保存调度</el-button></div>
             <p class="hint" style="margin:6px 0 0">「检查队列」= 多久扫一次待推队列；「每条间隔」= 两条 TG 消息之间隔几秒（防风控，默认 2 秒）。Cron 5 段（分 时 日 月 周，北京时间），非空时优先于检查间隔；保存即生效，无需重启。</p>
           </div>
+
+          <!-- v0.7.0：TG 分发配置升级 -->
+          <div class="panel">
+            <div class="panel-head"><h3>TG 推送配置</h3><span>推送模式 · 消息样式 · 跳转入口</span></div>
+            <div class="tg-extra-grid">
+              <div class="field"><label>推送模式</label><el-select v-model="tgExtra.push_mode" style="width:100%"><el-option label="频道自己推送" value="channel"/><el-option label="频道由 Bot 推送" value="bot_channel"/><el-option label="自定义 Bot 推送群聊" value="custom_bot_group"/></el-select><small>自定义模式需填下方 Bot Token 与目标群聊</small></div>
+              <div class="field"><label>福袋 Bot 用户名</label><el-input v-model="tgExtra.fubao_bot" placeholder="如 fubao_bot（不带@），推送消息加跳转按钮"/><small>留空则不显示福袋/入库跳转按钮</small></div>
+              <div class="field" v-if="tgExtra.push_mode==='custom_bot_group'"><label>自定义 Bot Token</label><el-input v-model="tgExtra.custom_bot_token" type="password" show-password placeholder="123456:AA..."/></div>
+              <div class="field" v-if="tgExtra.push_mode==='custom_bot_group'"><label>目标群聊 chat_id</label><el-input v-model="tgExtra.custom_chat_id" placeholder="-1001234567890"/></div>
+              <div class="field"><label>分享链接样式</label><el-select v-model="tgExtra.link_style" style="width:100%"><el-option label="按钮（推荐）" value="button"/><el-option label="纯文本" value="plain"/></el-select></div>
+              <div class="field"><label>详情篇幅</label><el-select v-model="tgExtra.detail_level" style="width:100%"><el-option label="精简" value="compact"/><el-option label="完整" value="full"/></el-select></div>
+            </div>
+            <div class="panel-foot"><el-button type="primary" :loading="tgExtraSaving" @click="saveTgExtra">保存 TG 配置</el-button></div>
+          </div>
+
+          <!-- v0.7.0：打赏/赞赏码 -->
+          <div class="panel narrow">
+            <div class="panel-head"><h3>我想打赏 · 赞赏码</h3><span>用户可通过推送看到的赞赏码支持你</span></div>
+            <div class="field"><label>赞赏码（图片 URL 或文字说明）</label><el-input v-model="rewardCfg.code" placeholder="如 https://.../reward.png 或文字说明"/></div>
+            <p class="hint">赞赏码配置保存后可按需加入推送模板（在模板编辑器插入 {{reward_code}} 变量）。</p>
+            <div class="panel-foot"><el-button type="primary" :loading="rewardSaving" @click="saveReward">保存赞赏码</el-button></div>
+          </div>
+
           <div class="manage-grid">
             <!-- Bot 管理卡片 -->
             <div class="panel manage-card">
@@ -1319,6 +1437,25 @@ button{font-family:inherit}
 .ai-test{display:flex;gap:10px;margin-top:14px}
 .ai-result{margin-top:10px;background:#f7f8fc;border:1px solid var(--yg-line);border-radius:10px;padding:10px}
 .ai-result pre{margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:#4a5578}
+/* ============ v0.7.0：状态栏 / 批量管理 / 角标 ============ */
+.status-tabs{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;margin-bottom:14px;padding:10px 14px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:12px}
+.status-tab-group{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.stab-label{font-size:11px;color:var(--yg-muted);margin-right:2px}
+.status-tab-group button{border:1px solid transparent;background:#f4f6fb;color:#6b74a8;border-radius:16px;padding:5px 12px;font-size:12px;cursor:pointer;transition:.16s}
+.status-tab-group button:hover{background:#eeedff;color:var(--yg-primary)}
+.status-tab-group button.on{background:var(--yg-primary);color:#fff;box-shadow:0 4px 10px rgba(91,91,214,.22)}
+.batch-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;padding:10px 14px;background:linear-gradient(135deg,#eeedff,#f6f4ff);border:1px solid #d9d4ff;border-radius:12px;font-size:12px}
+.batch-bar b{color:var(--yg-primary)}
+.grid-toolbar{display:flex;align-items:center;margin:0 0 8px 2px;font-size:12px;color:var(--yg-muted)}
+.select-all{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+.select-all input,.card-check{width:15px;height:15px;accent-color:var(--yg-primary);cursor:pointer}
+.media-card.series-card{cursor:pointer;position:relative;transition:.18s}
+.media-card.series-card.picked{border-color:var(--yg-primary);box-shadow:0 0 0 2px rgba(91,91,214,.25)}
+.card-check{position:absolute;top:8px;left:8px;z-index:5;width:18px;height:18px;background:rgba(255,255,255,.9);border-radius:4px}
+.finish-badge{position:absolute;bottom:8px;left:8px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;z-index:4}
+.fin-ended{background:rgba(25,179,166,.92)}.fin-returning{background:rgba(242,163,60,.95)}
+.dur-badge{position:absolute;top:8px;right:8px;padding:2px 7px;border-radius:9px;background:rgba(20,24,40,.72);color:#fff;font-size:9px;z-index:4}
+.tg-extra-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
 @media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}}
 
 /* ============ v0.6.5 手机 / 触屏适配 ============ */
@@ -1368,7 +1505,9 @@ button{font-family:inherit}
   .media-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .media-poster{height:auto;aspect-ratio:2/3}
   .media-actions .el-button{margin:0 3px 4px 0;padding:5px 8px;font-size:11px}
-  .credential-bar,.auth-summary,.kv-grid,.var-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .credential-bar,.auth-summary,.kv-grid,.var-grid,.tg-extra-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  .status-tabs{gap:8px 12px;padding:8px 10px}
+  .batch-bar{gap:6px}
   .cursor-box{grid-template-columns:repeat(2,1fr);gap:10px}
   .connect-steps{flex-wrap:wrap}
   .cstep{flex:1 1 45%}

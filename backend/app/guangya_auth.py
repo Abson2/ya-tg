@@ -33,6 +33,7 @@ def _session(db: Session) -> AuthSession:
 
 def status(db: Session) -> dict:
     from . import runtime_config
+    from .utils import mask_account
     t = _token(db)
     s = _session(db)
     now = utcnow()
@@ -47,7 +48,7 @@ def status(db: Session) -> dict:
         "client_id": client_id,
         "flow": flow,
         "share_configured": share_configured,
-        "sub": t.sub if t else "",
+        "sub": mask_account(t.sub) if t else "",  # v0.7.0：用户 ID 脱敏
         "expires_at": expires.isoformat().replace("+00:00", "Z") if expires else None,
         "expires_in_seconds": max(0, int((expires - now).total_seconds())) if expires else None,
         "expired": bool(expires and expires <= now),
