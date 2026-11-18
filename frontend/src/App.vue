@@ -11,8 +11,7 @@ const keyword = ref('')
 const statusFilter = ref('')
 const seriesGroups = ref([])   // v0.6.4：/api/library/series 聚合结果
 
-const overview = ref({}), task = ref({ cron: '*/30 * * * *', root_id: '', enabled: true,
-  effective_root_id: '', root_source: '' })
+const overview = ref({}), task = ref({ cron: '*/30 * * * *', enabled: true })
 const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
@@ -39,17 +38,16 @@ const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, interval_presets: [], unverified_endpoints: [], note: '' })
 const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [] })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
-// v0.8.1：扫描设置不再单独成页，折叠进「资源库」；根目录只读引用镜像同步里的 B 库 ID
+// v0.8.1：扫描设置不再单独成页，折叠进「资源库」
+// v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const scanning = ref(false), showScanPanel = ref(false)
-const rootSourceLabel = computed(() => ({
-  mirror_target: '镜像同步 · B 库目录 ID（自动引用）',
-  scan_task: '扫描计划旧值',
-  env: '.env SCAN_ROOT_ID'
-}[task.value.root_source] || '未配置'))
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持' })
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
 const finishChecks = ref([]), finishChecking = ref(false)
+// v0.8.3：日志保留策略（操作审计页配置，不新增 .env 项）
+const logCfg = ref({ retention_days: 30, max_rows: 5000, auto_prune: true, schedule: '' })
+const logStats = ref([]), logBusy = ref(false), logOverview = ref({ total_rows: 0, total_pruneable: 0, container_log: '' })
 
 async function loadTmdb() {
   try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
@@ -346,9 +344,54 @@ async function load() {
   try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
   try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
   try { mediaRequests.value = await api('/media-requests?limit=50') } catch (e) {}
+  // v0.8.3：日志概览独立加载，任一接口异常不影响主界面
+  try { await loadLogs() } catch (e) {}
   await loadAuth()
   await loadTmdb()
   await loadAi()
+}
+async function loadLogs() {
+  try {
+    const d = await api('/logs/overview')
+    logCfg.value = d.config || logCfg.value
+    logStats.value = d.tables || []
+    logOverview.value = { total_rows: d.total_rows || 0, total_pruneable: d.total_pruneable || 0,
+      container_log: d.container_log || '' }
+  } catch (e) {}
+}
+async function saveLogCfg() {
+  logBusy.value = true
+  try {
+    const body = { retention_days: Number(logCfg.value.retention_days) || 30,
+      max_rows: Number(logCfg.value.max_rows) || 5000, auto_prune: !!logCfg.value.auto_prune }
+    await api('/logs/config', { method: 'POST', body: JSON.stringify(body) })
+    ElMessage.success('日志保留策略已保存')
+    await loadLogs()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { logBusy.value = false }
+}
+async function pruneLogs() {
+  logBusy.value = true
+  try {
+    const d = await api('/logs/prune', { method: 'POST' })
+    ElMessage.success(`已按策略清理 ${d.deleted || 0} 条`)
+    await loadLogs(); await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { logBusy.value = false }
+}
+async function clearLogs() {
+  try {
+    await ElMessageBox.confirm(
+      '将清空操作审计、扫描批次、镜像任务、版本留痕、已处理分发事件、已推送队列历史与被替代文件记录；待推送队列、未完成批次和业务映射会保留。确认继续？',
+      '清空全部日志', { confirmButtonText: '确认清空', cancelButtonText: '返回', type: 'warning' })
+  } catch (e) { return }
+  logBusy.value = true
+  try {
+    const d = await api('/logs/clear', { method: 'POST', body: JSON.stringify({ confirm: true }) })
+    ElMessage.success(`已清空 ${d.deleted || 0} 条日志`)
+    await loadLogs(); await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { logBusy.value = false }
 }
 async function loadAuth() {
   // 三个请求独立加载：任一端点报错不再拖垮其余状态展示
@@ -363,7 +406,7 @@ async function login() {
 function logout() { authed.value = false; password.value = ''; localStorage.removeItem('ya_tg_password') }
 async function saveTask() {
   // v0.8.0：默认用预设间隔按钮，只有开启「自定义 Cron」才提交表达式
-  // v0.8.1：根目录 ID 不再由前端提交，后端统一引用镜像同步里的 B 库目录 ID
+  // v0.8.3：根目录 ID 已从界面和提交体里完全移除，后端统一引用镜像同步里的 B 库 ID
   const body = { interval_minutes: scanCustom.value ? 0 : Number(scanInterval.value || 0),
     cron: scanCustom.value ? (task.value.cron || '') : '',
     enabled: !!task.value.enabled }
@@ -962,7 +1005,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.2 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.3 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1143,7 +1186,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             </div>
             <div class="form-grid">
               <div class="field inline"><label>启用定时同步</label><el-switch v-model="mirrorCfg.enabled"/></div>
-              <div class="field inline"><label>B 库主目录带 * 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
+              <div class="field inline"><label>B 库主目录带 · 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
               <div class="field inline"><label>B 库缺目录自动创建</label><el-switch v-model="mirrorCfg.auto_create_dirs"/></div>
               <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、变化更新的每个文件操作前都会等待。</small></div>
             </div>
@@ -1156,7 +1199,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
             <p class="hint">
               生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
-              · 主目录带星号：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
+              · 主目录带 · 标记：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
               · B 库目录 ID：{{ mirrorStatus.config?.target_root_id || '未填写' }}
               · 文件空闲：{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s
             </p>
@@ -1171,10 +1214,10 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="parent_id" label="父目录 ID" min-width="180"/>
               <el-table-column label="失败原因 / 处理建议" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || s.row.tip }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。若网盘拒绝带星号的目录名，v0.8.2 会自动降级为不带星号的标准影视名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
+            <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
           </div>
           <div class="panel">
-            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 *</el-tag></div>
+            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.dirs || []" size="small">
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
@@ -1183,7 +1226,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
               <el-table-column prop="error" label="备注 / 失败原因" min-width="200"/>
             </el-table></div>
-            <p class="hint">分类目录保持 A 库原名、不加星号；只有影视主目录按星号规则命名，括号里的年份与 TMDB 标记保持原样。</p>
+            <p class="hint">分类目录保持 A 库原名、不加标记；只有影视主目录按 · 规则命名，括号里的年份与 TMDB 标记保持原样。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>影视映射清单</h3></div>
@@ -1347,9 +1390,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <small v-if="scanCustom">例：*/10 * * * * 每 10 分钟；0 3 * * * 每天 03:00</small>
             </div>
             <div class="form-grid">
-              <div class="field"><label>扫描根目录（自动引用，无需填写）</label><el-input :model-value="task.effective_root_id || '根目录（全部文件）'" readonly/><small>{{ rootSourceLabel }} · 在「镜像同步」里改 B 库目录 ID 即可，此处会自动同步</small></div>
               <div class="field inline"><label>启用定时扫描</label><el-switch v-model="task.enabled"/></div>
             </div>
+            <p class="hint">扫描根目录自动引用「镜像同步」里填的 B 库目录 ID，无需在此填写；改 B 库 ID 后下一次扫描立即生效。</p>
             <div class="panel-foot"><el-button type="primary" @click="saveTask">保存扫描计划</el-button><el-button :loading="scanning" @click="scan">立即扫描</el-button></div>
             <div class="cursor-box"><div><small>游标状态</small><b>{{ task.cursor_status }}</b></div><div><small>已处理文件</small><b>{{ task.cursor_files }}</b></div><div><small>遍历目录</small><b>{{ task.cursor_dirs }}</b></div><div><small>上次结果</small><b>{{ task.last_status || 'never' }}</b></div></div>
             <p class="hint">{{ task.last_message || '尚未执行扫描' }}{{ task.cursor_error ? ' · 错误：' + task.cursor_error : '' }}</p>
@@ -1554,6 +1597,25 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
 
         <section v-else-if="tab === '操作审计'" class="fade">
           <div class="page-head"><div><h2>操作审计</h2><p>授权、建分享、推送、审核与重试的全量记录</p></div><el-tag>{{ audit.length }} 条</el-tag></div>
+          <div class="panel" style="margin-bottom:14px">
+            <div class="panel-head"><h3>日志保留与清理</h3><el-tag size="small" type="info">共 {{ logOverview.total_rows }} 条 · 可清理 {{ logOverview.total_pruneable }} 条</el-tag></div>
+            <div class="form-grid">
+              <div class="field"><label>保留天数</label><el-input-number v-model="logCfg.retention_days" :min="1" :max="3650" controls-position="right" style="width:150px"/><small>超过天数的历史日志自动清理</small></div>
+              <div class="field"><label>每类日志上限（条）</label><el-input-number v-model="logCfg.max_rows" :min="100" :max="200000" :step="500" controls-position="right" style="width:160px"/><small>超出时从最旧的记录开始删</small></div>
+              <div class="field inline"><label>自动清理</label><el-switch v-model="logCfg.auto_prune"/></div>
+            </div>
+            <p class="hint">{{ logCfg.schedule }}；关闭自动清理后只能手动点「立即清理」或「清空全部日志」。</p>
+            <div class="panel-foot"><el-button type="primary" :loading="logBusy" @click="saveLogCfg">保存保留策略</el-button><el-button :loading="logBusy" @click="pruneLogs">立即清理</el-button><el-button type="danger" plain :loading="logBusy" @click="clearLogs">清空全部日志</el-button></div>
+            <div class="table-scroll"><el-table :data="logStats" size="small">
+              <el-table-column prop="label" label="日志类别" width="150"/>
+              <el-table-column prop="rows" label="总条数" width="100"/>
+              <el-table-column prop="pruneable" label="可清理" width="100"/>
+              <el-table-column prop="protected" label="绝不删除" min-width="210"/>
+              <el-table-column prop="oldest" label="最早" min-width="170"/>
+              <el-table-column prop="newest" label="最新" min-width="170"/>
+            </el-table></div>
+            <p class="hint">只清理日志与历史留痕；资源、目录映射、当前文件映射、待推送队列与待处理分发事件一律保留。{{ logOverview.container_log }}</p>
+          </div>
           <div class="panel"><div class="timeline full"><div v-for="a in audit" :key="a.id" class="tl-row"><span class="tl-dot"></span><span class="tl-time">{{ a.ts }}</span><b class="tl-action">{{ a.action }}</b><span class="tl-target">{{ a.target_type }} {{ a.target_id }}</span><span class="tl-detail">{{ a.detail }}</span></div><div v-if="!audit.length" class="empty big">暂无审计记录</div></div></div>
         </section>
       </main>

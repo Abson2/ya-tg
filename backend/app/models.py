@@ -231,7 +231,7 @@ class MirrorRule(Base):
     target_root_id: Mapped[str] = mapped_column(String(64), default="")   # B 镜像库目录
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)    # 按钮式间隔，非手写 Cron
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    star_naming: Mapped[bool] = mapped_column(Boolean, default=True)      # B 库主目录插入 * 的约定
+    star_naming: Mapped[bool] = mapped_column(Boolean, default=True)      # B 库主目录插入 · 的约定
     auto_identify: Mapped[bool] = mapped_column(Boolean, default=True)    # 镜像后自动识别（不推送）
     # v0.8.1：每次文件复制操作之间的空闲秒数，可在管理页调高；硬下限由 mirror.py 强制，
     # 依据官方 OpenAPI v1.3 §10 写接口 2 次/秒，用户不可调低。
@@ -248,8 +248,8 @@ class MirrorRule(Base):
 class MirrorDir(Base):
     """v0.8.1：A 库目录 → B 库目录的 1:1 镜像映射。
 
-    分类目录（动画电影/国产电影 等）在 B 库保持**原名**，不加 *；只有影视主目录
-    才按 star_naming 加 *。create_dir 接口已由抓包 HAR 确认，缺目录时自动创建；
+    分类目录（动画电影/国产电影 等）在 B 库保持**原名**，不加标记；只有影视主目录
+    才按 star_naming 加 ·（v0.8.3 起，网盘拒绝 * 返回 code=141）。create_dir 接口已由抓包 HAR 确认，缺目录时自动创建；
     失败原因写入 error 字段供管理页展示，绝不静默记成「请手工建立」。
     """
     __tablename__ = "mirror_dirs"
@@ -277,7 +277,7 @@ class MirrorMedia(Base):
     rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
     work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
     title_standard: Mapped[str] = mapped_column(String(512), default="")   # 展示/推送用标准名
-    title_mirror: Mapped[str] = mapped_column(String(512), default="")     # B 库带 * 的真实目录名
+    title_mirror: Mapped[str] = mapped_column(String(512), default="")     # B 库带 · / 不带标记的真实目录名
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     media_type: Mapped[str] = mapped_column(String(16), default="")
     source_dir_id: Mapped[str] = mapped_column(String(64), default="")     # A 目录 fileId

@@ -1,8 +1,8 @@
 """v0.8.1 回归：分类目录 1:1 镜像、命名规则、自动建目录、电影目录分享、风控下限。
 
 锁死以下红线：
-  - 分类目录在 B 库保持原名，绝不改成带 * 的影视名。
-  - * 只加在主标题，括号里的年份与 TMDB 标记原样保留。
+  - 分类目录在 B 库保持原名，绝不改成带 · 的影视名（原名里的中点也不许被吃掉）。
+  - v0.8.3 起标记由 * 改为 ·（网盘 code=141 拒绝 *），只加在主标题。
   - create_dir / rename / delete_file 按抓包原文实现，未取证的接口仍不猜参数。
   - 文件操作空闲时间有不可调低的硬下限（官方写接口 2 次/秒）。
   - 电影与剧集一律按作品目录分享，不按单文件。
@@ -21,7 +21,7 @@ from app.db import SessionLocal, migrate
 from app.main import (MirrorConfigInput, MirrorRule, QueueItem, Resource, ScanTask,
                       _effective_scan_root, mirror_config_save)
 from app.models import MirrorDir, MirrorFile, MirrorMedia, MirrorTask
-from app.utils import normalize_work_name, series_dir_info, star_media_name
+from app.utils import NAME_MARK, normalize_work_name, series_dir_info, star_media_name
 
 TABLES = [MirrorFile, MirrorTask, MirrorDir, MirrorMedia, MirrorRule, QueueItem,
           Resource, ScanTask]
@@ -105,8 +105,8 @@ class FakeAPI:
 # ---------- 1. 命名规则 ----------
 def test_star_media_name_keeps_year_and_tags_unchanged():
     got = star_media_name("大醉侠 (2002) {tmdb-135646}")
-    assert got == "大*醉*侠 (2002) {tmdb-135646}", got
-    assert "*(2002)" not in got and "(2002)" in got
+    assert got == "大·醉·侠 (2002) {tmdb-135646}", got
+    assert "·(2002)" not in got and "(2002)" in got
     assert "{tmdb-135646}" in got
     # A 标准名与 B 带 * 名必须归一到同一作品键
     assert normalize_work_name(got) == normalize_work_name("大醉侠 (2002) {tmdb-135646}")
@@ -114,8 +114,8 @@ def test_star_media_name_keeps_year_and_tags_unchanged():
 
 def test_star_media_name_ascii_uses_word_separators():
     got = star_media_name("Spider Man No Way Home (2021)")
-    assert got == "Spider*Man*No*Way*Home (2021)", got
-    assert "S*p*i*d*e*r" not in got
+    assert got == "Spider·Man·No·Way·Home (2021)", got
+    assert "S·p·i·d·e·r" not in got
 
 
 # ---------- 2. 分类目录识别 ----------
@@ -138,8 +138,9 @@ def test_discover_works_treats_category_dirs_as_path():
 
 
 def test_category_dir_is_never_starred():
-    # 分类目录只走 standard_media_name，绝不经过 star_media_name
+    # v0.8.3：分类目录直传 A 库原名，绝不经过标记剥离
     assert "*" not in mirror.standard_media_name("动画电影")
+    assert NAME_MARK not in mirror.standard_media_name("动画电影")
     assert mirror.standard_media_name("动画电影") == "动画电影"
 
 
@@ -152,8 +153,9 @@ def test_mirror_auto_creates_category_and_work_dirs(db):
     assert out["new"] == 1 and out["done"] == 1, out
     assert out["dirs_created"] == 2, out
     names = [n for _, n in FakeAPI.created]
-    assert names[0] == "动画电影", names          # 分类目录原名，不加 *
-    assert names[1].startswith("侠*客*行"), names  # 作品主目录才加 *
+    assert names[0] == "动画电影", names          # 分类目录原名，不加标记
+    assert names[1].startswith("侠·客·行"), names  # 作品主目录才加 ·
+    assert "*" not in names[1] and NAME_MARK in names[1], names
     assert "(2001) {tmdb-135646}" in names[1], names
     assert FakeAPI.copies == [(["F1"], "B_2")], FakeAPI.copies
     assert db.query(QueueItem).count() == 0       # 镜像完成禁止自动推 TG

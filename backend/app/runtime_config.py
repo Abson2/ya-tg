@@ -62,6 +62,10 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "donation_image_url": ("donation_image_url", ""),
     "donation_text": ("donation_text", ""),
     "donation_button_text": ("donation_button_text", "打赏支持"),
+    # v0.8.3：日志保留策略（管理页配置，不新增 .env 项）
+    "log_retention_days": ("log_retention_days", "30"),
+    "log_max_rows": ("log_max_rows", "5000"),
+    "log_auto_prune": ("log_auto_prune", "true"),
 }
 
 

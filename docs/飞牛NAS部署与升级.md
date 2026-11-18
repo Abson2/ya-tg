@@ -1,4 +1,4 @@
-# 飞牛 NAS 部署与升级教程（v0.8.2）
+# 飞牛 NAS 部署与升级教程（v0.8.3）
 
 > 普通用户只需要 `docker compose` 拉官方镜像，**不用 clone 源码、不用本地构建、不用懂 Python**。
 > 配置与数据库都在 `./db` 卷里，升级时不要删这个目录。
@@ -44,7 +44,7 @@ ADMIN_PASSWORD=换成你自己的强密码
 APP_SECRET=用 openssl rand -hex 32 生成
 ```
 
-其余保持默认。想锁版本就加 `IMAGE_TAG=v0.8.2`；留空跟随 `latest`。
+其余保持默认。想锁版本就加 `IMAGE_TAG=v0.8.3`；留空跟随 `latest`。
 
 ### 3. 启动
 
@@ -114,7 +114,7 @@ docker compose ps
 改 `.env`：
 
 ```dotenv
-IMAGE_TAG=v0.8.2
+IMAGE_TAG=v0.8.3
 ```
 
 然后 `docker compose up -d`。回滚把 `IMAGE_TAG` 改成上一个版本号（如 `v0.7.1`）再 `up -d` 即可；每个 `vX.Y.Z` 标签与 Release 都保留历史版本，不会移动已发布标签。
@@ -155,3 +155,9 @@ docker compose up -d
 ```
 
 恢复时把备份解回同一路径再启动。`.env` 里的 `APP_SECRET` 必须与备份时一致，否则已加密的凭证解不开。
+
+## 日志与数据库体积（v0.8.3）
+
+- **容器内 stdout 日志**：`docker-compose.yml` / `docker-compose.build.yml` 已加 `json-file` 限额 `max-size: 10m` + `max-file: 3`，最多约 30MB，无需手工删 `./logs`。升级到 v0.8.3 后需重新 `docker compose up -d` 让限额生效。
+- **数据库里的日志/留痕**：管理页「操作审计 → 日志保留与清理」默认保留 30 天 / 每类 5000 条，启动时与每天 03:30 自动清理；也可手动「立即清理」「清空全部日志」。配置加密落库，升级不会丢。
+- 升级前照旧备份 `./db/ya-tg.db`；清理只删历史日志，不动资源、目录映射、分享链接与待推送队列。

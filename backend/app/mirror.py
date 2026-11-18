@@ -27,8 +27,8 @@ from sqlalchemy.orm import Session
 
 from .guangya import GuangYaWebFiles, WebFileError
 from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask
-from .utils import (VIDEO_EXTS, media_identity, normalize_work_name, parse_media_name,
-                    standard_media_name, star_media_name, utcnow)
+from .utils import (NAME_MARK, VIDEO_EXTS, media_identity, normalize_work_name,
+                    parse_media_name, standard_media_name, star_media_name, utcnow)
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +85,8 @@ def _looks_like_work(name: str) -> bool:
 def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, str]]]]:
     """从 A 根目录往下找到「真正的影视主目录」，返回 (节点, 分类目录链)。
 
-    分类目录（自身无视频、子树有视频、名字像分类）在 B 库保持原名、不加 *；
-    只有影视主目录才按 star_naming 加 *。支持多级分类与未整理剧集
+    分类目录（自身无视频、子树有视频、名字像分类）在 B 库保持原名、不加标记；
+    只有影视主目录才按 star_naming 加 ·。支持多级分类与未整理剧集
     （剧名目录下直接放单集）两种常见结构。
     """
     cache: dict[str, bool] = {}
@@ -135,8 +135,8 @@ async def _resolve_b_dir(api: GuangYaWebFiles, b_root: str,
                          star_naming: bool, cache: dict):
     """逐级把 A 的目录路径映射到 B，返回 (目标目录ID, 缺失清单, 已解析链)。
 
-    分类目录按原名匹配（B 库不改名）；影视主目录按归一化名匹配（B 库带 * 也能命中）。
-    创建目录接口未验证，缺失时只登记清单，绝不猜测接口参数去自动创建。
+    分类目录按原名匹配（B 库不改名）；影视主目录按归一化名匹配（带 · / 无标记都能命中）。
+    本函数只供旧映射回查；实际建目录走 sync_rule._ensure_child（create_dir 已由 HAR 取证）。
     """
     parent = str(b_root)
     missing: list[dict] = []
@@ -147,7 +147,7 @@ async def _resolve_b_dir(api: GuangYaWebFiles, b_root: str,
         if not fid:
             missing.append({"parent_id": parent, "name": standard_media_name(cat_name),
                             "kind": "分类目录", "star": False,
-                            "tip": "在 B 库建立同名目录，名称保持不变，不要加 *"})
+                            "tip": "在 B 库建立同名目录，名称保持不变，不要加 ·"})
             return "", missing, chain
         chain.append((cat_id, cat_name, "category", fid))
         parent = fid
@@ -158,7 +158,7 @@ async def _resolve_b_dir(api: GuangYaWebFiles, b_root: str,
     if not fid:
         missing.append({"parent_id": parent, "name": expected,
                         "kind": "影视主目录", "star": bool(star_naming),
-                        "tip": "这是影视主目录，按 * 约定命名" if star_naming else "保持标准影视名"})
+                        "tip": "这是影视主目录，按 · 约定命名" if star_naming else "保持标准影视名"})
         return "", missing, chain
     chain.append(("", work_name, "work", fid))
     return fid, missing, chain
@@ -306,7 +306,7 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
 
 
 async def _target_children(api: GuangYaWebFiles, parent_id: str) -> dict[str, str]:
-    """B 库某目录的直属子目录 → {归一化名: fileId}。带 * 的目录名归一化后与 A 对齐。"""
+    """B 库某目录的直属子目录 → {归一化名: fileId}。带 · / 无标记目录名归一化后与 A 对齐。"""
     items, ok = await _list_dir(api, parent_id)
     if not ok:
         raise WebFileError("B 库目录分页不完整，已中止本次镜像")
@@ -385,7 +385,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     """执行一次 A→B 增量同步。逐部影视完成后立即提交，不等整库结束。
 
     v0.8.1：
-      - 分类目录 1:1 镜像到 B 库，名称不修改；只有影视主目录按 star_naming 加 *。
+      - 分类目录 1:1 镜像到 B 库，名称不修改；只有影视主目录按 star_naming 加 ·。
       - B 库缺目录时自动 create_dir（抓包已确认，可用 auto_create_dirs 关闭）。
       - 每次文件复制之间留可配置空闲时间，硬下限 MIN_FILE_IDLE_SECONDS 不可调低。
       - 本模块绝不写 push_queue、绝不调用 _enqueue_* / process_queue。
@@ -419,7 +419,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             f"B 镜像库根目录不可访问（{b_root}）：{exc}。"
             "请核对「镜像同步」里填的 B 库目录 ID、确认目录存在且光鸭登录态有效"
         ) from exc
-    # 一旦网盘拒绝带 * 的目录名，整轮改用标准影视名，避免每个作品都失败一次
+    # v0.8.3：网盘拒绝 *（code=141），标记已改为 ·；只有连 · 也拒绝时整轮才用无标记标准名
     plain_mode = {"on": False, "tried": False}
 
     async def _ensure_child(parent_id: str, name: str, kind: str,
@@ -436,9 +436,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path, fid, "mapped")
             stats["dirs_mapped"] += 1
             return fid, None, name
-        tip = ("在 B 库建立同名分类目录，名称保持不变，不要加 *"
+        tip = ("在 B 库建立同名分类目录，名称保持不变，不要加 ·"
                if kind == "category" else
-               "按 * 约定命名（括号年份保持原样）" if (kind == "work" and rule.star_naming)
+               "按 · 约定命名（括号年份保持原样）" if (kind == "work" and rule.star_naming)
                else "保持标准影视名/子目录名")
         missing = {"parent_id": parent_id, "name": name, "kind": kind,
                    "star": kind == "work" and bool(rule.star_naming), "tip": tip}
@@ -453,8 +453,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 stats["dir_errors"].append(f"{name}：{err}")
             return "", missing, name
 
-        effective = name
-        if kind == "work" and "*" in effective and plain_mode["on"]:
+        # v0.8.3：真实网盘 create_dir 拒绝 *（code=141「文件夹名包含非法字符: *」），
+        # 影视主目录标记统一改为 ·；旧数据/旧配置里残留的 * 就地换成 · 再建目录。
+        # 分类目录与季目录直传 A 库原名，绝不替换字符（原名里的中点不是标记）。
+        effective = name.replace("*", NAME_MARK) if kind == "work" else name
+        # 本轮已确认网盘连 · 也拒绝时，后续作品直接用无标记标准名，避免逐部重试
+        if kind == "work" and plain_mode["on"]:
             effective = standard_media_name(effective)
         await asyncio.sleep(idle)
         fallback_note = ""
@@ -463,7 +467,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         except Exception as exc:
             first = str(exc)[:300]
             plain = standard_media_name(effective)
-            if (kind == "work" and "*" in effective and plain != effective
+            if (kind == "work" and NAME_MARK in effective and plain != effective
                     and not plain_mode["tried"]):
                 plain_mode["tried"] = True
                 await asyncio.sleep(idle)
@@ -471,8 +475,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     made = await api.create_dir(parent_id, plain)
                     plain_mode["on"] = True
                     effective = plain
-                    fallback_note = (f"网盘拒绝带 * 的目录名（{first[:120]}），"
-                                     "已自动降级为不带 * 的标准影视名")
+                    fallback_note = (f"网盘拒绝带 · 的目录名（{first[:120]}），"
+                                     "已自动降级为不带标记的标准影视名")
                     stats["dirs_fallback"] += 1
                     logger.warning("[mirror] %s：%s", name, fallback_note)
                 except Exception as exc2:
@@ -515,11 +519,11 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             stats["skipped"] += 1
             continue
 
-        # 1:1 解析/创建 B 库分类目录（原名），再解析/创建影视主目录（带 *）
+        # 1:1 解析/创建 B 库分类目录（原名），再解析/创建影视主目录（带 ·）
         target_dir_id = b_root
         missing_all: list[dict] = []
         for cat_name, cat_id in cats:
-            fid, miss, _actual = await _ensure_child(target_dir_id, standard_media_name(cat_name),
+            fid, miss, _actual = await _ensure_child(target_dir_id, cat_name,
                                                     "category", cat_id, cat_path)
             if miss:
                 missing_all.append(miss)
@@ -532,7 +536,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 missing_all.append(miss)
             else:
                 target_dir_id = fid
-                # v0.8.2：降级为不带 * 名称时，展示与实际网盘目录保持一致
+                # v0.8.3：降级为不带标记名称时，展示与实际网盘目录保持一致
                 expected = actual
 
         media = db.scalar(select(MirrorMedia).where(
@@ -591,7 +595,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 if row.identity == identity and row.status == "synced":
                     row.status = "superseded"
                     stats["changed"] += 1
-            # 作品目录下的 Season/子目录在 B 库同名镜像（不加 *）
+            # 作品目录下的 Season/子目录在 B 库同名镜像（不加标记）
             target_parent = media.target_dir_id
             for sub_name in _relative_dir_names(container, work, nodes):
                 key = f"{target_parent}|{normalize_work_name(sub_name)}"

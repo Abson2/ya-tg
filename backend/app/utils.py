@@ -118,6 +118,15 @@ VIDEO_EXTS = {
 }
 
 
+# B 库影视主目录的标记字符。
+# v0.8.0~v0.8.2 用 `*`，但真实网盘 create_dir 返回
+# code=141「文件夹名包含非法字符: *」；v0.8.3 起按用户要求改用中点 `·`。
+# 旧库里已存在的带 * 名称、v0.8.2 已降级创建的无标记名称都要继续兼容，
+# 因此归一化/还原时两种标记都识别。
+NAME_MARK = "·"
+_NAME_MARKS_RE = re.compile(r"[*·]")
+
+
 def normalize_work_name(s: str) -> str:
     """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
     if not s:
@@ -128,53 +137,48 @@ def normalize_work_name(s: str) -> str:
     v = re.sub(r"[\[(（【{][^\])）】}]*[\])）】}]", "", str(s))
     # 兜底：裸 tmdb-/imdb- 标记（无括号包裹时）也去掉，避免同剧裂卡
     v = re.sub(r"\b(?:tmdb|imdb)[-_:：]?\d+\b", "", v, flags=re.I)
-    # v0.8.0：B 库影视主目录按约定插入 *（如「大*醉*侠 (2002)」）。
-    # 归一化必须剥掉 *，否则 A 库「大醉侠」与 B 库「大*醉*侠」会算成两部剧，
-    # 镜像映射、资源库聚合、TG 整剧统计全部错位。
-    v = v.replace("*", "")
+    # v0.8.3：B 库影视主目录标记由 * 改为 ·。两种标记都必须剥掉，否则
+    # A 库「大醉侠」/ B 库「大·醉·侠」/ v0.8.2 已降级的「大醉侠」会算成三部剧，
+    # 且升级后已有的无标记目录无法被复用（会重复建目录）。
+    v = _NAME_MARKS_RE.sub("", v)
     v = re.sub(r"[\s\-_.,·:：]+", "", v).lower()
     v = re.sub(r"(19|20)\d{2}$", "", v)
     return v
 
 
 def standard_media_name(s: str) -> str:
-    """B 库带 * 目录名 → 展示/管理/TG 推送使用的标准影视名。
+    """B 库带标记目录名 → 展示/管理/分享标题/TG 推送使用的标准影视名。
 
-    只去掉 *，保留年份与 {tmdb-} 标记（它们携带识别信息）。带 * 的目录名只存在于
-    B 库网盘；资源库、分享标题、TG 推送一律走这里做标准化。
+    v0.8.3：同时剥掉 * 与 ·，保留年份与 {tmdb-} 标记（它们携带识别信息）。
+    注意「分类目录」不要走这里：分类目录在 B 库必须保持 A 库原名，
+    原名里若含中点不能被当成标记吃掉（mirror._ensure_child 已改为直传原名）。
     """
-    return str(s or "").replace("*", "").strip()
+    return _NAME_MARKS_RE.sub("", str(s or "")).strip()
 
 
 def star_media_name(s: str) -> str:
-    """按 B 库命名约定生成带 * 的期望目录名。
+    """按 B 库命名约定生成带标记的期望目录名（函数名沿用 v0.8.0 的 * 时代）。
 
-    v0.8.1：中文按字符插 *，纯英文按单词插 *；括号段（年份 / {tmdb-} 标记）原样保留，
-    括号前只用空格分隔，不加 *。v0.8.1 起由 mirror.sync_rule() 用已取证的 create_dir
-    接口自动创建这些目录，不再需要人工改名或手工预建。
+    v0.8.3：标记由 * 改为 ·（网盘明确拒绝 *）。中文按字符、纯英文按单词插 ·；
+    括号段（年份 / {tmdb-} 标记）原样保留，括号前只用空格分隔，不加标记。
+      大醉侠 (2002) {tmdb-135646} → 大·醉·侠 (2002) {tmdb-135646}
+    已经带过标记的名称不重复插入；旧带 * 名称就地换成 ·。
     """
     text = str(s or "").strip()
     if not text:
         return ""
-    # 只给主标题段加 *，年份与 {tmdb-} 标记保持可识别
+    # 只给主标题段加标记，年份与 {tmdb-} 标记保持可识别
     m = re.match(r"^(.*?)(\s*[\(（\[【].*)?$", text)
     head, tail = (m.group(1), m.group(2) or "") if m else (text, "")
-    if "*" in head:
-        return text
-    # v0.8.1：纯英文片名按「单词」插 *，中文按「字符」插 *。
-    # 旧逻辑对 ASCII 逐字符插星会生成 S*p*i*d*e*r... 这种超长且难读的目录名，
-    # 用户截图里显示成一串乱码。归一化会剥掉所有 *，两种写法匹配结果一致。
+    if "*" in head or NAME_MARK in head:
+        return text.replace("*", NAME_MARK)
     core = head.strip()
     if core and all(ord(c) < 128 for c in core):
-        starred = "*".join(w for w in re.split(r"\s+", core) if w)
+        marked = NAME_MARK.join(w for w in re.split(r"\s+", core) if w)
     else:
-        starred = "*".join(core)
-    # v0.8.1：括号段（年份 / {tmdb-} 标记）保持原样，前面只用空格分隔，不加 *。
-    # 用户明确要求「名称中加 *，（）中的年份不用加」：
-    #   大醉侠 (2002) {tmdb-135646} → 大*醉*侠 (2002) {tmdb-135646}
-    # 旧实现会在括号前多插一个 *（…侠*(2002)），既难读也让 B 库目录名与 A 库不对齐。
+        marked = NAME_MARK.join(core)
     suffix = " " + tail.strip() if tail.strip() else ""
-    return starred + suffix
+    return marked + suffix
 
 
 def media_identity(tmdb_id, media_type: str, season, episode, file_name: str = "") -> tuple[str, bool]:

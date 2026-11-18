@@ -5,7 +5,8 @@
     不再被硬编码的「请在 B 库该父目录下建立此目录后重新同步」覆盖。
   - B 库根目录不可访问时明确中止，不把访问失败误判成「B 库没有这个目录」，
     更不会逐部作品调 42 次 create_dir 全部失败。
-  - 网盘拒绝带 * 目录名时自动降级为不带 * 的标准影视名，同步仍能完成。
+  - 网盘拒绝带 · 目录名时自动降级为不带标记的标准影视名，同步仍能完成。
+  - v0.8.3：旧 * 名称就地换成 ·，真实环境 code=141 不再出现。
   - 自动创建被关闭时，失败原因明确说明是开关关闭。
   - 状态接口回显实际生效配置，一眼看出 auto_create_dirs 是否为 False。
 """
@@ -71,6 +72,7 @@ class FakeAPI:
     fail_b_root = False
     fail_create = False
     reject_star = False
+    reject_dot = False
 
     def __init__(self, db):
         self.db = db
@@ -98,7 +100,10 @@ class FakeAPI:
                                "code=400 msg=目录名包含非法字符", 400)
         if self.reject_star and "*" in dir_name:
             raise WebFileError("网页端 /userres/v1/file/create_dir 失败 "
-                               "code=400 msg=名称不允许包含 *", 400)
+                               "code=141 msg=文件夹名包含非法字符: *", 141)
+        if self.reject_dot and "·" in dir_name:
+            raise WebFileError("网页端 /userres/v1/file/create_dir 失败 "
+                               "code=141 msg=文件夹名包含非法字符: ·", 141)
         self.created.append((parent_id, dir_name))
         return {"file_id": f"B_{len(self.created)}", "name": dir_name,
                 "parent_id": parent_id, "raw": {}}
@@ -116,6 +121,7 @@ def _reset(**kw):
     FakeAPI.fail_b_root = False
     FakeAPI.fail_create = False
     FakeAPI.reject_star = False
+    FakeAPI.reject_dot = False
     for k, v in kw.items():
         setattr(FakeAPI, k, v)
 
@@ -163,10 +169,10 @@ def test_unreadable_b_root_aborts_instead_of_42_failed_creates(db):
     assert db.query(MirrorMedia).count() == 0
 
 
-# ---------- 3. 网盘拒绝 * 名称时自动降级，同步仍能完成 ----------
-def test_starred_name_rejected_falls_back_to_plain_name(db):
+# ---------- 3. 网盘拒绝 · 名称时自动降级，同步仍能完成 ----------
+def test_dot_name_rejected_falls_back_to_plain_name(db):
     r = _rule(db)
-    _reset(reject_star=True)
+    _reset(reject_dot=True)
     with patch("app.mirror.GuangYaWebFiles", FakeAPI):
         out = asyncio.run(mirror.sync_rule(db, r))
 
@@ -176,7 +182,7 @@ def test_starred_name_rejected_falls_back_to_plain_name(db):
     assert out["dirs_created"] == 2, out
     names = [n for _, n in FakeAPI.created]
     assert names[0] == "动画电影", names
-    assert "*" not in names[1], names          # 降级后是不带 * 的标准名
+    assert "*" not in names[1] and "·" not in names[1], names  # 降级后不带任何标记
     assert names[1] == WORK_NAME, names
 
     work_row = db.scalar(select(MirrorDir).where(MirrorDir.kind == "work"))
@@ -188,6 +194,21 @@ def test_starred_name_rejected_falls_back_to_plain_name(db):
     assert db.query(QueueItem).count() == 0     # 镜像仍不推 TG
     st = mirror_status(db=db)
     assert st["counts"]["dirs_fallback"] == 1, st["counts"]
+
+
+# ---------- 3b. 真实环境 code=141：旧 * 名称就地换成 ·，不再被网盘拒绝 ----------
+def test_legacy_star_is_converted_to_dot_no_code_141(db):
+    r = _rule(db)
+    _reset(reject_star=True)  # 网盘只拒绝 *，模拟用户实测的 code=141
+    with patch("app.mirror.GuangYaWebFiles", FakeAPI):
+        out = asyncio.run(mirror.sync_rule(db, r))
+
+    assert out["new"] == 1 and out["done"] == 1, out
+    assert out["dirs_fallback"] == 0 and out["missing_dirs"] == [], out
+    names = [n for _, n in FakeAPI.created]
+    assert all("*" not in n for n in names), names
+    assert names[1].startswith("侠·客·行"), names
+    assert "(2001) {tmdb-135646}" in names[1], names
 
 
 # ---------- 4. 自动创建被关闭时给出明确原因 ----------

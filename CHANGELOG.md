@@ -8,6 +8,34 @@
 
 ---
 
+## v0.8.3 (2026-11-18)
+
+按用户「库的复制已实现」后的三条实测反馈修复：**命名字符、扫描根目录、日志膨胀**。
+
+### 一、网盘拒绝 `*`，B 库影视主目录改用 `·`
+- 真实环境 `POST /userres/v1/file/create_dir` 返回 `code=141 msg=文件夹名包含非法字符: *`，v0.8.2 只能降级成不带标记的标准影视名。本版按用户要求把标记换成 `·`：`大醉侠 (2002) {tmdb-135646}` → `大·醉·侠 (2002) {tmdb-135646}`（中文按字符、英文按单词，括号年份与 TMDB 标记原样）。
+- `standard_media_name()` / `normalize_work_name()` 同时识别 `*` 与 `·`：旧带 `*` 名称就地转换；v0.8.2 已降级创建的**无标记目录被归一化命中复用**，不重复建目录、不改存量目录名；A/B/无标记三种写法仍落到同一作品键。
+- 分类目录改为直传 A 库原名，原名里带中点也不会被剥离（新增 `动画·电影` 1:1 回归）。
+- 保底降级仍在：只有网盘连 `·` 也拒绝时，才自动降级为无标记标准影视名，`created_fallback` 与真实报错照常落库回显。
+
+### 二、资源库定时配置不再有目录 ID 输入框
+- 删除「扫描根目录（自动引用，无需填写）」输入框与 `rootSourceLabel`，界面只保留一句「自动引用镜像同步 B 库 ID」说明。
+- `ScanConfig` 移除 `root_id`，保存扫描计划不再把 B 库 ID 写进 `ScanTask` 形成第二份配置；扫描（含定时任务）统一由 `_effective_scan_root()` 实时取值，改 B 库 ID 立即生效。
+
+### 三、日志保留策略（自动清理 + 手动清空 + 容器限额）
+- 此前 `AuditLog`、`ResourceScanBatch`、`MirrorTask`、`ResourceVersion`、`DistributionEvent`、`QueueItem`、`MirrorFile(superseded)` 全部只增不减，SQLite 与界面列表会无限膨胀。
+- 新增 `log_retention.py`：保留天数（默认 30）+ 每表条数上限（默认 5000）+ 自动清理开关；管理页「操作审计 → 日志保留与清理」可配置、可「立即清理」、可「清空全部日志」（需二次确认）。
+- **绝不误删业务关键行**：running 扫描批次、pending/running 镜像任务、`queue_id=0` 待处理分发事件、pending/retry/review 队列项、非 `superseded` 文件映射一律保留；资源、目录映射、分享链接不在清理范围。
+- 自动清理在启动时与每天 03:30（Asia/Shanghai）各跑一次；两个 compose 文件给 stdout 日志加 `json-file` 限额 `3 × 10MB`。
+- 配置走运行时加密落库（`log_retention_days` / `log_max_rows` / `log_auto_prune`），不新增 `.env` 项；API：`GET /api/logs/overview`、`POST /api/logs/config|prune|clear`。
+
+### 四、回归
+- `pytest tests -q`：**142 passed**（新增 `tests/test_v083_fixes.py` 11 项；`test_v082_mirror_diagnostics.py` 补 1 项 `code=141` 回归；v0.8.0 / v0.8.1 / v0.8.2 命名契约断言同步更新）。
+- `vite build` 通过、`py_compile` 通过、`git diff --check` 通过。
+- **仍待真实环境确认**：`·` 是否被该网盘接受、已复制库的无标记目录是否按预期复用、日志自动清理在真实数据量下的耗时；投稿转存 HAR 与 `QueueItem`/`DistributionEvent` 的 `source/mode` 数据层隔离仍未做。
+
+---
+
 ## v0.8.2 (2026-11-18)
 
 按用户实测「镜像库同步并没有成功」修复：42 部作品全部 `missing` / `blocked` / 文件数 0，而界面只显示通用文案「请在 B 库该父目录下建立此目录后重新同步」，**真实错误被吞掉，无法判断根因**。

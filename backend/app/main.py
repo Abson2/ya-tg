@@ -18,8 +18,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, mirror,
-               runtime_config, tgto, tmdb)
+from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, log_retention,
+               mirror, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
@@ -105,6 +105,24 @@ async def _job_bot_poll():
             db.rollback()
 
 
+async def _job_log_prune():
+    """v0.8.3：每日按保留策略自动清理日志与历史留痕。失败只记日志，不影响其它任务。"""
+    with SessionLocal() as db:
+        try:
+            cfg = log_retention.config(db)
+            if not cfg["auto_prune"]:
+                return
+            out = log_retention.prune(db, days=cfg["retention_days"],
+                                      max_rows=cfg["max_rows"])
+            db.commit()
+            if out["deleted"]:
+                logger.info("[logs] 自动清理 %s 条（保留 %s 天 / 每表上限 %s）",
+                            out["deleted"], out["days"], out["max_rows"])
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[logs] 自动清理失败：%s", exc)
+
+
 def _queue_trigger(db: Session):
     """v0.6.4：按管理页配置生成队列推送触发器。cron 优先（5 段），否则用间隔秒数。"""
     cron = (runtime_config.get(db, "queue_cron") or "").strip()
@@ -152,6 +170,16 @@ async def _scheduled_scan(root: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     migrate()
+    # v0.8.3：启动时先按保留策略清理一次，避免长期运行后 SQLite 被历史日志撑爆
+    try:
+        with SessionLocal() as db:
+            cfg = log_retention.config(db)
+            if cfg["auto_prune"]:
+                log_retention.prune(db, days=cfg["retention_days"],
+                                    max_rows=cfg["max_rows"])
+                db.commit()
+    except Exception as exc:
+        logger.warning("[logs] 启动清理失败（不影响启动）：%s", exc)
     with SessionLocal() as db:
         guangya_auth.seed_from_config(db)
         task = db.scalar(select(ScanTask).limit(1))
@@ -184,18 +212,22 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
                       max_instances=1, coalesce=True)
+    scheduler.add_job(_job_log_prune,
+                      CronTrigger.from_crontab("30 3 * * *", timezone="Asia/Shanghai"),
+                      id="log_prune", replace_existing=True,
+                      max_instances=1, coalesce=True)
     scheduler.start()
     yield
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.2", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.3", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.2", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.3", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -437,8 +469,7 @@ def scan_task(db: Session = Depends(get_db)):
 class ScanConfig(BaseModel):
     cron: str = ""                    # 高级自定义；interval_minutes>0 时由预设生成
     interval_minutes: int = 0
-    root_id: str = ""
-    enabled: bool = True
+    enabled: bool = True              # v0.8.3：不再接收 root_id，根目录只引用镜像同步的 B 库 ID
 
 
 @app.put("/api/scan-task", dependencies=ADMIN)
@@ -451,9 +482,10 @@ def save_scan_task(p: ScanConfig, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(400, f"扫描计划无效：{e}")
     t = db.scalar(select(ScanTask).limit(1))
-    # v0.8.1：前端不再让用户填扫描根目录；留空时自动引用镜像同步里的 B 库目录 ID
-    root_id = (p.root_id or "").strip() or _effective_scan_root(db)[0]
-    t.cron, t.root_id, t.enabled = cron, root_id, p.enabled
+    # v0.8.3：不再把根目录 ID 存进 ScanTask 形成第二份配置，避免 B 库 ID 改了以后
+    # 旧值固化。每次扫描（含定时任务）都由 _effective_scan_root() 实时取 B 库 ID。
+    root_id, _ = _effective_scan_root(db)
+    t.cron, t.enabled = cron, p.enabled
     add_audit(db, "scan_task_updated", target_type="scan", detail=json_dumps({"cron": cron, "root_id": root_id, "enabled": p.enabled}))
     db.commit()
     if scheduler.get_job("global_scan"):
@@ -2076,6 +2108,55 @@ def audit(limit: int = 200, db: Session = Depends(get_db)):
     return [{"id": x.id, "ts": x.ts.isoformat() if x.ts else "", "action": x.action,
              "target_type": x.target_type, "target_id": x.target_id, "detail": x.detail, "actor": x.actor}
             for x in rows]
+
+
+# ---------- v0.8.3：日志保留策略与清理 ----------
+class LogConfigInput(BaseModel):
+    retention_days: int = 30
+    max_rows: int = 5000
+    auto_prune: bool = True
+
+
+class LogClearInput(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/api/logs/overview", dependencies=ADMIN)
+def logs_overview(db: Session = Depends(get_db)):
+    return log_retention.overview(db)
+
+
+@app.post("/api/logs/config", dependencies=ADMIN)
+def logs_config_save(p: LogConfigInput, db: Session = Depends(get_db)):
+    cfg = log_retention.save_config(db, retention_days=p.retention_days,
+                                    max_rows=p.max_rows, auto_prune=p.auto_prune)
+    add_audit(db, "logs_config_updated", target_type="logs",
+              detail=json_dumps({"retention_days": cfg["retention_days"],
+                                 "max_rows": cfg["max_rows"],
+                                 "auto_prune": cfg["auto_prune"]}))
+    db.commit()
+    return {"ok": True, "config": cfg}
+
+
+@app.post("/api/logs/prune", dependencies=ADMIN)
+def logs_prune(db: Session = Depends(get_db)):
+    out = log_retention.prune(db, mode="prune")
+    add_audit(db, "logs_pruned", target_type="logs",
+              detail=json_dumps({"deleted": out["deleted"], "days": out["days"],
+                                 "max_rows": out["max_rows"]}))
+    db.commit()
+    return out
+
+
+@app.post("/api/logs/clear", dependencies=ADMIN)
+def logs_clear(p: LogClearInput, db: Session = Depends(get_db)):
+    if not p.confirm:
+        raise HTTPException(400, "清空日志需要显式确认 confirm=true")
+    out = log_retention.prune(db, mode="clear")
+    add_audit(db, "logs_cleared", target_type="logs",
+              detail=json_dumps({"deleted": out["deleted"]}))
+    db.commit()
+    return out
 
 
 # ---------- v0.6.1：分发链路修复 ----------

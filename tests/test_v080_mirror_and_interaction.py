@@ -25,7 +25,8 @@ from app.main import (BatchLibraryInput, DistributionEvent, MirrorFile, MirrorMe
 from app.models import (Bot, Channel, MediaRequest, UserContribution,
                         ResourceVersion, MirrorDir)
 from app.scanner import _record_change_events
-from app.utils import media_identity, normalize_work_name, star_media_name, work_group_key
+from app.utils import (NAME_MARK, media_identity, normalize_work_name, star_media_name,
+                        work_group_key)
 
 TABLES = [QueueItem, ResourceVersion, DistributionEvent, MirrorFile, MirrorTask,
           MirrorDir, MirrorMedia, MirrorRule, ResourceScanBatch, UserContribution, MediaRequest,
@@ -62,12 +63,12 @@ def _res(fid, name, **kw):
     return Resource(**base)
 
 
-# ---------- 1. B 库带 * 命名与身份保护 ----------
+# ---------- 1. B 库带 · 命名与身份保护（v0.8.3 起，* 已被网盘拒绝） ----------
 def test_star_naming_maps_to_same_work_key():
     a = "侠客行 (2001) {tmdb-135646}"
     b = "侠*客*行 *(2001) {tmdb-135646}"
     assert normalize_work_name(a) == normalize_work_name(b) == "侠客行"
-    assert "*" in star_media_name(a)
+    assert NAME_MARK in star_media_name(a) and "*" not in star_media_name(a)
     x = _res("f1", "X.S01E01.mkv", path_hint="影视/" + a + "/Season 1")
     y = _res("f2", "X.S01E02.mkv", path_hint="影视/" + b + "/Season 1")
     assert work_group_key(x) == work_group_key(y)
@@ -273,7 +274,7 @@ def test_mirror_incremental_and_never_pushes_tg(db):
         assert db.query(QueueItem).count() == 0  # 镜像完成禁止自动推 TG
         media = db.scalar(select(MirrorMedia))
         assert media.title_standard == "侠客行 (2001) {tmdb-135646}"
-        assert "*" in media.title_mirror
+        assert NAME_MARK in media.title_mirror and "*" not in media.title_mirror
         assert media.target_dir_id == B_WORK
 
         second = asyncio.run(mirror.sync_rule(db, r))

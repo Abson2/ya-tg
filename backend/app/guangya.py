@@ -214,7 +214,7 @@ class GuangYaWebFiles:
 
         POST /userres/v1/file/create_dir {"parentId":"...","dirName":"..."}
         → data: {fileId, fileName, parentId, resType:2, depth, ...}
-        分类目录按 A 库原名创建（不改名），影视主目录按 * 约定创建。
+        分类目录按 A 库原名创建（不改名），影视主目录按 · 约定创建（v0.8.3 起拒绝 *）。
         """
         name = str(dir_name or "").strip()
         if not name or not str(parent_id or "").strip():
