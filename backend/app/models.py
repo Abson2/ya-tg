@@ -249,8 +249,8 @@ class MirrorDir(Base):
     """v0.8.1：A 库目录 → B 库目录的 1:1 镜像映射。
 
     分类目录（动画电影/国产电影 等）在 B 库保持**原名**，不加 *；只有影视主目录
-    才按 star_naming 加 *。创建目录接口仍未验证，B 库缺失的目录登记为 missing，
-    由用户照清单在网页端手工建立，系统绝不猜测创建接口参数。
+    才按 star_naming 加 *。create_dir 接口已由抓包 HAR 确认，缺目录时自动创建；
+    失败原因写入 error 字段供管理页展示，绝不静默记成「请手工建立」。
     """
     __tablename__ = "mirror_dirs"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -261,7 +261,10 @@ class MirrorDir(Base):
     kind: Mapped[str] = mapped_column(String(24), default="category")      # category/work/season
     category_path: Mapped[str] = mapped_column(String(512), default="")
     target_dir_id: Mapped[str] = mapped_column(String(64), default="")
-    status: Mapped[str] = mapped_column(String(24), default="missing")     # mapped/missing
+    # mapped / created / created_fallback / missing
+    status: Mapped[str] = mapped_column(String(24), default="missing")
+    # v0.8.2：建目录失败的真实原因（接口报错 / 自动创建关闭 / 降级说明），不再被前端通用文案覆盖
+    error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("rule_id", "source_dir_id", name="uq_mirror_dir_rule_source"),)

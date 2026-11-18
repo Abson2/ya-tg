@@ -67,6 +67,10 @@ _COLUMNS = {
     "mirror_media": {
         "category_path": "TEXT DEFAULT ''",
     },
+    # v0.8.2：建目录失败原因，管理页如实展示，不再用通用文案掩盖接口报错
+    "mirror_dirs": {
+        "error": "TEXT DEFAULT ''",
+    },
 }
 
 

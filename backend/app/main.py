@@ -1,5 +1,6 @@
 import html
 import json
+import logging
 import re
 import time
 from contextlib import asynccontextmanager
@@ -29,6 +30,8 @@ from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, Distributio
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, mask_secret
+logger = logging.getLogger(__name__)
+
 from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name,
                     retry_after_seconds, standard_media_name, star_media_name, utcnow,
                     work_episode_numbers, work_group_key)
@@ -186,13 +189,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.2", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -526,7 +529,8 @@ def mirror_config_get(db: Session = Depends(get_db)):
         "auto_identify": bool(r.auto_identify) if r else True,
         "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
-        "auto_create_dirs": bool(getattr(r, "auto_create_dirs", True)) if r else True,
+        "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
+                              else bool(r.auto_create_dirs)) if r else True,
         "interval_presets": MIRROR_INTERVAL_PRESETS,
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
@@ -585,6 +589,7 @@ async def mirror_run(post_identify: bool = False, db: Session = Depends(get_db))
         db.commit()
         return stats
     except WebFileError as exc:
+        logger.warning("[mirror] 同步被接口错误中止：%s", exc)
         db.rollback()
         rr = db.scalar(select(MirrorRule).limit(1))
         if rr:
@@ -593,6 +598,7 @@ async def mirror_run(post_identify: bool = False, db: Session = Depends(get_db))
         raise HTTPException(400, str(exc))
     except Exception as exc:
         # v0.8.1：不再把真实异常吞成笼统 502，保留类型与消息并落库，便于直接排查
+        logger.exception("[mirror] 镜像同步异常")
         db.rollback()
         detail = f"{type(exc).__name__}: {exc}"
         rr = db.scalar(select(MirrorRule).limit(1))
@@ -639,6 +645,9 @@ def mirror_status(db: Session = Depends(get_db)):
             "dirs_mapped": db.query(MirrorDir).filter(MirrorDir.status != "missing").count(),
             "dirs_created": db.query(MirrorDir).filter(MirrorDir.status == "created").count(),
             "dirs_missing": len(missing),
+            "dirs_failed": len(missing),
+            "dirs_fallback": db.query(MirrorDir).filter(
+                MirrorDir.status == "created_fallback").count(),
         },
         "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
                    "media_type": m.media_type, "status": m.status,
@@ -648,16 +657,29 @@ def mirror_status(db: Session = Depends(get_db)):
                   for m in media],
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
-                  "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id}
+                  "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id,
+                  "error": getattr(d, "error", "") or ""}
                  for d in dirs],
+        # v0.8.2：tip 不再硬编码成「请手工建立」，直接回显 create_dir 的真实报错
         "missing_dirs": [{"parent_id": d.parent_target_id, "name": d.name_standard,
                           "kind": d.kind, "star": d.kind == "work",
-                          "tip": "在 B 库该父目录下建立此目录后重新同步"} for d in missing],
+                          "error": getattr(d, "error", "") or "",
+                          "tip": (getattr(d, "error", "") or "")
+                                 or "在 B 库该父目录下建立此目录后重新同步"} for d in missing],
         "tasks": [{"id": t.id, "task_id": t.task_id, "status": t.status,
                    "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
+        # v0.8.2：回显实际生效配置，一眼看出「自动创建是不是被关掉了」
+        "config": {
+            "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
+                                  else bool(r.auto_create_dirs)) if r else True,
+            "star_naming": bool(r.star_naming) if r else True,
+            "source_root_id": r.source_root_id if r else "",
+            "target_root_id": r.target_root_id if r else "",
+            "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,
+        },
     }
 
 

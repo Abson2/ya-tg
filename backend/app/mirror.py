@@ -1,4 +1,4 @@
-"""v0.8.0 起：A 源头库 → B 镜像库 增量同步；v0.8.1 增加分类目录 1:1 镜像与风控节流。
+"""v0.8.0 起：A 源头库 → B 镜像库 增量同步；v0.8.1 分类目录 1:1 镜像与风控节流；v0.8.2 建目录失败可诊断与自动降级。
 
 设计红线（来自《tg-gy 最终版项目开发需求文档》）：
   1. A 源头库**只读**，任何情况下不修改 A 的文件/目录。
@@ -16,9 +16,10 @@
     POST /userres/v1/get_task_status    {"taskId":"..."}                  → data.status
     status=2 表示完成；其它取值含义未验证，只记录 raw_status，不猜测成功/失败。
 
-仍待验证、因此**未实现**的接口（8.6）：
+仍待验证、因此**未实现**的接口（8.6）：只有「投稿分享转存」（TgtoDrive 侧，未抓包）。
 """
 import asyncio
+import logging
 import re
 
 from sqlalchemy import select
@@ -28,6 +29,8 @@ from .guangya import GuangYaWebFiles, WebFileError
 from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask
 from .utils import (VIDEO_EXTS, media_identity, normalize_work_name, parse_media_name,
                     standard_media_name, star_media_name, utcnow)
+
+logger = logging.getLogger(__name__)
 
 # v0.8.1：w.har 已取证 create_dir / rename / delete_file（含批量）。
 # 下面只保留仍未取证的转存能力；前端 JS 里虽出现 move_file / recycle_file 等路径，
@@ -117,11 +120,13 @@ def _relative_dir_names(node: dict, work: dict, nodes: dict) -> list[str]:
 
 async def _target_children_cached(api: GuangYaWebFiles, parent_id: str,
                                   cache: dict) -> dict[str, str]:
+    """v0.8.2：不再吞异常。B 库访问失败 ≠ B 库没有该目录，必须让上层明确中止。
+
+    旧版把「根目录不可访问」当成空目录，接着对每部作品都调一次 create_dir 并
+    静默记成 missing，界面只显示「请手工建立」，真实原因完全丢失。
+    """
     if parent_id not in cache:
-        try:
-            cache[parent_id] = await _target_children(api, parent_id)
-        except Exception:
-            cache[parent_id] = {}
+        cache[parent_id] = await _target_children(api, parent_id)
     return cache[parent_id]
 
 
@@ -160,7 +165,8 @@ async def _resolve_b_dir(api: GuangYaWebFiles, b_root: str,
 
 
 def _record_dir(db: Session, rule_id: int, source_dir_id: str, parent_target_id: str,
-                name: str, kind: str, cat_path: str, target_dir_id: str, status: str) -> None:
+                name: str, kind: str, cat_path: str, target_dir_id: str, status: str,
+                error: str = "") -> None:
     row = db.scalar(select(MirrorDir).where(MirrorDir.rule_id == rule_id,
                                             MirrorDir.source_dir_id == source_dir_id))
     if not row:
@@ -172,6 +178,7 @@ def _record_dir(db: Session, rule_id: int, source_dir_id: str, parent_target_id:
     row.category_path = cat_path
     row.target_dir_id = target_dir_id
     row.status = status
+    row.error = str(error or "")[:500]
     row.updated_at = utcnow()
     db.flush()
 
@@ -386,7 +393,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
     stats = {"media": 0, "new": 0, "changed": 0, "unchanged": 0, "skipped": 0,
              "tasks": 0, "done": 0, "unknown": 0, "blocked": 0,
-             "dirs_created": 0, "dirs_mapped": 0, "missing_dirs": [],
+             "dirs_created": 0, "dirs_mapped": 0, "dirs_fallback": 0,
+             "dir_errors": [], "missing_dirs": [],
              "idle_seconds": idle, "errors": []}
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
         raise WebFileError("请先配置 A 源头库目录 ID 与 B 镜像库目录 ID")
@@ -398,18 +406,36 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     root = str(rule.source_root_id or "*")
     b_root = str(rule.target_root_id)
     cache: dict[str, dict[str, str]] = {}
-    auto_dirs = bool(getattr(rule, "auto_create_dirs", True))
+    # v0.8.2：防御异常数据。列本身是 NOT NULL，但 bool(None) 会把它当成「关闭」，
+    # 让整批作品静默变成 missing；NULL 一律按默认开启处理。
+    _raw_auto = getattr(rule, "auto_create_dirs", True)
+    auto_dirs = True if _raw_auto is None else bool(_raw_auto)
+    # v0.8.2：先确认 B 库根目录真的可读。旧版把「访问失败」吞成「空目录」，
+    # 会连着对每部作品调用 create_dir 全部失败，界面却只显示「请手工建立」。
+    try:
+        cache[b_root] = await _target_children(api, b_root)
+    except Exception as exc:
+        raise WebFileError(
+            f"B 镜像库根目录不可访问（{b_root}）：{exc}。"
+            "请核对「镜像同步」里填的 B 库目录 ID、确认目录存在且光鸭登录态有效"
+        ) from exc
+    # 一旦网盘拒绝带 * 的目录名，整轮改用标准影视名，避免每个作品都失败一次
+    plain_mode = {"on": False, "tried": False}
 
     async def _ensure_child(parent_id: str, name: str, kind: str,
-                            source_id: str, cat_path: str) -> tuple[str, dict | None]:
-        """在 B 库找同名子目录；开启 auto_create_dirs 时自动创建。返回 (fileId, missing)。"""
+                            source_id: str, cat_path: str) -> tuple[str, dict | None, str]:
+        """在 B 库找同名子目录；开启 auto_create_dirs 时自动创建。
+
+        返回 (fileId, missing, 实际使用的目录名)。失败原因写进 MirrorDir.error 与
+        stats["dir_errors"]，不再被上层的通用文案覆盖。
+        """
         children = await _target_children_cached(api, parent_id, cache)
         key = normalize_work_name(name)
         fid = children.get(key) or ""
         if fid:
             _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path, fid, "mapped")
             stats["dirs_mapped"] += 1
-            return fid, None
+            return fid, None, name
         tip = ("在 B 库建立同名分类目录，名称保持不变，不要加 *"
                if kind == "category" else
                "按 * 约定命名（括号年份保持原样）" if (kind == "work" and rule.star_naming)
@@ -417,21 +443,67 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         missing = {"parent_id": parent_id, "name": name, "kind": kind,
                    "star": kind == "work" and bool(rule.star_naming), "tip": tip}
         if not auto_dirs:
-            _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path, "", "missing")
-            return "", missing
-        # 建目录同样是文件操作，受同一风控间隔约束
+            err = "自动创建目录已关闭：请在「镜像同步 → B 库缺目录自动创建」开启后重新同步"
+            logger.warning("[mirror] %s（%s）", err, name)
+            missing["error"] = err
+            missing["tip"] = err
+            _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path,
+                        "", "missing", err)
+            if len(stats["dir_errors"]) < 5:
+                stats["dir_errors"].append(f"{name}：{err}")
+            return "", missing, name
+
+        effective = name
+        if kind == "work" and "*" in effective and plain_mode["on"]:
+            effective = standard_media_name(effective)
         await asyncio.sleep(idle)
+        fallback_note = ""
         try:
-            made = await api.create_dir(parent_id, name)
+            made = await api.create_dir(parent_id, effective)
         except Exception as exc:
-            missing["tip"] = f"自动创建失败：{str(exc)[:160]}"
-            _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path, "", "missing")
-            return "", missing
-        fid = made["file_id"]
+            first = str(exc)[:300]
+            plain = standard_media_name(effective)
+            if (kind == "work" and "*" in effective and plain != effective
+                    and not plain_mode["tried"]):
+                plain_mode["tried"] = True
+                await asyncio.sleep(idle)
+                try:
+                    made = await api.create_dir(parent_id, plain)
+                    plain_mode["on"] = True
+                    effective = plain
+                    fallback_note = (f"网盘拒绝带 * 的目录名（{first[:120]}），"
+                                     "已自动降级为不带 * 的标准影视名")
+                    stats["dirs_fallback"] += 1
+                    logger.warning("[mirror] %s：%s", name, fallback_note)
+                except Exception as exc2:
+                    err = f"create_dir 失败：{first}；降级标准名仍失败：{str(exc2)[:200]}"
+            else:
+                err = f"create_dir 失败：{first}"
+            if not fallback_note:
+                logger.warning("[mirror] 建目录失败 %s：%s", name, err)
+                missing["error"] = err
+                missing["tip"] = err
+                _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path,
+                            "", "missing", err)
+                if len(stats["dir_errors"]) < 5:
+                    stats["dir_errors"].append(f"{name}：{err}")
+                return "", missing, name
+        fid = str(made.get("file_id") or "")
+        if not fid:
+            err = f"create_dir 未返回 fileId（{effective}）"
+            missing["error"] = err
+            missing["tip"] = err
+            _record_dir(db, rule.id, source_id, parent_id, effective, kind, cat_path,
+                        "", "missing", err)
+            if len(stats["dir_errors"]) < 5:
+                stats["dir_errors"].append(f"{name}：{err}")
+            return "", missing, effective
         cache.setdefault(parent_id, {})[key] = fid
-        _record_dir(db, rule.id, source_id, parent_id, name, kind, cat_path, fid, "created")
+        status = "created_fallback" if fallback_note else "created"
+        _record_dir(db, rule.id, source_id, parent_id, effective, kind, cat_path,
+                    fid, status, fallback_note)
         stats["dirs_created"] += 1
-        return fid, None
+        return fid, None, effective
 
     works = _discover_works(nodes, root)
     for work, cats in works[:max_media]:
@@ -447,19 +519,21 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         target_dir_id = b_root
         missing_all: list[dict] = []
         for cat_name, cat_id in cats:
-            fid, miss = await _ensure_child(target_dir_id, standard_media_name(cat_name),
-                                            "category", cat_id, cat_path)
+            fid, miss, _actual = await _ensure_child(target_dir_id, standard_media_name(cat_name),
+                                                    "category", cat_id, cat_path)
             if miss:
                 missing_all.append(miss)
                 break
             target_dir_id = fid
         if not missing_all:
-            fid, miss = await _ensure_child(target_dir_id, expected, "work",
-                                            work["id"], cat_path)
+            fid, miss, actual = await _ensure_child(target_dir_id, expected, "work",
+                                                    work["id"], cat_path)
             if miss:
                 missing_all.append(miss)
             else:
                 target_dir_id = fid
+                # v0.8.2：降级为不带 * 名称时，展示与实际网盘目录保持一致
+                expected = actual
 
         media = db.scalar(select(MirrorMedia).where(
             MirrorMedia.rule_id == rule.id, MirrorMedia.work_key == wkey))
@@ -524,8 +598,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 if key in sub_cache:
                     target_parent = sub_cache[key]
                     continue
-                sub_id, miss = await _ensure_child(target_parent, standard_media_name(sub_name),
-                                                    "season", container["id"], cat_path)
+                sub_id, miss, _actual = await _ensure_child(target_parent, standard_media_name(sub_name),
+                                                            "season", container["id"], cat_path)
                 if miss:
                     stats["missing_dirs"].append(miss)
                     stats["blocked"] += 1
@@ -600,6 +674,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         f"未变 {stats['unchanged']} · 任务完成 {stats['done']} · 待确认 {stats['unknown']} · "
         f"跳过 {stats['skipped']} · 建目录 {stats['dirs_created']} · "
         f"待建目录 {len(stats['missing_dirs'])} · 文件间隔 {idle}s")
+    if stats["dir_errors"]:
+        rule.last_message += " · 首个建目录错误：" + stats["dir_errors"][0][:300]
+    if stats["dirs_fallback"]:
+        rule.last_message += f" · 已降级标准名 {stats['dirs_fallback']} 次"
     db.commit()
     stats["ok"] = True
     return stats

@@ -37,7 +37,7 @@ const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, unverified_endpoints: [] })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [] })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」；根目录只读引用镜像同步里的 B 库 ID
 const scanning = ref(false), showScanPanel = ref(false)
@@ -397,9 +397,13 @@ async function runMirror(postIdentify = false) {
     const d = await api(`/mirror/run?post_identify=${postIdentify ? 'true' : 'false'}`, { method: 'POST' }, 300000)
     const extra = []
     if (d.dirs_created) extra.push(`新建目录 ${d.dirs_created}`)
+    if (d.dirs_fallback) extra.push(`已降级标准名 ${d.dirs_fallback} 次`)
     if (d.blocked) extra.push(`${d.blocked} 部待建目录（见下方清单）`)
-    if (d.errors?.length) extra.push(d.errors[0])
-    ElMessage.success(`同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : ''))
+    if (d.dir_errors?.length) extra.push(`首个建目录错误：${String(d.dir_errors[0]).slice(0, 140)}`)
+    if (!d.dir_errors?.length && d.errors?.length) extra.push(d.errors[0])
+    const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
+    if (d.dir_errors?.length) ElMessage.warning(msg)
+    else ElMessage.success(msg)
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -958,7 +962,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.1 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.2 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1150,6 +1154,12 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
             <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>内容变化事件</small><b>{{ mirrorStatus.counts?.change_events || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div></div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
+            <p class="hint">
+              生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
+              · 主目录带星号：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
+              · B 库目录 ID：{{ mirrorStatus.config?.target_root_id || '未填写' }}
+              · 文件空闲：{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s
+            </p>
             <p class="hint">已确认接口：<span v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}；</span></p>
             <p class="hint">待验证接口（未实现，不猜测参数）：<span v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}、</span></p>
           </div>
@@ -1159,9 +1169,9 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="name" label="B 库应建目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="parent_id" label="父目录 ID" min-width="180"/>
-              <el-table-column prop="tip" label="处理建议" min-width="220"/>
+              <el-table-column label="失败原因 / 处理建议" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || s.row.tip }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">开启「B 库缺目录自动创建」后下次同步会自动补齐；相关作品当前标记为 blocked（不是失败），建好后重新同步即可继续。</p>
+            <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。若网盘拒绝带星号的目录名，v0.8.2 会自动降级为不带星号的标准影视名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 *</el-tag></div>
@@ -1171,6 +1181,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="category_path" label="所属分类" min-width="160"/>
               <el-table-column prop="status" label="状态" width="110"/>
               <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
+              <el-table-column prop="error" label="备注 / 失败原因" min-width="200"/>
             </el-table></div>
             <p class="hint">分类目录保持 A 库原名、不加星号；只有影视主目录按星号规则命名，括号里的年份与 TMDB 标记保持原样。</p>
           </div>
