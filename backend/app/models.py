@@ -239,6 +239,9 @@ class MirrorRule(Base):
     # v0.8.1：B 库缺目录时自动按 1:1 结构创建（create_dir 接口已抓包确认）。
     # 关闭后退回旧行为：只登记待创建清单，由用户手工建立。
     auto_create_dirs: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v0.8.6：B 库单集/单电影文件按英文剧名改名（只换中文片名段）。
+    # A 库只读、B 库目录命名不变；改名结果落在 MirrorFile.target_name。
+    rename_files: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str] = mapped_column(String(24), default="never")
     last_message: Mapped[str] = mapped_column(Text, default="")
@@ -284,6 +287,10 @@ class MirrorMedia(Base):
     target_dir_id: Mapped[str] = mapped_column(String(64), default="")     # B 目录 fileId
     # v0.8.1：A 库中该作品之上的分类目录路径（如「动画电影/国产」），B 库同名镜像。
     category_path: Mapped[str] = mapped_column(String(512), default="")
+    # v0.8.6：整部作品只解析一次英文剧名并缓存，避免每一集都打 TMDB / AI。
+    # english_source: tmdb / ai / resource / manual；空 english_title 表示「待翻译」。
+    english_title: Mapped[str] = mapped_column(String(512), default="")
+    english_source: Mapped[str] = mapped_column(String(24), default="")
     status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/syncing/synced/blocked/failed
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -291,7 +298,12 @@ class MirrorMedia(Base):
 
 
 class MirrorFile(Base):
-    """单个文件的 A→B 映射与身份指纹。替换只在同一 identity 内进行。"""
+    """单个文件的 A→B 映射与身份指纹。替换只在同一 identity 内进行。
+
+    v0.8.6：`file_name` 永远是 **A 库原名**（改名也不覆盖，增量比对锚点），
+    `target_name` 才是 B 库改名后的实际文件名。A 文件是否变化只看
+    `source_file_id + fingerprint(size:utime)`，与两边文件名无关。
+    """
     __tablename__ = "mirror_files"
     id: Mapped[int] = mapped_column(primary_key=True)
     media_id: Mapped[int] = mapped_column(ForeignKey("mirror_media.id"), index=True)
@@ -306,6 +318,11 @@ class MirrorFile(Base):
     status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/copying/synced/superseded/failed
     task_id: Mapped[str] = mapped_column(String(64), default="")
     error: Mapped[str] = mapped_column(Text, default="")
+    # v0.8.6：B 库改名结果。rename_status: ""(未处理)/done/failed/skipped_ascii。
+    # 这些字段只描述「B 库文件名」，绝不参与 A→B 身份比对。
+    target_name: Mapped[str] = mapped_column(String(512), default="")
+    rename_status: Mapped[str] = mapped_column(String(24), default="")
+    rename_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 同一 identity 允许保留历史版本（superseded）与当前版本，靠 source_file_id 区分。

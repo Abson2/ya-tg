@@ -35,8 +35,8 @@ const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
-const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [] })
+const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, interval_presets: [], unverified_endpoints: [], note: '' })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [] })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
@@ -453,8 +453,25 @@ async function runMirror(mode = 'auto') {
     const p = d.pipeline
     if (p) extra.push(`自动入库 ${p.files || 0} 文件 · 识别成功 ${p.identify?.identified || 0} · 入队 ${p.queued || 0} · 内容变化待处理 ${p.changes_pending || 0}`)
     else if (d.pipeline_enabled === false) extra.push('本次仅同步，未刷新入库')
+    // v0.8.6：改名统计必须显式带出，否则「审核不通过」时看不出改名有没有生效
+    const r = d.rename
+    if (r) extra.push(`改名 ${r.renamed || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`)
+    else if (d.rename_enabled === false) extra.push('本次未自动改名（开关关闭）')
     const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 重试 ${d.retries || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 复制失败 ${d.failed || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
-    if (d.dir_errors?.length || d.failed) ElMessage.warning(msg)
+    if (d.dir_errors?.length || d.failed || r?.failed) ElMessage.warning(msg)
+    else ElMessage.success(msg)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v0.8.6：存量 B 库单集/电影文件按英文剧名批量改名，不重新复制、不动 A 库
+async function renameMirrorFiles(force = false) {
+  mirrorBusy.value = true
+  try {
+    const d = await api(`/mirror/rename?force=${force ? 'true' : 'false'}`, { method: 'POST' }, 300000)
+    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}`
+    const first = d.errors?.length ? ` · 首个错误：${String(d.errors[0]).slice(0, 140)}` : ''
+    if (d.failed || d.untranslated) ElMessage.warning(msg + first)
     else ElMessage.success(msg)
     await load()
   } catch (e) { ElMessage.error(e.message) }
@@ -1020,7 +1037,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.5 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.6 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1187,7 +1204,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '镜像同步'" class="fade">
-          <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；同步完成自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
+          <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；单集/电影文件按英文剧名改名 → 自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
           <div class="panel narrow">
             <div class="panel-head"><h3>A / B 库设置</h3></div>
             <div class="form-grid">
@@ -1204,20 +1221,23 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="field inline"><label>B 库主目录带 · 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
               <div class="field inline"><label>B 库缺目录自动创建</label><el-switch v-model="mirrorCfg.auto_create_dirs"/></div>
               <div class="field inline"><label>同步后自动入库识别并推送</label><el-switch v-model="mirrorCfg.auto_identify"/></div>
-              <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、变化更新的每个文件操作前都会等待。</small></div>
+              <div class="field inline"><label>B 库单集/电影文件英文改名</label><el-switch v-model="mirrorCfg.rename_files"/></div>
+              <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、改名、变化更新的每个文件操作前都会等待。</small></div>
             </div>
             <p class="hint">开启「同步后自动入库识别并推送」后，同步结束会刷新 B 库入库、识别影视，并把<b>本轮识别成功且拿到海报</b>的影视按 TG 分发规则入队；不会对全库群发，也不会批量补推历史内容变化事件。关闭后定时同步与「立即同步」都只复制文件，需要到资源库手动点「立即扫描」。</p>
+            <p class="hint"><b>v0.8.6 英文改名</b>：开启后按英文剧名改 B 库<b>单集 / 单电影文件名</b>（TMDB en-US 官方片名优先、AI 翻译兜底），<b>只替换中文片名段</b>，季集号 / 年份 / 画质 / 压制组 / 扩展名一律原样保留。A 库只读、B 库分类目录与影视主目录命名不变；A→B 映射靠 source_file_id + 文件指纹保持，改名不影响后期变量更新比对。存量已同步文件点「按英文规范改名」一键处理，不重新复制。解析不到英文剧名的作品会列入下方「英文名待处理」清单，绝不瞎猜改名。</p>
             <p class="hint">{{ mirrorCfg.note }}</p>
-            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
+            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
-            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div><div><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div></div>
+            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div><div><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div><div><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div><div><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div><div><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div></div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
             <p class="hint">
               生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
               · 主目录带 · 标记：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
               · 同步后自动入库识别并推送：<b :style="mirrorStatus.config?.auto_identify === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_identify === false ? '关闭' : '开启' }}</b>
+              · B 库单集/电影文件英文改名：<b :style="mirrorStatus.config?.rename_files === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.rename_files === false ? '关闭' : '开启' }}</b>
               · B 库目录 ID：{{ mirrorStatus.config?.target_root_id || '未填写' }}
               · 文件空闲：{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s
             </p>
@@ -1243,6 +1263,21 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column label="失败原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
             <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>下一轮「立即同步」会自动重试这些文件</b>，重试前会先核对 B 库，确认已存在的不会重复复制。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
+          </div>
+          <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length" class="panel">
+            <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag></div>
+            <div v-if="mirrorStatus.untranslated_works?.length" class="table-scroll"><el-table :data="mirrorStatus.untranslated_works" size="small">
+              <el-table-column prop="work" label="作品（A 库原名）" min-width="220"/>
+              <el-table-column prop="reason" label="原因 / 处理建议" min-width="340"/>
+            </el-table></div>
+            <div v-if="mirrorStatus.rename_errors?.length" class="table-scroll" style="margin-top:10px"><el-table :data="mirrorStatus.rename_errors" size="small">
+              <el-table-column prop="work" label="作品" min-width="160"/>
+              <el-table-column prop="file" label="A 库原名" min-width="200"/>
+              <el-table-column prop="target" label="目标英文名" min-width="200"/>
+              <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
+            </el-table></div>
+            <div class="panel-foot"><el-button :loading="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button></div>
+            <p class="hint">英文剧名按 TMDB en-US 官方片名优先、AI 翻译兜底，<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。解析不到时不改名、不瞎猜。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库</b>。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag></div>

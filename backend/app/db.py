@@ -63,9 +63,20 @@ _COLUMNS = {
     "mirror_rules": {
         "file_idle_seconds": "FLOAT DEFAULT 1.0",
         "auto_create_dirs": "BOOLEAN DEFAULT 1",
+        # v0.8.6：B 库单集/电影文件按英文剧名改名开关
+        "rename_files": "BOOLEAN DEFAULT 1",
     },
     "mirror_media": {
         "category_path": "TEXT DEFAULT ''",
+        # v0.8.6：每部作品缓存一次英文剧名，避免逐集打 TMDB / AI
+        "english_title": "TEXT DEFAULT ''",
+        "english_source": "TEXT DEFAULT ''",
+    },
+    "mirror_files": {
+        # v0.8.6：file_name 仍是 A 原名；target_name 才是 B 库改名后的名字
+        "target_name": "TEXT DEFAULT ''",
+        "rename_status": "TEXT DEFAULT ''",
+        "rename_error": "TEXT DEFAULT ''",
     },
     # v0.8.2：建目录失败原因，管理页如实展示，不再用通用文案掩盖接口报错
     "mirror_dirs": {

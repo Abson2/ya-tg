@@ -222,13 +222,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.5", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.6", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.5", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.6", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -568,6 +568,10 @@ async def _scheduled_mirror() -> None:
             if r and r.source_root_id and r.target_root_id:
                 await mirror.sync_rule(db, r)
                 await mirror.backfill_target_file_ids(db, r)
+                # v0.8.6：改名必须赶在「扫描入库」之前，否则 Resource 记的是旧中文名。
+                # 只改 B 库单集/单电影文件名，A 库与 B 库目录名都不动。
+                if bool(getattr(r, "rename_files", True)):
+                    await _safe_rename(db, r)
                 if bool(getattr(r, "auto_identify", True)):
                     p = await _mirror_post_sync_pipeline(db, r)
                     db.commit()
@@ -599,6 +603,8 @@ class MirrorConfigInput(BaseModel):
     # v0.8.1：文件操作空闲秒数（硬下限不可调低）、B 库缺目录自动创建
     file_idle_seconds: float = 1.0
     auto_create_dirs: bool = True
+    # v0.8.6：B 库单集/单电影文件按英文剧名改名（只换中文片名段）
+    rename_files: bool = True
 
 
 @app.get("/api/mirror/config", dependencies=ADMIN)
@@ -616,16 +622,21 @@ def mirror_config_get(db: Session = Depends(get_db)):
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
         "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
                               else bool(r.auto_create_dirs)) if r else True,
+        # v0.8.6：改名开关；NULL 一律按默认开启（与 auto_create_dirs 同一防御口径）
+        "rename_files": (True if getattr(r, "rename_files", None) is None
+                         else bool(r.rename_files)) if r else True,
         "interval_presets": MIRROR_INTERVAL_PRESETS,
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
         "last_message": r.last_message if r else "",
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
-        "note": ("v0.8.5：A 库分类目录在 B 库按原名 1:1 自动创建（不改名），影视主目录按 · 约定命名，"
-                 "括号里的年份与 TMDB 标记保持原样。每个文件操作之间留可配置空闲时间，"
-                 "下限来自官方写接口 2 次/秒限频，不可调低。同步完成后默认自动刷新资源库入库、"
-                 "识别影视，并把本轮识别成功且拿到海报的影视按 TG 分发规则入队；"
+        "note": ("v0.8.6：A 库只读且目录名不变；B 库分类目录按原名 1:1 镜像、影视主目录按 · 约定命名，"
+                 "括号年份与 TMDB 标记保持原样。单集/单电影文件按英文剧名改名（TMDB en-US 优先、"
+                 "AI 翻译兜底），只替换中文片名段，季集号/年份/画质/压制组/扩展名原样保留；"
+                 "A→B 映射靠 source_file_id + 指纹保持，改名不影响后期变量更新比对。"
+                 "每个文件操作之间留可配置空闲时间，下限来自官方写接口 2 次/秒限频，不可调低。"
+                 "同步完成后默认刷新入库、识别，并把本轮识别成功且有海报的影视按 TG 分发规则入队；"
                  "不做全库群发，也不批量补推历史内容变化事件。"),
     }
 
@@ -646,13 +657,34 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
     r.interval_minutes, r.enabled = p.interval_minutes, p.enabled
     r.star_naming, r.auto_identify = p.star_naming, p.auto_identify
     r.file_idle_seconds, r.auto_create_dirs = float(p.file_idle_seconds), p.auto_create_dirs
+    r.rename_files = p.rename_files
     add_audit(db, "mirror_config_saved", target_type="mirror",
               detail=json_dumps({"source": r.source_root_id, "target": r.target_root_id,
                                  "interval": r.interval_minutes,
-                                 "idle": r.file_idle_seconds, "auto_dirs": r.auto_create_dirs}))
+                                 "idle": r.file_idle_seconds, "auto_dirs": r.auto_create_dirs,
+                                 "rename_files": r.rename_files}))
     db.commit()
     _schedule_mirror_job(r.interval_minutes, r.enabled)
     return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
+
+
+async def _safe_rename(db: Session, r: MirrorRule) -> dict:
+    """v0.8.6：改名是可选优化，整体失败绝不能拖垮已完成的复制与后续入库 / 推送。
+
+    `rename_mirror_files()` 已逐文件捕获 `rename_file` 异常；这里再兜住「列 B 库 /
+    解析英文名」等整体异常，把原因写进 `rename.errors` 与日志。故意**不 rollback**：
+    `sync_rule()` / `backfill_target_file_ids()` 在此之前已各自提交，回滚反而可能
+    让 session 状态与后续扫描管线互相干扰。
+    """
+    try:
+        return await mirror.rename_mirror_files(db, r)
+    except Exception as exc:
+        logger.warning("[mirror] 文件改名整体失败，不阻断同步：%s", exc)
+        msg = f"{type(exc).__name__}: {exc}"[:300]
+        return {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
+                "untranslated": 0, "failed": 0,
+                "errors": [f"文件改名未执行：{msg}"],
+                "untranslated_works": [], "idle_seconds": 0}
 
 
 @app.post("/api/mirror/run", dependencies=ADMIN)
@@ -672,12 +704,18 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
     try:
         stats = await mirror.sync_rule(db, r)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+        # v0.8.6：改名赶在「扫描入库」之前，只动 B 库单集/单电影文件名；
+        # A 库与 B 库目录名不变，A→B 映射靠 MirrorFile 保持。
+        stats["rename_enabled"] = bool(getattr(r, "rename_files", True))
+        if stats["rename_enabled"]:
+            stats["rename"] = await _safe_rename(db, r)
         stats["pipeline_enabled"] = do_pipeline
         if do_pipeline:
             stats["pipeline"] = await _mirror_post_sync_pipeline(db, r)
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
                                      "done": stats.get("done"), "unknown": stats.get("unknown"),
+                                     "renamed": (stats.get("rename") or {}).get("renamed"),
                                      "pipeline": stats.get("pipeline")}))
         db.commit()
         return stats
@@ -701,6 +739,32 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
         raise HTTPException(502, f"镜像同步失败：{detail}")
 
 
+@app.post("/api/mirror/rename", dependencies=ADMIN)
+async def mirror_rename_files(force: bool = False, db: Session = Depends(get_db)):
+    """v0.8.6：手动对 B 库已同步的单集 / 单电影文件批量改名（存量一键处理）。
+
+    不重新复制文件、不改 A 库、不改 B 库目录名；只按已存的 A→B 映射逐个定位 B fileId。
+    `force=True` 会重新解析每部作品的英文剧名（TMDB en-US / AI 翻译缓存失效）。
+    即使关闭「自动改名」开关，这个手动按钮仍然可用。
+    """
+    r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
+    try:
+        out = await mirror.rename_mirror_files(db, r, force=force)
+        add_audit(db, "mirror_files_renamed", target_type="mirror",
+                  detail=json_dumps({"renamed": out["renamed"], "failed": out["failed"],
+                                     "untranslated": out["untranslated"], "force": force}))
+        db.commit()
+        return out
+    except WebFileError as exc:
+        db.rollback()
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(502, f"文件改名失败：{type(exc).__name__}: {exc}")
+
+
 @app.post("/api/mirror/tasks/poll", dependencies=ADMIN)
 async def mirror_poll_tasks(db: Session = Depends(get_db)):
     r = _mirror_rule(db)
@@ -710,6 +774,8 @@ async def mirror_poll_tasks(db: Session = Depends(get_db)):
         out = await mirror.poll_pending_tasks(db, r)
         if out["done"]:
             out["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+            if bool(getattr(r, "rename_files", True)):
+                out["rename"] = await _safe_rename(db, r)
         return out
     except Exception as exc:
         raise HTTPException(502, str(exc))
@@ -731,6 +797,18 @@ def mirror_status(db: Session = Depends(get_db)):
                     "file": f.file_name, "task_id": f.task_id or "",
                     "error": f.error or "", "status": f.status}
                    for f in failed_files]
+    # v0.8.6：改名失败与「英文名待处理」都必须持久化可查，刷新页面仍在
+    rename_failed = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.rename_status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
+    rename_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
+                      "file": f.file_name, "target": f.target_name or "",
+                      "error": f.rename_error or ""} for f in rename_failed]
+    no_english = list(db.scalars(select(MirrorMedia).where(
+        or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == "")
+    ).order_by(MirrorMedia.id.desc()).limit(50)).all())
+    untranslated_works = [{"work": m.title_standard,
+                           "reason": "尚未解析到英文剧名；补齐 TMDB 密钥或 AI 配置后点「按英文规范改名」重跑"}
+                          for m in no_english]
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -747,6 +825,14 @@ def mirror_status(db: Session = Depends(get_db)):
             "files_unknown": db.query(MirrorFile).filter(MirrorFile.status == "unknown").count(),
             "files_retryable": db.query(MirrorFile).filter(
                 MirrorFile.status.in_(list(mirror.RETRYABLE_FILE_STATUS))).count(),
+            # v0.8.6：改名进度与卡点
+            "files_renamed": db.query(MirrorFile).filter(
+                MirrorFile.rename_status == "done").count(),
+            "files_rename_failed": db.query(MirrorFile).filter(
+                MirrorFile.rename_status == "failed").count(),
+            "works_without_english": db.query(MirrorMedia).filter(
+                or_(MirrorMedia.english_title.is_(None),
+                    MirrorMedia.english_title == "")).count(),
             "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
             "tasks_failed": db.query(MirrorTask).filter(MirrorTask.status == "failed").count(),
             "scan_batches": db.query(ResourceScanBatch).count(),
@@ -760,6 +846,8 @@ def mirror_status(db: Session = Depends(get_db)):
         },
         "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
                    "media_type": m.media_type, "status": m.status,
+                   "english_title": getattr(m, "english_title", "") or "",
+                   "english_source": getattr(m, "english_source", "") or "",
                    "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
                    "category_path": getattr(m, "category_path", "") or "",
                    "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
@@ -779,6 +867,9 @@ def mirror_status(db: Session = Depends(get_db)):
                    "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
         # v0.8.4：文件复制失败清单（持久化，刷新页面仍在）
         "file_errors": file_errors,
+        # v0.8.6：改名失败与英文名待处理清单
+        "rename_errors": rename_errors,
+        "untranslated_works": untranslated_works,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
@@ -790,6 +881,9 @@ def mirror_status(db: Session = Depends(get_db)):
             # v0.8.5：auto_identify 从「死配置」变为真正生效的开关，状态页必须回显
             "auto_identify": (True if getattr(r, "auto_identify", None) is None
                               else bool(r.auto_identify)) if r else True,
+            # v0.8.6：改名开关生效值
+            "rename_files": (True if getattr(r, "rename_files", None) is None
+                             else bool(r.rename_files)) if r else True,
             "source_root_id": r.source_root_id if r else "",
             "target_root_id": r.target_root_id if r else "",
             "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,

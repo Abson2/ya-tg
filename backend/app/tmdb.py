@@ -286,6 +286,21 @@ async def detail(tmdb_id: int, media_type: str, db: Session | None = None) -> di
     return _normalize(data, media_type)
 
 
+async def english_title(tmdb_id: int, media_type: str, db: Session | None = None) -> str:
+    """v0.8.6：按 en-US 取官方英文片名，供 B 库单集/电影文件改名。
+
+    zh-CN 详情的 name/title 多为中文译名，不能当英文剧名；这里单独请求 en-US，
+    依次尝试 name/title/original_name/original_title，只接受纯 ASCII 且含拉丁字母的值。
+    日韩作品的 original_* 可能是非拉丁文字，返回空串让调用方走 AI 翻译兜底。
+    """
+    data = await _get(f"/{media_type}/{int(tmdb_id)}", {"language": "en-US"}, db)
+    for key in ("name", "title", "original_name", "original_title"):
+        v = str(data.get(key) or "").strip()
+        if v and re.search(r"[A-Za-z]", v) and all(ord(c) < 128 for c in v):
+            return v
+    return ""
+
+
 async def detail_by_id_any(tmdb_id: int, preferred: str = "movie",
                            db: Session | None = None) -> tuple[dict | None, str]:
     """ID 精确匹配：先试首选类型，再试另一类型（有些标记不带类型）。"""

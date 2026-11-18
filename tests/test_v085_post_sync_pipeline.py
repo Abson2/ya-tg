@@ -290,16 +290,16 @@ def test_config_status_and_note_reflect_new_policy(db):
     assert "群推" in (main._mirror_post_sync_pipeline.__doc__ or "")
 
 
-def test_version_is_085_everywhere():
-    assert main.app.version == "0.8.5"
-    assert main.health()["version"] == "0.8.5"
-    main_py = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="0.8.5"' in main_py
+def test_version_is_current_everywhere():
+    """版本一致性以 frontend/package.json 为准；以后发版不必再改这条用例。"""
     pkg = json.loads((ROOT / "frontend/package.json").read_text(encoding="utf-8"))
-    assert pkg["version"] == "0.8.5"
+    v = pkg["version"]
+    assert main.app.version == v
+    assert main.health()["version"] == v
+    assert f'version="{v}"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
     vue = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert "v0.8.5 · Asia/Shanghai" in vue
+    assert f"v{v} · Asia/Shanghai" in vue
     assert "runMirror('auto')" in vue and "runMirror('force')" in vue
     assert "同步并识别（不推送）" not in vue
     assert "v-model=\"mirrorCfg.auto_identify\"" in vue
-    assert (ROOT / "README.md").read_text(encoding="utf-8").count("v0.8.5") >= 1
+    assert f"v{v}" in (ROOT / "README.md").read_text(encoding="utf-8")

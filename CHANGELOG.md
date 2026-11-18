@@ -8,6 +8,46 @@
 
 ---
 
+## v0.8.6 (2026-11-18)
+
+按用户实测反馈「目前看流程正常，能推送，不过影视文件的审核没通过，需要对剧集中的每一集、电影文件也进行改名，将中文翻译为英文剧名」实现 B 库文件级英文改名。
+用户同时划死边界：**A 库仍然保持不动，B 库影视文件夹还是保持之前的命名，本次是对单集、单电影文件进行命名优化，别忘记，仍然需要和 A 库保持映射关系，便于后期对比变量更新**。
+选项确认：英文名来源 = TMDB en-US + AI 兜底；命名格式 = 只换中文片名段；存量处理 = 立即批量改名。
+
+### 一、边界（红线）
+- 只对 **B 库单集 / 单电影文件** 调 `POST /userres/v1/file/rename`；A 源头库全程只读，绝不传 A 的 `fileId`。
+- B 库分类目录（A 原名 1:1）、影视主目录（v0.8.3 起 `·` 命名）、季目录一律不改名。
+- 不重新复制文件、不写 Resource、不建分享、不入推送队列；改名赶在「扫描入库」之前完成。
+- 解析不到英文剧名时**绝不瞎猜改名**，作品列入「英文名待处理」清单。
+
+### 二、命名规则与英文名来源
+- 新增 `backend/app/file_naming.py` 纯函数：`work_core_title()` / `sanitize_english_title()` / `english_file_name()` / `with_conflict_suffix()`；无网络、无 DB，可单测。
+- 只替换中文片名段，季集号 / 年份 / 画质 / 编码 / 压制组 / 扩展名（含其中文）原样保留。示例：`大醉侠 第04集 2160p.WEB-DL.H.265.mkv` → `The Drunk Hero 第04集 2160p.WEB-DL.H.265.mkv`。
+- `_resolve_english_title()` 每部作品只解析一次：优先取已识别 `Resource.original_title`（纯 ASCII），再走新增的 `tmdb.english_title(id, type, db)`（`language=en-US`，只接受纯 ASCII 且含拉丁字母的 `name` / `title` / `original_*`），最后用 `ai_assist.translate_title()` 翻译中文剧名；缓存到 `MirrorMedia.english_title` / `english_source`（`tmdb` / `ai` / `resource`）。日韩作品 `original_*` 非拉丁文字会被判为不可用，交给 AI。
+- 目标名先过网盘非法字符清洗（`* ? : / \ " < > |`）；B 库已有同名且非同一 `fileId` 时追加 ASCII `-vN`，避免 A 库内容更新后的新旧版本互相覆盖。
+- 文件之间沿用 `file_idle_seconds`（硬下限 0.5 秒）节流，与复制 / 建目录共用同一风控口径。
+
+### 三、A→B 映射不丢（本版核心约束）
+- `MirrorFile.file_name` 永远保存 **A 库原名**，改名结果另存新增的 `target_name`；增量比对仍只用 `source_file_id + fingerprint(size:utime)`，与两边文件名无关，因此改名不影响「后期对比变量更新」。
+- 新增 `rename_status`（`""` / `done` / `failed` / `skipped_ascii`）与 `rename_error`，失败原因落库、刷新页面仍在。
+- `_b_names()` / `_lookup_b_file()` 让「重试前核对 B 库」与 `backfill_target_file_ids()` **优先按 `target_name` 反查** B 库 `fileId`；改名后下一轮不会被误判为文件不存在、也不会重复复制。
+- 只处理 `status == "synced"` 的文件；已改过且目标名未变直接跳过（幂等）。
+
+### 四、入口与管理页
+- 新增开关 `MirrorRule.rename_files`（默认开）；`POST /api/mirror/run`、定时镜像、`POST /api/mirror/tasks/poll` 都在扫描入库前调用 `rename_mirror_files()`。
+- 新增 `POST /api/mirror/rename?force=`：存量已同步文件一键批量改名；`force=true` 重新解析英文剧名；**即使关闭自动开关，手动按钮仍可用**。
+- `/api/mirror/run` 返回 `rename_enabled` 与 `rename{works, renamed, skipped, ascii, untranslated, failed, errors, untranslated_works, idle_seconds}`；`/api/mirror/status` 回显 `rename_errors` / `untranslated_works` 与 `files_renamed` / `files_rename_failed` / `works_without_english` 计数。
+- 管理页新增「B 库单集/电影文件英文改名」开关、「按英文规范改名」与「重新解析英文名并改名」按钮；同步结果提示带「改名 N · 待翻译作品 N · 改名失败 N」；状态卡新增「英文名待处理 / 改名失败」两张清单。
+- `db.py` 补列：`mirror_rules.rename_files`、`mirror_media.english_title/english_source`、`mirror_files.target_name/rename_status/rename_error`；老库升级自动 ALTER，不用重建数据库。
+
+### 五、测试与交付
+- 新增 `tests/test_v086_file_rename.py` 18 项：只换中文片名段、ASCII/非法英文名不改、TMDB 优先且映射保持、AI 兜底、无英文名不改并列清单、幂等、改名后仍能反查 B 库且不重复复制、单文件失败隔离并持久化、冲突加 `-vN`、文件间风控间隔、**A 库与 B 库目录名零改动**、关闭开关时手动端点仍可用、开关与状态回显、版本与 UI 契约、**改名整体异常不阻断手动 / 定时同步管线（2 项）**。
+- 全套 `184 passed`，前端 `vite build` 通过。
+- **隔离保护**：新增 `main._safe_rename()`，手动 / 定时同步 / 任务轮询里的改名整体异常只记日志与 `rename.errors`，绝不阻断已完成的复制与后续入库识别推送；两项专项测试锁死这条边界。
+- **升级提示**：存量已同步文件不会自动改名（改名随后续同步 / 任务轮询发生），升级后到「镜像同步」点一次「按英文规范改名」即可，不重新复制文件。真实网盘 `rename` 对中文→英文文件名的接受度与审核结果仍需真实环境确认。
+
+---
+
 ## v0.8.5 (2026-11-18)
 
 按用户三轮明确口径接通「镜像完成 → 刷新入库 → 识别 → 只推本轮识别成功影视」链路：

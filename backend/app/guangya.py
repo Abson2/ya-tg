@@ -233,7 +233,9 @@ class GuangYaWebFiles:
     async def rename_file(self, file_id: str, new_name: str) -> None:
         """v0.8.1 抓包取证：重命名。POST /userres/v1/file/rename
         {"fileId":"...","newName":"..."} → {"msg":"success"}（无 data 段）。
-        当前仅作能力预留，镜像链路默认不改名，避免误改用户网盘。
+
+        v0.8.6 起镜像链路用它改 B 库单集/电影文件名（只换中文片名段）。
+        **fileId 必须是 B 镜像库的文件**：A 源头库全程只读，绝不传 A 的 fileId。
         """
         if not str(file_id or "").strip() or not str(new_name or "").strip():
             raise WebFileError("重命名需要 fileId 与 newName")
