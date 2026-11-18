@@ -5,9 +5,11 @@
   2. B 镜像库才进入扫描、资源库、分享与 Telegram 分发；A/B fileId 不同，
      必须通过 mirror_files 映射，禁止把 A 的 dir_chain / share_dir_id 搬到 B。
   3. 身份优先「TMDB ID + 类型 + 季 + 集」；身份不明确只允许新增，禁止自动替换。
-  4. 本模块**绝不写 push_queue、绝不调用 _enqueue_* / process_queue**。镜像完成
-     不做 Telegram 推送；B 库扫描后的自动识别需由调用方显式传
-     publish_after_identify=False。
+  4. 本模块**绝不写 push_queue、绝不调用 _enqueue_* / process_queue**。推送统一由
+     上层 main.py 的镜像后管线负责：v0.8.5 起同步完成会自动扫描 B 库、识别，并把
+     本轮识别成功且有海报的影视按分发规则入队（用户明确要求，反转了 v0.8.0~v0.8.4
+     写死的「镜像完成不自动推 TG」红线）。但**镜像完成仍不是群推送**：该管线不调用
+     process_change_events，不批量补推历史内容变化事件，也不回溯推送历史资源。
   5. 禁止「先删除旧文件再复制新文件」。内容变化只新增复制，旧 B 文件保留并标记
      superseded（删除接口在 8.6 待验证，未实现）。
 

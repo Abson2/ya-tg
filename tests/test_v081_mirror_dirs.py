@@ -158,7 +158,8 @@ def test_mirror_auto_creates_category_and_work_dirs(db):
     assert "*" not in names[1] and NAME_MARK in names[1], names
     assert "(2001) {tmdb-135646}" in names[1], names
     assert FakeAPI.copies == [(["F1"], "B_2")], FakeAPI.copies
-    assert db.query(QueueItem).count() == 0       # 镜像完成禁止自动推 TG
+    # 只锁「sync_rule 复制函数不写队列」；v0.8.5 起上层管线另按规则入队
+    assert db.query(QueueItem).count() == 0
     kinds = {d.kind: d.status for d in db.scalars(select(MirrorDir)).all()}
     assert kinds == {"category": "created", "work": "created"}, kinds
 

@@ -192,7 +192,8 @@ async def lifespan(app: FastAPI):
         mr = db.scalar(select(MirrorRule).limit(1))
         mirror_minutes, mirror_enabled = ((mr.interval_minutes, mr.enabled)
                                           if mr else (60, False))
-    # v0.8.0：镜像定时任务热注册；只同步，不注册任何自动推送任务
+    # 镜像定时任务热注册；v0.8.5 起任务内部按 auto_identify 接「入库→识别→推送」，
+    # 推送走分发规则与作品级去重，不单独注册群发任务
     if mirror_enabled:
         try:
             _schedule_mirror_job(mirror_minutes, True)
@@ -221,13 +222,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.4", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.5", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.4", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.5", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -516,14 +517,66 @@ def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
                           id="mirror_sync", replace_existing=True, max_instances=1, coalesce=True)
 
 
+async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
+    """v0.8.5：镜像完成 → B 库刷新入库 → 识别 → 只推本轮识别成功且有海报的影视。
+
+    用户 2026-11-18 明确口径（务必保持）：「镜像完成不是群推送，镜像完成，
+    触发资源库入库刷新，识别影视，识别成功的影视就推送」。
+
+    本管线只做三件事：
+      1. 扫 B 库刷新资源库（与「立即扫描」共用 _effective_scan_root 与 run_scan）；
+      2. 自动识别待识别资源；
+      3. 本轮识别成功且拿到海报的影视按启用的 TG 分发规则入队
+         （_enqueue_after_identify → _enqueue_ready：已识别+有海报闸门、同作品同频道去重）。
+
+    明确不做（防群推红线）：
+      - 不调用 process_change_events(publish=True)。v0.8.0~v0.8.4 刻意积压了
+        queue_id=0 的内容变化事件，在此放开会一次性批量补推历史更新。
+      - 不做对账删除、不重建分享、不取消分享、不回溯推送历史已识别资源。
+    内容变化更新仍由用户主动的「立即扫描 / 重新扫描库」按既有机制处理。
+    """
+    root, root_source = _effective_scan_root(db)
+    if not root:
+        # 定时路径已校验 target_root_id 非空；这里只是防止 _effective_scan_root 取到空值
+        root, root_source = str(r.target_root_id or "").strip(), "mirror_target"
+    scan = await run_scan(root, resume=False)
+    out = {
+        "root_source": root_source,
+        "files": int(scan.get("files", 0) or 0),
+        "directories": int(scan.get("directories", 0) or 0),
+        "complete": bool(scan.get("complete", False)),
+    }
+    ident = await _post_scan_identify(db, publish_after_identify=True, limit=500)
+    out["identify"] = ident
+    out["queued"] = int(ident.get("queued", 0) or 0)
+    # 只读统计，绝不在这里处理：内容变化事件仍由常规扫描链路消化
+    out["changes_pending"] = int(db.scalar(
+        select(func.count()).select_from(DistributionEvent).where(
+            DistributionEvent.queue_id == 0)) or 0)
+    return out
+
+
 async def _scheduled_mirror() -> None:
-    """定时镜像：只同步 + 补映射，绝不触发 Telegram 推送。"""
+    """定时镜像：同步 + 补映射；按 auto_identify 决定是否刷新入库并推送本轮新识别影视。
+
+    v0.8.5 起不再写死「镜像完成不推 TG」：识别成功（拿到海报）的影视按分发规则推送。
+    仍不对全库群发，也不批量补推历史内容变化事件。
+    """
     with SessionLocal() as db:
         try:
             r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
             if r and r.source_root_id and r.target_root_id:
                 await mirror.sync_rule(db, r)
                 await mirror.backfill_target_file_ids(db, r)
+                if bool(getattr(r, "auto_identify", True)):
+                    p = await _mirror_post_sync_pipeline(db, r)
+                    db.commit()
+                    # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message，不能冲掉
+                    tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
+                            f"{p['identify']['identified']} · 入队 {p['queued']}"
+                            f" · 内容变化待处理 {p['changes_pending']}")
+                    r.last_message = (str(r.last_message or "") + tail)[-1000:]
+                    db.commit()
         except Exception as exc:
             db.rollback()
             try:
@@ -569,10 +622,11 @@ def mirror_config_get(db: Session = Depends(get_db)):
         "last_message": r.last_message if r else "",
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
-        "note": ("v0.8.1：A 库分类目录会在 B 库按原名 1:1 自动创建（不改名），"
-                 "只有影视主目录按 * 约定命名，括号里的年份与 TMDB 标记保持原样。"
-                 "每次文件复制之间留可配置空闲时间，下限来自官方写接口 2 次/秒限频，不可调低。"
-                 "镜像完成不会自动推送 Telegram。"),
+        "note": ("v0.8.5：A 库分类目录在 B 库按原名 1:1 自动创建（不改名），影视主目录按 · 约定命名，"
+                 "括号里的年份与 TMDB 标记保持原样。每个文件操作之间留可配置空闲时间，"
+                 "下限来自官方写接口 2 次/秒限频，不可调低。同步完成后默认自动刷新资源库入库、"
+                 "识别影视，并把本轮识别成功且拿到海报的影视按 TG 分发规则入队；"
+                 "不做全库群发，也不批量补推历史内容变化事件。"),
     }
 
 
@@ -602,22 +656,29 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
 
 
 @app.post("/api/mirror/run", dependencies=ADMIN)
-async def mirror_run(post_identify: bool = False, db: Session = Depends(get_db)):
-    """立即同步一次。post_identify=True 时额外做 B 库扫描+识别，但强制不推 TG。"""
+async def mirror_run(post_identify: bool | None = None, db: Session = Depends(get_db)):
+    """v0.8.5：立即同步；默认按 mirror.auto_identify 决定是否接「入库 → 识别 → 推送」管线。
+
+    post_identify 不传（前端「立即同步」）= 遵循配置开关；
+    False（「仅同步」）= 跳过管线；True（「强制入库识别」）= 即使开关关闭也执行。
+    管线只推本轮识别成功且有海报的影视，不做全库群发、不补推历史内容变化事件。
+    """
     r = _mirror_rule(db, create=True)
     if not r.source_root_id or not r.target_root_id:
         raise HTTPException(400, "请先在镜像设置里填写 A 源头库目录 ID 与 B 镜像库目录 ID")
+    # auto_identify 在 v0.8.4 及之前只是「存了、回显了」的死配置，v0.8.5 起真正接线
+    do_pipeline = (bool(getattr(r, "auto_identify", True))
+                   if post_identify is None else bool(post_identify))
     try:
         stats = await mirror.sync_rule(db, r)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
-        if post_identify:
-            scan = await run_scan(r.target_root_id, resume=False)
-            stats["scan"] = {k: v for k, v in scan.items() if k != "seen_file_ids"}
-            # 关键：镜像链路的识别绝不入队推送（V2.0 第十章）
-            stats["identify"] = await _post_scan_identify(db, publish_after_identify=False)
+        stats["pipeline_enabled"] = do_pipeline
+        if do_pipeline:
+            stats["pipeline"] = await _mirror_post_sync_pipeline(db, r)
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
-                                     "done": stats.get("done"), "unknown": stats.get("unknown")}))
+                                     "done": stats.get("done"), "unknown": stats.get("unknown"),
+                                     "pipeline": stats.get("pipeline")}))
         db.commit()
         return stats
     except WebFileError as exc:
@@ -726,6 +787,9 @@ def mirror_status(db: Session = Depends(get_db)):
             "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
                                   else bool(r.auto_create_dirs)) if r else True,
             "star_naming": bool(r.star_naming) if r else True,
+            # v0.8.5：auto_identify 从「死配置」变为真正生效的开关，状态页必须回显
+            "auto_identify": (True if getattr(r, "auto_identify", None) is None
+                              else bool(r.auto_identify)) if r else True,
             "source_root_id": r.source_root_id if r else "",
             "target_root_id": r.target_root_id if r else "",
             "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,
@@ -748,8 +812,9 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     """v0.7.1：扫描完成后自动 TMDB 识别 + 完结/追更状态回填。
 
     需求3：扫描入库后自动识别；识别成功拿到海报才允许分发（沿用 v0.6.5 闸门）。
-    需求2/V2.0 第十章：镜像同步复用本管线时必须传 publish_after_identify=False，
-    避免 B 库复制完成就自动发 Telegram——这是「独立调用模式」的隔离点。
+    v0.8.5：用户已反转 V2.0 第十章的「镜像完成不自动推 TG」红线——镜像链路现在
+    传 publish_after_identify=True，只推本轮识别成功的影视；群推防护由
+    _enqueue_ready 的作品级去重 + 镜像管线不调用 process_change_events 共同保证。
 
     完结标签：已识别但 finish_status 为空的历史资源（v0.7.0 之前识别的）用已有
     tmdb_id 回查 TMDB detail 补 status，否则角标永远不显示。
@@ -865,7 +930,9 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
 
     - 同一 (作品, 变化指纹) 只处理一次；一批多集同时变化只推一条。
     - 已分享影视内容变化**复用原分享链接**，不重建分享、不取消再创建。
-    - publish=False 时只保留事件不处理（镜像链路禁止完成后自动推 TG）。
+    - 仅由「立即扫描 / 重新扫描库 / 定时扫描」调用。v0.8.5 的镜像同步管线刻意不调用
+      本函数：历史 queue_id=0 事件一旦在这里放开，会一次性批量补推，属用户明确禁止的群推。
+    - publish=False 时只保留事件不处理（保留给未来需要延期处理的调用方）。
     """
     events = list(db.scalars(select(DistributionEvent).where(
         DistributionEvent.queue_id == 0)).all())

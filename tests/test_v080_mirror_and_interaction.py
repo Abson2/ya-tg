@@ -271,7 +271,9 @@ def test_mirror_incremental_and_never_pushes_tg(db):
     with patch("app.mirror.GuangYaWebFiles", FakeMirrorAPI):
         first = asyncio.run(mirror.sync_rule(db, r))
         assert first["new"] == 1 and first["done"] == 1, first
-        assert db.query(QueueItem).count() == 0  # 镜像完成禁止自动推 TG
+        # 只锁「复制函数本身不写队列」；v0.8.5 起上层镜像后管线会按分发规则
+        # 推送本轮识别成功且有海报的影视，那是 main.py 的职责，不在这里断言
+        assert db.query(QueueItem).count() == 0
         media = db.scalar(select(MirrorMedia))
         assert media.title_standard == "侠客行 (2001) {tmdb-135646}"
         assert NAME_MARK in media.title_mirror and "*" not in media.title_mirror

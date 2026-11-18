@@ -145,7 +145,9 @@ def test_post_scan_identify_and_finish_backfill(db):
     assert got.identify_status == "identified" and got.poster_path == "/p.jpg"
     old = db.scalar(select(Resource).where(Resource.file_id == "v071-old"))
     assert old.finish_status == "ended"
-    # publish_after_identify=False 时绝不自动入队（V2.0 第十章镜像隔离）
+    # 显式传 publish_after_identify=False 的调用方仍绝不自动入队。
+    # 注意：v0.8.5 起镜像链路改传 True（只推本轮识别成功影视），本用例锁的是
+    # 「函数参数本身可控」，不再代表镜像链路的默认行为。
     assert db.query(QueueItem).count() == 0
 
 

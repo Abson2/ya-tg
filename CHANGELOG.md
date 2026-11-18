@@ -8,6 +8,45 @@
 
 ---
 
+## v0.8.5 (2026-11-18)
+
+按用户三轮明确口径接通「镜像完成 → 刷新入库 → 识别 → 只推本轮识别成功影视」链路：
+「同步完没有自动触发资源库扫描入库」→「扫描入库完，识别成功（获取到海报），自动按照 tg 分发规则推送」→
+「**镜像完成不是群推送**，镜像完成，触发资源库入库刷新，识别影视，识别成功的影视就推送」。
+
+本版**反转**了 v0.8.0~v0.8.4 写死的 V2.0 第十章「镜像完成不自动推送 Telegram」红线，
+但没有放开两道防群推闸门（见第二节）。
+
+### 一、`auto_identify` 是死配置（头号根因）
+- `MirrorRule.auto_identify` 在 v0.8.0 就已经存库、`/api/mirror/config` 也回显，前端初始 state 里也有 `auto_identify: true`，但 `mirror_run()` 与 `_scheduled_mirror()` **从未读取它**；保存开关后不产生任何运行时效果。
+- 前端「立即同步」硬编码 `runMirror(false)` → `/mirror/run?post_identify=false`，永不扫描；「同步并识别（不推送）」传 `true`，但 `mirror_run()` 强制 `publish_after_identify=False`。
+- 定时镜像 `_scheduled_mirror()` 只有 `sync_rule()` + `backfill_target_file_ids()`，完全没有扫描。
+- 修：新增共享管线 `_mirror_post_sync_pipeline()`，手动与定时两条路径统一调用；开关默认开启。
+
+### 二、管线边界（防群推红线）
+- 管线只做三件事：① `run_scan(_effective_scan_root(), resume=False)` 刷新 B 库入库；② `_post_scan_identify(db, publish_after_identify=True, limit=500)` 识别待识别资源；③ 本轮识别成功且有海报的影视按启用规则入队（`_enqueue_after_identify` → `_enqueue_ready`）。
+- **不调用** `process_change_events(db, publish=True)`：v0.8.0~v0.8.4 刻意积压了 `queue_id=0` 的内容变化事件，在此放开会一次性批量补推历史更新。返回值里的 `changes_pending` 只是只读计数。
+- 不做对账删除、不重建/取消分享、不回溯推送历史已识别资源；`_enqueue_ready` 的作品级去重保证同作品同频道已推过就不再入队。
+- 内容变化更新仍由用户主动的「立即扫描 / 重新扫描库 / 定时扫描」按既有机制处理。
+
+### 三、手动与定时两条路径
+- `/api/mirror/run` 的 `post_identify` 改为 `bool | None = None`：不传 = 遵循 `auto_identify`；`false` = 仅同步；`true` = 开关关闭也强制执行。
+- 返回 `pipeline_enabled` 与 `pipeline{files, directories, complete, root_source, identify, queued, changes_pending}`。
+- 定时镜像按开关走同一管线；`last_message` **追加**「[自动入库] …」而不是覆盖，保留 v0.8.4 的文件级复制错误诊断。
+
+### 四、管理页
+- 镜像设置新增「同步后自动入库识别并推送」开关；同步状态「生效配置」回显 `auto_identify`。
+- 按钮改为「立即同步」（遵循开关）、「强制入库识别」、「仅同步」、「继续轮询任务」，删除语义冲突的「同步并识别（不推送）」。
+- 同步结果提示追加「自动入库 N 文件 · 识别成功 N · 入队 N · 内容变化待处理 N」。
+- `/api/mirror/config` 的 `note` 修正：v0.8.1 文案仍写 `* 命名` 与「镜像完成不会自动推送 Telegram」，两处均已过时。
+
+### 五、测试与交付
+- 新增 `tests/test_v085_post_sync_pipeline.py` 14 项：手动/定时两条路径都读开关、显式 `true/false` 覆盖开关、识别失败与无海报不入队、历史已识别资源不回溯推送、同作品已有队列项不重复入队、**历史 `queue_id=0` 事件保持原样且 `process_change_events` 零调用**、管线不做对账、配置与版本口径一致。
+- 全套 `166 passed`，前端 `vite build` 通过。
+- **行为变更提示**：升级后默认开启自动链路。若不想让镜像同步触发推送，到「镜像同步」关闭开关，或只用「仅同步」按钮；`queue_id=0` 的历史内容变化事件**不会**被本版补推。
+
+---
+
 ## v0.8.4 (2026-11-18)
 
 按用户实测反馈「**影视目录的文件夹创建正常、命名正常，对应的文件没有镜像过去**」修复文件复制链路。v0.8.2 解决的是「建目录失败看不到原因」，本版解决的是「目录建好了但文件没过去、且反复同步无效」。

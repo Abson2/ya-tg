@@ -434,10 +434,13 @@ async function saveMirror() {
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorSaving.value = false }
 }
-async function runMirror(postIdentify = false) {
+// v0.8.5：mode = 'auto'（默认，遵循 auto_identify 开关）| 'force' | 'skip'
+// 不再把「立即同步」硬编码成不识别；同步完成后会刷新入库 → 识别 → 只推本轮识别成功且有海报的影视
+async function runMirror(mode = 'auto') {
   mirrorBusy.value = true
   try {
-    const d = await api(`/mirror/run?post_identify=${postIdentify ? 'true' : 'false'}`, { method: 'POST' }, 300000)
+    const q = mode === 'auto' ? '' : `?post_identify=${mode === 'force' ? 'true' : 'false'}`
+    const d = await api(`/mirror/run${q}`, { method: 'POST' }, 300000)
     const extra = []
     if (d.dirs_created) extra.push(`新建目录 ${d.dirs_created}`)
     if (d.dirs_fallback) extra.push(`已降级标准名 ${d.dirs_fallback} 次`)
@@ -447,6 +450,9 @@ async function runMirror(postIdentify = false) {
     // v0.8.4：文件复制失败必须显式提示，不能只显示「同步 N 部」让人误以为成功
     if (d.file_errors?.length) extra.push(`首个文件错误：${String(d.file_errors[0]).slice(0, 160)}`)
     else if (!d.dir_errors?.length && d.errors?.length) extra.push(d.errors[0])
+    const p = d.pipeline
+    if (p) extra.push(`自动入库 ${p.files || 0} 文件 · 识别成功 ${p.identify?.identified || 0} · 入队 ${p.queued || 0} · 内容变化待处理 ${p.changes_pending || 0}`)
+    else if (d.pipeline_enabled === false) extra.push('本次仅同步，未刷新入库')
     const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 重试 ${d.retries || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 复制失败 ${d.failed || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
     if (d.dir_errors?.length || d.failed) ElMessage.warning(msg)
     else ElMessage.success(msg)
@@ -1014,7 +1020,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.4 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.5 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1181,7 +1187,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '镜像同步'" class="fade">
-          <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；增量复制、身份保护、完成不自动推送 Telegram</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
+          <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；同步完成自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
           <div class="panel narrow">
             <div class="panel-head"><h3>A / B 库设置</h3></div>
             <div class="form-grid">
@@ -1197,10 +1203,12 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="field inline"><label>启用定时同步</label><el-switch v-model="mirrorCfg.enabled"/></div>
               <div class="field inline"><label>B 库主目录带 · 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
               <div class="field inline"><label>B 库缺目录自动创建</label><el-switch v-model="mirrorCfg.auto_create_dirs"/></div>
+              <div class="field inline"><label>同步后自动入库识别并推送</label><el-switch v-model="mirrorCfg.auto_identify"/></div>
               <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、变化更新的每个文件操作前都会等待。</small></div>
             </div>
+            <p class="hint">开启「同步后自动入库识别并推送」后，同步结束会刷新 B 库入库、识别影视，并把<b>本轮识别成功且拿到海报</b>的影视按 TG 分发规则入队；不会对全库群发，也不会批量补推历史内容变化事件。关闭后定时同步与「立即同步」都只复制文件，需要到资源库手动点「立即扫描」。</p>
             <p class="hint">{{ mirrorCfg.note }}</p>
-            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button :loading="mirrorBusy" @click="runMirror(false)">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror(true)">同步并识别（不推送）</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
+            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
@@ -1209,6 +1217,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <p class="hint">
               生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
               · 主目录带 · 标记：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
+              · 同步后自动入库识别并推送：<b :style="mirrorStatus.config?.auto_identify === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_identify === false ? '关闭' : '开启' }}</b>
               · B 库目录 ID：{{ mirrorStatus.config?.target_root_id || '未填写' }}
               · 文件空闲：{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s
             </p>
