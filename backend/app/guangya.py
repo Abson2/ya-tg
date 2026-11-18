@@ -162,11 +162,14 @@ class GuangYaWebFiles:
         }
 
     async def list_files(self, parent_id: str = "", page: int = 0, page_size: int = 100) -> dict:
+        # v0.8.4：与 w.har 中网页端真实请求体对齐。旧版自造的 needSubFolderStat
+        # 不是抓包字段；网页端固定带 orderBy=3 / sortType=1，page 从 0 开始。
         body = {
             "page": page,
             "pageSize": page_size,
             "parentId": parent_id or "*",  # 网页端根目录标识为 "*"
-            "needSubFolderStat": True,
+            "orderBy": 3,
+            "sortType": 1,
         }
         last_error = ""
         for attempt in range(3):
@@ -270,12 +273,19 @@ class GuangYaWebFiles:
         return task_id
 
     async def get_task_status(self, task_id: str) -> dict:
-        """查询复制任务。只原样返回 status，含义判断交给调用方。
+        """查询复制任务，原样返回 status 与 detail，含义判断交给调用方。
 
-        已确认 status=2 表示完成；其它取值含义未验证，不得猜测成成功或失败。
+        v0.8.4：前端 JS 的轮询函数 p5 已给出确切语义——
+          status=2 且 detail.code 非 0 → 失败（如 157 云盘空间不足）
+          status=3 → 失败
+          status=2 且无 detail.code / code=0 → 成功
+        旧版把 data.detail 丢掉，导致「复制失败」被当成「待确认」，
+        MirrorFile 永远停在 copying，下一轮同步又被当成已存在而跳过。
         """
         data = await self._post_web(self.TASK_PATH, {"taskId": str(task_id)})
-        return {"status": data.get("status"), "raw": data}
+        return {"status": data.get("status"),
+                "detail": data.get("detail") or {},
+                "raw": data}
 
     @staticmethod
     def _json(r: httpx.Response) -> dict:

@@ -8,6 +8,37 @@
 
 ---
 
+## v0.8.4 (2026-11-18)
+
+按用户实测反馈「**影视目录的文件夹创建正常、命名正常，对应的文件没有镜像过去**」修复文件复制链路。v0.8.2 解决的是「建目录失败看不到原因」，本版解决的是「目录建好了但文件没过去、且反复同步无效」。
+
+### 一、未完成的文件被永久跳过（头号根因）
+- `sync_rule()` 旧版把该作品下**所有** `MirrorFile` 塞进 `existing = {(source_file_id, fingerprint): row}`，只要键命中就判 `unchanged` 跳过。上一轮 `copy_file` 抛异常或任务未确认时留下的是 `copying` / `failed` / `unknown`，文件根本没到 B 库，下一轮却被当成「已存在」，永远不再发起复制。
+- 修：只有 `status == "synced"` 才算已到位；`pending` / `copying` / `failed` / `unknown` 归入 `RETRYABLE_FILE_STATUS`，**复用同一行重新发起复制**（不新建行，避免唯一键冲突与历史留痕膨胀），统计新增「重试」计数。
+- **防重复复制**：重试前先只读列 B 库该作品目录（含直属子目录），按「归一化文件名 + 大小」核对。任务其实已成功、只是轮询超时的，直接回填 `target_file_id` 并标 `synced`，不再重发 `copy_file`——需求明确禁止「先删旧再复制」。`backfill_target_file_ids()` 同步复用这个核对逻辑，失败/未确认记录若已在 B 库存在也会纠正为 `synced`。
+
+### 二、复制任务失败被误记成「待确认」
+- 前端 JS `index.4998cfbcbd.js` 的轮询函数 `p5` 给出确切语义：`status=2` 且 `detail.code !== 0` → 失败（如 157 云盘空间不足）；`status=3` → 失败；只有 `status=2` 且无错误码才是成功。旧版 `get_task_status()` 丢掉了 `data.detail`，且只认 `status=2` 为完成，其余一律记 `unknown`。
+- 修：`get_task_status()` 原样返回 `detail`；新增 `_task_outcome()` 区分 `done` / `failed` / `pending`；失败时把 `MirrorTask.status`、`MirrorFile.status` 标 `failed` 并写入可读错误（含 `detail.msg`），下一轮自动重试。`poll_pending_tasks()` 也按同一语义处理。
+
+### 三、文件级错误是新的诊断黑洞
+- v0.8.2 只把 `create_dir` 的真实报错落库回显；文件复制的 `stats["errors"]` 仅存在于 `POST /api/mirror/run` 的**那一次响应**里，刷新页面即丢，`rule.last_message` 也只有计数，界面会显示「已同步」而 B 库是空目录。
+- 修：`MirrorFile.error` / `MirrorTask.error` 持久化；`last_message` 追加「复制失败 N · 首个文件错误：…」；`GET /api/mirror/status` 新增 `counts.files_failed` / `files_copying` / `files_unknown` / `files_retryable` / `tasks_failed` 与 `file_errors[]`（最近 50 条，含作品名、文件名、任务 ID、真实报错）。管理页镜像同步新增「文件复制失败 / 待重试」清单、状态卡新增失败计数，「立即同步」与「轮询任务」提示显式带出失败数与首个错误。还有未完成文件时不把作品标 `synced`。
+
+### 四、列目录请求体与分页判定对齐抓包
+- `w.har` 中网页端 `get_file_list` 的真实请求体是 `{pageSize:50, orderBy:3, sortType:1, parentId, page:0}`，响应 `data.total` / `data.list`。旧版自造了 `needSubFolderStat` 字段、发 `pageSize:100`，且用 `page*100 >= total` 判完整——接口实际每页返回不足 100 条时会提前结束并误判为「分页不完整」，整轮镜像直接中止或漏掉文件层条目。
+- 修：请求体按抓包对齐（`LIST_PAGE_SIZE=50` + `orderBy` / `sortType`），分页改用「累计条数 vs total」判定，短页但 `total` 更大时明确判不完整。`scanner.py` 的分页不受影响，仍用独立逻辑。
+
+### 五、接口取证口径更正（重要）
+- 复查原始 `w.har`：54 条请求里**没有任何一次 `copy_file` 真实请求**，抓到的写请求只有 `create_dir` / `rename` / `delete_file` / `get_task_status`。`copy_file {fileIds, parentId} → data.taskId` 来自前端 JS 的 `onCopyTo` 调用代码，**不是抓包响应**。
+- 因此把 `copy_file` 从「抓包已确认」改标为「仅前端 JS 契约，待 HAR 复核」，并加入 `UNVERIFIED_ENDPOINTS`。这与用户现象一致：抓包确认的建目录能用，只有 JS 契约的复制接口需要进一步取证。**请在网页端手动执行一次「复制到」并抓包**，重点看 `data.taskId`、错误码（如 157 空间不足）与鉴权差异。
+
+### 六、验证与仍待确认
+- `pytest tests -q`：**152 passed, 1 warning**（新增 `tests/test_v084_file_copy.py` 10 项；更新 `test_v081_mirror_dirs.py` 的待验证接口契约断言）；`vite build` 通过；`py_compile` / `git diff --check` 通过。
+- **仍待用户实测**：升级后点「立即同步」，确认 B 库空目录里的文件被补上；看「文件复制失败 / 待重试」清单是否给出 `copy_file` 或 `get_task_status` 的真实报错；若全部卡在 `copy_file`，按第五节补抓 HAR。投稿分享转存 HAR、`QueueItem` / `DistributionEvent` 的 `source/mode` 数据层隔离仍未闭环，**本版不宣称全面功能实现**。
+
+---
+
 ## v0.8.3 (2026-11-18)
 
 按用户「库的复制已实现」后的三条实测反馈修复：**命名字符、扫描根目录、日志膨胀**。

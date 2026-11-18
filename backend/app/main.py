@@ -221,13 +221,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.4", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -661,6 +661,15 @@ def mirror_status(db: Session = Depends(get_db)):
     tasks = list(db.scalars(select(MirrorTask).order_by(MirrorTask.id.desc()).limit(30)).all())
     dirs = list(db.scalars(select(MirrorDir).order_by(MirrorDir.id.desc()).limit(200)).all())
     missing = [d for d in dirs if d.status == "missing"]
+    # v0.8.4：文件复制失败的诊断不再只存在于「立即同步」那一次响应里。
+    # MirrorFile.error / MirrorTask.error 落库持久化，刷新页面依然可查。
+    failed_files = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
+    titles = {m.id: m.title_standard for m in db.scalars(select(MirrorMedia)).all()}
+    file_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
+                    "file": f.file_name, "task_id": f.task_id or "",
+                    "error": f.error or "", "status": f.status}
+                   for f in failed_files]
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -671,7 +680,14 @@ def mirror_status(db: Session = Depends(get_db)):
             "files": db.query(MirrorFile).count(),
             "synced": db.query(MirrorFile).filter(MirrorFile.status == "synced").count(),
             "superseded": db.query(MirrorFile).filter(MirrorFile.status == "superseded").count(),
+            # v0.8.4：把「目录建好但 B 库空」的卡点量化，一眼看出是否卡在复制阶段
+            "files_failed": db.query(MirrorFile).filter(MirrorFile.status == "failed").count(),
+            "files_copying": db.query(MirrorFile).filter(MirrorFile.status == "copying").count(),
+            "files_unknown": db.query(MirrorFile).filter(MirrorFile.status == "unknown").count(),
+            "files_retryable": db.query(MirrorFile).filter(
+                MirrorFile.status.in_(list(mirror.RETRYABLE_FILE_STATUS))).count(),
             "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
+            "tasks_failed": db.query(MirrorTask).filter(MirrorTask.status == "failed").count(),
             "scan_batches": db.query(ResourceScanBatch).count(),
             "change_events": db.query(DistributionEvent).count(),
             "dirs_mapped": db.query(MirrorDir).filter(MirrorDir.status != "missing").count(),
@@ -700,6 +716,8 @@ def mirror_status(db: Session = Depends(get_db)):
                                  or "在 B 库该父目录下建立此目录后重新同步"} for d in missing],
         "tasks": [{"id": t.id, "task_id": t.task_id, "status": t.status,
                    "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
+        # v0.8.4：文件复制失败清单（持久化，刷新页面仍在）
+        "file_errors": file_errors,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,

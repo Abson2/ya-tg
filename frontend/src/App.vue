@@ -442,10 +442,13 @@ async function runMirror(postIdentify = false) {
     if (d.dirs_created) extra.push(`新建目录 ${d.dirs_created}`)
     if (d.dirs_fallback) extra.push(`已降级标准名 ${d.dirs_fallback} 次`)
     if (d.blocked) extra.push(`${d.blocked} 部待建目录（见下方清单）`)
+    if (d.retries) extra.push(`重试 ${d.retries} 个未成功文件`)
     if (d.dir_errors?.length) extra.push(`首个建目录错误：${String(d.dir_errors[0]).slice(0, 140)}`)
-    if (!d.dir_errors?.length && d.errors?.length) extra.push(d.errors[0])
-    const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
-    if (d.dir_errors?.length) ElMessage.warning(msg)
+    // v0.8.4：文件复制失败必须显式提示，不能只显示「同步 N 部」让人误以为成功
+    if (d.file_errors?.length) extra.push(`首个文件错误：${String(d.file_errors[0]).slice(0, 160)}`)
+    else if (!d.dir_errors?.length && d.errors?.length) extra.push(d.errors[0])
+    const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 重试 ${d.retries || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 复制失败 ${d.failed || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
+    if (d.dir_errors?.length || d.failed) ElMessage.warning(msg)
     else ElMessage.success(msg)
     await load()
   } catch (e) { ElMessage.error(e.message) }
@@ -453,7 +456,13 @@ async function runMirror(postIdentify = false) {
 }
 async function pollMirrorTasks() {
   mirrorBusy.value = true
-  try { const d = await api('/mirror/tasks/poll', { method: 'POST' }, 120000); ElMessage.success(`轮询 ${d.tasks} 个任务，确认完成 ${d.done} 个`); await load() }
+  try {
+    const d = await api('/mirror/tasks/poll', { method: 'POST' }, 120000)
+    const msg = `轮询 ${d.tasks} 个任务，确认完成 ${d.done || 0} 个，失败 ${d.failed || 0} 个，待确认 ${d.still_unknown || 0} 个`
+    if (d.failed) ElMessage.warning(msg + '（失败文件会在下次同步自动重试）')
+    else ElMessage.success(msg)
+    await load()
+  }
   catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
@@ -1005,7 +1014,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.3 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.4 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1195,7 +1204,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
-            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>内容变化事件</small><b>{{ mirrorStatus.counts?.change_events || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div></div>
+            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div><div><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div></div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
             <p class="hint">
               生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
@@ -1215,6 +1224,16 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column label="失败原因 / 处理建议" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || s.row.tip }}</span></template></el-table-column>
             </el-table></div>
             <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
+          </div>
+          <div v-if="mirrorStatus.file_errors?.length" class="panel">
+            <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.file_errors" size="small">
+              <el-table-column prop="work" label="作品" min-width="160"/>
+              <el-table-column prop="file" label="文件名" min-width="200"/>
+              <el-table-column prop="task_id" label="任务 ID" min-width="140"/>
+              <el-table-column label="失败原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
+            </el-table></div>
+            <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>下一轮「立即同步」会自动重试这些文件</b>，重试前会先核对 B 库，确认已存在的不会重复复制。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag></div>
@@ -1238,7 +1257,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="files" label="文件" width="80"/>
               <el-table-column prop="status" label="状态" width="110"/>
             </el-table></div>
-            <p class="hint">B 库目录名里的星号只存在于网盘；资源库、分享标题与 Telegram 推送一律使用标准影视名。</p>
+            <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。文件数为 0 但状态显示已同步时，优先看上面的「文件复制失败 / 待重试」清单。</p>
           </div>
         </section>
 

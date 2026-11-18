@@ -262,5 +262,10 @@ def test_web_write_endpoints_match_har_contract(db):
 
 
 def test_only_transfer_remains_unverified():
-    assert mirror.UNVERIFIED_ENDPOINTS == ["投稿分享转存（TgtoDrive 侧接口，未抓包）"]
+    # v0.8.4 更正取证口径：w.har 里 54 条请求没有任何一次「复制到」操作，
+    # copy_file 只有前端 JS 调用契约，不能与 create_dir/rename/delete_file
+    # 一起算「抓包已确认」。这里如实列为待复核项。
+    assert any("投稿分享转存" in x for x in mirror.UNVERIFIED_ENDPOINTS)
+    assert any("copy_file" in x for x in mirror.UNVERIFIED_ENDPOINTS)
     assert any("create_dir" in x for x in mirror.CONFIRMED_WRITE_ENDPOINTS)
+    assert any("仅前端 JS 契约" in x for x in mirror.CONFIRMED_WRITE_ENDPOINTS)
