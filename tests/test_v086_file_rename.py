@@ -383,10 +383,10 @@ def test_scheduled_rename_exception_never_blocks_pipeline(db):
 
 def test_version_and_ui_contract():
     pkg = json.loads((ROOT / "frontend/package.json").read_text(encoding="utf-8"))
-    assert pkg["version"] == "0.8.6"
-    assert main.app.version == "0.8.6" and main.health()["version"] == "0.8.6"
+    v = pkg["version"]
+    assert main.app.version == v and main.health()["version"] == v
     vue = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert "v0.8.6 · Asia/Shanghai" in vue
+    assert f"v{v} · Asia/Shanghai" in vue
     assert "renameMirrorFiles(false)" in vue and "renameMirrorFiles(true)" in vue
     assert "v-model=\"mirrorCfg.rename_files\"" in vue
     assert "按英文规范改名" in vue

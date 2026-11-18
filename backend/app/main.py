@@ -222,13 +222,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.6", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.7", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.6", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.7", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -963,14 +963,22 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
 
 async def _reconcile_library(db: Session, seen_file_ids: list[str],
                              cancel_shares: bool = True, scan_complete: bool = True,
-                             resumed: bool = False, batch_id: int | None = None) -> dict:
+                             resumed: bool = False, batch_id: int | None = None,
+                             allow_empty: bool = False) -> dict:
     """v0.7.1：B 库对账——本轮没扫到的影视移除看板并取消分享（需求3-1）。
 
     V2.0 第 12.2 节扫描批次保护：必须同时满足
       ① 全量扫描（非断点续扫）、② 全部分页读取成功、③ seen 非空，
     否则一律跳过对账。宁可保留旧数据，也绝不能因接口抖动把整个资源库清空。
+
+    v0.8.7：用户明确「刷新 = 读取最新 B 库内容，B 库已无该影视则清理出面板」。
+    用户主动触发的刷新可传 `allow_empty=True`，允许**可信空批次**清库，但仍要
+    满足硬门槛：批次 success + complete + 非断点 + **确实扫到了目录**（directories>0）
+    + seen_count=0。B 库根目录都读不到（directories=0）时不信任，仍跳过。
+    定时扫描与其它自动链路不传此参数，行为完全不变。
     """
     skipped = ""
+    empty_ok = False
     # v0.8.0：批次表是「是否允许对账删除」的唯一权威信号。传入 batch_id 时，
     # 即使调用方声称 complete=True，只要批次未标记 reconcile_allowed 就一律跳过。
     if batch_id:
@@ -978,9 +986,17 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
         if not b:
             return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
                     "skipped": "batch_missing"}
-        if b.status != "success" or not b.complete or b.resumed or not b.reconcile_allowed:
+        if b.status != "success" or not b.complete or b.resumed:
             return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
                     "skipped": "batch_not_allowed"}
+        if not b.reconcile_allowed:
+            if not allow_empty:
+                return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
+                        "skipped": "batch_not_allowed"}
+            if not b.directories or b.seen_count:
+                return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0,
+                        "skipped": "empty_scan_untrusted"}
+            empty_ok = True
         try:
             saved = json.loads(b.seen_json or "[]")
             if saved:
@@ -992,10 +1008,12 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     elif not scan_complete:
         skipped = "incomplete_pages"
     seen = set(str(f) for f in seen_file_ids)
-    if not skipped and not seen:
+    if not skipped and not seen and not empty_ok:
         skipped = "empty_seen"
     if skipped:
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0, "skipped": skipped}
+    if empty_ok and not seen:
+        logger.info("[library] 用户主动刷新：B 库可信空批次，按实际内容清空资源库面板")
     stale = [x for x in db.scalars(select(Resource)).all() if x.file_id not in seen]
     if not stale:
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0}
@@ -1015,8 +1033,11 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
         db.delete(x)
     add_audit(db, "library_reconciled", target_type="library",
               detail=json_dumps({"removed": len(ids), "shares_cancelled": cancelled,
-                                 "queue_cleared": q}))
-    return {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q}
+                                 "queue_cleared": q, "empty_seen_allowed": empty_ok}))
+    out = {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q}
+    if empty_ok:
+        out["empty_seen_allowed"] = True
+    return out
 
 
 def process_change_events(db: Session, *, publish: bool = True) -> dict:
@@ -1077,19 +1098,48 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
     return stats
 
 
+async def _refresh_library_from_b(db: Session, *, reconcile: bool = True,
+                                  auto_identify: bool = True,
+                                  allow_empty_reconcile: bool = False) -> dict:
+    """v0.8.7：三个「刷新」入口共用的「按 B 库实际内容重建资源库」。
+
+    用户口径：「资源库里面刷新定义为读取最新的 B 库内容，B 库文件夹已无该影视
+    则清理出面板」。顶部「刷新」、资源库「立即扫描」、「重新扫描库」统一走这里：
+      ① run_scan(B 库, resume=False) 全量读取最新内容；
+      ② _reconcile_library 按 seen 移除 B 库已不存在的影视并取消分享；
+      ③ 识别新入库资源；④ 按既有机制处理内容变化。
+    定时扫描与镜像后管线**不走这里**，继续保持「不自动删数据」。
+    """
+    root, root_source = _effective_scan_root(db)
+    data = await run_scan(root, resume=False)
+    out = {k: v for k, v in data.items() if k != "seen_file_ids"}
+    out["root_source"] = root_source
+    if reconcile:
+        out["reconcile"] = await _reconcile_library(
+            db, data.get("seen_file_ids") or [],
+            scan_complete=bool(data.get("complete", False)),
+            resumed=bool(data.get("resumed", False)),
+            batch_id=data.get("batch_id") or None,
+            allow_empty=allow_empty_reconcile)
+    if auto_identify:
+        out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+    try:
+        out["changes"] = process_change_events(db, publish=True)
+    except Exception as exc:
+        out["changes"] = {"error": str(exc)[:200]}
+    return out
+
+
 @app.post("/api/scan-now", dependencies=ADMIN)
 async def scan_now(resume: bool = True, auto_identify: bool = True,
                    db: Session = Depends(get_db)):
-    root, _ = _effective_scan_root(db)
+    """v0.8.7：资源库「立即扫描」= 按最新 B 库内容全量重建（与顶部刷新 / 重新扫描库同口径）。
+
+    `resume` 仅为兼容旧调用保留，统一为全量扫描，不再断点续扫。
+    """
     try:
-        data = await run_scan(root, resume=resume)
-        out = {k: v for k, v in data.items() if k != "seen_file_ids"}
-        if auto_identify:
-            out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
-        try:
-            out["changes"] = process_change_events(db, publish=True)
-        except Exception as exc:
-            out["changes"] = {"error": str(exc)[:200]}
+        out = await _refresh_library_from_b(db, auto_identify=auto_identify,
+                                            allow_empty_reconcile=True)
         add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(out))
         db.commit()
         return out
@@ -1100,28 +1150,28 @@ async def scan_now(resume: bool = True, auto_identify: bool = True,
 @app.post("/api/library/rescan", dependencies=ADMIN)
 async def rescan_library(auto_identify: bool = True, reconcile: bool = True,
                          db: Session = Depends(get_db)):
-    """资源库「重新扫描库」：全量重扫 B 库 → 对账移除已删除影视并取消分享 → 自动识别。
-
-    全量扫描（resume=False）才允许对账，避免断点续扫 seen 不完整导致误删。
-    返回统计供前端一次展示，扫描过程中资源逐目录 commit，看板可边扫边刷新。
-    """
-    root, _ = _effective_scan_root(db)
+    """v0.8.7：「重新扫描库」与顶部刷新、立即扫描共用同一重建管线。"""
     try:
-        data = await run_scan(root, resume=False)
-        out = {k: v for k, v in data.items() if k != "seen_file_ids"}
-        if reconcile:
-            out["reconcile"] = await _reconcile_library(
-                db, data.get("seen_file_ids") or [],
-                scan_complete=bool(data.get("complete", False)),
-                resumed=bool(data.get("resumed", False)),
-                batch_id=data.get("batch_id") or None)
-        if auto_identify:
-            out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
-        try:
-            out["changes"] = process_change_events(db, publish=True)
-        except Exception as exc:
-            out["changes"] = {"error": str(exc)[:200]}
+        out = await _refresh_library_from_b(db, reconcile=reconcile,
+                                            auto_identify=auto_identify,
+                                            allow_empty_reconcile=True)
         add_audit(db, "library_rescan", target_type="library", detail=json_dumps(out))
+        db.commit()
+        return {"ok": True, **out}
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/library/refresh", dependencies=ADMIN)
+async def refresh_library(db: Session = Depends(get_db)):
+    """v0.8.7：顶部「刷新」——读取最新 B 库内容并按实际内容重建资源库面板。
+
+    B 库已无该影视时清出面板并取消分享；空批次只有「批次完整且确实扫到目录」
+    才被信任，接口抖动不会误清整个资源库。
+    """
+    try:
+        out = await _refresh_library_from_b(db, allow_empty_reconcile=True)
+        add_audit(db, "library_refresh", target_type="library", detail=json_dumps(out))
         db.commit()
         return {"ok": True, **out}
     except Exception as e:

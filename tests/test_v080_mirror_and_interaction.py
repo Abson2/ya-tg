@@ -44,6 +44,11 @@ def _clean():
 def _fresh():
     migrate()
     _clean()
+    # v0.8.7：类变量跨用例累加会污染「B 库是否为空」的判定，每个用例重置
+    FakeMirrorAPI.copies = []
+    FakeMirrorAPI.b_files = []
+    FakeMirrorAPI.fp = 1
+    FakeMirrorAPI.task_status = 2
     yield
     _clean()
 
@@ -232,6 +237,9 @@ class FakeMirrorAPI:
     fp = 1
     copies = []
     task_status = 2
+    # v0.8.7：模拟「复制任务落地后 B 库作品目录里真的有文件」。旧假 API 永远返回
+    # 空目录，v0.8.7 起 sync_rule 会据此判定文件缺失并重新复制，故必须补齐。
+    b_files = []
 
     def __init__(self, db):
         self.db = db
@@ -248,10 +256,15 @@ class FakeMirrorAPI:
         if parent_id == B_ROOT:
             return {"list": [{"fileId": B_WORK, "resType": 2,
                               "fileName": "侠*客*行 *(2001) {tmdb-135646}"}], "total": 1}
+        if parent_id == B_WORK:
+            return {"list": [dict(f) for f in self.b_files], "total": len(self.b_files)}
         return {"list": [], "total": 0}
 
     async def copy_file(self, file_ids, parent_id):
         self.copies.append((list(file_ids), parent_id))
+        self.b_files.append({"fileId": f"BF{len(self.b_files) + 1}", "resType": 1,
+                             "fileName": "X.S01E01.mkv", "fileSize": 100,
+                             "utime": self.fp, "parentId": parent_id})
         return "TASK1"
 
     async def get_task_status(self, task_id):

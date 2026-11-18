@@ -415,10 +415,31 @@ async function saveTask() {
 }
 function pickScanInterval(v) { scanInterval.value = v; scanCustom.value = false }
 const intervalLabel = v => v >= 1440 ? '每天' : (v >= 60 ? `每 ${v / 60} 小时` : `每 ${v} 分钟`)
+// v0.8.7：三个入口统一「读取最新 B 库内容 → 按实际内容重建面板」
+// 顶部「刷新」= /library/refresh，「立即扫描」= /scan-now，「重新扫描库」= /library/rescan
+const refreshing = ref(false)
+function reconcileTip(d) {
+  const rc = d.reconcile || {}
+  if (rc.skipped) return `对账已跳过（${rc.skipped}）`
+  const empty = rc.empty_seen_allowed ? '（B 库为空，面板已按实际内容清空）' : ''
+  return `移除 ${rc.removed || 0} 项、取消分享 ${rc.shares_cancelled || 0} 个${empty}`
+}
+async function refreshAll() {
+  refreshing.value = true
+  try {
+    const d = await api('/library/refresh', { method: 'POST' }, 180000)
+    ElMessage.success(`已按 B 库最新内容刷新：${d.files || 0} 个文件 · ${reconcileTip(d)}`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { refreshing.value = false }
+}
 async function scan() {
   scanning.value = true
-  try { const d = await api('/scan-now', { method: 'POST' }, 180000); ElMessage.success(`扫描完成：${d.files} 个文件（${d.resumed ? '断点续扫' : '全新扫描'}）`); await load() }
-  catch (e) { ElMessage.error(e.message) }
+  try {
+    const d = await api('/scan-now', { method: 'POST' }, 180000)
+    ElMessage.success(`扫描完成：${d.files || 0} 个文件 · ${reconcileTip(d)}`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
   finally { scanning.value = false }
 }
 // ---------- A/B 镜像 ----------
@@ -725,9 +746,8 @@ async function rescanLibrary() {
   rescanning.value = true
   try {
     const d = await api('/library/rescan', { method: 'POST' }, 180000)
-    const rc = d.reconcile || {}, idf = d.identify || {}
-    const parts = [`扫描 ${d.files || 0} 个文件`]
-    parts.push(rc.skipped ? `对账已跳过（${rc.skipped}）` : `移除 ${rc.removed || 0} 项、取消分享 ${rc.shares_cancelled || 0} 个`)
+    const idf = d.identify || {}
+    const parts = [`扫描 ${d.files || 0} 个文件`, reconcileTip(d)]
     parts.push(`识别 ${idf.identified || 0} 项、完结回填 ${idf.finish_backfilled || 0} 项`)
     ElMessage.success(parts.join(' · '))
     await load()
@@ -1037,7 +1057,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.6 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.7 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1047,7 +1067,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         <div class="top-actions">
           <span class="clock">{{ clock }}</span>
           <el-button size="small" plain @click="verify">验证连接</el-button>
-          <el-button size="small" type="primary" plain @click="load">
+          <el-button size="small" type="primary" plain :loading="refreshing" @click="refreshAll">
             <svg class="ico" viewBox="0 0 24 24"><path :d="icon('refresh')"/></svg> 刷新
           </el-button>
           <el-button size="small" text @click="logout">

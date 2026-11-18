@@ -16,6 +16,10 @@
      分类目录/影视主目录/季目录名一律不变。`MirrorFile.file_name` 永远是 A 原名，
      改名结果另存 `target_name`；增量比对仍以 `source_file_id + fingerprint` 为准，
      改名不得影响「后期对比变量更新」。
+  7. v0.8.7：**以 B 库实际内容为准**。`sync_rule()` 不能只信 `MirrorFile.status`，
+     每部作品只读列一次 B 库核对已同步记录；只有列目录完整可信且确实找不到时，
+     才把 `synced` 重置为 `pending` 复用同一行重新复制。B 库文件数不少于已同步
+     记录数时绝不重置（可能只是网盘改名 / 重名加后缀），避免重复复制整部作品。
 
 v0.8.4 接口取证口径（务必区分三类，勿再混为一谈）：
   - w.har 抓到真实请求+响应：create_dir / rename / delete_file / get_file_list / get_task_status。
@@ -78,6 +82,11 @@ _TMDB_TAG = re.compile(r"\{?\s*tmdb[-_:：]?(\d+)\s*\}?", re.I)
 _MEDIA_MARK = re.compile(r"(?:tmdb|imdb)[-_:：]?\d+|[\[(（【{]\s*(?:19|20)\d{2}\s*[\])）】}]", re.I)
 # 分类目录兜底特征：动画电影 / 国产电影 / 剧集合集 等
 _CATEGORY_HINT = re.compile(r"(电影|电视剧|剧集|分类|合集|综艺|纪录片)", re.I)
+# v0.8.7：季目录特征。作品目录名不带年份/{tmdb-} 且下挂 Season N 时，
+# 它仍是作品主目录，不能继续下探（否则 Season 1 会被当成作品、分类链多一层）。
+_SEASON_DIR = re.compile(
+    r"^(?:season\s*\d+|s\d{1,2}|第\s*[0-9一二三四五六七八九十]+\s*季|specials?|extras?)$",
+    re.I)
 
 
 # ---------- v0.8.1：分类目录识别与 1:1 路径镜像 ----------
@@ -119,7 +128,17 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
         node = nodes.get(did)
         if not node or not _subtree_video(did, nodes, cache):
             continue
-        hint = bool(_CATEGORY_HINT.search(node["name"])) and not _looks_like_work(node["name"])
+        cat_hint = bool(_CATEGORY_HINT.search(node["name"]))
+        hint = cat_hint and not _looks_like_work(node["name"])
+        # v0.8.7：目录名不像分类、不带年份标记，但直属子目录是 Season N 时，
+        # 该目录就是作品主目录（常见写法：影视/国产剧/侠客行/Season 1/E01.mkv）。
+        has_season_child = any(
+            bool(_SEASON_DIR.search(str(nodes.get(cid, {}).get("name") or "")))
+            for cid in (node.get("children") or []))
+        if (not cat_hint and not _looks_like_work(node["name"])
+                and has_season_child):
+            out.append((node, cats))
+            continue
         if (hint and node.get("children")) or (not _has_video(node) and not _looks_like_work(node["name"])):
             for child in node.get("children") or []:
                 stack.append((child, cats + [(node["name"], did)]))
@@ -491,6 +510,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     stats = {"media": 0, "new": 0, "changed": 0, "unchanged": 0, "skipped": 0,
              "tasks": 0, "done": 0, "unknown": 0, "blocked": 0,
              "retries": 0, "failed": 0,
+             # v0.8.7：DB 标记 synced 但 B 库实际没有 → 自动补复制的计数
+             "missing_in_b": 0, "name_mismatch": 0,
              "dirs_created": 0, "dirs_mapped": 0, "dirs_fallback": 0,
              "dir_errors": [], "missing_dirs": [], "file_errors": [],
              "idle_seconds": idle, "errors": []}
@@ -674,10 +695,38 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         synced_identities = {m.identity for m in all_rows if m.status == "synced"}
         retry_rows = {(m.source_file_id, m.fingerprint): m
                       for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
+        # v0.8.7 补上另一半：DB 标记 synced **也不等于** B 库真的有文件。
+        # 用户实测「B 库影视文件夹下为空目录」反复出现，根因是文件被删 /
+        # 换了 B 库目录 / 复制任务没落地后，记录仍停在 synced，永远判 unchanged。
+        # 每部作品先只读列一次 B 库，核对已同步记录是否真实存在。
+        if synced_rows or retry_rows:
+            candidates, b_verified = await _b_file_candidates(api, media)
+        else:
+            candidates, b_verified = {}, False
+        # 只在「列目录完整可信」时判定缺失；接口抖动 / 分页不全一律不动 synced。
+        b_file_count = len({v for k, v in candidates.items() if ":" in k})
+        if b_verified and synced_rows:
+            if b_file_count < len(synced_rows):
+                for key, row in list(synced_rows.items()):
+                    if _lookup_b_file(candidates, row):
+                        continue
+                    # 复用同一行重新复制，不新建行、不碰 A 库、不改任何目录名
+                    row.status, row.error = "pending", "B 库未找到已同步文件，自动重新复制"
+                    row.target_file_id = ""
+                    del synced_rows[key]
+                    retry_rows[key] = row
+                    stats["missing_in_b"] += 1
+                    stats["file_errors"].append(
+                        f"{title}/{row.file_name}：B 库未找到已同步文件，已重新入复制队列")
+            else:
+                # B 库文件数不少于已同步记录数：多半是网盘改名 / 重名加了后缀，
+                # 名字对不上而已。此时**绝不重置**，否则会重复复制整部作品。
+                for row in synced_rows.values():
+                    if not _lookup_b_file(candidates, row):
+                        stats["name_mismatch"] += 1
         # 重试前先核对 B 库：任务其实已成功、只是轮询超时的，回填成 synced 后
         # 不再重发复制，避免产生重复文件（需求禁止「先删旧再复制」）。
         if retry_rows:
-            candidates = await _b_file_candidates(api, media)
             for key, old in list(retry_rows.items()):
                 # v0.8.6：改名后按 target_name 优先，A 原名 file_name 兜底
                 hit = _lookup_b_file(candidates, old)
@@ -827,7 +876,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         f"影视 {stats['media']} 部 · 新增 {stats['new']} · 重试 {stats['retries']} · "
         f"变化 {stats['changed']} · 未变 {stats['unchanged']} · "
         f"任务完成 {stats['done']} · 复制失败 {stats['failed']} · 待确认 {stats['unknown']} · "
-        f"跳过 {stats['skipped']} · 建目录 {stats['dirs_created']} · "
+        f"跳过 {stats['skipped']} · B库缺失补复制 {stats['missing_in_b']} · "
+        f"名称不符 {stats['name_mismatch']} · 建目录 {stats['dirs_created']} · "
         f"待建目录 {len(stats['missing_dirs'])} · 文件间隔 {idle}s")
     if stats["dir_errors"]:
         rule.last_message += " · 首个建目录错误：" + stats["dir_errors"][0][:300]
@@ -843,24 +893,42 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     return stats
 
 
-async def _b_file_candidates(api: GuangYaWebFiles, media: MirrorMedia) -> dict[str, str]:
-    """只读列 B 库该作品目录（含直属子目录），返回 {归一化名(:大小): B fileId}。
+async def _b_file_candidates(api: GuangYaWebFiles, media: MirrorMedia) -> tuple[dict[str, str], bool]:
+    """只读列 B 库该作品目录（含直属子目录），返回 (候选映射, 列目录是否完整可信)。
 
-    v0.8.4：既供 backfill 补齐映射，也供 sync_rule 重试前核对——
-    「任务其实已成功、只是轮询超时」的文件据此直接标 synced，避免重复复制。
+    v0.8.4：既供 backfill 补齐映射，也供 sync_rule 重试前核对。
+    v0.8.7：**必须区分「B 库确实空」与「没读到」**。`verified=False`（接口异常 /
+    分页不完整）时调用方绝不能据此判断文件缺失，否则接口抖动会把已同步文件
+    误判成丢失并重复复制。
     """
-    try:
-        direct, _ = await _list_dir(api, media.target_dir_id)
-        sub_ids = [str(i.get("fileId") or "") for i in direct
-                   if int(i.get("resType", 1) or 1) == 2 and i.get("fileId")]
-    except Exception:
-        return {}
-    candidates: dict[str, str] = {}
-    for parent in [media.target_dir_id] + sub_ids:
-        try:
-            items, _ = await _list_dir(api, parent)
-        except Exception:
+    # v0.8.7：改为**递归遍历**（旧版只列主目录 + 一层直属子目录）。剧集常在
+    # `作品/Season 1/1080p/` 多层结构里，只列一层会把「文件其实在更深层」
+    # 误判成「B 库空」，从而重复复制整部作品。
+    listing: list[tuple[list[dict], bool]] = []
+    stack = [str(media.target_dir_id or "")]
+    visited: set[str] = set()
+    truncated = False
+    while stack:
+        pid = stack.pop()
+        if not pid or pid in visited:
             continue
+        if len(visited) >= 60:  # 防止接口风暴；到上限即视为「不完整」
+            truncated = True
+            break
+        visited.add(pid)
+        try:
+            items, ok = await _list_dir(api, pid)
+        except Exception as exc:
+            logger.debug("[mirror] B 库列目录失败 %s：%s", pid, exc)
+            listing.append(([], False))
+            continue
+        listing.append((items, ok))
+        for it in items:
+            if int(it.get("resType", 1) or 1) == 2 and it.get("fileId"):
+                stack.append(str(it["fileId"]))
+    verified = bool(listing) and not truncated and all(o for _, o in listing)
+    candidates: dict[str, str] = {}
+    for items, _ in listing:
         for it in items:
             if int(it.get("resType", 1) or 1) == 2:
                 continue
@@ -870,7 +938,7 @@ async def _b_file_candidates(api: GuangYaWebFiles, media: MirrorMedia) -> dict[s
             if fid:
                 candidates[f"{normalize_work_name(name)}:{size}".rstrip(":")] = fid
                 candidates[normalize_work_name(name)] = fid
-    return candidates
+    return candidates, verified
 
 
 async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
@@ -890,7 +958,7 @@ async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
             MirrorFile.status.in_(["synced", "copying", "failed", "unknown", "pending"]))).all())
         if not pending:
             continue
-        candidates = await _b_file_candidates(api, media)
+        candidates, _verified = await _b_file_candidates(api, media)
         if not candidates:
             continue
         for row in pending:
@@ -1008,7 +1076,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         if not rows:
             continue
         # 只读列一次 B 库：既定位 fileId，也避免 A 库内容更新后新旧版本同名冲突
-        candidates = await _b_file_candidates(api, media)
+        candidates, _verified = await _b_file_candidates(api, media)
         name_fids = {k: v for k, v in candidates.items() if ":" not in k}
         first = True
         for row in rows:
