@@ -59,6 +59,14 @@ _COLUMNS = {
         "dir_paths_json": "TEXT DEFAULT '{}'",
         "dir_chains_json": "TEXT DEFAULT '{}'",
     },
+    # v0.8.1：镜像目录 1:1 与文件操作节流（表由 create_all 新建，老库走 ALTER 补列）
+    "mirror_rules": {
+        "file_idle_seconds": "FLOAT DEFAULT 1.0",
+        "auto_create_dirs": "BOOLEAN DEFAULT 1",
+    },
+    "mirror_media": {
+        "category_path": "TEXT DEFAULT ''",
+    },
 }
 
 

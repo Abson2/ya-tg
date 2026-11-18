@@ -23,7 +23,7 @@ from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
 from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, DistributionEvent,
-                     MediaRequest, MessageTemplate, MirrorFile, MirrorMedia, MirrorRule,
+                     MediaRequest, MessageTemplate, MirrorDir, MirrorFile, MirrorMedia, MirrorRule,
                      MirrorTask, QueueItem, Resource, ResourceScanBatch, ResourceVersion, Rule,
                      ScanCursor, ScanTask, UserContribution)
 from .publisher import ensure_share, process_queue
@@ -136,7 +136,9 @@ async def _scheduled_scan(root: str) -> None:
     """
     with SessionLocal() as db:
         try:
-            await run_scan(root, resume=False)
+            # v0.8.1：每次执行都重新取 B 镜像库目录，用户在镜像设置里改 ID 后立即生效
+            effective, _ = _effective_scan_root(db)
+            await run_scan(effective, resume=False)
             await _post_scan_identify(db, publish_after_identify=True)
             process_change_events(db, publish=True)
             db.commit()
@@ -184,13 +186,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.1", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.1", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -355,6 +357,21 @@ async def verify_openapi(db: Session = Depends(get_db)):
 
 
 # ---------- 扫描 ----------
+def _effective_scan_root(db: Session) -> tuple[str, str]:
+    """v0.8.1：扫描根目录直接引用「镜像同步」里填过的 B 库目录 ID，不再重复填写。
+
+    优先级：B 镜像库 > ScanTask.root_id（高级覆盖）> .env SCAN_ROOT_ID。
+    返回 (root_id, 来源标记)，供前端只读展示。
+    """
+    mr = db.scalar(select(MirrorRule).limit(1))
+    if mr and str(mr.target_root_id or "").strip():
+        return str(mr.target_root_id).strip(), "mirror_target"
+    t = db.scalar(select(ScanTask).limit(1))
+    if t and str(t.root_id or "").strip():
+        return str(t.root_id).strip(), "scan_task"
+    return str(settings.scan_root_id or ""), "env"
+
+
 # v0.8.0：文档要求扫描周期用「时间间隔按钮」，不再让用户手写 Cron。
 # 仍保留高级自定义 Cron 输入（前端折叠），但默认与常用选项均由预设生成。
 SCAN_INTERVAL_PRESETS = [10, 15, 30, 60, 120, 360, 720, 1440]
@@ -399,7 +416,9 @@ def scan_task(db: Session = Depends(get_db)):
     t = db.scalar(select(ScanTask).limit(1))
     c = db.get(ScanCursor, 1)
     last = db.scalar(select(ResourceScanBatch).order_by(ResourceScanBatch.id.desc()).limit(1))
+    eff_root, root_src = _effective_scan_root(db)
     return {k: getattr(t, k) for k in ["id", "name", "cron", "root_id", "enabled", "last_run", "last_status", "last_message"]} | {
+        "effective_root_id": eff_root, "root_source": root_src,
         "interval_minutes": _cron_to_interval(t.cron),
         "interval_presets": SCAN_INTERVAL_PRESETS,
         "cursor_status": c.status if c else "never",
@@ -429,13 +448,15 @@ def save_scan_task(p: ScanConfig, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(400, f"扫描计划无效：{e}")
     t = db.scalar(select(ScanTask).limit(1))
-    t.cron, t.root_id, t.enabled = cron, p.root_id, p.enabled
-    add_audit(db, "scan_task_updated", target_type="scan", detail=json_dumps({"cron": cron, "root_id": p.root_id, "enabled": p.enabled}))
+    # v0.8.1：前端不再让用户填扫描根目录；留空时自动引用镜像同步里的 B 库目录 ID
+    root_id = (p.root_id or "").strip() or _effective_scan_root(db)[0]
+    t.cron, t.root_id, t.enabled = cron, root_id, p.enabled
+    add_audit(db, "scan_task_updated", target_type="scan", detail=json_dumps({"cron": cron, "root_id": root_id, "enabled": p.enabled}))
     db.commit()
     if scheduler.get_job("global_scan"):
         scheduler.remove_job("global_scan")
     if p.enabled:
-        scheduler.add_job(_scheduled_scan, trigger, args=[p.root_id], id="global_scan", replace_existing=True,
+        scheduler.add_job(_scheduled_scan, trigger, args=[root_id], id="global_scan", replace_existing=True,
                           max_instances=1, coalesce=True)
     return {"ok": True, "cron": cron, "interval_minutes": _cron_to_interval(cron),
             "timezone": "Asia/Shanghai"}
@@ -487,6 +508,9 @@ class MirrorConfigInput(BaseModel):
     enabled: bool = False
     star_naming: bool = True
     auto_identify: bool = True
+    # v0.8.1：文件操作空闲秒数（硬下限不可调低）、B 库缺目录自动创建
+    file_idle_seconds: float = 1.0
+    auto_create_dirs: bool = True
 
 
 @app.get("/api/mirror/config", dependencies=ADMIN)
@@ -500,18 +524,19 @@ def mirror_config_get(db: Session = Depends(get_db)):
         "enabled": bool(r.enabled) if r else False,
         "star_naming": bool(r.star_naming) if r else True,
         "auto_identify": bool(r.auto_identify) if r else True,
+        "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,
+        "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
+        "auto_create_dirs": bool(getattr(r, "auto_create_dirs", True)) if r else True,
         "interval_presets": MIRROR_INTERVAL_PRESETS,
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
         "last_message": r.last_message if r else "",
-        "confirmed_endpoints": [
-            "POST /userres/v1/file/copy_file",
-            "POST /userres/v1/get_task_status（status=2 为完成）",
-        ],
+        "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
-        "note": ("B 库影视主目录可带 * 命名，展示与推送一律用标准影视名；"
-                 "创建目录/重命名/删除接口未验证，系统不会自动改名或删文件，"
-                 "请在光鸭网页端手工建立对应目录。镜像完成不会自动推送 Telegram。"),
+        "note": ("v0.8.1：A 库分类目录会在 B 库按原名 1:1 自动创建（不改名），"
+                 "只有影视主目录按 * 约定命名，括号里的年份与 TMDB 标记保持原样。"
+                 "每次文件复制之间留可配置空闲时间，下限来自官方写接口 2 次/秒限频，不可调低。"
+                 "镜像完成不会自动推送 Telegram。"),
     }
 
 
@@ -519,14 +544,22 @@ def mirror_config_get(db: Session = Depends(get_db)):
 def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
     if p.interval_minutes not in MIRROR_INTERVAL_PRESETS:
         raise HTTPException(400, "同步间隔请选择预设值")
+    # v0.8.1：官方写接口 2 次/秒 → 0.5 秒是不可调低的硬下限，前端 min 只是第一道约束
+    if float(p.file_idle_seconds) < mirror.MIN_FILE_IDLE_SECONDS:
+        raise HTTPException(400, f"文件操作间隔不能低于 {mirror.MIN_FILE_IDLE_SECONDS} 秒："
+                                "该下限来自官方写接口 2 次/秒限频，不可调整")
+    if float(p.file_idle_seconds) > 60:
+        raise HTTPException(400, "文件操作间隔不能超过 60 秒")
     r = _mirror_rule(db, create=True)
     r.name = (p.name or "默认镜像").strip()
     r.source_root_id, r.target_root_id = p.source_root_id.strip(), p.target_root_id.strip()
     r.interval_minutes, r.enabled = p.interval_minutes, p.enabled
     r.star_naming, r.auto_identify = p.star_naming, p.auto_identify
+    r.file_idle_seconds, r.auto_create_dirs = float(p.file_idle_seconds), p.auto_create_dirs
     add_audit(db, "mirror_config_saved", target_type="mirror",
               detail=json_dumps({"source": r.source_root_id, "target": r.target_root_id,
-                                 "interval": r.interval_minutes, "enabled": r.enabled}))
+                                 "interval": r.interval_minutes,
+                                 "idle": r.file_idle_seconds, "auto_dirs": r.auto_create_dirs}))
     db.commit()
     _schedule_mirror_job(r.interval_minutes, r.enabled)
     return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
@@ -552,9 +585,21 @@ async def mirror_run(post_identify: bool = False, db: Session = Depends(get_db))
         db.commit()
         return stats
     except WebFileError as exc:
+        db.rollback()
+        rr = db.scalar(select(MirrorRule).limit(1))
+        if rr:
+            rr.last_status, rr.last_message = "failed", str(exc)[:1000]
+            db.commit()
         raise HTTPException(400, str(exc))
     except Exception as exc:
-        raise HTTPException(502, f"镜像同步失败：{exc}")
+        # v0.8.1：不再把真实异常吞成笼统 502，保留类型与消息并落库，便于直接排查
+        db.rollback()
+        detail = f"{type(exc).__name__}: {exc}"
+        rr = db.scalar(select(MirrorRule).limit(1))
+        if rr:
+            rr.last_status, rr.last_message = "failed", detail[:1000]
+            db.commit()
+        raise HTTPException(502, f"镜像同步失败：{detail}")
 
 
 @app.post("/api/mirror/tasks/poll", dependencies=ADMIN)
@@ -576,6 +621,8 @@ def mirror_status(db: Session = Depends(get_db)):
     r = _mirror_rule(db)
     media = list(db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc()).limit(200)).all())
     tasks = list(db.scalars(select(MirrorTask).order_by(MirrorTask.id.desc()).limit(30)).all())
+    dirs = list(db.scalars(select(MirrorDir).order_by(MirrorDir.id.desc()).limit(200)).all())
+    missing = [d for d in dirs if d.status == "missing"]
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -589,15 +636,28 @@ def mirror_status(db: Session = Depends(get_db)):
             "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
             "scan_batches": db.query(ResourceScanBatch).count(),
             "change_events": db.query(DistributionEvent).count(),
+            "dirs_mapped": db.query(MirrorDir).filter(MirrorDir.status != "missing").count(),
+            "dirs_created": db.query(MirrorDir).filter(MirrorDir.status == "created").count(),
+            "dirs_missing": len(missing),
         },
         "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
                    "media_type": m.media_type, "status": m.status,
                    "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
+                   "category_path": getattr(m, "category_path", "") or "",
                    "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
                   for m in media],
+        "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
+                  "category_path": d.category_path, "status": d.status,
+                  "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id}
+                 for d in dirs],
+        "missing_dirs": [{"parent_id": d.parent_target_id, "name": d.name_standard,
+                          "kind": d.kind, "star": d.kind == "work",
+                          "tip": "在 B 库该父目录下建立此目录后重新同步"} for d in missing],
         "tasks": [{"id": t.id, "task_id": t.task_id, "status": t.status,
                    "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
+        "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
+        "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
     }
 
 
@@ -787,8 +847,7 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
 @app.post("/api/scan-now", dependencies=ADMIN)
 async def scan_now(resume: bool = True, auto_identify: bool = True,
                    db: Session = Depends(get_db)):
-    task = db.scalar(select(ScanTask).limit(1))
-    root = task.root_id if task else settings.scan_root_id
+    root, _ = _effective_scan_root(db)
     try:
         data = await run_scan(root, resume=resume)
         out = {k: v for k, v in data.items() if k != "seen_file_ids"}
@@ -813,8 +872,7 @@ async def rescan_library(auto_identify: bool = True, reconcile: bool = True,
     全量扫描（resume=False）才允许对账，避免断点续扫 seen 不完整导致误删。
     返回统计供前端一次展示，扫描过程中资源逐目录 commit，看板可边扫边刷新。
     """
-    task = db.scalar(select(ScanTask).limit(1))
-    root = task.root_id if task else settings.scan_root_id
+    root, _ = _effective_scan_root(db)
     try:
         data = await run_scan(root, resume=False)
         out = {k: v for k, v in data.items() if k != "seen_file_ids"}
@@ -1151,7 +1209,7 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
                 await _cancel_share_one(db, x)
                 db.flush()
                 dir_id = str(getattr(x, "share_dir_id", "") or "")
-                is_series = x.media_type == "tv" and bool(dir_id)
+                is_series = bool(dir_id)
                 target_id = dir_id if is_series else x.file_id
                 title = x.media_title or x.name or ""
                 if is_series and x.season:
@@ -1194,7 +1252,7 @@ async def create_share(rid: int, duration: int = 0, db: Session = Depends(get_db
         # 与 publisher.ensure_share 同口径：目录 fileId + 标题带季，链接同步给同目录所有单集。
         dir_id = str(getattr(x, "share_dir_id", "") or "")
         scope = str(getattr(x, "share_scope", "") or "")
-        is_series = x.media_type == "tv" and bool(dir_id)
+        is_series = bool(dir_id)
         target_id = dir_id if is_series else x.file_id
         title = x.media_title or x.name or ""
         if is_series and x.season:
@@ -1302,15 +1360,15 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     # v0.8.0：用户在资源库手动修正过的状态锁定，重新识别/回填都不得覆盖人工判断
     if not bool(getattr(x, "finish_locked", False)):
         x.finish_status = str(d.get("finish_status") or "")
-    # v0.6.3：剧集按「剧集目录」分享而非单集。未整理取父目录，已整理取上上层。
-    if x.media_type == "tv":
-        from .utils import series_dir_info
-        info = series_dir_info(x.path_hint, getattr(x, "dir_chain_json", "[]"), x.parent_id)
-        x.share_scope = info["scope"]
-        x.share_dir_id = info["dir_id"]
-        x.share_dir_name = info["dir_name"]
-    else:
-        x.share_scope, x.share_dir_id, x.share_dir_name = "file", "", ""
+    # v0.8.1：电影与剧集统一按「作品目录」分享，绝不按单文件。
+    # tv 已整理取上上层（剧名目录），movie 取直接父目录（电影主目录）；
+    # 父目录是分类目录且无年份/TMDB 标记时退化为按文件，避免整类当一个作品。
+    from .utils import series_dir_info
+    info = series_dir_info(x.path_hint, getattr(x, "dir_chain_json", "[]"), x.parent_id,
+                           x.media_type or "")
+    x.share_scope = info["scope"]
+    x.share_dir_id = info["dir_id"]
+    x.share_dir_name = info["dir_name"]
 
 
 def _work_key(x: Resource) -> str:
@@ -1327,11 +1385,12 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     """
     if x.identify_status != "identified" or not (x.poster_path or "").strip():
         return False
-    # v0.6.5：旧数据/未重扫的剧集可能缺 share_dir_id（旧版按单集分享），
-    # 入队前现场补算剧集目录，确保推送走整剧目录分享而非单集。
-    if x.media_type == "tv" and not (getattr(x, "share_dir_id", "") or "").strip():
+    # v0.8.1：旧数据（含电影）可能缺 share_dir_id，入队前现场补算作品目录，
+    # 确保推送走整目录分享而非单文件。
+    if not (getattr(x, "share_dir_id", "") or "").strip():
         from .utils import series_dir_info
-        info = series_dir_info(x.path_hint or "", getattr(x, "dir_chain_json", "[]"), x.parent_id)
+        info = series_dir_info(x.path_hint or "", getattr(x, "dir_chain_json", "[]"),
+                               x.parent_id, x.media_type or "")
         x.share_scope, x.share_dir_id, x.share_dir_name = info["scope"], info["dir_id"], info["dir_name"]
     ch = db.get(Channel, rule.channel_id)
     bot = db.get(Bot, ch.bot_id) if ch else None

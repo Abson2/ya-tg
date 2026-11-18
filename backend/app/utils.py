@@ -128,7 +128,7 @@ def normalize_work_name(s: str) -> str:
     v = re.sub(r"[\[(（【{][^\])）】}]*[\])）】}]", "", str(s))
     # 兜底：裸 tmdb-/imdb- 标记（无括号包裹时）也去掉，避免同剧裂卡
     v = re.sub(r"\b(?:tmdb|imdb)[-_:：]?\d+\b", "", v, flags=re.I)
-    # v0.8.0：B 库影视主目录按约定插入 *（如「大*醉*侠 *(2002)」）。
+    # v0.8.0：B 库影视主目录按约定插入 *（如「大*醉*侠 (2002)」）。
     # 归一化必须剥掉 *，否则 A 库「大醉侠」与 B 库「大*醉*侠」会算成两部剧，
     # 镜像映射、资源库聚合、TG 整剧统计全部错位。
     v = v.replace("*", "")
@@ -140,16 +140,18 @@ def normalize_work_name(s: str) -> str:
 def standard_media_name(s: str) -> str:
     """B 库带 * 目录名 → 展示/管理/TG 推送使用的标准影视名。
 
-    只去掉 *，保留年份与 {tmdb-} 标记（它们携带识别信息）。重命名接口未验证前，
-    系统不改动网盘里的真实目录名，仅在展示层做标准化。
+    只去掉 *，保留年份与 {tmdb-} 标记（它们携带识别信息）。带 * 的目录名只存在于
+    B 库网盘；资源库、分享标题、TG 推送一律走这里做标准化。
     """
     return str(s or "").replace("*", "").strip()
 
 
 def star_media_name(s: str) -> str:
-    """按 B 库命名约定生成带 * 的期望目录名（每个字符间插入 *，保留年份/标记）。
+    """按 B 库命名约定生成带 * 的期望目录名。
 
-    仅用于对照与提示；由于重命名接口未验证，系统不会自动执行改名。
+    v0.8.1：中文按字符插 *，纯英文按单词插 *；括号段（年份 / {tmdb-} 标记）原样保留，
+    括号前只用空格分隔，不加 *。v0.8.1 起由 mirror.sync_rule() 用已取证的 create_dir
+    接口自动创建这些目录，不再需要人工改名或手工预建。
     """
     text = str(s or "").strip()
     if not text:
@@ -159,7 +161,20 @@ def star_media_name(s: str) -> str:
     head, tail = (m.group(1), m.group(2) or "") if m else (text, "")
     if "*" in head:
         return text
-    return "*".join(head.strip()) + ("*" + tail.strip().lstrip("*") if tail.strip() else "")
+    # v0.8.1：纯英文片名按「单词」插 *，中文按「字符」插 *。
+    # 旧逻辑对 ASCII 逐字符插星会生成 S*p*i*d*e*r... 这种超长且难读的目录名，
+    # 用户截图里显示成一串乱码。归一化会剥掉所有 *，两种写法匹配结果一致。
+    core = head.strip()
+    if core and all(ord(c) < 128 for c in core):
+        starred = "*".join(w for w in re.split(r"\s+", core) if w)
+    else:
+        starred = "*".join(core)
+    # v0.8.1：括号段（年份 / {tmdb-} 标记）保持原样，前面只用空格分隔，不加 *。
+    # 用户明确要求「名称中加 *，（）中的年份不用加」：
+    #   大醉侠 (2002) {tmdb-135646} → 大*醉*侠 (2002) {tmdb-135646}
+    # 旧实现会在括号前多插一个 *（…侠*(2002)），既难读也让 B 库目录名与 A 库不对齐。
+    suffix = " " + tail.strip() if tail.strip() else ""
+    return starred + suffix
 
 
 def media_identity(tmdb_id, media_type: str, season, episode, file_name: str = "") -> tuple[str, bool]:
@@ -455,8 +470,9 @@ def version_spec(name: str) -> str:
 
 
 def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
-                    parent_id: str = "") -> dict:
+                    parent_id: str = "", media_type: str = "tv") -> dict:
     """v0.6.3：判定单集文件对应的「剧集目录」层级与 fileId。
+    v0.8.1：电影同样按「电影主目录」分享，不再退化成单文件。
 
     两种剧集存放方式：
       1) 未整理：剧名/单集.mkv          → 剧集目录 = 直接父目录
@@ -476,6 +492,25 @@ def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
     segments = [s for s in re.split(r"[/\\]+", path_hint or "") if s.strip()]
     parent_name = segments[-1] if segments else ""
     is_season_dir = bool(parent_name and _SEASON_DIR.match(parent_name))
+
+    # v0.8.1：电影也按「电影主目录」分享。父目录是分类目录（动画电影/国产电影 等）
+    # 且不含年份/TMDB 标记时，说明文件散放在分类下，按文件分享才不会把整类当一部作品。
+    if media_type != "tv":
+        category_like = bool(parent_name and re.search(
+            r"(电影|电视剧|剧集|分类|合集|综艺|纪录片)$", parent_name))
+        has_media_mark = bool(parent_name and re.search(
+            r"(?:19|20)\d{2}|tmdb|imdb", parent_name, re.I))
+        if category_like and not has_media_mark:
+            return {"dir_id": "", "dir_name": parent_name, "scope": "file",
+                    "reason": "电影文件散放在分类目录下，按文件分享"}
+        if chain:
+            return {"dir_id": chain[0], "dir_name": parent_name, "scope": "series_dir",
+                    "reason": "电影主目录 = 直接父目录"}
+        if parent_id and parent_id != "*":
+            return {"dir_id": parent_id, "dir_name": parent_name or "电影目录",
+                    "scope": "series_dir", "reason": "缺目录链，按父目录分享电影"}
+        return {"dir_id": "", "dir_name": parent_name, "scope": "file",
+                "reason": "缺父目录信息，无法按目录分享"}
 
     if is_season_dir and len(chain) >= 2:
         return {"dir_id": chain[1], "dir_name": segments[-2] if len(segments) >= 2 else parent_name,

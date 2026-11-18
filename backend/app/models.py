@@ -233,10 +233,38 @@ class MirrorRule(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     star_naming: Mapped[bool] = mapped_column(Boolean, default=True)      # B 库主目录插入 * 的约定
     auto_identify: Mapped[bool] = mapped_column(Boolean, default=True)    # 镜像后自动识别（不推送）
+    # v0.8.1：每次文件复制操作之间的空闲秒数，可在管理页调高；硬下限由 mirror.py 强制，
+    # 依据官方 OpenAPI v1.3 §10 写接口 2 次/秒，用户不可调低。
+    file_idle_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    # v0.8.1：B 库缺目录时自动按 1:1 结构创建（create_dir 接口已抓包确认）。
+    # 关闭后退回旧行为：只登记待创建清单，由用户手工建立。
+    auto_create_dirs: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str] = mapped_column(String(24), default="never")
     last_message: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MirrorDir(Base):
+    """v0.8.1：A 库目录 → B 库目录的 1:1 镜像映射。
+
+    分类目录（动画电影/国产电影 等）在 B 库保持**原名**，不加 *；只有影视主目录
+    才按 star_naming 加 *。创建目录接口仍未验证，B 库缺失的目录登记为 missing，
+    由用户照清单在网页端手工建立，系统绝不猜测创建接口参数。
+    """
+    __tablename__ = "mirror_dirs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
+    source_dir_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    parent_target_id: Mapped[str] = mapped_column(String(64), default="")
+    name_standard: Mapped[str] = mapped_column(String(512), default="")   # B 库期望名称
+    kind: Mapped[str] = mapped_column(String(24), default="category")      # category/work/season
+    category_path: Mapped[str] = mapped_column(String(512), default="")
+    target_dir_id: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(24), default="missing")     # mapped/missing
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("rule_id", "source_dir_id", name="uq_mirror_dir_rule_source"),)
 
 
 class MirrorMedia(Base):
@@ -251,7 +279,9 @@ class MirrorMedia(Base):
     media_type: Mapped[str] = mapped_column(String(16), default="")
     source_dir_id: Mapped[str] = mapped_column(String(64), default="")     # A 目录 fileId
     target_dir_id: Mapped[str] = mapped_column(String(64), default="")     # B 目录 fileId
-    status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/syncing/synced/failed
+    # v0.8.1：A 库中该作品之上的分类目录路径（如「动画电影/国产」），B 库同名镜像。
+    category_path: Mapped[str] = mapped_column(String(512), default="")
+    status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/syncing/synced/blocked/failed
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (UniqueConstraint("rule_id", "work_key", name="uq_mirror_rule_work"),)

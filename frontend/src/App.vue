@@ -11,7 +11,8 @@ const keyword = ref('')
 const statusFilter = ref('')
 const seriesGroups = ref([])   // v0.6.4：/api/library/series 聚合结果
 
-const overview = ref({}), task = ref({ cron: '*/30 * * * *', root_id: '', enabled: true })
+const overview = ref({}), task = ref({ cron: '*/30 * * * *', root_id: '', enabled: true,
+  effective_root_id: '', root_source: '' })
 const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
@@ -35,9 +36,16 @@ const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
-const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], tasks: [], rule: {}, unverified_endpoints: [] })
+const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, interval_presets: [], unverified_endpoints: [], note: '' })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, unverified_endpoints: [] })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
+// v0.8.1：扫描设置不再单独成页，折叠进「资源库」；根目录只读引用镜像同步里的 B 库 ID
+const scanning = ref(false), showScanPanel = ref(false)
+const rootSourceLabel = computed(() => ({
+  mirror_target: '镜像同步 · B 库目录 ID（自动引用）',
+  scan_task: '扫描计划旧值',
+  env: '.env SCAN_ROOT_ID'
+}[task.value.root_source] || '未配置'))
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持' })
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
@@ -165,7 +173,6 @@ const navGroups = [
   { label: '工作台', items: [{ key: '概览', icon: 'grid', label: '概览' }] },
   { label: '光鸭资源', items: [
     { key: '光鸭授权', icon: 'key', label: '光鸭授权' },
-    { key: '扫描设置', icon: 'scan', label: '扫描设置' },
     { key: '镜像同步', icon: 'copy', label: '镜像同步' },
     { key: '资源库', icon: 'folder', label: '资源库' }
   ] },
@@ -356,23 +363,29 @@ async function login() {
 function logout() { authed.value = false; password.value = ''; localStorage.removeItem('ya_tg_password') }
 async function saveTask() {
   // v0.8.0：默认用预设间隔按钮，只有开启「自定义 Cron」才提交表达式
+  // v0.8.1：根目录 ID 不再由前端提交，后端统一引用镜像同步里的 B 库目录 ID
   const body = { interval_minutes: scanCustom.value ? 0 : Number(scanInterval.value || 0),
     cron: scanCustom.value ? (task.value.cron || '') : '',
-    root_id: task.value.root_id || '', enabled: !!task.value.enabled }
+    enabled: !!task.value.enabled }
   try { await api('/scan-task', { method: 'PUT', body: JSON.stringify(body) }); ElMessage.success('扫描计划已保存'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
 function pickScanInterval(v) { scanInterval.value = v; scanCustom.value = false }
 const intervalLabel = v => v >= 1440 ? '每天' : (v >= 60 ? `每 ${v / 60} 小时` : `每 ${v} 分钟`)
 async function scan() {
+  scanning.value = true
   try { const d = await api('/scan-now', { method: 'POST' }, 180000); ElMessage.success(`扫描完成：${d.files} 个文件（${d.resumed ? '断点续扫' : '全新扫描'}）`); await load() }
   catch (e) { ElMessage.error(e.message) }
+  finally { scanning.value = false }
 }
 // ---------- A/B 镜像 ----------
 async function saveMirror() {
   mirrorSaving.value = true
   try {
-    await api('/mirror/config', { method: 'POST', body: JSON.stringify(mirrorCfg.value) })
+    // 清空数字框会给出 null，兜底为 1.0 秒，避免后端 422
+    const body = { ...mirrorCfg.value,
+      file_idle_seconds: Number(mirrorCfg.value.file_idle_seconds) || 1.0 }
+    await api('/mirror/config', { method: 'POST', body: JSON.stringify(body) })
     ElMessage.success('镜像设置已保存')
     await load()
   } catch (e) { ElMessage.error(e.message) }
@@ -382,8 +395,11 @@ async function runMirror(postIdentify = false) {
   mirrorBusy.value = true
   try {
     const d = await api(`/mirror/run?post_identify=${postIdentify ? 'true' : 'false'}`, { method: 'POST' }, 300000)
-    ElMessage.success(`同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}`)
-    if (d.errors?.length) ElMessage.warning(d.errors[0])
+    const extra = []
+    if (d.dirs_created) extra.push(`新建目录 ${d.dirs_created}`)
+    if (d.blocked) extra.push(`${d.blocked} 部待建目录（见下方清单）`)
+    if (d.errors?.length) extra.push(d.errors[0])
+    ElMessage.success(`同步 ${d.media || 0} 部：新增 ${d.new || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : ''))
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -521,7 +537,7 @@ async function publishResource(row) {
 async function reidentifyAll() {
   try {
     await ElMessageBox.confirm(
-      '按目录剧名重新识别库中资源（含已识别项，用于修正误配）。升级后请先到「扫描设置」执行一次「立即扫描」补全目录线索。',
+      '按目录剧名重新识别库中资源（含已识别项，用于修正误配）。升级后请先到「资源库」执行一次「立即扫描」补全目录线索。',
       '按目录重识别', { confirmButtonText: '开始', cancelButtonText: '取消', type: 'warning' })
   } catch (e) { return }
   reidentifying.value = true
@@ -942,7 +958,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.0 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.1 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1108,45 +1124,6 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
         </section>
 
-        <section v-else-if="tab === '扫描设置'" class="fade">
-          <div class="page-head"><div><h2>扫描设置</h2><p>点击选择扫描间隔，固定 Asia/Shanghai（UTC+8）；高级用户可展开自定义 Cron</p></div></div>
-          <div class="panel narrow">
-            <div class="panel-head"><h3>扫描计划</h3><el-tag size="small">Asia/Shanghai · UTC+8</el-tag></div>
-            <div class="field"><label>扫描间隔</label>
-              <div class="preset-row">
-                <button v-for="v in scanPresets" :key="v" class="preset-btn" :class="{on: !scanCustom && scanInterval === v}" @click="pickScanInterval(v)">{{ intervalLabel(v) }}</button>
-              </div>
-              <small>点选即可，无需手写 Cron。当前表达式：{{ task.cron || '未设置' }}</small>
-            </div>
-            <div class="field"><label class="inline-label"><input type="checkbox" v-model="scanCustom"/> 自定义 Cron 表达式</label>
-              <el-input v-if="scanCustom" v-model="task.cron" placeholder="*/30 * * * *"/>
-              <small v-if="scanCustom">例：*/10 * * * * 每 10 分钟；0 3 * * * 每天 03:00</small>
-            </div>
-            <div class="form-grid">
-              <div class="field"><label>扫描根目录 ID（B 镜像库）</label><el-input v-model="task.root_id" placeholder="留空为根目录"/></div>
-              <div class="field inline"><label>启用定时扫描</label><el-switch v-model="task.enabled"/></div>
-            </div>
-            <div class="panel-foot"><el-button type="primary" @click="saveTask">保存计划</el-button><el-button @click="scan"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('play')"/></svg> 立即扫描</el-button></div>
-          </div>
-          <div class="panel narrow">
-            <div class="panel-head"><h3>断点与上次结果</h3><el-tag :type="task.last_status === 'success' ? 'success' : 'info'" size="small">{{ task.last_status || 'never' }}</el-tag></div>
-            <div class="cursor-box"><div><small>游标状态</small><b>{{ task.cursor_status }}</b></div><div><small>已处理文件</small><b>{{ task.cursor_files }}</b></div><div><small>遍历目录</small><b>{{ task.cursor_dirs }}</b></div></div>
-            <p class="hint">{{ task.last_message || '尚未执行扫描' }}{{ task.cursor_error ? ' · 错误：' + task.cursor_error : '' }}</p>
-          </div>
-          <div class="panel narrow">
-            <div class="panel-head"><h3>扫描批次保护</h3><el-tag size="small" type="info">仅完整全量批次允许对账删除</el-tag></div>
-            <div class="table-scroll"><el-table :data="scanBatches" size="small">
-              <el-table-column prop="id" label="#" width="60"/>
-              <el-table-column prop="status" label="状态" width="100"/>
-              <el-table-column prop="files" label="文件" width="80"/>
-              <el-table-column prop="seen_count" label="本轮见到" width="100"/>
-              <el-table-column label="完整" width="80"><template #default="s">{{ s.row.complete ? '是' : '否' }}</template></el-table-column>
-              <el-table-column label="允许对账" width="100"><template #default="s">{{ s.row.reconcile_allowed ? '是' : '否' }}</template></el-table-column>
-            </el-table></div>
-            <p class="hint">分页不完整、断点续扫、空结果或接口异常时，一律跳过对账，不会误删资源或取消分享。</p>
-          </div>
-        </section>
-
         <section v-else-if="tab === '镜像同步'" class="fade">
           <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；增量复制、身份保护、完成不自动推送 Telegram</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
           <div class="panel narrow">
@@ -1163,27 +1140,51 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <div class="form-grid">
               <div class="field inline"><label>启用定时同步</label><el-switch v-model="mirrorCfg.enabled"/></div>
               <div class="field inline"><label>B 库主目录带 * 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
+              <div class="field inline"><label>B 库缺目录自动创建</label><el-switch v-model="mirrorCfg.auto_create_dirs"/></div>
+              <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、变化更新的每个文件操作前都会等待。</small></div>
             </div>
             <p class="hint">{{ mirrorCfg.note }}</p>
             <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button :loading="mirrorBusy" @click="runMirror(false)">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror(true)">同步并识别（不推送）</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
-            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>内容变化事件</small><b>{{ mirrorStatus.counts?.change_events || 0 }}</b></div></div>
+            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>内容变化事件</small><b>{{ mirrorStatus.counts?.change_events || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div></div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
             <p class="hint">已确认接口：<span v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}；</span></p>
             <p class="hint">待验证接口（未实现，不猜测参数）：<span v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}、</span></p>
           </div>
+          <div v-if="mirrorStatus.missing_dirs?.length" class="panel">
+            <div class="panel-head"><h3>待创建目录</h3><el-tag type="warning" size="small">{{ mirrorStatus.missing_dirs.length }} 个</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.missing_dirs" size="small">
+              <el-table-column prop="name" label="B 库应建目录名" min-width="200"/>
+              <el-table-column prop="kind" label="类别" width="100"/>
+              <el-table-column prop="parent_id" label="父目录 ID" min-width="180"/>
+              <el-table-column prop="tip" label="处理建议" min-width="220"/>
+            </el-table></div>
+            <p class="hint">开启「B 库缺目录自动创建」后下次同步会自动补齐；相关作品当前标记为 blocked（不是失败），建好后重新同步即可继续。</p>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 *</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.dirs || []" size="small">
+              <el-table-column prop="name" label="目录名" min-width="200"/>
+              <el-table-column prop="kind" label="类别" width="100"/>
+              <el-table-column prop="category_path" label="所属分类" min-width="160"/>
+              <el-table-column prop="status" label="状态" width="110"/>
+              <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
+            </el-table></div>
+            <p class="hint">分类目录保持 A 库原名、不加星号；只有影视主目录按星号规则命名，括号里的年份与 TMDB 标记保持原样。</p>
+          </div>
           <div class="panel">
             <div class="panel-head"><h3>影视映射清单</h3></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.media || []" size="small">
+              <el-table-column prop="category_path" label="分类目录" min-width="140"/>
               <el-table-column prop="title" label="标准影视名" min-width="180"/>
               <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
               <el-table-column prop="media_type" label="类型" width="90"/>
               <el-table-column prop="files" label="文件" width="80"/>
               <el-table-column prop="status" label="状态" width="110"/>
             </el-table></div>
-            <p class="hint">B 库目录名里的 * 只存在于网盘；资源库、分享标题与 Telegram 推送一律使用标准影视名。</p>
+            <p class="hint">B 库目录名里的星号只存在于网盘；资源库、分享标题与 Telegram 推送一律使用标准影视名。</p>
           </div>
         </section>
 
@@ -1238,7 +1239,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="scanning" @click="scan">立即扫描</el-button><el-button size="small" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">
@@ -1319,6 +1320,40 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               </div>
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
+          </div>
+
+          <!-- v0.8.1：原「扫描设置」页已合并到资源库；扫描根目录只读引用镜像同步里的 B 库 ID -->
+          <div v-if="showScanPanel" class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>扫描计划与断点</h3><el-tag size="small">Asia/Shanghai · UTC+8</el-tag></div>
+            <div class="field"><label>扫描间隔</label>
+              <div class="preset-row">
+                <button v-for="v in scanPresets" :key="v" class="preset-btn" :class="{on: !scanCustom && scanInterval === v}" @click="pickScanInterval(v)">{{ intervalLabel(v) }}</button>
+              </div>
+              <small>点选即可，无需手写 Cron。当前表达式：{{ task.cron || '未设置' }}</small>
+            </div>
+            <div class="field"><label class="inline-label"><input type="checkbox" v-model="scanCustom"/> 自定义 Cron 表达式</label>
+              <el-input v-if="scanCustom" v-model="task.cron" placeholder="*/30 * * * *"/>
+              <small v-if="scanCustom">例：*/10 * * * * 每 10 分钟；0 3 * * * 每天 03:00</small>
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>扫描根目录（自动引用，无需填写）</label><el-input :model-value="task.effective_root_id || '根目录（全部文件）'" readonly/><small>{{ rootSourceLabel }} · 在「镜像同步」里改 B 库目录 ID 即可，此处会自动同步</small></div>
+              <div class="field inline"><label>启用定时扫描</label><el-switch v-model="task.enabled"/></div>
+            </div>
+            <div class="panel-foot"><el-button type="primary" @click="saveTask">保存扫描计划</el-button><el-button :loading="scanning" @click="scan">立即扫描</el-button></div>
+            <div class="cursor-box"><div><small>游标状态</small><b>{{ task.cursor_status }}</b></div><div><small>已处理文件</small><b>{{ task.cursor_files }}</b></div><div><small>遍历目录</small><b>{{ task.cursor_dirs }}</b></div><div><small>上次结果</small><b>{{ task.last_status || 'never' }}</b></div></div>
+            <p class="hint">{{ task.last_message || '尚未执行扫描' }}{{ task.cursor_error ? ' · 错误：' + task.cursor_error : '' }}</p>
+          </div>
+          <div v-if="showScanPanel" class="panel" style="margin-top:14px">
+            <div class="panel-head"><h3>扫描批次保护</h3><el-tag size="small" type="info">仅完整全量批次允许对账删除</el-tag></div>
+            <div class="table-scroll"><el-table :data="scanBatches" size="small">
+              <el-table-column prop="id" label="#" width="60"/>
+              <el-table-column prop="status" label="状态" width="100"/>
+              <el-table-column prop="files" label="文件" width="80"/>
+              <el-table-column prop="seen_count" label="本轮见到" width="100"/>
+              <el-table-column label="完整" width="80"><template #default="s">{{ s.row.complete ? '是' : '否' }}</template></el-table-column>
+              <el-table-column label="允许对账" width="100"><template #default="s">{{ s.row.reconcile_allowed ? '是' : '否' }}</template></el-table-column>
+            </el-table></div>
+            <p class="hint">分页不完整、断点续扫、空结果或接口异常时，一律跳过对账，不会误删资源或取消分享。</p>
           </div>
         </section>
 

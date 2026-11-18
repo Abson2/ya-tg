@@ -8,6 +8,68 @@
 
 ---
 
+## v0.8.1 (2026-11-18)
+
+按用户实测反馈修复 A/B 镜像与分享粒度，并把抓包 HAR 里已确认的写接口落地。HAR 原始凭证已脱敏，取证结论见 `docs/光鸭接口取证.md`。
+
+### 一、分类目录识别与 B 库 1:1 镜像
+- `mirror._discover_works()` 不再把 A 根目录的直接子目录一律当作影视主目录：结合目录名线索、子树是否直接含视频文件、是否像作品名，逐层找到真正的作品主目录，并记录分类目录链 `category_path`。
+- B 库按 A 库结构自动建目录：
+  - **分类目录**（如「动画电影 / 国产电影 / 欧美电影 / 日韩电影」）按**原名** 1:1 创建，不改名、不加 `*`；
+  - **影视主目录**按 `*` 约定创建；
+  - **子目录**（如 `Season 1`）按原名创建。
+- 新增 `mirror_dirs` 表记录每个目录的 A→B 映射（`kind=category/work/season`、`status=mapped/created/missing`）。`GET /api/mirror/status` 返回 `dirs` 与 `missing_dirs` 清单，管理页可直接查看。
+- 开启「B 库缺目录自动创建」时不再要求手工预建；关闭时只登记 `missing_dirs`、作品标 `blocked`（**不是 failed**），不再把 47 部作品一次性打成失败。旧版误判留下的空 `failed` 记录会被清理。
+
+### 二、B 库 `*` 命名规则纠正
+- 用户纠正：**括号里的年份与 TMDB 标记不加 `*`**。
+  ```
+  大醉侠 (2002) {tmdb-135646}  →  大*醉*侠 (2002) {tmdb-135646}
+  ```
+- 括号段整体保持原样，括号前只保留一个空格；纯英文片名改为按「单词」插 `*`（中文仍按字符），避免生成 `S*p*i*d*e*r` 式乱码目录名。
+
+### 三、HAR 取证后的写接口
+`GuangYaWebFiles` 新增三个已确认写接口，URL / 请求体 / 响应体均有契约测试锁死：
+
+```http
+POST /userres/v1/file/create_dir   {"parentId":"...","dirName":"..."} → data.fileId
+POST /userres/v1/file/rename       {"fileId":"...","newName":"..."}
+POST /userres/v1/file/delete_file  {"fileIds":["...","..."]}          → data.taskId
+POST /userres/v1/get_task_status   {"taskId":"..."}                     → data.status（2 = 完成）
+```
+
+- `delete_file` 支持批量 `fileIds`，返回 `taskId` 后需轮询；没有 `taskId` 直接报错，不假装成功。
+- 前端 JS bundle 里还出现 `move_file` / `recycle_file` / `clear_recycle_bin` 等路径，但**没有请求体证据，不实现、不猜参数**。
+- 需求文档 8.6 的待验证清单现在只剩「投稿分享转存（TgtoDrive 侧接口，未抓包）」。
+
+### 四、文件操作风控节流
+- `MIN_FILE_IDLE_SECONDS = 0.5`：来自官方 OpenAPI v1.3 §10 写接口 2 次/秒限频，是**硬下限，人为不可调低**，前端 `min` 与后端 400 校验双重约束。
+- `MirrorRule.file_idle_seconds` 可在管理页调高（默认 1.0 秒，上限 60 秒），每次 `copy_file` / `create_dir` / 变化更新前按 `max(配置值, 0.5)` 等待；`get_task_status` 另有 0.2 秒轮询保护。
+- 任务轮询改为**批量**提交后再统一等待，避免逐条阻塞放大同步耗时。
+
+### 五、电影按作品目录分享
+- 旧逻辑只有 `media_type == "tv"` 才计算 `share_dir_id`，电影一律 `share_scope="file"`，导致电影分享的是单文件而不是对应目录。
+- `series_dir_info(..., media_type="movie")` 现在把**电影主目录 = 直接父目录**，电影也走目录分享；若电影文件直接散放在分类目录下（父目录名像分类且无年份 / TMDB 标记），退化为按文件分享，避免误把整个分类目录当成一部作品。
+- `create_share()` 与 `publisher.ensure_share()` 改以 `bool(dir_id)` 判断是否按目录分享，不再按媒体类型写死；识别与入队时若缺 `share_dir_id` 会现场补算。
+
+### 六、扫描设置合并到资源库
+- 删除侧栏独立的「扫描设置」页与独立 section；扫描计划 / 断点 / 批次保护折叠进「资源库」，页头新增「立即扫描」「扫描计划」按钮。
+- **扫描根目录 ID 不再重复填写**：`_effective_scan_root()` 优先引用「镜像同步」里已填的 B 库目录 ID（`ScanTask.root_id` / `.env` 仅作兜底）；`GET /api/scan-task` 返回 `effective_root_id` 与 `root_source`，前端只读展示。`scan_now` / `rescan_library` / 定时扫描统一走有效根目录。
+
+### 七、诊断与界面
+- `POST /api/mirror/run` 异常不再吞成笼统 502：保留异常类型与消息并写入 `MirrorRule.last_status=failed` / `last_message`。
+- 同步状态新增「目录已映射 / 自动创建目录 / 待创建目录 / 文件操作下限」计数，新增「待创建目录」「目录映射清单」两张表与影视清单的「分类目录」列。
+- 同步结果提示合并成一条，不连弹多个提示。
+
+### 八、取证工具随仓库交付
+- 新增 `scripts/har_extract.py`：HAR 脱敏提取、base64 响应解码、前端 JS 接口路径汇总、凭证残留自检；`.gitignore` 禁止 `*.har` 入库，避免原始登录凭证外泄。补抓「投稿转存」的步骤见 `docs/光鸭接口取证.md` 第七节。
+
+### 回归
+- `pytest tests -q`：**124 passed**（v0.8.0 为 110，新增 `tests/test_v081_mirror_dirs.py` 14 项）。
+- `vite build` 通过。旧用例 `test_mirror_missing_target_dir_is_skipped_not_created` 改为 `..._when_auto_create_off`，显式关闭自动建目录后断言 `missing_dirs` 与 `blocked`。
+
+---
+
 ## v0.8.0 (2026-11-18)
 
 按《tg-gy 最终版项目开发需求文档》的全局架构推进第二批：A/B 镜像同步、扫描批次表、内容变化检测、完结校验与手动打标、用户互动/TgtoDrive 对接。同时把扫描设置页改成文档要求的时间间隔按钮。

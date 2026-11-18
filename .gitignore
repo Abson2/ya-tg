@@ -11,3 +11,8 @@ logs/*
 *.db
 *.db-journal
 .DS_Store
+
+# 浏览器抓包原始文件含登录凭证，禁止入库。
+# 需要分享接口结构时，用 scripts/har_extract.py 生成脱敏摘要。
+*.har
+*.har.gz

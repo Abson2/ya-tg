@@ -23,12 +23,12 @@ from app.main import (BatchLibraryInput, DistributionEvent, MirrorFile, MirrorMe
                       _post_scan_identify, _reconcile_library, batch_library,
                       process_change_events)
 from app.models import (Bot, Channel, MediaRequest, UserContribution,
-                        ResourceVersion)
+                        ResourceVersion, MirrorDir)
 from app.scanner import _record_change_events
 from app.utils import media_identity, normalize_work_name, star_media_name, work_group_key
 
 TABLES = [QueueItem, ResourceVersion, DistributionEvent, MirrorFile, MirrorTask,
-          MirrorMedia, MirrorRule, ResourceScanBatch, UserContribution, MediaRequest,
+          MirrorDir, MirrorMedia, MirrorRule, ResourceScanBatch, UserContribution, MediaRequest,
           Resource, Channel, Bot]
 
 
@@ -305,8 +305,11 @@ def test_mirror_unknown_task_status_is_not_guessed(db):
     assert db.scalar(select(MirrorFile)).status == "synced"
 
 
-def test_mirror_missing_target_dir_is_skipped_not_created(db):
+def test_mirror_missing_target_dir_is_skipped_when_auto_create_off(db):
+    """v0.8.1：关闭「自动创建 B 库目录」后，缺目录只登记清单不猜测、不误复制。"""
     r = _mirror_rule(db)
+    r.auto_create_dirs = False
+    db.commit()
 
     class NoB(FakeMirrorAPI):
         async def list_files(self, parent_id, page=0, page_size=100):
@@ -317,8 +320,8 @@ def test_mirror_missing_target_dir_is_skipped_not_created(db):
     with patch("app.mirror.GuangYaWebFiles", NoB):
         out = asyncio.run(mirror.sync_rule(db, r))
     assert out["skipped"] == 1 and out["new"] == 0, out
-    assert "缺少对应影视目录" in out["errors"][0]
-    assert db.scalar(select(MirrorMedia)).status == "failed"
+    assert out["missing_dirs"] and out["missing_dirs"][0]["kind"] == "work", out
+    assert db.scalar(select(MirrorMedia)).status == "blocked"
 
 
 def test_web_copy_endpoints_match_confirmed_contract(db):

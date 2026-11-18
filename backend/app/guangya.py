@@ -128,11 +128,17 @@ class GuangYaWebFiles:
     """
 
     LIST_PATH = "/userres/v1/file/get_file_list"
-    # v0.8.0：A→B 镜像复制。以下两个路径与请求/响应结构来自《tg-gy 最终版项目开发需求文档》
+    # v0.8.0 起：A→B 镜像复制。以下路径与请求/响应结构来自需求文档与 v0.8.1 抓包 HAR
     # 第八章「已确认光鸭接口」，按原样实现，不推测参数。其余写接口（建目录/重命名/删除/
     # 转存）在 8.6 仍标为待验证，未在此实现。
     COPY_PATH = "/userres/v1/file/copy_file"
     TASK_PATH = "/userres/v1/get_task_status"
+    # v0.8.1：用户抓包 w.har 取证的三个写接口（请求体/响应体见 docs/光鸭接口取证.md）。
+    # 只按抓到的原样实现，未出现的接口（move_file / recycle_file / clear_recycle_bin 等）
+    # 虽然出现在前端 JS 里，但没有请求体证据，仍然不实现。
+    CREATE_DIR_PATH = "/userres/v1/file/create_dir"
+    RENAME_PATH = "/userres/v1/file/rename"
+    DELETE_FILE_PATH = "/userres/v1/file/delete_file"
 
     def __init__(self, db: Session):
         from .models import AuthToken
@@ -202,6 +208,50 @@ class GuangYaWebFiles:
                 continue
             break
         raise WebFileError(last_error)
+
+    async def create_dir(self, parent_id: str, dir_name: str) -> dict:
+        """v0.8.1 抓包取证：创建目录。
+
+        POST /userres/v1/file/create_dir {"parentId":"...","dirName":"..."}
+        → data: {fileId, fileName, parentId, resType:2, depth, ...}
+        分类目录按 A 库原名创建（不改名），影视主目录按 * 约定创建。
+        """
+        name = str(dir_name or "").strip()
+        if not name or not str(parent_id or "").strip():
+            raise WebFileError("创建目录需要 parentId 与 dirName")
+        data = await self._post_web(self.CREATE_DIR_PATH,
+                                    {"parentId": str(parent_id), "dirName": name})
+        fid = str(data.get("fileId") or "")
+        if not fid:
+            raise WebFileError(f"创建目录「{name}」未返回 fileId，本次同步不标记完成")
+        return {"file_id": fid, "name": str(data.get("fileName") or name),
+                "parent_id": str(data.get("parentId") or parent_id), "raw": data}
+
+    async def rename_file(self, file_id: str, new_name: str) -> None:
+        """v0.8.1 抓包取证：重命名。POST /userres/v1/file/rename
+        {"fileId":"...","newName":"..."} → {"msg":"success"}（无 data 段）。
+        当前仅作能力预留，镜像链路默认不改名，避免误改用户网盘。
+        """
+        if not str(file_id or "").strip() or not str(new_name or "").strip():
+            raise WebFileError("重命名需要 fileId 与 newName")
+        await self._post_web(self.RENAME_PATH,
+                             {"fileId": str(file_id), "newName": str(new_name)})
+
+    async def delete_files(self, file_ids: list[str]) -> str:
+        """v0.8.1 抓包取证：删除文件/目录（支持批量，异步任务）。
+
+        POST /userres/v1/file/delete_file {"fileIds":[...]} → data.taskId
+        需再用 get_task_status 轮询。需求文档明确「禁止先删旧再复制」，
+        因此镜像链路默认**不调用**本方法，仅清理 superseded 时由管理员显式决定。
+        """
+        ids = [str(x) for x in file_ids if str(x).strip()]
+        if not ids:
+            raise WebFileError("删除需要至少一个 fileId")
+        data = await self._post_web(self.DELETE_FILE_PATH, {"fileIds": ids})
+        task_id = str(data.get("taskId") or "")
+        if not task_id:
+            raise WebFileError("删除接口未返回 taskId，无法确认是否完成")
+        return task_id
 
     async def copy_file(self, file_ids: list[str], parent_id: str) -> str:
         """把 A 库文件复制到 B 库目录，返回光鸭 taskId。
