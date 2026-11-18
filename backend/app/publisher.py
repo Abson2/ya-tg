@@ -14,7 +14,9 @@ from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import AuditLog, Bot, Channel, MessageTemplate, QueueItem, Resource, utcnow
 from .security import decrypt_secret
-from .utils import backoff_seconds, parse_media_name, plus_seconds, render_template, retry_after_seconds, version_spec
+from .utils import (backoff_seconds, is_video_file, parse_media_name, plus_seconds,
+                    render_template, retry_after_seconds, version_spec, work_episode_numbers,
+                    work_group_key)
 
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
@@ -107,29 +109,28 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     season = res.season if res.season is not None else hint.get("season")
     episode = res.episode if res.episode is not None else hint.get("episode")
     episode_tag = f"S{int(season):02d}E{int(episode):02d}" if season and episode else ""
-    # v0.6.5：整剧推送——大小取同作品所有单集之和，集数取全集范围，不是代表单集
+    # v0.7.1：整剧统计改用「与展示/分享完全相同的作品键」圈定同剧全部单集。
+    # 旧实现用 share_dir_id / tmdb_id 查成员，这两个字段只有识别成功才写入，
+    # 未识别单集被整批漏掉，且只读 DB 的 season/episode（同样只有识别才有），
+    # 于是 TG 里集数与总大小都偏小——这是「推送的集数显示不对」的直接根因。
     total_size = int(res.size or 0)
     whole_season_label = f"第{int(season)}季" if season else ""
     episode_count = ""
     if res.media_type == "tv":
-        from sqlalchemy import select as _select
-        dir_id = str(getattr(res, "share_dir_id", "") or "")
-        if dir_id:
-            sibs = list(db.scalars(_select(Resource).where(Resource.share_dir_id == dir_id)).all())
-        elif res.tmdb_id:
-            sibs = list(db.scalars(_select(Resource).where(
-                Resource.tmdb_id == res.tmdb_id, Resource.media_type == "tv")).all())
-        else:
-            sibs = []
-        if sibs:
-            total_size = sum(int(s.size or 0) for s in sibs)
-            seasons = sorted({int(s.season) for s in sibs if s.season is not None})
+        key = work_group_key(res)
+        sibs = [s for s in db.scalars(select(Resource)).all()
+                if work_group_key(s) == key]
+        videos = [s for s in sibs if is_video_file(s)] or sibs
+        if videos:
+            total_size = sum(int(s.size or 0) for s in videos)
+            parsed = [work_episode_numbers(s) for s in videos]
+            seasons = sorted({se for se, _ in parsed if se is not None})
             if seasons:
                 whole_season_label = (f"第{seasons[0]}季" if len(seasons) == 1
                                       else f"第{seasons[0]}-{seasons[-1]}季")
-            # 整剧集数：按 (季, 集) 去重计数；无集号时用成员数兜底
-            eps = {(int(s.season or 0), int(s.episode)) for s in sibs if s.episode is not None}
-            n = len(eps) if eps else len(sibs)
+            # 按 (季, 集) 去重；文件名解析不出集号时（如未识别单集）用视频文件数兜底
+            eps = {(se or 0, ep) for se, ep in parsed if ep is not None}
+            n = len(eps) if eps else len(videos)
             if n > 0:
                 episode_count = str(n)
     season_label = whole_season_label  # v0.6.4：整剧展示用「第N季」而非单集信息

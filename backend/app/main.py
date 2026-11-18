@@ -25,7 +25,8 @@ from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, MessageTemp
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, mask_secret
-from .utils import as_utc, parse_media_name, retry_after_seconds, utcnow
+from .utils import (as_utc, normalize_work_name, parse_media_name, retry_after_seconds,
+                    utcnow, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 _last_device_poll = 0.0
@@ -112,6 +113,22 @@ def _schedule_queue_worker(trigger) -> None:
                           max_instances=1, coalesce=True, replace_existing=True)
 
 
+async def _scheduled_scan(root: str) -> None:
+    """v0.7.1：Cron 定时全量扫描 B 库 → 自动识别 → 完结回填（需求3-1）。
+
+    与手动「重新扫描库」的区别：定时任务**不做对账删除**，避免断点/接口抖动
+    造成误删；对账只由用户主动点击「重新扫描库」触发。全程独立 Session，
+    不复用请求级 db，异常自行吞掉并由 run_scan 写入 ScanTask.last_status。
+    """
+    with SessionLocal() as db:
+        try:
+            data = await run_scan(root, resume=False)
+            await _post_scan_identify(db, publish_after_identify=True)
+            db.commit()
+        except Exception:
+            db.rollback()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     migrate()
@@ -126,7 +143,7 @@ async def lifespan(app: FastAPI):
         queue_trigger = _queue_trigger(db)
     if enabled:
         try:
-            scheduler.add_job(run_scan, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
+            scheduler.add_job(_scheduled_scan, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
                               args=[root], id="global_scan", replace_existing=True,
                               max_instances=1, coalesce=True)
         except Exception:
@@ -141,13 +158,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.7.1", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.7.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.7.1", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -343,20 +360,150 @@ def save_scan_task(p: ScanConfig, db: Session = Depends(get_db)):
     if scheduler.get_job("global_scan"):
         scheduler.remove_job("global_scan")
     if p.enabled:
-        scheduler.add_job(run_scan, trigger, args=[p.root_id], id="global_scan", replace_existing=True,
+        scheduler.add_job(_scheduled_scan, trigger, args=[p.root_id], id="global_scan", replace_existing=True,
                           max_instances=1, coalesce=True)
     return {"ok": True, "timezone": "Asia/Shanghai"}
 
 
+async def _post_scan_identify(db: Session, *, publish_after_identify: bool = True,
+                              limit: int = 200) -> dict:
+    """v0.7.1：扫描完成后自动 TMDB 识别 + 完结/追更状态回填。
+
+    需求3：扫描入库后自动识别；识别成功拿到海报才允许分发（沿用 v0.6.5 闸门）。
+    需求2/V2.0 第十章：镜像同步复用本管线时必须传 publish_after_identify=False，
+    避免 B 库复制完成就自动发 Telegram——这是「独立调用模式」的隔离点。
+
+    完结标签：已识别但 finish_status 为空的历史资源（v0.7.0 之前识别的）用已有
+    tmdb_id 回查 TMDB detail 补 status，否则角标永远不显示。
+    """
+    stats = {"identified": 0, "failed": 0, "queued": 0, "finish_backfilled": 0}
+    pending = list(db.scalars(select(Resource).where(
+        Resource.identify_status.in_(["unidentified", "ambiguous", "failed", "none", ""])
+    ).order_by(Resource.id.desc()).limit(min(limit, 500))).all())
+    for x in pending:
+        try:
+            r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+            if r.get("ok") and r.get("best"):
+                _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
+                                      note=r.get("reason") or "", hint=r.get("hint"))
+                stats["identified"] += 1
+                # autoflush=False：同批次识别后立刻查队列去重，必须 flush
+                db.flush()
+                if publish_after_identify:
+                    stats["queued"] += _enqueue_after_identify(db, x)
+            else:
+                x.identify_status = r.get("status") or "none"
+                x.identify_source = r.get("source") or ""
+                x.identify_note = r.get("reason") or ""
+                stats["failed"] += 1
+        except Exception as exc:
+            # TMDB 未配置/401/限流不得阻断扫描链路（项目既定降级约定）
+            x.identify_status = "failed"
+            x.identify_note = str(exc)[:300]
+            stats["failed"] += 1
+    # 完结状态回填：只处理已识别的剧集且缺 finish_status（限量，避免重复请求）
+    stale = list(db.scalars(select(Resource).where(
+        Resource.media_type == "tv", Resource.tmdb_id.isnot(None),
+        Resource.identify_status == "identified",
+        or_(Resource.finish_status.is_(None), Resource.finish_status == "")
+    ).limit(60)).all())
+    seen_tmdb: dict[int, str] = {}
+    for x in stale:
+        tid = int(x.tmdb_id)
+        if tid not in seen_tmdb:
+            try:
+                d = await tmdb.detail(tid, "tv", db)
+                seen_tmdb[tid] = str(d.get("finish_status") or "")
+            except Exception:
+                seen_tmdb[tid] = ""
+        if seen_tmdb[tid]:
+            x.finish_status = seen_tmdb[tid]
+            stats["finish_backfilled"] += 1
+    return stats
+
+
+async def _reconcile_library(db: Session, seen_file_ids: list[str],
+                             cancel_shares: bool = True, scan_complete: bool = True,
+                             resumed: bool = False) -> dict:
+    """v0.7.1：B 库对账——本轮没扫到的影视移除看板并取消分享（需求3-1）。
+
+    V2.0 第 12.2 节扫描批次保护：必须同时满足
+      ① 全量扫描（非断点续扫）、② 全部分页读取成功、③ seen 非空，
+    否则一律跳过对账。宁可保留旧数据，也绝不能因接口抖动把整个资源库清空。
+    """
+    skipped = ""
+    if resumed:
+        skipped = "resumed_incomplete_seen"
+    elif not scan_complete:
+        skipped = "incomplete_pages"
+    seen = set(str(f) for f in seen_file_ids)
+    if not skipped and not seen:
+        skipped = "empty_seen"
+    if skipped:
+        return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0, "skipped": skipped}
+    stale = [x for x in db.scalars(select(Resource)).all() if x.file_id not in seen]
+    if not stale:
+        return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0}
+    share_ids = {str(x.share_id) for x in stale if x.share_id}
+    ids = [x.id for x in stale]
+    cancelled = 0
+    if cancel_shares and share_ids:
+        for sid in share_ids:
+            try:
+                await GuangYaShareClient(db).delete(sid)
+                cancelled += 1
+            except Exception:
+                pass  # 单个分享取消失败不阻断对账
+    q = db.query(QueueItem).filter(QueueItem.resource_id.in_(ids)).delete(
+        synchronize_session=False)
+    for x in stale:
+        db.delete(x)
+    add_audit(db, "library_reconciled", target_type="library",
+              detail=json_dumps({"removed": len(ids), "shares_cancelled": cancelled,
+                                 "queue_cleared": q}))
+    return {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q}
+
+
 @app.post("/api/scan-now", dependencies=ADMIN)
-async def scan_now(resume: bool = True, db: Session = Depends(get_db)):
+async def scan_now(resume: bool = True, auto_identify: bool = True,
+                   db: Session = Depends(get_db)):
     task = db.scalar(select(ScanTask).limit(1))
     root = task.root_id if task else settings.scan_root_id
     try:
         data = await run_scan(root, resume=resume)
-        add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(data))
+        out = {k: v for k, v in data.items() if k != "seen_file_ids"}
+        if auto_identify:
+            out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+        add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(out))
         db.commit()
-        return data
+        return out
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/library/rescan", dependencies=ADMIN)
+async def rescan_library(auto_identify: bool = True, reconcile: bool = True,
+                         db: Session = Depends(get_db)):
+    """资源库「重新扫描库」：全量重扫 B 库 → 对账移除已删除影视并取消分享 → 自动识别。
+
+    全量扫描（resume=False）才允许对账，避免断点续扫 seen 不完整导致误删。
+    返回统计供前端一次展示，扫描过程中资源逐目录 commit，看板可边扫边刷新。
+    """
+    task = db.scalar(select(ScanTask).limit(1))
+    root = task.root_id if task else settings.scan_root_id
+    try:
+        data = await run_scan(root, resume=False)
+        out = {k: v for k, v in data.items() if k != "seen_file_ids"}
+        if reconcile:
+            out["reconcile"] = await _reconcile_library(
+                db, data.get("seen_file_ids") or [],
+                scan_complete=bool(data.get("complete", False)),
+                resumed=bool(data.get("resumed", False)))
+        if auto_identify:
+            out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+        add_audit(db, "library_rescan", target_type="library", detail=json_dumps(out))
+        db.commit()
+        return {"ok": True, **out}
     except Exception as e:
         raise HTTPException(502, str(e))
 
@@ -381,35 +528,17 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
 
 
 def _normalize_work_name(s: str) -> str:
-    """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
-    if not s:
-        return ""
-    v = re.sub(r"[\[(（【][^\])）】]*[\])）】]", "", str(s))
-    v = re.sub(r"[\s\-_.,·:：]+", "", v).lower()
-    v = re.sub(r"(19|20)\d{2}$", "", v)
-    return v
+    """兼容旧引用；v0.7.1 起实现统一收在 utils，供 main / publisher 共用。"""
+    return normalize_work_name(s)
 
 
 def _series_group_key(x: Resource) -> str:
-    """v0.6.5：单集 → 作品的聚合键。目录/作品名优先，TMDB 兜底。
+    """v0.6.5/v0.7.1：单集 → 作品的聚合键。
 
-    已识别单集有 tmdb_id、未识别的没有；若优先 TMDB 会把同一部剧裂成两张卡。
-    统一用「归一化作品名」让识别与否都归到同一作品，展示与推送共用此键。
+    展示（library/series）、分享（series_dir）与推送（publisher 集数/大小）三处共用
+    utils.work_group_key，且只用扫描阶段就有的字段，未识别单集不会被漏掉或裂成两张卡。
     """
-    work_name = str(getattr(x, "share_dir_name", "") or "").strip()
-    parts = [s for s in re.split(r"[/\\]+", x.path_hint or "") if s.strip()]
-    parent_name = ""
-    if parts:
-        last = parts[-1]
-        parent_name = "" if _SEASON_DIR_RE.match(last) else last
-        if not parent_name and len(parts) >= 2:
-            parent_name = parts[-2]
-    normalized = _normalize_work_name(work_name or parent_name or x.media_title)
-    if normalized:
-        return f"work:{normalized}"
-    if x.tmdb_id and x.media_type:
-        return f"tmdb:{x.media_type}:{x.tmdb_id}"
-    return f"file:{x.file_id}"
+    return work_group_key(x)
 
 
 _SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$|^S\d{1,2}$", re.I)

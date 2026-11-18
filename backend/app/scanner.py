@@ -97,8 +97,18 @@ def _upsert_resource(db: Session, item: dict, parent: str,
 
 
 async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = None) -> dict:
+    """返回 {"files","directories","resumed","seen_file_ids"}。
+
+    v0.7.1：额外返回本轮真实见到的 fileId 集合，供「重新扫描库」做对账——
+    B 库已不存在（本轮没扫到）的影视要移除看板并取消分享（需求3-1）。
+    断点续扫时 seen 不完整，调用方必须跳过对账，避免误删。
+    """
     own_db = db is None
     db = db or SessionLocal()
+    seen_file_ids: set[str] = set()
+    # V2.0 第 12.2 节「扫描批次保护」：只有本轮全部分页读取成功，才允许清理缺失资源。
+    # 接口在 total 未读完时提前返回空页，属于不完整批次，绝不能据此对账删数据。
+    scan_complete = True
     # 短信登录用户走网页端文件接口（无需开放平台 client_id，真正零配置）；
     # 仅当使用官方 Device/PKCE 授权时才走官方 OpenAPI 业务接口。
     t = db.get(AuthToken, 1)
@@ -146,9 +156,11 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                 continue
             visited.append(parent)
             dirs += 1
+            fetched = 0  # 本目录实际读到的条目数，用于与 total 对账
             while True:
                 result = await api.list_files(parent, page, 100)
                 items = result.get("list") or []
+                fetched += len(items)
                 for item in items:
                     fid = str(item.get("fileId", ""))
                     if not fid:
@@ -166,11 +178,17 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                         continue
                     _upsert_resource(db, item, parent, dir_paths.get(parent, ""),
                                      dir_chains.get(parent, []))
+                    seen_file_ids.add(fid)
                     files += 1
                 db.commit()
                 total = int(result.get("total", 0) or 0)
                 page += 1
                 if not items or page * 100 >= total:
+                    # V2.0 12.2：只要实际抓取条数少于 total，就是不完整批次。
+                    # 覆盖「total=150、第 2 页提前返回空页」这类 page*100 >= total
+                    # 但数据其实缺失的情况，绝不能据此对账删资源。
+                    if total and fetched < total:
+                        scan_complete = False
                     page = 0
                     break
                 _save_cursor(c, visited, stack, page, files, dirs, dir_paths=dir_paths, dir_chains=dir_chains)
@@ -187,7 +205,8 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
         db.add(AuditLog(action="scan_done", target_type="scan", target_id=str(c.id),
                         detail=json_dumps({"files": files, "directories": dirs, "resumed": can_resume})))
         db.commit()
-        return {"files": files, "directories": dirs, "resumed": can_resume}
+        return {"files": files, "directories": dirs, "resumed": can_resume,
+                "complete": scan_complete, "seen_file_ids": sorted(seen_file_ids)}
     except Exception as exc:
         db.rollback()
         try:

@@ -288,11 +288,20 @@ function errText(value, fallback = '请求失败') {
   if (typeof value === 'object') return value.message || value.msg || value.detail || JSON.stringify(value)
   return String(value)
 }
-async function api(path, opt = {}) {
-  const r = await fetch('/api' + path, { ...opt, headers: { ...headers(), ...(opt.headers || {}) } })
-  const d = await r.json().catch(() => ({}))
-  if (!r.ok) throw Error(errText(d.detail ?? d.message, r.statusText))
-  return d
+async function api(path, opt = {}, timeoutMs = 0) {
+  // v0.7.1：全量重扫可能耗时数分钟，允许单独放宽超时（AbortSignal 不影响其它请求）
+  const ctl = timeoutMs ? new AbortController() : null
+  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null
+  try {
+    const r = await fetch('/api' + path, { ...opt, ...(ctl ? { signal: ctl.signal } : {}),
+      headers: { ...headers(), ...(opt.headers || {}) } })
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) throw Error(errText(d.detail ?? d.message, r.statusText))
+    return d
+  } catch (e) {
+    if (ctl && ctl.signal.aborted) throw Error('扫描仍在进行中，请稍后刷新资源库查看结果')
+    throw e
+  } finally { if (timer) clearTimeout(timer) }
 }
 async function load() {
   overview.value = await api('/overview')
@@ -524,6 +533,21 @@ async function cancelShare(row) {
     ElMessage.success('分享已取消，链接已失效')
     await load()
   } catch (e) { ElMessage.error(e.message) }
+}
+// v0.7.1：重新扫描库——全量重扫 B 库 + 对账移除已删除影视（并取消其分享）+ 自动识别
+const rescanning = ref(false)
+async function rescanLibrary() {
+  rescanning.value = true
+  try {
+    const d = await api('/library/rescan', { method: 'POST' }, 180000)
+    const rc = d.reconcile || {}, idf = d.identify || {}
+    const parts = [`扫描 ${d.files || 0} 个文件`]
+    parts.push(rc.skipped ? `对账已跳过（${rc.skipped}）` : `移除 ${rc.removed || 0} 项、取消分享 ${rc.shares_cancelled || 0} 个`)
+    parts.push(`识别 ${idf.identified || 0} 项、完结回填 ${idf.finish_backfilled || 0} 项`)
+    ElMessage.success(parts.join(' · '))
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { rescanning.value = false }
 }
 // v0.6.4：清空当前扫描结果，避免旧的识别失败/重试残留干扰重新扫描
 async function clearLibrary() {
@@ -810,7 +834,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.7.0 · Asia/Shanghai</div>
+        <div class="foot-version">v0.7.1 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -995,7 +1019,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">

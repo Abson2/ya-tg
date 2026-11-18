@@ -109,6 +109,90 @@ _GENERIC_DIR = re.compile(
 _SEASON_NUM = re.compile(r"(?:season|series|s)\s*[._\- ]?(\d{1,2})|第\s*(\d{1,2})\s*[季部]", re.I)
 _CN = re.compile(r"[\u4e00-\u9fff]")
 
+# v0.7.1：整剧聚合键必须由「展示 / 分享 / 推送」三处共用，且不能依赖识别状态。
+# 旧逻辑在 publisher 里用 share_dir_id / tmdb_id 查同剧成员，这两个字段只有识别成功才写入，
+# 未识别单集被全部漏掉，导致 TG 的集数、总大小偏小——与用户「集数显示不对」直接对应。
+VIDEO_EXTS = {
+    ".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".flv", ".rmvb", ".rm",
+    ".iso", ".webm", ".mpg", ".mpeg", ".m4v", ".strm", ".vob", ".3gp", ".f4v",
+}
+
+
+def normalize_work_name(s: str) -> str:
+    """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
+    if not s:
+        return ""
+    # v0.7.1：{} 也要纳入括号噪声。A 库目录标准格式含 {tmdb-135646} 标记，
+    # 旧正则漏掉它 → 已识别单集(share_dir_name=侠客行) 与未识别单集
+    # (目录名=侠客行 (2001) {tmdb-135646}) 归一化结果不同，同一部剧被切成两个作品键。
+    v = re.sub(r"[\[(（【{][^\])）】}]*[\])）】}]", "", str(s))
+    # 兜底：裸 tmdb-/imdb- 标记（无括号包裹时）也去掉，避免同剧裂卡
+    v = re.sub(r"\b(?:tmdb|imdb)[-_:：]?\d+\b", "", v, flags=re.I)
+    v = re.sub(r"[\s\-_.,·:：]+", "", v).lower()
+    v = re.sub(r"(19|20)\d{2}$", "", v)
+    return v
+
+
+def work_group_key(x) -> str:
+    """单集 → 作品的聚合键。目录/作品名优先，TMDB 兜底。
+
+    只用扫描阶段就有的字段（path_hint / share_dir_name / media_title / file_id），
+    绝不依赖 tmdb_id、share_dir_id、season、episode 这类「识别成功后才有」的字段，
+    保证未识别单集与已识别单集归到同一部剧。展示、分享、推送三处必须共用此键。
+    x 只需具备同名属性（SQLAlchemy 模型或简单对象皆可），避免反向 import models。
+    """
+    work_name = str(getattr(x, "share_dir_name", "") or "").strip()
+    parts = [s for s in re.split(r"[/\\]+", getattr(x, "path_hint", "") or "") if s.strip()]
+    parent_name = ""
+    if parts:
+        last = parts[-1]
+        parent_name = "" if _SEASON_DIR.match(last) else last
+        if not parent_name and len(parts) >= 2:
+            parent_name = parts[-2]
+    normalized = normalize_work_name(
+        work_name or parent_name or str(getattr(x, "media_title", "") or ""))
+    if normalized:
+        return f"work:{normalized}"
+    if getattr(x, "tmdb_id", None) and getattr(x, "media_type", ""):
+        return f"tmdb:{getattr(x, 'media_type', '')}:{getattr(x, 'tmdb_id')}"
+    return f"file:{getattr(x, 'file_id', '')}"
+
+
+def is_video_file(x) -> bool:
+    """整剧统计只算视频文件，排除字幕/nfo/海报/样片，否则集数与大小都会虚高。"""
+    name = str(getattr(x, "name", "") or "")
+    ext = str(getattr(x, "ext", "") or "").lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    if not ext and "." in name:
+        ext = "." + name.rsplit(".", 1)[-1].lower()
+    return ext in VIDEO_EXTS
+
+
+def work_episode_numbers(x) -> tuple[int | None, int | None]:
+    """取单集季/集号：DB 字段优先，缺失时从文件名现场解析（未识别单集也能算集数）。
+
+    旧逻辑只读 Resource.season/episode，这两个字段由 _apply_identification 写入，
+    未识别单集必然为 None，被整剧统计排除——这正是集数偏小的第二个原因。
+    """
+    season = getattr(x, "season", None)
+    episode = getattr(x, "episode", None)
+    if episode is None:
+        hint = parse_media_name(str(getattr(x, "name", "") or ""),
+                                str(getattr(x, "path_hint", "") or ""))
+        if season is None:
+            season = hint.get("season")
+        episode = hint.get("episode")
+    try:
+        season = int(season) if season is not None else None
+    except (TypeError, ValueError):
+        season = None
+    try:
+        episode = int(episode) if episode is not None else None
+    except (TypeError, ValueError):
+        episode = None
+    return season, episode
+
 # v0.6.2：发布组 / 资源站目录不是作品名。
 # 用户真实场景：文件在「[高清剧集网发布 www.THDT...]」目录下，文件名 Tian.Xian.Pei.S01E28.2007
 # 才是真剧名。旧逻辑把站点名当作品名搜 TMDB，必然失败，整批剧集散落未识别。

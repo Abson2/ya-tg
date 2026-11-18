@@ -8,6 +8,42 @@
 
 ---
 
+## v0.7.1 (2026-11-18)
+
+需求3 补漏修复版：把 v0.7.0 里「代码写了但链路没通」的四项真正接起来，并按最终版需求文档第 12.2 节补齐扫描批次保护。**本版仍不含** A/B 镜像同步（需求2）与投稿/TgtoDrive 对接（需求4第二批），这两项按全局架构分阶段推进，不因本版发版而标记为完成。
+
+### 用户反馈的四项修复
+- **推送集数/大小显示不对**：根因是 `publisher._build_message()` 只用 `share_dir_id` / `tmdb_id` 找同剧成员，而这两个字段只有识别成功才写入，未识别单集被整批漏算；且集号只读 DB 的 `season/episode`，同样识别后才有。现统一改用 `utils.work_group_key()` 圈定同剧全部单集，用 `is_video_file()` 排除字幕/nfo，用 `work_episode_numbers()` 在 DB 缺字段时从文件名现场解析季集号。36 集里仅 1 集识别成功的复现场景，由「共 1 集 / 2.0GB」修正为「共 36 集 / 72.0GB」。
+- **作品键裂卡**：`normalize_work_name()` 的括号噪声正则补上 `{}`，并去掉裸 `tmdb-` / `imdb-` 标记。A/B 库标准目录名 `侠客行 (2001) {tmdb-135646}` 与已识别单集的 `share_dir_name=侠客行` 现归一到同一作品键，不再一部剧拆成两张卡。展示（`/api/library/series`）、分享、推送三处共用 `work_group_key()`，且只依赖扫描阶段就有的字段。
+- **完结标签没实现**：`tmdb._normalize()` 与 `Resource.finish_status` 在 v0.7.0 已有，但存量已识别资源从未回填。新增 `_post_scan_identify()` 的回填分支：对已识别、有 `tmdb_id`、缺 `finish_status` 的剧集回查 TMDB detail 补 `ended/returning`，按 TMDB ID 去重请求、限量 60 条/轮。TMDB 未配置/401 时静默降级，不阻断扫描。
+- **扫描后不自动识别 / 没有重新扫描库**：
+  - `POST /api/library/rescan` + 资源库页「重新扫描库」按钮：全量重扫 → 对账移除 B 库已不存在的影视（删除前先取消分享、清队列）→ 自动识别 → 完结回填，一次返回统计。前端对全量重扫单独放宽请求超时到 180 秒。
+  - `POST /api/scan-now` 增加 `auto_identify` 参数，扫描完成后默认自动识别；Cron 定时扫描改走 `_scheduled_scan()`，同样自动识别，但**不做对账删除**，避免接口抖动误删。
+  - `scanner.run_scan()` 新增返回 `seen_file_ids` 与 `complete`，供对账判断。
+
+### 扫描批次保护（最终版需求文档 12.2）
+- `_reconcile_library()` 强制三重条件同时满足才允许清理：全量扫描（非断点续扫）、全部分页读取成功、`seen_file_ids` 非空；否则返回 `skipped` 原因（`incomplete_pages` / `resumed_incomplete_seen` / `empty_seen`），一条数据都不删。
+- `run_scan()` 按目录累计实际抓取条数与接口 `total` 比对；覆盖「total=150、第 2 页提前返回空页」这类 `page*100 >= total` 但实际少读数据的隐蔽不完整批次。API 异常则直接抛出，调用方走 502，不进入对账。
+
+### 镜像同步的推送隔离预埋
+- `_post_scan_identify()` 增加 `publish_after_identify` 开关：镜像同步复用识别管线时传 `False`，识别与回填照常进行但绝不自动入队推送 TG，满足「镜像完成禁止自动推送」的隔离要求。
+- **边界说明**：这是调用层开关，不是完整隔离。数据层独立状态（`QueueItem` 的 source/mode）、`mirror_rules` / `mirror_media` / `mirror_files` / `mirror_tasks` / `resource_scan_batches` 映射表、网页端 `copy_file` / `get_task_status` 客户端均尚未实现；8.6 列出的创建文件夹、重命名、删除、投稿转存接口仍待抓包验证，不会凭猜测落地。
+
+### 升级提示
+- 升级后建议在资源库点一次「重新扫描库」：全量重扫会补齐旧资源缺失的目录链，自动回填完结状态，并清理网盘里已删除的旧记录。
+- 该按钮会取消被移除资源的光鸭分享链接，属预期行为；若本轮分页不完整，按钮会显示「对账已跳过」并保留全部数据。
+
+### 测试
+- 新增 `tests/test_v071_scan_pipeline.py`（9 项）：`{tmdb-}` 归一化、36 集整剧统计、非视频文件排除、文件名现场解析 `S01E28`、扫描后自动识别与完结回填、`publish_after_identify=False` 不入队、TMDB 失败降级、批次保护三类跳过、完整批次对账清理、短分页批次判定、重扫端点返回统计。
+- 全套 **95 项通过**，前端 `vite build` 通过。
+
+### 镜像
+```bash
+docker pull abson2/ya-tg:v0.7.1
+```
+
+---
+
 ## v0.7.0 (2026-11-18)
 
 四大需求分批交付的第一批：授权脱敏、资源库重构与批量管理、TG 分发配置升级（纯本地功能）。镜像库复制（需求2）与投稿/TgtoDrive 对接（需求4第二批）按计划放下一版。
