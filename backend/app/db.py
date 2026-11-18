@@ -1,10 +1,39 @@
 import json
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
 
-args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+_IS_SQLITE = settings.database_url.startswith("sqlite")
+args = {"check_same_thread": False} if _IS_SQLITE else {}
+if _IS_SQLITE:
+    # v0.8.8：SQLite 只有一个写者。后台 job（3 秒 Token 轮询 / 10 秒 Bot 轮询 /
+    # 30 秒队列 worker）与手动同步、定时扫描并发写时，默认 5 秒等待极易抛
+    # `database is locked`。把等待放宽到 30 秒，并开 WAL 让读写不再互斥。
+    args["timeout"] = 30
 engine = create_engine(settings.database_url, connect_args=args, pool_pre_ping=True)
+
+if _IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        """每个新连接都生效；journal_mode=WAL 是库级持久设置，重复执行无副作用。
+
+        顺序与隔离都有讲究：busy_timeout 是纯连接级、不需要拿锁，必须最先设且
+        单独 try。若把 journal_mode=WAL 放在前面，别的连接正持写锁时它自己就可能
+        抛 `database is locked`，整个 try 一起失败会把最关键的 30 秒等待也吞掉——
+        恰好是最需要它的时刻。synchronous / journal_mode 各自独立，互不影响。
+        """
+        for pragma in ("PRAGMA busy_timeout=30000",
+                       "PRAGMA synchronous=NORMAL",
+                       "PRAGMA journal_mode=WAL"):
+            try:
+                cur = dbapi_conn.cursor()
+                cur.execute(pragma)
+                cur.close()
+            except Exception:
+                # 内存库 / 只读文件系统 / 并发写锁等场景单项失败不影响其余设置
+                pass
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 

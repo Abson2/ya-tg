@@ -474,12 +474,18 @@ async function runMirror(mode = 'auto') {
     const p = d.pipeline
     if (p) extra.push(`自动入库 ${p.files || 0} 文件 · 识别成功 ${p.identify?.identified || 0} · 入队 ${p.queued || 0} · 内容变化待处理 ${p.changes_pending || 0}`)
     else if (d.pipeline_enabled === false) extra.push('本次仅同步，未刷新入库')
-    // v0.8.6：改名统计必须显式带出，否则「审核不通过」时看不出改名有没有生效
+    // v0.8.8：改名统计必须把「跳过原因 / 整体异常」也带出来，否则
+    // 「改名 0 · 待翻译 0 · 失败 0」三个零看不出到底是跳过、无中文还是改名没执行
     const r = d.rename
-    if (r) extra.push(`改名 ${r.renamed || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`)
-    else if (d.rename_enabled === false) extra.push('本次未自动改名（开关关闭）')
+    if (r) {
+      const rp = [`改名 ${r.renamed || 0} · 已达标跳过 ${r.skipped || 0} · 无中文跳过 ${r.ascii || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`]
+      if (r.no_rows) rp.push(`无待改名文件 ${r.no_rows} 部`)
+      if (r.errors?.length) rp.push(`首个改名错误：${String(r.errors[0]).slice(0, 140)}`)
+      extra.push(rp.join(' · '))
+    } else if (d.rename_enabled === false) extra.push('本次未自动改名（开关关闭）')
+    else extra.push('本次未自动改名（未返回统计）')
     const msg = `同步 ${d.media || 0} 部：新增 ${d.new || 0} · 重试 ${d.retries || 0} · 变化 ${d.changed || 0} · 未变 ${d.unchanged || 0} · 完成 ${d.done || 0} · 复制失败 ${d.failed || 0} · 待确认 ${d.unknown || 0}` + (extra.length ? ' · ' + extra.join(' · ') : '')
-    if (d.dir_errors?.length || d.failed || r?.failed) ElMessage.warning(msg)
+    if (d.dir_errors?.length || d.failed || r?.failed || r?.errors?.length) ElMessage.warning(msg)
     else ElMessage.success(msg)
     await load()
   } catch (e) { ElMessage.error(e.message) }
@@ -1057,7 +1063,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.7 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.8 · Asia/Shanghai</div>
       </div>
     </aside>
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -10,6 +11,8 @@ from .guangya import GuangYaOpenAPI, GuangYaWebFiles
 from .models import (AuditLog, AuthToken, DistributionEvent, Resource, ResourceScanBatch,
                      ResourceVersion, ScanCursor, ScanTask, utcnow)
 from .utils import work_group_key
+
+logger = logging.getLogger(__name__)
 
 
 def _cursor(db: Session) -> ScanCursor:
@@ -203,6 +206,10 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
         db.add(batch)
         db.flush()
         batch_id = int(batch.id)
+        # v0.8.8：必须在这里就提交。下面第一个 `await api.list_files()` 是网络请求，
+        # 若让这个写事务跨 await 持有，其它后台 job 只要写库就会撞
+        # `sqlite3.OperationalError: database is locked`（用户实测的失败重试循环）。
+        db.commit()
 
         # v0.6.5：扫描只入库，不再读取规则入队；推送由识别成功触发
         while stack:
@@ -280,21 +287,31 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
                 "batch_id": batch_id, "change_events": events}
     except Exception as exc:
         db.rollback()
+        # v0.8.8：写冲突必须给可操作提示，否则用户只看到一串 SQL 与参数，
+        # 在「失败 → 重试 → 又失败」里空转（真实环境反馈）。
+        raw = str(exc)
+        if "database is locked" in raw.lower():
+            detail = ("数据库写冲突（database is locked）：请确认只运行一个容器实例、"
+                      "没有两个 compose 项目共用同一个 ./db 目录；"
+                      "v0.8.8 已启用 WAL 与 30 秒写等待，稍后重试即可。原始错误：" + raw)
+            logger.warning("[scan] %s", detail)
+        else:
+            detail = raw
         try:
             if batch_id:
                 b = db.get(ResourceScanBatch, batch_id)
                 if b:
-                    b.status, b.error, b.finished_at = "failed", str(exc)[:1000], utcnow()
+                    b.status, b.error, b.finished_at = "failed", detail[:1000], utcnow()
                     db.commit()
             c = _cursor(db)
             _save_cursor(c, json.loads(c.visited_json or "[]"), json.loads(c.stack_json or "[]"),
                          int(c.next_page or 0), int(c.files_count or 0), int(c.dirs_count or 0),
-                         status="failed", error=str(exc), dir_paths=dir_paths, dir_chains=dir_chains)
+                         status="failed", error=detail, dir_paths=dir_paths, dir_chains=dir_chains)
             task = db.scalar(select(ScanTask).limit(1))
             if task:
                 task.last_run = utcnow()
                 task.last_status = "failed"
-                task.last_message = str(exc)[:1500]
+                task.last_message = detail[:1500]
             db.commit()
         except Exception:
             db.rollback()

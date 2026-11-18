@@ -713,6 +713,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     # 复用同一行重新复制，不新建行、不碰 A 库、不改任何目录名
                     row.status, row.error = "pending", "B 库未找到已同步文件，自动重新复制"
                     row.target_file_id = ""
+                    # v0.8.8：补复制回来的是 **A 库中文原名**，旧改名状态必须作废。
+                    # 否则 rename_mirror_files() 看到 rename_status=done 会整批跳过，
+                    # 表现就是用户反馈的「现在文件是有了，不过汉字名称没有翻译」。
+                    row.target_name = ""
+                    row.rename_status = ""
+                    row.rename_error = ""
                     del synced_rows[key]
                     retry_rows[key] = row
                     stats["missing_in_b"] += 1
@@ -1054,7 +1060,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     """
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
     stats = {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
-             "untranslated": 0, "failed": 0, "errors": [],
+             "untranslated": 0, "failed": 0, "no_rows": 0, "errors": [],
              "untranslated_works": [], "idle_seconds": idle}
     api = GuangYaWebFiles(db)
     medias = list(db.scalars(select(MirrorMedia).where(
@@ -1074,10 +1080,18 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
             MirrorFile.media_id == media.id,
             MirrorFile.status == "synced")).all())
         if not rows:
+            stats["no_rows"] += 1
             continue
         # 只读列一次 B 库：既定位 fileId，也避免 A 库内容更新后新旧版本同名冲突
-        candidates, _verified = await _b_file_candidates(api, media)
+        candidates, b_verified = await _b_file_candidates(api, media)
         name_fids = {k: v for k, v in candidates.items() if ":" not in k}
+        # v0.8.8：以 B 库**实际文件名**判断是否已经改过名，不再只信 DB 状态。
+        # v0.8.7 空目录补复制会把文件恢复成 A 库中文原名，而复用的同一行里
+        # rename_status / target_name 可能仍停在 done / 英文名，旧逻辑会整批跳过，
+        # 用户看到的就是「现在文件是有了，不过影视单集、电影文件汉字名称没有翻译」。
+        fid_to_norm: dict[str, str] = {}
+        for k, v in name_fids.items():
+            fid_to_norm.setdefault(str(v), k)
         first = True
         for row in rows:
             target = english_file_name(row.file_name, core, eng)
@@ -1085,10 +1099,9 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 stats["ascii"] += 1
                 row.rename_status = "skipped_ascii"
                 continue
-            if row.target_name == target and row.rename_status == "done":
-                stats["skipped"] += 1
-                continue
-            fid = str(row.target_file_id or "") or _lookup_b_file(candidates, row)
+            # v0.8.8：优先用 B 库列目录命中的 fileId；DB 里的 target_file_id
+            # 可能是补复制前旧文件的 ID，列目录失败时才回退到 DB 值。
+            fid = _lookup_b_file(candidates, row) or str(row.target_file_id or "")
             if not fid:
                 row.rename_status, row.rename_error = "failed", "B 库未找到对应 fileId，未改名"
                 stats["failed"] += 1
@@ -1100,6 +1113,19 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                    and name_fids[normalize_work_name(final)] != fid and n < 20):
                 n += 1
                 final = with_conflict_suffix(target, n)
+            cur = fid_to_norm.get(str(fid), "")
+            if cur and cur == normalize_work_name(final):
+                # B 库当前确实已是目标英文名：只纠正 DB 状态，不重复调接口
+                row.target_file_id = fid
+                row.target_name = final
+                row.rename_status, row.rename_error = "done", ""
+                stats["skipped"] += 1
+                db.flush()
+                continue
+            # 列目录不完整时不信任实际名字，退回 DB 幂等判断，防接口抖动误改
+            if not b_verified and row.target_name == final and row.rename_status == "done":
+                stats["skipped"] += 1
+                continue
             if not first:
                 await asyncio.sleep(idle)  # 与复制/建目录共用同一风控间隔
             first = False

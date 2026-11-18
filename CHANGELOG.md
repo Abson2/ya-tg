@@ -8,6 +8,43 @@
 
 ---
 
+## v0.8.8 (2026-11-18)
+
+按用户实测反馈「现在文件是有了，不过影视单集、电影文件汉字名称没有翻译」修复改名链路。
+现场同步结果是「重试 4 · 完成 4 · **改名 0 · 待翻译作品 0 · 改名失败 0**」——
+v0.8.7 的空目录补复制已经生效，但改名整批没执行。
+
+### 一、头号根因：补复制回来的是中文原名，DB 却记着「已改名」
+- v0.8.7 把 DB 标记 `synced` 但 B 库实际缺失的文件**复用同一行**重新复制；复制回来的是 **A 库中文原名**。但该行只重置了 `target_file_id`，`rename_status=done` / `target_name=英文名` / `rename_error` 残留。
+- `rename_mirror_files()` 旧逻辑用 `row.target_name == target and row.rename_status == "done"` 判幂等 → 整批 `skipped`，一次 `rename_file` 都不调。前端提示只显示「改名 / 待翻译 / 改名失败」三项，恰好全是 0，形成诊断黑洞。
+- 修复 ①：`sync_rule()` 的补复制分支同步清空 `target_name` / `rename_status` / `rename_error`，新复制的文件一律视为「待改名」。
+- 修复 ②（更根本）：`rename_mirror_files()` 改为**以 B 库实际文件名为准**，与 v0.8.7「DB 状态不等于网盘实际」同一红线。列目录后建立 `fileId → 实际（归一化）文件名` 反查：B 库当前名已是目标英文名才跳过（并顺手把 DB 状态纠正为 `done`）；否则无论 DB 写的是什么都重新改名。`fileId` 也优先取 B 库列目录命中值，DB 的 `target_file_id` 只在列目录失败时兜底（可能是补复制前的旧 ID）。
+- 列目录失败 / 分页不完整时 `verified=False`，仍退回 DB 幂等判断，防接口抖动误改。冲突加 `-vN`、文件间 `file_idle_seconds` 风控、`file_name` 恒为 A 原名、A 库只读、B 库分类目录 / 影视主目录 / 季目录名不动等既有红线全部不变。
+- 用户现场文件名 `小黄人大眼萌 (2015) - 2160p.BluRay REMUX.HDR.TrueHD 7.1 Atmos-DreamHD.mkv` 已补纯函数回归：命名规则本身没问题，问题只在状态机。
+
+### 二、诊断补齐：不再出现「三个零」
+- `rename_mirror_files()` 新增 `no_rows`（没有 `status=synced` 文件的作品数）；`_safe_rename()` 整体异常返回同样带该字段。
+- `POST /api/mirror/run` 把 `rename.errors[]` 首条追加到 `rule.last_message`，刷新「同步状态」页仍能看到「文件改名未执行：…」或单文件真实报错，不再只留在本次响应里。
+- 管理页同步结果提示改为「改名 N · **已达标跳过 N · 无中文跳过 N** · 待翻译作品 N · 改名失败 N」，并带出「无待改名文件 N 部」「首个改名错误：…」；开关关闭或未返回统计时明确写出原因；有改名错误时提示降级为 warning。
+
+### 三、SQLite `database is locked` 并发写冲突（用户「失败一直重试中」）
+
+现场报错：`sqlite3.OperationalError: database is locked`，SQL 为 `UPDATE resources SET thumbnail=?, scanned_at=? WHERE resources.id = ?`。两层根因：
+
+- **连接层**：`db.py` 的 SQLite 连接既没开 WAL，也没放宽写等待（pysqlite 默认约 5 秒）。后台 job（3 秒 Token 轮询 / 10 秒 Bot 轮询 / 30 秒队列 worker）、定时扫描、定时镜像与手动「立即同步」都在同一事件循环里并发写库，短写事务撞上扫描的长事务就立刻报错。
+- **扫描层（更关键）**：`scanner.run_scan()` 在 `db.flush()` 插入 `ResourceScanBatch` 后，直接 `await api.list_files()` 发网络请求——**写事务跨 await 持有**，把持锁时间从毫秒级放大成一整次网络往返。
+
+修复：① `db.py` 给 SQLite 连接设 `timeout=30`，并在 `connect` 事件里执行 `PRAGMA journal_mode=WAL` / `busy_timeout=30000` / `synchronous=NORMAL`（内存库等不支持场景静默跳过）；② 扫描批次插入后先 `flush()` 取 ID、再**立即 `commit()`**，绝不跨网络 await 持有写事务；③ 锁错误落可操作中文提示到 `ResourceScanBatch.error` / `ScanCursor.error` / `ScanTask.last_message` 与 502 响应——「请确认只运行一个容器实例、没有两个 compose 项目共用同一个 `./db`」，避免用户在「失败 → 重试 → 又失败」里空转。扫描的对账 / 断点语义不变：异常仍标 `failed`、保留现场，下一轮全量重扫。
+
+### 四、升级与验证
+- **升级后点一次「立即同步」即可自愈改名**：新逻辑按 B 库实际文件名发现中文名并重新改成英文剧名，不需要清库、不需要重新复制、不需要重建数据库。也可直接点「镜像同步 → 按英文规范改名」（或「重新解析英文名并改名」）立刻处理存量。
+- **数据库写冲突**：升级后重启一次容器让 WAL 生效；若仍报 `database is locked`，先确认只有一个容器实例、没有两个 compose 项目共用同一个 `./db` 目录。
+- 新增 `tests/test_v088_rename_after_recopy.py` 9 项 + `tests/test_v088_sqlite_concurrency.py` 5 项（WAL / busy_timeout 生效、批次在网络 await 前已提交、锁错误落中文提示、502 带可操作提示）。另补两项发版前加固回归：三条 PRAGMA 各自独立执行（`journal_mode` 自身抛 `database is locked` 时不会连带吞掉最关键的 30 秒写等待）、`last_message` 为 NULL 时追加改名诊断不会把整次同步拖成 failed。
+- 全套 `215 passed, 1 warning`；v0.8.6 的 18 项改名回归与 v0.8.7 的 17 项空目录回归全部保持通过；前端 `vite build` 通过（1399 modules）。
+- 真实环境待验证：`rename` 对中文→英文长文件名（含 `BluRay REMUX` / `TrueHD 7.1 Atmos` 等空格与点号）的接受度、TMDB en-US 对中文作品的英文名覆盖率、改名后审核是否通过、多容器实例下的写等待表现。
+
+---
+
 ## v0.8.7 (2026-11-18)
 
 按用户实测反馈「又出现之前的问题，B库内影视文件夹下为空目录」修掉 v0.8.4 只补了一半的根因，

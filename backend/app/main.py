@@ -222,13 +222,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.7", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.8", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.7", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.8", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -682,7 +682,7 @@ async def _safe_rename(db: Session, r: MirrorRule) -> dict:
         logger.warning("[mirror] 文件改名整体失败，不阻断同步：%s", exc)
         msg = f"{type(exc).__name__}: {exc}"[:300]
         return {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
-                "untranslated": 0, "failed": 0,
+                "untranslated": 0, "failed": 0, "no_rows": 0,
                 "errors": [f"文件改名未执行：{msg}"],
                 "untranslated_works": [], "idle_seconds": 0}
 
@@ -709,6 +709,13 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
         stats["rename_enabled"] = bool(getattr(r, "rename_files", True))
         if stats["rename_enabled"]:
             stats["rename"] = await _safe_rename(db, r)
+            # v0.8.8：改名整体异常 / 单文件失败不能只留在本次响应里；
+            # 追加到 last_message，刷新「同步状态」页仍能看到真实原因。
+            rename_errors = (stats["rename"] or {}).get("errors") or []
+            if rename_errors:
+                # 新建规则 / 旧库缺列时 last_message 可能是 None，别让一条诊断把整次同步拖成 failed
+                r.last_message = ((r.last_message or "")
+                                  + " · 首个改名错误：" + str(rename_errors[0])[:300])
         stats["pipeline_enabled"] = do_pipeline
         if do_pipeline:
             stats["pipeline"] = await _mirror_post_sync_pipeline(db, r)
@@ -732,6 +739,9 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
         logger.exception("[mirror] 镜像同步异常")
         db.rollback()
         detail = f"{type(exc).__name__}: {exc}"
+        if "database is locked" in detail.lower():
+            detail += ("（数据库写冲突：请确认只运行一个容器实例、没有两个 compose 项目共用同一个 ./db；"
+                       "v0.8.8 已启用 WAL 与 30 秒写等待，稍后重试即可）")
         rr = db.scalar(select(MirrorRule).limit(1))
         if rr:
             rr.last_status, rr.last_message = "failed", detail[:1000]
