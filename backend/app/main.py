@@ -2,8 +2,9 @@ import html
 import json
 import logging
 import re
+import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -37,6 +38,10 @@ from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name
                     work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+# v0.8.9：镜像同步 / 改名是分钟级长任务，同一进程内只允许一个在跑。
+# 用 threading.Lock 而非 asyncio.Lock：定时 job 与手动端点可能来自不同执行上下文，
+# 且测试里 asyncio.run() 会换事件循环，threading 锁不受影响。
+_mirror_lock = threading.Lock()
 _last_device_poll = 0.0
 
 
@@ -222,13 +227,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.8", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.8.9", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.8", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.9", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -561,35 +566,43 @@ async def _scheduled_mirror() -> None:
 
     v0.8.5 起不再写死「镜像完成不推 TG」：识别成功（拿到海报）的影视按分发规则推送。
     仍不对全库群发，也不批量补推历史内容变化事件。
+    v0.8.9：与手动同步共用互斥锁，手动任务在跑时直接跳过本轮，不叠加长任务。
     """
-    with SessionLocal() as db:
-        try:
-            r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
-            if r and r.source_root_id and r.target_root_id:
-                await mirror.sync_rule(db, r)
-                await mirror.backfill_target_file_ids(db, r)
-                # v0.8.6：改名必须赶在「扫描入库」之前，否则 Resource 记的是旧中文名。
-                # 只改 B 库单集/单电影文件名，A 库与 B 库目录名都不动。
-                if bool(getattr(r, "rename_files", True)):
-                    await _safe_rename(db, r)
-                if bool(getattr(r, "auto_identify", True)):
-                    p = await _mirror_post_sync_pipeline(db, r)
-                    db.commit()
-                    # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message，不能冲掉
-                    tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
-                            f"{p['identify']['identified']} · 入队 {p['queued']}"
-                            f" · 内容变化待处理 {p['changes_pending']}")
-                    r.last_message = (str(r.last_message or "") + tail)[-1000:]
-                    db.commit()
-        except Exception as exc:
-            db.rollback()
+    if not _mirror_lock.acquire(blocking=False):
+        logger.info("[mirror] 已有同步 / 改名任务运行，跳过本轮定时镜像")
+        return
+    try:
+        with SessionLocal() as db:
             try:
-                r = db.scalar(select(MirrorRule).limit(1))
-                if r:
-                    r.last_status, r.last_message = "failed", str(exc)[:1000]
-                    db.commit()
-            except Exception:
-                pass
+                r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
+                if r and r.source_root_id and r.target_root_id:
+                    await mirror.sync_rule(db, r)
+                    await mirror.backfill_target_file_ids(db, r)
+                    # v0.8.6：改名必须赶在「扫描入库」之前，否则 Resource 记的是旧中文名。
+                    # 只改 B 库单集/单电影文件名，A 库与 B 库目录名都不动。
+                    # v0.8.9：TMDB 查不到英文名会快速直译兜底，不阻断下面的入库/推送。
+                    if bool(getattr(r, "rename_files", True)):
+                        await _safe_rename(db, r)
+                    if bool(getattr(r, "auto_identify", True)):
+                        p = await _mirror_post_sync_pipeline(db, r)
+                        db.commit()
+                        # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message
+                        tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
+                                f"{p['identify']['identified']} · 入队 {p['queued']}"
+                                f" · 内容变化待处理 {p['changes_pending']}")
+                        r.last_message = (str(r.last_message or "") + tail)[-1000:]
+                        db.commit()
+            except Exception as exc:
+                db.rollback()
+                try:
+                    r = db.scalar(select(MirrorRule).limit(1))
+                    if r:
+                        r.last_status, r.last_message = "failed", str(exc)[:1000]
+                        db.commit()
+                except Exception:
+                    pass
+    finally:
+        _mirror_lock.release()
 
 
 class MirrorConfigInput(BaseModel):
@@ -668,6 +681,23 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
     return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
 
 
+@contextmanager
+def _mirror_guard():
+    """v0.8.9：镜像同步 / 改名互斥，拿不到锁立刻 409，不让长任务排队堆积。
+
+    用户等不及连点「立即同步」时，多个分钟级任务并发会互相抢 SQLite 写锁、
+    成倍放大列目录与 rename 请求，管理页所有请求排队到 30 秒 busy_timeout，
+    表现就是「整理剧集改名时后台页面卡死打不开」。宁可明确拒绝，也不排队。
+    """
+    if not _mirror_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, "已有镜像同步 / 改名任务正在运行，请等当前任务结束后再操作")
+    try:
+        yield
+    finally:
+        _mirror_lock.release()
+
+
 async def _safe_rename(db: Session, r: MirrorRule) -> dict:
     """v0.8.6：改名是可选优化，整体失败绝不能拖垮已完成的复制与后续入库 / 推送。
 
@@ -683,12 +713,13 @@ async def _safe_rename(db: Session, r: MirrorRule) -> dict:
         msg = f"{type(exc).__name__}: {exc}"[:300]
         return {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
                 "untranslated": 0, "failed": 0, "no_rows": 0,
-                "errors": [f"文件改名未执行：{msg}"],
+                "literal_ai": 0, "literal_pinyin": 0,
+                "errors": [f"文件改名未执行：{msg}"], "notices": [],
+                "remaining": 0, "truncated_reason": "",
                 "untranslated_works": [], "idle_seconds": 0}
 
 
-@app.post("/api/mirror/run", dependencies=ADMIN)
-async def mirror_run(post_identify: bool | None = None, db: Session = Depends(get_db)):
+async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
     """v0.8.5：立即同步；默认按 mirror.auto_identify 决定是否接「入库 → 识别 → 推送」管线。
 
     post_identify 不传（前端「立即同步」）= 遵循配置开关；
@@ -718,6 +749,9 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
                                   + " · 首个改名错误：" + str(rename_errors[0])[:300])
         stats["pipeline_enabled"] = do_pipeline
         if do_pipeline:
+            # v0.8.9：找不到官方英文名的作品在改名环节已直接直译兜底，绝不在这里
+            # 再补跑一次解析（会重复触发 TMDB / AI 网络等待）。复制 → 入库 →
+            # 识别 → 分享/推送 主链路必须照常走完，改名只是可选优化。
             stats["pipeline"] = await _mirror_post_sync_pipeline(db, r)
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
@@ -749,8 +783,14 @@ async def mirror_run(post_identify: bool | None = None, db: Session = Depends(ge
         raise HTTPException(502, f"镜像同步失败：{detail}")
 
 
-@app.post("/api/mirror/rename", dependencies=ADMIN)
-async def mirror_rename_files(force: bool = False, db: Session = Depends(get_db)):
+@app.post("/api/mirror/run", dependencies=ADMIN)
+async def mirror_run(post_identify: bool | None = None, db: Session = Depends(get_db)):
+    """v0.8.9：立即同步入口加互斥；重复点击直接 409，不让长任务排队堆积。"""
+    with _mirror_guard():
+        return await _do_mirror_run(post_identify, db)
+
+
+async def _do_mirror_rename_files(force: bool, db: Session) -> dict:
     """v0.8.6：手动对 B 库已同步的单集 / 单电影文件批量改名（存量一键处理）。
 
     不重新复制文件、不改 A 库、不改 B 库目录名；只按已存的 A→B 映射逐个定位 B fileId。
@@ -775,8 +815,14 @@ async def mirror_rename_files(force: bool = False, db: Session = Depends(get_db)
         raise HTTPException(502, f"文件改名失败：{type(exc).__name__}: {exc}")
 
 
-@app.post("/api/mirror/tasks/poll", dependencies=ADMIN)
-async def mirror_poll_tasks(db: Session = Depends(get_db)):
+@app.post("/api/mirror/rename", dependencies=ADMIN)
+async def mirror_rename_files(force: bool = False, db: Session = Depends(get_db)):
+    """v0.8.9：与「立即同步」共用互斥锁，避免两个长任务并发拖死管理页。"""
+    with _mirror_guard():
+        return await _do_mirror_rename_files(force, db)
+
+
+async def _do_mirror_poll_tasks(db: Session) -> dict:
     r = _mirror_rule(db)
     if not r:
         return {"tasks": 0, "done": 0, "still_unknown": 0}
@@ -789,6 +835,35 @@ async def mirror_poll_tasks(db: Session = Depends(get_db)):
         return out
     except Exception as exc:
         raise HTTPException(502, str(exc))
+
+
+@app.post("/api/mirror/tasks/poll", dependencies=ADMIN)
+async def mirror_poll_tasks(db: Session = Depends(get_db)):
+    """v0.8.9：任务轮询也会触发改名，纳入同一把互斥锁。"""
+    with _mirror_guard():
+        return await _do_mirror_poll_tasks(db)
+
+
+@app.post("/api/mirror/mappings/prune", dependencies=ADMIN)
+async def mirror_mappings_prune(dry_run: bool = False, db: Session = Depends(get_db)):
+    """v0.8.9：清理 B 库中已不存在的文件 / 目录映射（管理页「清理无效映射」）。
+
+    只读核对 B 库实际内容，列目录不可信或整部作品为空时一律跳过，绝不误清。
+    默认真正执行；`dry_run=true` 只返回清单不写库，供用户先预览。
+    """
+    with _mirror_guard():
+        r = _mirror_rule(db)
+        if not r or not (r.target_root_id or "").strip():
+            raise HTTPException(400, "请先在镜像设置里填写 B 镜像库目录 ID")
+        stats = await mirror.prune_stale_mappings(db, r, dry_run=dry_run)
+        if not dry_run:
+            add_audit(db, "mirror_mappings_prune", target_type="mirror",
+                      detail=json_dumps({
+                          "files_pruned": stats["files_pruned"],
+                          "dirs_pruned": stats["dirs_pruned"],
+                          "media_skipped_unverified": stats["media_skipped_unverified"]}))
+            db.commit()
+        return stats
 
 
 @app.get("/api/mirror/status", dependencies=ADMIN)
@@ -1653,6 +1728,13 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     # v0.8.0：用户在资源库手动修正过的状态锁定，重新识别/回填都不得覆盖人工判断
     if not bool(getattr(x, "finish_locked", False)):
         x.finish_status = str(d.get("finish_status") or "")
+    # v0.8.9：TMDB 官方总集数。只取 tv 的 number_of_episodes，电影恒为 0；
+    # 模板用它与「本地已收录集数」对比，才能显示「更新至 12 / 共 24 集」。
+    try:
+        x.total_episodes = (int(d.get("number_of_episodes") or 0)
+                            if d.get("media_type") == "tv" else 0)
+    except (TypeError, ValueError):
+        x.total_episodes = 0
     # v0.8.1：电影与剧集统一按「作品目录」分享，绝不按单文件。
     # tv 已整理取上上层（剧名目录），movie 取直接父目录（电影主目录）；
     # 父目录是分类目录且无年份/TMDB 标记时退化为按文件，避免整类当一个作品。

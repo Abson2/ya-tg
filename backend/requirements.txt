@@ -6,3 +6,4 @@ pydantic-settings==2.7.1
 httpx==0.28.1
 apscheduler==3.11.0
 cryptography==44.0.2
+pypinyin==0.55.0

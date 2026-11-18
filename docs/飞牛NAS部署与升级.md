@@ -1,4 +1,4 @@
-# 飞牛 NAS 部署与升级教程（v0.8.8）
+# 飞牛 NAS 部署与升级教程（v0.8.9）
 
 > 普通用户只需要 `docker compose` 拉官方镜像，**不用 clone 源码、不用本地构建、不用懂 Python**。
 > 配置与数据库都在 `./db` 卷里，升级时不要删这个目录。
@@ -44,7 +44,7 @@ ADMIN_PASSWORD=换成你自己的强密码
 APP_SECRET=用 openssl rand -hex 32 生成
 ```
 
-其余保持默认。想锁版本就加 `IMAGE_TAG=v0.8.8`；留空跟随 `latest`。
+其余保持默认。想锁版本就加 `IMAGE_TAG=v0.8.9`；留空跟随 `latest`。
 
 ### 3. 启动
 
@@ -114,7 +114,7 @@ docker compose ps
 改 `.env`：
 
 ```dotenv
-IMAGE_TAG=v0.8.8
+IMAGE_TAG=v0.8.9
 ```
 
 然后 `docker compose up -d`。回滚把 `IMAGE_TAG` 改成上一个版本号（如 `v0.7.1`）再 `up -d` 即可；每个 `vX.Y.Z` 标签与 Release 都保留历史版本，不会移动已发布标签。

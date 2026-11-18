@@ -37,6 +37,13 @@ const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, interval_presets: [], unverified_endpoints: [], note: '' })
 const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [] })
+// v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
+const mirrorDiagOpen = ref([])
+const diagCount = computed(() => {
+  const s = mirrorStatus.value
+  return (s.missing_dirs?.length || 0) + (s.file_errors?.length || 0) +
+    (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0)
+})
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
@@ -214,9 +221,12 @@ const icon = name => paths[name] || paths.grid
 const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件块支持嵌套')
 // 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
 const tagHint = computed(() => 'TMDB 分类打标：{{type}}=movie/tv，{{type_label}}=电影/剧集，{{origin_country}}=制片地区，{{genres}}=类型，{{tags}}=组合标签（示例 #保镖恋人 #电影 #爱情 #惊悚）。按示例打标可写：type={{type}} · origin_country={{origin_country}} · genres={{genres}}')
+// v0.8.9：剧集状态 / 集数进度变量，说明含 {{}} 字面量必须由 computed 返回
+const episodeHint = computed(() => '剧集状态：{{episode_status}}=更新至第 N 集 / 共 M 集（完结剧显示「全 M 集 · 已完结」），{{episode_progress}}=N/M，{{updated_to_episode}}=已更新集号，{{total_episodes}}=TMDB 官方总集数，{{current_episode}}=当前集，{{episode_count}}=本地已收录集数。电影时这些变量为空，配合 {{#if}} 条件块使用')
 const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'reward_code', 'size', 'share_url',
   'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
-  'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename']
+  'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename',
+  'episode_status', 'episode_progress', 'updated_to_episode', 'total_episodes', 'current_episode']
 const previewDemo = {
   title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
   filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
@@ -226,7 +236,9 @@ const previewDemo = {
   type: 'movie', type_label: '电影', origin_country: '西班牙', origin_country_code: 'ES',
   genres: '爱情、惊悚', tags: '#保镖恋人 #电影 #西班牙 #爱情 #惊悚',
   vote_average: '7.0', original_title: 'Marfil', season: '', episode: '',
-  episode_tag: '', media_type: 'movie'
+  episode_tag: '', media_type: 'movie',
+  episode_status: '', episode_progress: '', updated_to_episode: '',
+  total_episodes: '', current_episode: ''
 }
 const previewText = computed(() => {
   const raw = tpl.value.content || ''
@@ -479,7 +491,11 @@ async function runMirror(mode = 'auto') {
     const r = d.rename
     if (r) {
       const rp = [`改名 ${r.renamed || 0} · 已达标跳过 ${r.skipped || 0} · 无中文跳过 ${r.ascii || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`]
+      // v0.8.9：TMDB 查不到英文名时直接直译，必须让用户看得到走了哪条兜底
+      if (r.literal_ai || r.literal_pinyin) rp.push(`无官方英文名·直译 ${r.literal_ai || 0} 部 · 拼音兜底 ${r.literal_pinyin || 0} 部`)
       if (r.no_rows) rp.push(`无待改名文件 ${r.no_rows} 部`)
+      // v0.8.9：长剧集分批是正常进度，单独提示「下一轮自动续改」，别让用户以为改失败
+      if (r.notices?.length) rp.push(String(r.notices[0]).slice(0, 160))
       if (r.errors?.length) rp.push(`首个改名错误：${String(r.errors[0]).slice(0, 140)}`)
       extra.push(rp.join(' · '))
     } else if (d.rename_enabled === false) extra.push('本次未自动改名（开关关闭）')
@@ -496,10 +512,11 @@ async function renameMirrorFiles(force = false) {
   mirrorBusy.value = true
   try {
     const d = await api(`/mirror/rename?force=${force ? 'true' : 'false'}`, { method: 'POST' }, 300000)
-    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}`
+    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}` + ((d.literal_ai || d.literal_pinyin) ? ` · 无官方英文名·直译 ${d.literal_ai || 0} 部 · 拼音兜底 ${d.literal_pinyin || 0} 部` : '')
     const first = d.errors?.length ? ` · 首个错误：${String(d.errors[0]).slice(0, 140)}` : ''
-    if (d.failed || d.untranslated) ElMessage.warning(msg + first)
-    else ElMessage.success(msg)
+    const notice = d.notices?.length ? ` · ${String(d.notices[0]).slice(0, 160)}` : ''
+    if (d.failed || d.untranslated) ElMessage.warning(msg + notice + first)
+    else ElMessage.success(msg + notice)
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -514,6 +531,28 @@ async function pollMirrorTasks() {
     await load()
   }
   catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v0.8.9：清理 B 库已不存在的文件 / 目录映射。只重置映射，不删资源与分享。
+async function pruneMirrorMappings() {
+  const ok = await confirmBox(
+    '将只读核对 B 库实际内容，清理其中已不存在的文件 / 目录映射。\n\n' +
+    '只重置映射（保留 A 库文件名与指纹），下一轮「立即同步」会自动补复制并改名；' +
+    '不会删除资源、分享链接或推送队列。\n' +
+    '列目录不可信或整部作品 B 库为空时一律跳过，绝不误清。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/mappings/prune', { method: 'POST' }, 300000)
+    const parts = [`已清理 ${d.files_pruned || 0} 个文件映射 · ${d.dirs_pruned || 0} 个目录映射`]
+    const skipped = (d.media_skipped_unverified || 0) + (d.dirs_skipped_unverified || 0)
+    if (skipped) parts.push(`列目录不可信跳过 ${skipped} 项`)
+    if (d.media_skipped_empty) parts.push(`${d.media_skipped_empty} 部 B 库无文件已跳过，请点「立即同步」补复制`)
+    if (d.errors?.length) parts.push(`首个错误：${String(d.errors[0]).slice(0, 120)}`)
+    if (d.errors?.length) ElMessage.warning(parts.join(' · '))
+    else ElMessage.success(parts.join(' · '))
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
 // ---------- 用户互动 ----------
@@ -1063,7 +1102,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.8 · Asia/Shanghai</div>
+        <div class="foot-version">v0.8.9 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1250,15 +1289,23 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="field inline"><label>B 库单集/电影文件英文改名</label><el-switch v-model="mirrorCfg.rename_files"/></div>
               <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、改名、变化更新的每个文件操作前都会等待。</small></div>
             </div>
+            <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
+              <el-collapse-item name="config-help">
+                <template #title><span class="fold-title">配置说明 · 改名规则 · 链路口径</span></template>
             <p class="hint">开启「同步后自动入库识别并推送」后，同步结束会刷新 B 库入库、识别影视，并把<b>本轮识别成功且拿到海报</b>的影视按 TG 分发规则入队；不会对全库群发，也不会批量补推历史内容变化事件。关闭后定时同步与「立即同步」都只复制文件，需要到资源库手动点「立即扫描」。</p>
-            <p class="hint"><b>v0.8.6 英文改名</b>：开启后按英文剧名改 B 库<b>单集 / 单电影文件名</b>（TMDB en-US 官方片名优先、AI 翻译兜底），<b>只替换中文片名段</b>，季集号 / 年份 / 画质 / 压制组 / 扩展名一律原样保留。A 库只读、B 库分类目录与影视主目录命名不变；A→B 映射靠 source_file_id + 文件指纹保持，改名不影响后期变量更新比对。存量已同步文件点「按英文规范改名」一键处理，不重新复制。解析不到英文剧名的作品会列入下方「英文名待处理」清单，绝不瞎猜改名。</p>
+            <p class="hint"><b>v0.8.9 英文改名</b>：开启后按英文剧名改 B 库<b>单集 / 单电影文件名</b>，<b>只替换中文片名段</b>，季集号 / 年份 / 画质 / 压制组 / 扩展名一律原样保留。A 库只读、B 库分类目录与影视主目录命名不变；A→B 映射靠 source_file_id + 文件指纹保持，改名不影响后期变量更新比对。存量已同步文件点「按英文规范改名」一键处理，不重新复制。<b>TMDB 上查不到官方英文名时不再等待重试</b>：直接用 AI 直译，AI 未配置或超时则本地拼音兜底，保证永远有可用剧名、不卡住复制 / 入库 / 分享。同步、改名、任务轮询共用一把锁，同一时间只跑一个长任务；重复点击会提示「已有任务正在运行」。</p>
             <p class="hint">{{ mirrorCfg.note }}</p>
-            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
+              </el-collapse-item>
+            </el-collapse>
+            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
             <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div><div><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div><div><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div><div><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div><div><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div></div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
+            <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
+              <el-collapse-item name="status-detail">
+                <template #title><span class="fold-title">生效配置 · 已确认接口 · 待验证接口</span></template>
             <p class="hint">
               生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
               · 主目录带 · 标记：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
@@ -1269,7 +1316,16 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             </p>
             <p class="hint">已确认接口：<span v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}；</span></p>
             <p class="hint">待验证接口（未实现，不猜测参数）：<span v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}、</span></p>
+              </el-collapse-item>
+            </el-collapse>
           </div>
+          <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
+            <el-collapse-item name="diagnostics">
+              <template #title>
+                <span class="fold-title">问题诊断</span>
+                <el-tag v-if="diagCount" type="warning" size="small" style="margin-left:8px">{{ diagCount }} 项待处理</el-tag>
+                <span v-else class="fold-sub">无待处理项</span>
+              </template>
           <div v-if="mirrorStatus.missing_dirs?.length" class="panel">
             <div class="panel-head"><h3>待创建目录</h3><el-tag type="warning" size="small">{{ mirrorStatus.missing_dirs.length }} 个</el-tag></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.missing_dirs" size="small">
@@ -1302,11 +1358,15 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-table-column prop="target" label="目标英文名" min-width="200"/>
               <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <div class="panel-foot"><el-button :loading="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button></div>
-            <p class="hint">英文剧名按 TMDB en-US 官方片名优先、AI 翻译兜底，<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。解析不到时不改名、不瞎猜。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库</b>。</p>
+            <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button></div>
+            <p class="hint">英文剧名按 TMDB en-US 官方片名优先、<b>查不到就直接直译</b>（AI 直译 → 本地拼音兜底），<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。v0.8.9 起 TMDB 单次 6 秒、AI 单次 10 秒硬超时，查不到立即走下一层，绝不会卡住整轮同步。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库，也不影响入库与分享</b>。</p>
           </div>
+            </el-collapse-item>
+            <el-collapse-item name="mappings">
+              <template #title><span class="fold-title">目录映射 / 影视映射清单</span></template>
           <div class="panel">
-            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag></div>
+            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag><el-button size="small" :loading="mirrorBusy" :disabled="mirrorBusy" @click="pruneMirrorMappings">清理无效映射</el-button></div>
+            <p class="hint">「清理无效映射」会只读核对 B 库，把其中已不存在的文件 / 目录映射重置为待同步（保留 A 库文件名与指纹），下一轮「立即同步」自动补复制并改名；不删资源、分享链接与推送队列。列目录不可信或整部作品为空时跳过，不会误清。</p>
             <div class="table-scroll"><el-table :data="mirrorStatus.dirs || []" size="small">
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
@@ -1329,6 +1389,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             </el-table></div>
             <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。文件数为 0 但状态显示已同步时，优先看上面的「文件复制失败 / 待重试」清单。</p>
           </div>
+            </el-collapse-item>
+          </el-collapse>
         </section>
 
         <section v-else-if="tab === '互动中心'" class="fade">
@@ -1678,6 +1740,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>
               <div class="var-grid"><button v-for="v in templateVars" :key="v" @click="insertVar(v)">{{ v }}</button></div>
               <p class="hint" style="margin:0 0 12px">{{ tagHint }}</p>
+              <p class="hint" style="margin:0 0 12px">{{ episodeHint }}</p>
               <div class="preview-box"><div class="preview-title">预览效果</div><div class="preview-body">{{ previewText }}</div></div>
               <p class="hint">条件块写法：{{ syntaxHint }}</p>
             </div>
@@ -1841,7 +1904,13 @@ button{font-family:inherit}
 .kv-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.kv-grid small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.kv-grid b{font-size:13px;word-break:break-all}
 .hint{color:#929bb5;font-size:11px;line-height:1.8;margin:12px 0 0}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
-.panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line)}
+.panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
+/* v0.8.9：镜像同步页折叠分区，长说明与诊断表格不再堆满一屏 */
+.mirror-fold{margin-top:14px;border-top:1px dashed var(--yg-line);border-bottom:0}
+.mirror-fold .el-collapse-item__header{font-size:12px;font-weight:600;color:#4b5270;min-height:38px;height:auto;padding:8px 0}
+.mirror-fold .el-collapse-item__content{padding-bottom:8px}
+.fold-title{font-size:12px;font-weight:600;color:#4b5270}
+.fold-sub{margin-left:8px;font-size:11px;color:#929bb5;font-weight:400}
 .cursor-box{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.cursor-box small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.cursor-box b{font-size:18px}
 .view-switch{display:flex;border:1px solid var(--yg-line);border-radius:9px;overflow:hidden}.view-switch button{border:0;background:#fff;padding:7px 10px;cursor:pointer;color:#9aa3bd}.view-switch button.on{background:#eeedff;color:var(--yg-primary)}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:14px}

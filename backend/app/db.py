@@ -70,6 +70,8 @@ _COLUMNS = {
         "finish_status": "TEXT DEFAULT ''",
         # v0.8.0：手动修正完结/追更后锁定，TMDB 自动回填不得覆盖
         "finish_locked": "BOOLEAN DEFAULT 0",
+        # v0.8.9：TMDB 官方总集数，供「更新至 N / 共 M 集」模板变量
+        "total_episodes": "INTEGER DEFAULT 0",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
         # v0.6.3：目录 fileId 链 + 剧集目录级分享
@@ -115,11 +117,14 @@ _COLUMNS = {
 
 
 # v0.6.5 默认模板：参考「保镖恋人」示例，整剧/整季展示，不暴露单集文件名。
-# v0.6.5 在 v0.6.4 基础上补「集数」行，让 TG 消息显示整剧总集数而非单集信息。
+# v0.8.9 补「剧集状态 / 集数进度」两行：追更剧显示「更新至第 N 集 / 共 M 集」，
+# 完结剧显示「全 M 集 · 已完结」； episode_count 改为「已收录」，避免与总集数重复。
 DEFAULT_TEMPLATE = (
     "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
     "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
-    "{{#if episode_count}}📼 集数：共 {{episode_count}} 集\n{{/if}}"
+    "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
+    "{{#if episode_progress}}🔢 进度：{{episode_progress}}\n{{/if}}"
+    "{{#if episode_count}}📼 本地已收录：共 {{episode_count}} 集\n{{/if}}"
     "{{#if tmdb_url}}🔗 TMDB：<a href=\"{{tmdb_url}}\">#{{tmdb_id}}</a>\n{{/if}}"
     "{{#if vote_average}}⭐ 评分：{{vote_average}}/10\n{{/if}}"
     "{{#if resolution}}📐 画质：{{resolution}}\n{{/if}}"
@@ -168,18 +173,26 @@ def _is_legacy_default(content: str) -> bool:
 
 
 def _needs_template_upgrade(content: str) -> bool:
-    """v0.6.5：判断存量默认模板是否需要升级到当前版本（老版整剧结构缺集数行）。
+    """判断存量默认模板是否需要升级到当前版本。
 
-    覆盖两类：
+    覆盖三类：
       1) v0.5.x/v0.6.0 老模板（含单集文件名/type= 调试行）；
-      2) v0.6.4 整剧模板（含 🎬，但缺 v0.6.5 新增的 {{episode_count}} 行）。
-    这样从 v0.6.4 升级的用户也能拿到集数显示——正是「已升级但模板没变」的根因。
-    用户真正自定义的模板（不含默认模板特征）不会被改动。
+      2) v0.6.4 整剧模板（含 🎬，但缺 v0.6.5 新增的 {{episode_count}} 行）；
+      3) v0.6.5~v0.8.8 默认模板（含 v0.8.9 之前的集数行原句，缺剧集状态行）。
+    第 3 类用**整句精确匹配**识别，用户自己改过、同样含 {{episode_count}} 的
+    自定义模板一律不动——这正是「升级了但模板没变 / 升级把自定义覆盖」的两头坑。
     """
     c = content or ""
     if not c:
         return False
-    if "{{episode_count}}" in c:  # 已是 v0.6.5 新版
+    if "{{episode_status}}" in c:  # 已是 v0.8.9 新版
+        return False
+    # v0.6.5~v0.8.8 默认模板：集数行原句 + 默认骨架。两者同时命中才升级，
+    # 用户自己改过、恰好也用了 {{episode_count}} 的自定义模板一律不动。
+    if ("📼 集数：共 {{episode_count}} 集" in c
+            and "🎬 {{title}}" in c and "🔗 TMDB" in c):
+        return True
+    if "{{episode_count}}" in c:  # 自定义模板：保持原样
         return False
     if _is_legacy_default(c):
         return True

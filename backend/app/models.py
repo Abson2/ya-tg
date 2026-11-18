@@ -49,6 +49,9 @@ class Resource(Base):
     finish_status: Mapped[str] = mapped_column(String(16), default="")  # ended/returning/""
     # v0.8.0：用户在资源库手动修正完结/追更后锁定，禁止 TMDB 自动回填覆盖人工判断
     finish_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    # v0.8.9：TMDB 官方总集数（tv.number_of_episodes），供推送模板「更新至 N/总 M 集」使用。
+    # 与本地实际收录集数（模板 episode_count）刻意分开：追更剧两者不等才有意义。
+    total_episodes: Mapped[int] = mapped_column(Integer, default=0)
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")

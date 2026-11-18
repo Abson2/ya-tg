@@ -20,6 +20,13 @@
      每部作品只读列一次 B 库核对已同步记录；只有列目录完整可信且确实找不到时，
      才把 `synced` 重置为 `pending` 复用同一行重新复制。B 库文件数不少于已同步
      记录数时绝不重置（可能只是网盘改名 / 重名加后缀），避免重复复制整部作品。
+  8. v0.8.9：**绝不跨 `await` 持有 SQLite 写事务**。本模块所有写操作一律用
+     `db.commit()`，不保留只 flush 不提交的写法：复制/改名循环里每个文件之间都有
+     `await asyncio.sleep(idle)`、`await api.copy_file/rename_file`、
+     `await _poll_tasks_batch()`，这些网络等待动辄几十秒。SQLite 只有一个写者，
+     只要事务没提交，管理页所有要写库的请求就会排到 30 秒 busy_timeout，
+     表现就是「整理剧集改名时后台页面卡死打不开」。v0.8.8 只在 scanner.run_scan()
+     修过同类问题，本模块漏了；此处统一收紧，勿改回 flush。
 
 v0.8.4 接口取证口径（务必区分三类，勿再混为一谈）：
   - w.har 抓到真实请求+响应：create_dir / rename / delete_file / get_file_list / get_task_status。
@@ -34,12 +41,13 @@ v0.8.4 接口取证口径（务必区分三类，勿再混为一谈）：
 import asyncio
 import logging
 import re
+import time
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import ai_assist, tmdb
-from .file_naming import (english_file_name, sanitize_english_title,
+from .file_naming import (english_file_name, pinyin_title, sanitize_english_title,
                           with_conflict_suffix, work_core_title)
 from .guangya import GuangYaWebFiles, WebFileError
 from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask, Resource
@@ -47,6 +55,15 @@ from .utils import (NAME_MARK, VIDEO_EXTS, media_identity, normalize_work_name,
                     parse_media_name, standard_media_name, star_media_name, utcnow)
 
 logger = logging.getLogger(__name__)
+
+# v0.8.9：长剧集分批改名。《中国通史》这类百集作品一轮连发上百次 rename，
+# 每个文件间隔 idle 秒，网盘偶发 429/5xx 时 _post_web 还会退避重试三次
+# （1+2+4 秒），单轮轻松超过前端 300 秒超时 → 界面报「改名失败」但其实
+# 已改了一部分。每轮只处理有限文件 / 有限时长，剩下的下一轮自动续改：
+# 每个文件改名后立即 commit，未处理的行 rename_status 仍为空，下轮会再被选中。
+RENAME_MAX_FILES = 50
+RENAME_MAX_SECONDS = 90.0
+RENAME_MAX_CONSECUTIVE_FAILURES = 5
 
 # v0.8.1：w.har 已取证 create_dir / rename / delete_file（含批量）。
 # 下面只保留仍未取证的转存能力；前端 JS 里虽出现 move_file / recycle_file 等路径，
@@ -220,7 +237,7 @@ def _record_dir(db: Session, rule_id: int, source_dir_id: str, parent_target_id:
     row.status = status
     row.error = str(error or "")[:500]
     row.updated_at = utcnow()
-    db.flush()
+    db.commit()
 
 
 def _purge_legacy_failed(db: Session, rule_id: int) -> int:
@@ -666,7 +683,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                                 target_dir_id=target_dir_id if not missing_all else "",
                                 category_path=cat_path)
             db.add(media)
-            db.flush()
+            db.commit()
         else:
             media.title_standard = title
             media.title_mirror = expected
@@ -742,7 +759,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     stats["unchanged"] += 1
                     del retry_rows[key]
                     synced_rows[key] = old
-            db.flush()
+            db.commit()
         sub_cache: dict[str, str] = {}
         copy_jobs: list[tuple[MirrorFile, str, str]] = []
         for container, item in _media_files(work, nodes):
@@ -803,7 +820,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                                  utime=int(item.get("utime", 0) or 0),
                                  fingerprint=fp, status="copying")
                 db.add(row)
-                db.flush()
+                db.commit()
                 stats["new"] += 1
             else:
                 stats["retries"] += 1
@@ -839,7 +856,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
                               status="running")
             db.add(task)
-            db.flush()
+            db.commit()
             row.task_id = task_id
             tasks.append((task, [row]))
             stats["tasks"] += 1
@@ -980,13 +997,31 @@ async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
 
 
 # ---------- v0.8.6：B 库单集/单电影文件按英文剧名改名 ----------
+# v0.8.9：英文名解析的每个外部调用都必须有硬上限。TMDB 详情 httpx 超时 20 秒、
+# AI 模型可能更久；旧版对 media_type 未知的作品还会串行查 movie + tv 再等 AI，
+# 一部剧就能把整轮同步卡几十秒，管理页直接打不开。
+ENGLISH_TITLE_TMDB_TIMEOUT = 6.0
+ENGLISH_TITLE_AI_TIMEOUT = 10.0
+
+
+async def _bounded(coro, timeout: float, label: str):
+    """硬超时 + 异常一律当作「没查到」，让调用方立刻走直译，绝不拖住主链路。"""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except Exception as exc:
+        logger.debug("[mirror] %s 跳过（%s: %s）", label, type(exc).__name__, str(exc)[:120])
+        return None
+
+
 async def _resolve_english_title(db: Session, media: MirrorMedia, *,
                                  force: bool = False) -> tuple[str, str]:
     """每部作品只解析一次英文剧名，缓存到 `MirrorMedia.english_title`。
 
-    优先级：TMDB en-US 官方英文片名 → 已识别 `Resource.original_title`（纯 ASCII）
-    → AI 翻译中文剧名。都没有就返回空串，由调用方列入「英文名待处理」清单，
-    **绝不瞎猜、绝不把中文原名当英文剧名写进文件名**。
+    v0.8.9 用户口径：「在 tmdb 上找不到英文名称的剧集卡死了，找不到就直接直译」。
+    优先级：本地缓存 → 已识别 `Resource.original_title` → TMDB en-US（**只查一次**、
+    6 秒硬超时）→ **AI 直译中文剧名**（10 秒硬超时）→ **本地拼音直译**（零网络）。
+    最后一层保证永远有可用 ASCII 剧名，绝不会因为某部剧查不到英文名而卡住
+    复制 / 入库 / 分享 / 推送主链路。
     """
     cached = str(getattr(media, "english_title", "") or "").strip()
     if cached and not force:
@@ -995,7 +1030,7 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     eng, source = "", ""
     if not core:
         media.english_title, media.english_source = "", ""
-        db.flush()
+        db.commit()
         return "", ""
 
     # 1) 收集可复用的识别结果：A 目录里的 {tmdb-} 标记 + 已回填 B fileId 的 Resource
@@ -1016,38 +1051,42 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
         if orig:
             eng, source = orig, "resource"
 
-    # 2) TMDB en-US 优先：官方英文片名比 AI 直译稳定，且每部只请求一次
+    # 2) TMDB en-US 只给一次机会。旧版对 mtype 未知会试 movie + tv 两次（最多 40 秒），
+    #    是「TMDB 找不到英文名的剧集卡死」的直接来源。查不到立即转直译。
     if tid and not eng:
-        order = [mtype] if mtype in ("movie", "tv") else ["movie", "tv"]
-        for mt in order:
-            try:
-                v = sanitize_english_title(await tmdb.english_title(tid, mt, db))
-            except Exception as exc:
-                logger.debug("[mirror] TMDB 英文片名 %s/%s 不可用：%s", tid, mt, exc)
-                continue
-            if v:
-                eng, source = v, "tmdb"
-                break
+        mt = mtype if mtype in ("movie", "tv") else "movie"
+        raw = await _bounded(tmdb.english_title(tid, mt, db),
+                             ENGLISH_TITLE_TMDB_TIMEOUT, f"TMDB en-US {tid}/{mt}")
+        v = sanitize_english_title(str(raw or ""))
+        if v:
+            eng, source = v, "tmdb"
 
-    # 3) AI 翻译兜底（未配置时静默降级，不阻断同步）
+    # 3) 直译：TMDB 无英文名（或超时 / 密钥无效）时直接用 AI 翻译中文剧名
     if not eng:
-        try:
-            tr = await ai_assist.translate_title(core, year, db)
+        tr = await _bounded(ai_assist.translate_title(core, year, db),
+                            ENGLISH_TITLE_AI_TIMEOUT, f"AI 直译 {core}")
+        if isinstance(tr, dict):
             titles = tr.get("titles") or {}
             cand = str(titles.get("en") or (tr.get("queries") or [""])[0])
             v = sanitize_english_title(cand)
             if v:
                 eng, source = v, "ai"
-        except Exception as exc:
-            logger.debug("[mirror] AI 翻译英文剧名失败：%s", exc)
+
+    # 4) 零网络兜底：AI 未配置 / 超时 / 模型不给结果时本地拼音直译，保证必有名字
+    if not eng:
+        v = pinyin_title(core)
+        if v:
+            eng, source = v, "pinyin"
 
     media.english_title, media.english_source = eng, source
-    db.flush()
+    db.commit()
     return eng, source
 
 
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
-                              force: bool = False, max_media: int = 100) -> dict:
+                              force: bool = False, max_media: int = 100,
+                              max_files: int | None = None,
+                              max_seconds: float | None = None) -> dict:
     """把 B 库已同步的单集 / 单电影文件按英文剧名改名（只换中文片名段）。
 
     边界：
@@ -1059,21 +1098,43 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         后期 A 库文件变量更新照常能识别出来并触发更新。
     """
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
+    file_budget = int(max_files if max_files is not None else RENAME_MAX_FILES)
+    time_budget = float(max_seconds if max_seconds is not None else RENAME_MAX_SECONDS)
     stats = {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
              "untranslated": 0, "failed": 0, "no_rows": 0, "errors": [],
-             "untranslated_works": [], "idle_seconds": idle}
+             # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
+             "notices": [],
+             "literal_ai": 0, "literal_pinyin": 0,
+             "remaining": 0, "truncated_reason": "", "attempts": 0,
+             "untranslated_works": [], "idle_seconds": idle,
+             "file_budget": file_budget, "time_budget": time_budget}
+    started_all = time.monotonic()
+    attempts = 0
+    consecutive_failures = 0
+    stop_reason = ""
     api = GuangYaWebFiles(db)
     medias = list(db.scalars(select(MirrorMedia).where(
         MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")).all())
     for media in medias[:max_media]:
-        eng, _source = await _resolve_english_title(db, media, force=force)
+        # v0.8.9：预算/熔断一旦触发，后续作品本轮一律不处理。旧写法会继续
+        # 为每部作品解析英文名（TMDB/AI 网络等待）却一个文件都不改，还逐部
+        # 堆一条 errors —— 百集剧目录里会拖出几十秒无谓等待。
+        if stop_reason:
+            break
+        eng, source = await _resolve_english_title(db, media, force=force)
+        # v0.8.9：让用户看得到「TMDB 查不到 → 直接用直译」有没有生效
+        if source == "ai":
+            stats["literal_ai"] += 1
+        elif source == "pinyin":
+            stats["literal_pinyin"] += 1
         if not eng:
+            # 有拼音兜底后几乎不会走到这里；真走到也只跳过改名，主链路照常
             stats["untranslated"] += 1
             if len(stats["untranslated_works"]) < 50:
                 stats["untranslated_works"].append({
                     "work": media.title_standard,
-                    "reason": "TMDB en-US 与 AI 翻译都没给出可用英文剧名，"
-                              "请检查 TMDB 密钥 / AI 配置，或等该作品被识别后重跑"})
+                    "reason": "TMDB / AI 直译 / 本地拼音都没给出可用剧名，已跳过改名；"
+                              "复制、入库、分享与推送不受影响，可点「重新解析英文名并改名」重试"})
             continue
         core, _year = work_core_title(media.title_standard)
         rows = list(db.scalars(select(MirrorFile).where(
@@ -1093,62 +1154,218 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         for k, v in name_fids.items():
             fid_to_norm.setdefault(str(v), k)
         first = True
-        for row in rows:
-            target = english_file_name(row.file_name, core, eng)
-            if not target:
-                stats["ascii"] += 1
-                row.rename_status = "skipped_ascii"
-                continue
-            # v0.8.8：优先用 B 库列目录命中的 fileId；DB 里的 target_file_id
-            # 可能是补复制前旧文件的 ID，列目录失败时才回退到 DB 值。
-            fid = _lookup_b_file(candidates, row) or str(row.target_file_id or "")
-            if not fid:
-                row.rename_status, row.rename_error = "failed", "B 库未找到对应 fileId，未改名"
-                stats["failed"] += 1
-                stats["errors"].append(
-                    f"{media.title_standard}/{row.file_name}：B 库未找到对应 fileId")
-                continue
-            final, n = target, 1
-            while (normalize_work_name(final) in name_fids
-                   and name_fids[normalize_work_name(final)] != fid and n < 20):
-                n += 1
-                final = with_conflict_suffix(target, n)
-            cur = fid_to_norm.get(str(fid), "")
-            if cur and cur == normalize_work_name(final):
-                # B 库当前确实已是目标英文名：只纠正 DB 状态，不重复调接口
+        for idx, row in enumerate(rows):
+            fname = str(row.file_name or "")
+            # v0.8.9：预算与熔断。已达标跳过不消耗「尝试次数」，保证下轮能
+            # 快速跳过已改名的文件、把预算留给真正还没改的那部分。
+            if time.monotonic() - started_all >= time_budget:
+                stop_reason = "time_budget"
+                break
+            if attempts >= file_budget:
+                stop_reason = "file_budget"
+                break
+            if consecutive_failures >= RENAME_MAX_CONSECUTIVE_FAILURES:
+                stop_reason = "rate_limited"
+                break
+            try:
+                target = english_file_name(fname, core, eng)
+                if not target:
+                    stats["ascii"] += 1
+                    row.rename_status = "skipped_ascii"
+                    db.commit()
+                    continue
+                # v0.8.8：优先用 B 库列目录命中的 fileId；DB 里的 target_file_id
+                # 可能是补复制前旧文件的 ID，列目录失败时才回退到 DB 值。
+                fid = _lookup_b_file(candidates, row) or str(row.target_file_id or "")
+                if not fid:
+                    # 列目录没覆盖到 ≠ 文件不存在。标「待可见」而非永久失败，
+                    # 下一轮自动重试，不让百集剧的后半段被一次性判死。
+                    row.rename_status = "pending_visible"
+                    row.rename_error = "B 库列目录暂未找到该文件（网盘可能尚未可见），下一轮自动重试"
+                    db.commit()
+                    attempts += 1
+                    continue
+                final, n = target, 1
+                while (normalize_work_name(final) in name_fids
+                       and name_fids[normalize_work_name(final)] != fid and n < 20):
+                    n += 1
+                    final = with_conflict_suffix(target, n)
+                cur = fid_to_norm.get(str(fid), "")
+                if cur and cur == normalize_work_name(final):
+                    # B 库当前确实已是目标英文名：只纠正 DB 状态，不重复调接口
+                    row.target_file_id = fid
+                    row.target_name = final
+                    row.rename_status, row.rename_error = "done", ""
+                    stats["skipped"] += 1
+                    db.commit()
+                    continue
+                # 列目录不完整时不信任实际名字，退回 DB 幂等判断，防接口抖动误改
+                if not b_verified and row.target_name == final and row.rename_status == "done":
+                    stats["skipped"] += 1
+                    continue
+                if not first:
+                    await asyncio.sleep(idle)  # 与复制/建目录共用同一风控间隔
+                first = False
+                attempts += 1
+                stats["attempts"] += 1
+                try:
+                    await api.rename_file(fid, final)
+                except Exception as exc:
+                    msg = str(exc)[:300]
+                    row.rename_status, row.rename_error = "failed", msg
+                    stats["failed"] += 1
+                    consecutive_failures += 1
+                    stats["errors"].append(
+                        f"{media.title_standard}/{fname}：改名失败 {msg[:160]}")
+                    logger.warning("[mirror] rename 失败 %s/%s：%s",
+                                   media.title_standard, fname, msg)
+                    db.commit()
+                    continue
+                consecutive_failures = 0
                 row.target_file_id = fid
                 row.target_name = final
                 row.rename_status, row.rename_error = "done", ""
-                stats["skipped"] += 1
-                db.flush()
-                continue
-            # 列目录不完整时不信任实际名字，退回 DB 幂等判断，防接口抖动误改
-            if not b_verified and row.target_name == final and row.rename_status == "done":
-                stats["skipped"] += 1
-                continue
-            if not first:
-                await asyncio.sleep(idle)  # 与复制/建目录共用同一风控间隔
-            first = False
-            try:
-                await api.rename_file(fid, final)
+                row.updated_at = utcnow()
+                name_fids[normalize_work_name(final)] = fid
+                stats["renamed"] += 1
+                db.commit()
             except Exception as exc:
-                msg = str(exc)[:300]
-                row.rename_status, row.rename_error = "failed", msg
-                stats["failed"] += 1
-                stats["errors"].append(
-                    f"{media.title_standard}/{row.file_name}：改名失败 {msg[:160]}")
-                logger.warning("[mirror] rename 失败 %s/%s：%s",
-                               media.title_standard, row.file_name, msg)
-                continue
-            row.target_file_id = fid
-            row.target_name = final
-            row.rename_status, row.rename_error = "done", ""
-            row.updated_at = utcnow()
-            name_fids[normalize_work_name(final)] = fid
-            stats["renamed"] += 1
-            db.flush()
+                # v0.8.9：任何单文件异常（含 db.commit 写冲突）只影响当前文件，
+                # 绝不中断整部剧 —— 这正是「长剧集只改了一部分」的旧病灶。
+                msg = f"{type(exc).__name__}: {exc}"[:300]
+                logger.warning("[mirror] 改名单文件异常 %s/%s：%s",
+                               media.title_standard, fname, msg)
+                stats["errors"].append(f"{media.title_standard}/{fname}：{msg[:160]}")
+                try:
+                    db.rollback()
+                    row.rename_status, row.rename_error = "failed", msg
+                    db.commit()
+                    stats["failed"] += 1
+                    consecutive_failures += 1
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    stop_reason = "db_error"
+                    break
         stats["works"] += 1
         db.commit()
+    if stop_reason:
+        # v0.8.9：一次性统计全局剩余（含本轮完全没触及的后续作品），只给一条
+        # 明确提示。旧写法逐部累加还会在空 rows 时误用上一轮的 idx。
+        stats["truncated_reason"] = stop_reason
+        remaining = db.scalar(select(func.count()).select_from(MirrorFile).where(
+            MirrorFile.rule_id == rule.id,
+            MirrorFile.status == "synced",
+            or_(MirrorFile.rename_status.is_(None),
+                MirrorFile.rename_status != "done"))) or 0
+        stats["remaining"] = int(remaining)
+        stats["notices"].append(
+            f"本轮改名到上限（{stop_reason}），剩余 {stats['remaining']} 个文件"
+            "下一轮自动续改，不是失败；可多点几次「立即同步」推进进度")
+    return stats
+
+
+async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
+                               dry_run: bool = False,
+                               max_media: int = 200) -> dict:
+    """v0.8.9：只读核对 B 库实际内容，清理「B 库已经不存在」的 A→B 映射。
+
+    用户反馈「目录映射清单没有清理无效的按钮」。这里给出可预览、可执行的清理，
+    但绝不按 DB 状态猜、绝不在列目录不可信时动手。
+
+    红线：
+      1. 只有 `_b_file_candidates()` / `_list_dir()` 返回完整可信且确实读到内容时
+         才清理；接口异常、分页截断、整部作品一个文件都没有 → 一律跳过，交给
+         `sync_rule()` 自动补复制，绝不让一次接口抖动清掉整部剧的映射。
+      2. 只重置映射字段，**不删行**：MirrorFile 保留 A 库锚点
+         (`file_name` / `source_file_id` / `fingerprint`)，把 status 置 pending、
+         清 target_file_id / target_name / rename_status，下轮同步自动补复制并改名。
+      3. 不动 Resource / share_url / QueueItem / DistributionEvent，也不删 B 库文件。
+      4. 每次写立即 `db.commit()`（设计红线 8：绝不跨 await 持有 SQLite 写事务）。
+    """
+    api = GuangYaWebFiles(db)
+    stats = {"ok": True, "dry_run": bool(dry_run), "media_checked": 0,
+             "media_skipped_unverified": 0, "media_skipped_empty": 0,
+             "files_pruned": 0, "dirs_checked": 0, "dirs_pruned": 0,
+             "dirs_skipped_unverified": 0, "samples": [], "errors": []}
+    medias = list(db.scalars(select(MirrorMedia).where(
+        MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")).all())
+    for media in medias[:max_media]:
+        stats["media_checked"] += 1
+        try:
+            candidates, verified = await _b_file_candidates(api, media)
+        except Exception as exc:
+            stats["media_skipped_unverified"] += 1
+            stats["errors"].append(
+                f"{media.title_standard}：列 B 库失败 {str(exc)[:120]}")
+            continue
+        visible = {str(v) for v in candidates.values()}
+        if not verified:
+            stats["media_skipped_unverified"] += 1
+            continue
+        if not visible:
+            # 整部作品 B 库无文件：不清映射，交给同步补复制（v0.8.7 同一口径）
+            stats["media_skipped_empty"] += 1
+            continue
+        rows = list(db.scalars(select(MirrorFile).where(
+            MirrorFile.media_id == media.id,
+            MirrorFile.target_file_id != "",
+            MirrorFile.status.in_(["synced", "copying", "failed", "unknown"]))).all())
+        for row in rows:
+            if str(row.target_file_id) in visible:
+                continue
+            stats["files_pruned"] += 1
+            if len(stats["samples"]) < 20:
+                stats["samples"].append(f"{media.title_standard}/{row.file_name}")
+            if dry_run:
+                continue
+            row.status = "pending"
+            row.target_file_id = ""
+            row.target_name = ""
+            row.rename_status = ""
+            row.rename_error = ""
+            row.task_id = ""
+            row.error = "B 库实际文件已不存在，映射已清理，等待下轮同步补复制"
+            row.updated_at = utcnow()
+            db.commit()
+
+    # 目录映射：按父目录分组，只读列一次即可核对同组所有兄弟，避免接口风暴
+    dirs = list(db.scalars(select(MirrorDir).where(
+        MirrorDir.rule_id == rule.id,
+        MirrorDir.target_dir_id != "",
+        MirrorDir.status != "missing")).all())
+    groups: dict[str, list[MirrorDir]] = {}
+    for d in dirs:
+        groups.setdefault(str(d.parent_target_id or ""), []).append(d)
+    for pid, group in groups.items():
+        if not pid:
+            stats["dirs_skipped_unverified"] += len(group)
+            continue
+        try:
+            items, ok = await _list_dir(api, pid)
+        except Exception:
+            items, ok = [], False
+        if not ok:
+            stats["dirs_skipped_unverified"] += len(group)
+            continue
+        alive = {str(it.get("fileId") or "") for it in items
+                 if int(it.get("resType", 1) or 1) == 2}
+        stats["dirs_checked"] += len(group)
+        for d in group:
+            if str(d.target_dir_id) in alive:
+                continue
+            stats["dirs_pruned"] += 1
+            if len(stats["samples"]) < 20:
+                stats["samples"].append(f"目录 {d.category_path or d.name_standard}")
+            if dry_run:
+                continue
+            d.target_dir_id = ""
+            d.status = "missing"
+            d.error = "B 库该目录已不存在，映射已清理，下轮同步自动重建"
+            d.updated_at = utcnow()
+            db.commit()
     return stats
 
 

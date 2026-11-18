@@ -211,16 +211,23 @@ def test_ai_fallback_when_tmdb_unavailable(db):
     assert db.get(MirrorFile, row.id).target_name.startswith("Drunk Hero AI")
 
 
-def test_no_english_title_keeps_file_and_lists_work(db):
+def test_no_english_title_uses_local_transliteration(db):
+    """v0.8.9 用户口径：TMDB 查不到英文名就直接直译，不许卡住、不许跳过主链路。
+
+    v0.8.6~v0.8.8 的行为是「列入待翻译、整部跳过」，实测会让剧集卡在 TMDB
+    等待上、后台管理页打不开。现在 AI 不可用时还有本地拼音兜底，保证必有剧名。
+    """
     rule, media, row = _seed(db)
     with _mocks(tmdb_title="", ai_en=""):
         out = _run(mirror.rename_mirror_files(db, rule))
-    assert out["renamed"] == 0 and out["untranslated"] == 1
-    assert out["untranslated_works"][0]["work"] == WORK
-    assert FakeAPI.renamed == []
+    assert out["renamed"] == 1 and out["untranslated"] == 0, out
+    assert out["literal_pinyin"] == 1, out
+    assert FakeAPI.renamed and FakeAPI.renamed[0][1].startswith("Da Zui Xia")
     db.expire_all()
-    assert db.get(MirrorFile, row.id).target_name == ""
-    assert db.get(MirrorMedia, media.id).english_title == ""
+    assert db.get(MirrorMedia, media.id).english_source == "pinyin"
+    assert db.get(MirrorFile, row.id).target_name.startswith("Da Zui Xia")
+    # A 原名仍是映射锚点，直译只改 B 库文件名
+    assert db.get(MirrorFile, row.id).file_name == ZH_NAME
 
 
 def test_rename_is_idempotent(db):

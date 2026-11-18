@@ -10,8 +10,9 @@
     A→B 映射与增量比对仍用 `source_file_id + fingerprint(size:utime)`，与文件名无关，
     因此改名不会破坏「后期对比变量更新」。
 
-英文名来源由 `mirror._resolve_english_title()` 负责（TMDB en-US 优先、AI 翻译兜底），
+英文名来源由 `mirror._resolve_english_title()` 负责（TMDB en-US → AI 直译 → 本地拼音），
 本模块只负责「拿到英文名之后怎么拼出 B 库文件名」。
+v0.8.9：新增 `pinyin_title()` 零网络兜底，TMDB 查不到且 AI 不可用也必须有可用英文名。
 """
 import re
 
@@ -47,6 +48,30 @@ def sanitize_english_title(title: str) -> str:
     if not t or _CN.search(t) or not re.search(r"[A-Za-z]", t):
         return ""
     return t[:120]
+
+
+def pinyin_title(chinese: str) -> str:
+    """v0.8.9：零网络兜底「直译」——中文剧名转拼音，保证永远有 ASCII 剧名。
+
+    TMDB en-US 查不到、AI 直译未配置或超时时，绝不把整轮同步卡在网络等待上：
+    直接在本地生成纯 ASCII 剧名，让 B 库单集/电影文件名不再含中文。
+    这是音译而非语义直译，仅作最后一层兜底；AI 可用时优先用 AI 直译。
+    `pypinyin` 是纯 Python 依赖，缺包时返回空串由调用方列入「待翻译」清单。
+    """
+    text = str(chinese or "").strip()
+    if not text or not _CN.search(text):
+        return ""
+    try:
+        from pypinyin import lazy_pinyin
+        parts = lazy_pinyin(text)
+    except ImportError:
+        return ""
+    words: list[str] = []
+    for part in parts:
+        p = re.sub(r"[^A-Za-z0-9]", "", str(part))
+        if p:
+            words.append(p[:1].upper() + p[1:].lower())
+    return sanitize_english_title(" ".join(words))
 
 
 def _core_variants(core: str) -> list[str]:

@@ -90,6 +90,9 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     可用：type / type_label / origin_country / origin_country_code / genres / tags，
     以及原有 title/overview/filename/year/resolution/size/tmdb_id/tmdb_url/share_url，
     另有 vote_average/original_title/season/episode/episode_tag/media_type。
+    v0.8.9 剧集状态组：episode_count（本地已收录集数）/ total_episodes（TMDB 官方总集数）
+    / updated_to_episode（已更新到第几集）/ current_episode（当前集）
+    / episode_progress（如 12/24）/ episode_status（如「更新至第 12 集 / 共 24 集 · 连载中」）。
     """
     esc = lambda v: html.escape(str(v if v is not None else ""), quote=False)
     title = res.media_title or res.name
@@ -116,6 +119,13 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     total_size = int(res.size or 0)
     whole_season_label = f"第{int(season)}季" if season else ""
     episode_count = ""
+    # v0.8.9：剧集状态与集数进度。episode_count 一直是「本地已收录集数」，
+    # 这里补上 TMDB 官方总集数、已更新到第几集，追更剧才能显示「更新至 12/24 集」。
+    total_episodes = 0
+    updated_ep = 0
+    cur_ep = 0
+    episode_progress = ""
+    episode_status = ""
     if res.media_type == "tv":
         key = work_group_key(res)
         sibs = [s for s in db.scalars(select(Resource)).all()
@@ -133,6 +143,35 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
             n = len(eps) if eps else len(videos)
             if n > 0:
                 episode_count = str(n)
+            # 官方总集数：同作品任一条识别结果里取最大非零值（单集都写了同一值）。
+            total_episodes = max((int(getattr(s, "total_episodes", 0) or 0)
+                                  for s in sibs), default=0)
+            # 已更新到第几集：多季剧取最后一季的最大集号；文件名解析不出集号时
+            # （未识别单集）退回本地视频数，绝不显示 0/N 这种误导值。
+            if eps:
+                last_season = max(se for se, _ in eps)
+                updated_ep = max(ep for se, ep in eps if se == last_season)
+            else:
+                updated_ep = n
+            cur_ep = int(episode) if episode else (updated_ep or 0)
+            if total_episodes > 0 and updated_ep > 0:
+                episode_progress = f"{updated_ep}/{total_episodes}"
+            elif updated_ep > 0:
+                episode_progress = f"第 {updated_ep} 集 / 已收录 {n} 集"
+            finish = (str(res.finish_status or "")
+                      or next((str(s.finish_status or "") for s in sibs
+                               if str(s.finish_status or "")), ""))
+            if total_episodes > 0:
+                if finish == "ended" and updated_ep >= total_episodes:
+                    episode_status = f"全 {total_episodes} 集 · 已完结"
+                else:
+                    episode_status = f"更新至第 {updated_ep} 集 / 共 {total_episodes} 集"
+                    if finish == "returning":
+                        episode_status += " · 连载中"
+            elif updated_ep > 0:
+                episode_status = f"更新至第 {updated_ep} 集 · 已收录 {n} 集"
+                if finish == "ended":
+                    episode_status += " · 已完结"
     season_label = whole_season_label  # v0.6.4：整剧展示用「第N季」而非单集信息
     version = version_spec(res.name)
 
@@ -166,7 +205,13 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "episode": episode or "",
         "episode_tag": episode_tag,
         "season_label": esc(season_label),
+        # v0.8.9：本地已收录集数 / TMDB 官方总集数 / 已更新集号 / 当前集 / 进度 / 状态文案
         "episode_count": esc(episode_count),
+        "total_episodes": str(total_episodes) if total_episodes else "",
+        "updated_to_episode": str(updated_ep) if updated_ep else "",
+        "current_episode": str(cur_ep) if cur_ep else "",
+        "episode_progress": esc(episode_progress),
+        "episode_status": esc(episode_status),
         "reward_code": esc(runtime_config.get(db, "reward_code") or ""),  # v0.7.0：赞赏码
         "version": esc(version),
     }
