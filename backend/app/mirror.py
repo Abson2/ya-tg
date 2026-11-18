@@ -1051,15 +1051,51 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
         if orig:
             eng, source = orig, "resource"
 
-    # 2) TMDB en-US 只给一次机会。旧版对 mtype 未知会试 movie + tv 两次（最多 40 秒），
-    #    是「TMDB 找不到英文名的剧集卡死」的直接来源。查不到立即转直译。
+    # v0.8.9.1 修复「改名能力丢了」：MirrorMedia 在镜像阶段创建时**不写 media_type**
+    # （默认空串，只有后面扫描入库才回填 Resource）。v0.8.9 把类型判断写成
+    # `else "movie"`，于是所有电视剧都用 /movie/{id} 查 en-US 官方英文名，必然查不到
+    # → 只剩拼音兜底 → 用户在「只配 TMDB、没配 AI」的现场看到文件名仍是中文。
+    # v0.8.8  movie + tv 都试才有英文名。这里恢复双查，但**每次仍带 6 秒硬超时**：
+    # 已知类型优先查、只补一次另一类型，最坏 12 秒且绝不重试，卡死红线不破。
+    # 类型来源优先级：显式 media_type → MirrorFile.identity(:tv:/:movie:) → 默认 movie。
+    if not mtype:
+        ident_tv = db.scalar(select(MirrorFile.identity).where(
+            MirrorFile.media_id == media.id,
+            MirrorFile.identity.like("%:tv:%")).limit(1))
+        if ident_tv:
+            mtype = "tv"
+        else:
+            ident_movie = db.scalar(select(MirrorFile.identity).where(
+                MirrorFile.media_id == media.id,
+                MirrorFile.identity.like("%:movie:%")).limit(1))
+            if ident_movie:
+                mtype = "movie"
+
+    # v0.8.9.1：A 库目录名未必带 {tmdb-} 标记；镜像阶段 identity 里已写入 TMDB ID
+    # （sync_rule 用 parse_media_name + media_identity 生成，如 tmdb:135646:tv:...）。
+    # 只配了 TMDB、目录名又没标记时，旧逻辑 tid=None 会**整个跳过 TMDB 查询**，
+    # 直接落到未配置的 AI / 拼音，用户看到的就是「文件名还是中文」。这里从 identity 补 tid。
+    if not tid:
+        ident_row = db.scalar(select(MirrorFile.identity).where(
+            MirrorFile.media_id == media.id,
+            MirrorFile.identity.like("tmdb:%")).limit(1))
+        ident_m = re.match(r"tmdb:(\d+):", str(ident_row or ""))
+        if ident_m:
+            tid = int(ident_m.group(1))
+
+    # 2) TMDB en-US：已知/推断类型优先，未知或被拒时补查另一类型。每次都过 _bounded()
+    #    硬超时，双查最坏 2×6 秒；绝不像旧版那样无上限串行 + 每类再等 AI。
     if tid and not eng:
-        mt = mtype if mtype in ("movie", "tv") else "movie"
-        raw = await _bounded(tmdb.english_title(tid, mt, db),
-                             ENGLISH_TITLE_TMDB_TIMEOUT, f"TMDB en-US {tid}/{mt}")
-        v = sanitize_english_title(str(raw or ""))
-        if v:
-            eng, source = v, "tmdb"
+        primary = mtype if mtype in ("movie", "tv") else "movie"
+        order = [primary] + (["tv" if primary == "movie" else "movie"]
+                             if mtype not in ("movie", "tv") else [])
+        for mt in order:
+            raw = await _bounded(tmdb.english_title(tid, mt, db),
+                                 ENGLISH_TITLE_TMDB_TIMEOUT, f"TMDB en-US {tid}/{mt}")
+            v = sanitize_english_title(str(raw or ""))
+            if v:
+                eng, source = v, "tmdb"
+                break
 
     # 3) 直译：TMDB 无英文名（或超时 / 密钥无效）时直接用 AI 翻译中文剧名
     if not eng:

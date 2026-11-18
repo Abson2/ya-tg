@@ -6,7 +6,7 @@
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub，公开可拉取）
-- 当前版本：v0.8.9
+- 当前版本：v0.9.0
 - 部署方式：一条 `docker compose` 命令，不需要源码、不需要构建、不需要懂 Python
 
 ---

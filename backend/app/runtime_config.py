@@ -66,6 +66,16 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "log_retention_days": ("log_retention_days", "30"),
     "log_max_rows": ("log_max_rows", "5000"),
     "log_auto_prune": ("log_auto_prune", "true"),
+    # v0.9.0：Bot 交互与推送白名单。内置指令固定四项（求片/投稿/搜索/打赏），
+    # 其余为管理员后台自定义的指令名→说明。白名单只放行 Bot 自己管理的频道/群聊，
+    # 绝不向用户私聊推送，避免刷屏。
+    "bot_commands_json": ("bot_commands_json", "[]"),       # 自定义指令 [{command,description}]
+    "bot_push_channels_json": ("bot_push_channels_json", "[]"),  # 白名单频道 ID（需管理员）
+    "bot_push_groups_json": ("bot_push_groups_json", "[]"),      # 白名单群聊 ID（无需管理员）
+    "bot_restrict_enabled": ("bot_restrict_enabled", "false"),   # 使用限制开关
+    "bot_restrict_cache_seconds": ("bot_restrict_cache_seconds", "120"),
+    "bot_required_channels_json": ("bot_required_channels_json", "[]"),  # 必须关注频道
+    "bot_required_groups_json": ("bot_required_groups_json", "[]"),      # 必须加入群聊
 }
 
 

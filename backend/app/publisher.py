@@ -335,6 +335,14 @@ async def process_queue(limit: int = 20) -> dict:
                 q.error = "Bot 或频道已停用，暂不推送；启用后自动继续"
                 q.next_retry_at = None
                 continue
+            # v0.9.0：推送白名单闸门。Bot 只向管理员配置的频道 / 群聊主动推送，
+            # 不私聊刷屏。白名单为空时保持兼容不拦截；非空时只放行列出的 chat_id。
+            from . import bot_listener
+            allowed, deny_reason = bot_listener.is_push_allowed(db, channel.chat_id)
+            if not allowed:
+                q.error = deny_reason
+                q.next_retry_at = None
+                continue
             need_share = not res.share_url
             try:
                 await ensure_share(db, res)

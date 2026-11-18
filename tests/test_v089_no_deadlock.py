@@ -287,6 +287,77 @@ def test_all_long_entrypoints_are_guarded():
 
 
 # ---------- 4. 改名异常绝不阻断入库 / 分享 / 推送 ----------
+# ---------- 5. v0.8.9.1 回归：中文名改英文名能力丢了的三个根因 ----------
+def _seed_no_mark(db, identity="tmdb:206484:tv:S1:E4", work_title="侠客行 (2001)"):
+    """A 库目录名**不带** {tmdb-} 标记——现场只配 TMDB 的真实形态。"""
+    rule = MirrorRule(name="v0891", source_root_id=A_ROOT, target_root_id=B_ROOT,
+                      enabled=True, star_naming=True, auto_identify=False,
+                      rename_files=True, file_idle_seconds=0.5, auto_create_dirs=True)
+    db.add(rule)
+    db.commit()
+    media = MirrorMedia(rule_id=rule.id,
+                        work_key="work:" + normalize_work_name(work_title),
+                        title_standard=work_title, title_mirror="侠客行 (2001)",
+                        source_dir_id=A_WORK, target_dir_id=B_WORK,
+                        english_title="", status="synced")  # media_type 默认空
+    db.add(media)
+    db.commit()
+    row = MirrorFile(media_id=media.id, rule_id=rule.id, identity=identity,
+                     source_file_id=A_FILE, target_file_id=B_FILE, file_name=ZH_NAME,
+                     size=1024, utime=1, fingerprint="1024:1", status="synced")
+    db.add(row)
+    db.commit()
+    return rule, media, row
+
+
+def test_identity_supplies_tmdb_id_when_dir_has_no_mark(db):
+    """A 目录无 {tmdb-} 标记时，从 MirrorFile.identity 补 tid，绝不跳过 TMDB。"""
+    rule, media, _row = _seed_no_mark(db, identity="tmdb:206484:tv:S1:E4")
+    p = _resolve_mocks(tmdb_value="The Legend of the Condor Heroes", ai_en="")
+    with _Bundle(p[:3]):
+        eng, source = _run(mirror._resolve_english_title(db, media))
+    assert eng == "The Legend of the Condor Heroes" and source == "tmdb", (eng, source)
+    assert p[4].await_count >= 1, "TMDB 必须真的被调用"
+
+
+def test_identity_supplies_tv_type_so_tv_endpoint_is_queried(db):
+    """剧集从 identity(:tv:) 取类型，优先查 /tv/{id}，修复 v0.8.9 一律 movie 的回归。"""
+    rule, media, _row = _seed_no_mark(db, identity="tmdb:206484:tv:S1:E4")
+
+    async def _tmdb(tid, mt, _db):
+        return "TV Title" if mt == "tv" else ""
+
+    p = _resolve_mocks(tmdb_value="", ai_en="")
+    with patch("app.mirror.GuangYaWebFiles", ProbeAPI), \
+         patch("app.mirror.tmdb.english_title", new=_tmdb), \
+         patch("app.mirror.ai_assist.translate_title", new=p[3]):
+        eng, source = _run(mirror._resolve_english_title(db, media))
+    assert eng == "TV Title" and source == "tmdb", (eng, source)
+
+
+def test_known_tid_unknown_type_queries_both(db):
+    """目录带 tid 但类型未知：movie 查不到时补查 tv，仍能拿到剧集英文名。"""
+    rule, media, _row = _seed_no_mark(db, identity="raw:fileid:no:type")
+    media.english_title = ""
+    db.commit()
+    # 给 A 目录名补 tmdb 标记，让 tid 有值、mtype 仍空
+    media.title_standard = "侠客行 (2001) {tmdb-206484}"
+    db.commit()
+    calls = []
+
+    async def _tmdb(tid, mt, _db):
+        calls.append(mt)
+        return "The Legend of the Condor Heroes" if mt == "tv" else ""
+
+    p = _resolve_mocks(tmdb_value="", ai_en="")
+    with patch("app.mirror.GuangYaWebFiles", ProbeAPI), \
+         patch("app.mirror.tmdb.english_title", new=_tmdb), \
+         patch("app.mirror.ai_assist.translate_title", new=p[3]):
+        eng, source = _run(mirror._resolve_english_title(db, media))
+    assert "movie" in calls and "tv" in calls, calls
+    assert eng == "The Legend of the Condor Heroes" and source == "tmdb", (eng, source)
+
+
 def test_rename_failure_does_not_block_post_sync_pipeline(db):
     _rule, _media, _row = _seed(db)
     pipeline = AsyncMock(return_value={"files": 1, "identify": {"identified": 1},

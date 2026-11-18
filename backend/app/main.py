@@ -227,13 +227,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.8.9", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.8.9", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.0", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -894,6 +894,34 @@ def mirror_status(db: Session = Depends(get_db)):
     untranslated_works = [{"work": m.title_standard,
                            "reason": "尚未解析到英文剧名；补齐 TMDB 密钥或 AI 配置后点「按英文规范改名」重跑"}
                           for m in no_english]
+    # v0.9.0：待进行 / 进行中清单——把「缺失目录 + 待复制 / 复制中 / 待确认文件 + 改名待办 +
+    # 未知任务」统一成一张待办表，管理页只保留「映射清单 + 待办清单」两个清单。
+    pending_items: list[dict] = []
+    for d in missing:
+        pending_items.append({"kind": "目录待建", "work": d.name_standard,
+                              "target": d.category_path or d.name_standard,
+                              "status": d.status, "detail": getattr(d, "error", "") or d.parent_target_id})
+    pending_files = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.status.in_(list(mirror.RETRYABLE_FILE_STATUS))
+    ).order_by(MirrorFile.id).limit(200)).all())
+    for f in pending_files:
+        pending_items.append({"kind": "文件待复制", "work": titles.get(f.media_id, ""),
+                              "target": f.file_name, "status": f.status,
+                              "detail": (f.error or "")[:300]})
+    rename_todo = list(db.scalars(select(MirrorFile).where(
+        or_(MirrorFile.rename_status.is_(None), MirrorFile.rename_status == "",
+            MirrorFile.rename_status == "pending_visible"),
+        MirrorFile.status == "synced"
+    ).order_by(MirrorFile.id).limit(200)).all())
+    for f in rename_todo:
+        pending_items.append({"kind": "文件待改名", "work": titles.get(f.media_id, ""),
+                              "target": f.file_name, "status": f.rename_status or "pending",
+                              "detail": (f.rename_error or "等待英文名解析 / B 库可见")[:300]})
+    for t in tasks:
+        if t.status in ("pending", "running", "unknown"):
+            pending_items.append({"kind": "复制任务待确认", "work": titles.get(t.media_id, ""),
+                                  "target": t.task_id, "status": t.status,
+                                  "detail": (t.error or "")[:300]})
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -955,6 +983,8 @@ def mirror_status(db: Session = Depends(get_db)):
         # v0.8.6：改名失败与英文名待处理清单
         "rename_errors": rename_errors,
         "untranslated_works": untranslated_works,
+        # v0.9.0：统一待进行 / 进行中清单（管理页两个清单之一）
+        "pending_items": pending_items,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
@@ -2850,6 +2880,14 @@ class InteractionConfigInput(BaseModel):
     donation_image_url: str | None = None
     donation_text: str | None = None
     donation_button_text: str | None = None
+    # v0.9.0：Bot 推送白名单 / 使用限制 / 自定义指令
+    bot_push_channels: list[str] | None = None       # 需管理员的频道 ID
+    bot_push_groups: list[str] | None = None         # 无需管理员的群聊 ID
+    bot_restrict_enabled: bool | None = None
+    bot_restrict_cache_seconds: int | None = None
+    bot_required_channels: list[str] | None = None   # 必须关注频道
+    bot_required_groups: list[str] | None = None     # 必须加入群聊
+    bot_commands: list[dict] | None = None           # 自定义指令 [{command,description,reply}]
 
 
 @app.get("/api/interaction/config", dependencies=ADMIN)
@@ -2860,6 +2898,17 @@ def interaction_config_get(db: Session = Depends(get_db)):
     out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
     out["donation_enabled"] = (runtime_config.get(db, "donation_enabled") or "").lower() == "true"
+    # v0.9.0：推送白名单 / 使用限制 / 指令清单回显
+    out["bot_push_channels"] = bot_listener.push_whitelist(db)[0]
+    out["bot_push_groups"] = bot_listener.push_whitelist(db)[1]
+    out["bot_restrict_enabled"] = (runtime_config.get(db, "bot_restrict_enabled") or "").lower() == "true"
+    try:
+        out["bot_restrict_cache_seconds"] = int(runtime_config.get(db, "bot_restrict_cache_seconds") or "120")
+    except ValueError:
+        out["bot_restrict_cache_seconds"] = 120
+    out["bot_required_channels"] = bot_listener._json_list("bot_required_channels_json", db)
+    out["bot_required_groups"] = bot_listener._json_list("bot_required_groups_json", db)
+    out["bot_commands"] = bot_listener.builtin_and_custom(db)
     out["scene_default"] = "ENV_FILTER_GUANGYA"
     out["unverified_endpoints"] = ["投稿分享转存（光鸭接口，8.6 待验证）"]
     return out
@@ -2874,6 +2923,30 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
+    # v0.9.0：Bot 交互配置。列表序列化为 JSON，缺省 None 表示保持原值。
+    if p.bot_push_channels is not None:
+        values["bot_push_channels_json"] = json_dumps([str(x).strip() for x in p.bot_push_channels if str(x).strip()])
+    if p.bot_push_groups is not None:
+        values["bot_push_groups_json"] = json_dumps([str(x).strip() for x in p.bot_push_groups if str(x).strip()])
+    if p.bot_required_channels is not None:
+        values["bot_required_channels_json"] = json_dumps([str(x).strip() for x in p.bot_required_channels if str(x).strip()])
+    if p.bot_required_groups is not None:
+        values["bot_required_groups_json"] = json_dumps([str(x).strip() for x in p.bot_required_groups if str(x).strip()])
+    if p.bot_restrict_enabled is not None:
+        values["bot_restrict_enabled"] = "true" if p.bot_restrict_enabled else "false"
+    if p.bot_restrict_cache_seconds is not None:
+        values["bot_restrict_cache_seconds"] = str(max(0, min(int(p.bot_restrict_cache_seconds), 86400)))
+    if p.bot_commands is not None:
+        cmds = []
+        for c in p.bot_commands:
+            if not isinstance(c, dict):
+                continue
+            cmd = str(c.get("command") or "").strip().lstrip("/")
+            if not cmd:
+                continue
+            cmds.append({"command": cmd[:64], "description": str(c.get("description") or "")[:200],
+                         "reply": str(c.get("reply") or "")[:2000]})
+        values["bot_commands_json"] = json_dumps(cmds)
     runtime_config.set_many(db, values)
     add_audit(db, "interaction_config_saved", target_type="interaction",
               detail=json_dumps({"keys": sorted(values)}))

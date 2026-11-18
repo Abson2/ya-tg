@@ -48,9 +48,33 @@ const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const scanning = ref(false), showScanPanel = ref(false)
-const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持' })
+// v0.9.0：Bot 交互配置——内置四指令固定、自定义指令、推送白名单、使用限制
+const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
+  bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [] })
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
+// v0.9.0：多行文本框 ↔ 数组 的双向映射，避免用户直接编辑数组
+const newCmd = ref({ command: '', description: '', reply: '' })
+const _linesToArr = (v) => String(v || '').split('\n').map(s => s.trim()).filter(Boolean)
+const _arrToLines = (a) => (a || []).join('\n')
+const pushChannelsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_push_channels), set: v => interactionCfg.value.bot_push_channels = _linesToArr(v) })
+const pushGroupsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_push_groups), set: v => interactionCfg.value.bot_push_groups = _linesToArr(v) })
+const requiredChannelsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_required_channels), set: v => interactionCfg.value.bot_required_channels = _linesToArr(v) })
+const requiredGroupsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_required_groups), set: v => interactionCfg.value.bot_required_groups = _linesToArr(v) })
+function addCustomCommand() {
+  const c = newCmd.value
+  const name = String(c.command || '').trim().replace(/^\//, '')
+  if (!name) { ElMessage.warning('请填写指令名'); return }
+  const list = interactionCfg.value.bot_commands || (interactionCfg.value.bot_commands = [])
+  if (list.some(x => x.command === name || x.builtin && x.command === name)) { ElMessage.warning('指令已存在'); return }
+  list.push({ command: name, description: c.description || name, reply: c.reply || '', builtin: false })
+  newCmd.value = { command: '', description: '', reply: '' }
+}
+function removeCustomCommand(c) {
+  const list = interactionCfg.value.bot_commands || []
+  const i = list.indexOf(c)
+  if (i >= 0) list.splice(i, 1)
+}
 const finishChecks = ref([]), finishChecking = ref(false)
 // v0.8.3：日志保留策略（操作审计页配置，不新增 .env 项）
 const logCfg = ref({ retention_days: 30, max_rows: 5000, auto_prune: true, schedule: '' })
@@ -181,15 +205,15 @@ const navGroups = [
     { key: '镜像同步', icon: 'copy', label: '镜像同步' },
     { key: '资源库', icon: 'folder', label: '资源库' }
   ] },
-  { label: '分发中心', items: [
+  { label: '分发与互动', items: [
     { key: '分发规则', icon: 'route', label: '分发规则' },
+    { key: 'Bot 交互中心', icon: 'link', label: 'Bot 交互中心' },
     { key: '审核中心', icon: 'check', label: '审核中心' },
     { key: '推送队列', icon: 'send', label: '推送队列' }
   ] },
   { label: '系统', items: [
     { key: 'TMDB 设置', icon: 'image', label: 'TMDB 设置' },
     { key: '消息模板', icon: 'file', label: '消息模板' },
-    { key: '互动中心', icon: 'link', label: '互动中心' },
     { key: '操作审计', icon: 'clock', label: '操作审计' }
   ] }
 ]
@@ -563,7 +587,12 @@ async function saveInteraction() {
     const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
       tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
       donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
-      donation_button_text: c.donation_button_text || '打赏支持' }
+      donation_button_text: c.donation_button_text || '打赏支持',
+      bot_push_channels: c.bot_push_channels || [], bot_push_groups: c.bot_push_groups || [],
+      bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
+      bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
+      // 自定义指令不含内置四项，内置由后端固定注入
+      bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
     // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
     if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
     if (c.contribution_bot_token) body.contribution_bot_token = c.contribution_bot_token
@@ -1102,7 +1131,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.8.9 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.0 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1301,21 +1330,57 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
-            <div class="cursor-box"><div><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div><div><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div><div><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div><div><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div><div><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div><div><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div><div><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div><div><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div><div><small>目录已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div><div><small>自动创建目录</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div><div><small>待创建目录</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div><div><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div><div><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div><div><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div><div><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#c0392b' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div></div>
+            <div class="stat-group">
+              <div class="stat-group-title"><span class="grp-ico">⇄</span>文件传输</div>
+              <div class="mini-stat-grid">
+                <div class="mini-stat"><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div>
+                <div class="mini-stat"><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div>
+                <div class="mini-stat"><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div>
+                <div class="mini-stat"><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div>
+                <div class="mini-stat"><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div>
+                <div class="mini-stat"><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div>
+              </div>
+            </div>
+            <div class="stat-group">
+              <div class="stat-group-title"><span class="grp-ico g-teal">文</span>英文改名</div>
+              <div class="mini-stat-grid">
+                <div class="mini-stat"><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div>
+                <div class="mini-stat"><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div>
+                <div class="mini-stat"><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div>
+              </div>
+            </div>
+            <div class="stat-group">
+              <div class="stat-group-title"><span class="grp-ico g-amber">▤</span>目录</div>
+              <div class="mini-stat-grid">
+                <div class="mini-stat"><small>已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div>
+                <div class="mini-stat"><small>自动创建</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div>
+                <div class="mini-stat"><small>待创建</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div>
+              </div>
+            </div>
+            <div class="stat-group">
+              <div class="stat-group-title"><span class="grp-ico g-violet">◷</span>任务 / 风控</div>
+              <div class="mini-stat-grid">
+                <div class="mini-stat"><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div>
+                <div class="mini-stat"><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div>
+                <div class="mini-stat"><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div>
+              </div>
+            </div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
             <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
               <el-collapse-item name="status-detail">
                 <template #title><span class="fold-title">生效配置 · 已确认接口 · 待验证接口</span></template>
-            <p class="hint">
-              生效配置 → B 库缺目录自动创建：<b :style="mirrorStatus.config?.auto_create_dirs === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭（会全部 blocked）' : '开启' }}</b>
-              · 主目录带 · 标记：{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}
-              · 同步后自动入库识别并推送：<b :style="mirrorStatus.config?.auto_identify === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.auto_identify === false ? '关闭' : '开启' }}</b>
-              · B 库单集/电影文件英文改名：<b :style="mirrorStatus.config?.rename_files === false ? 'color:#c0392b' : ''">{{ mirrorStatus.config?.rename_files === false ? '关闭' : '开启' }}</b>
-              · B 库目录 ID：{{ mirrorStatus.config?.target_root_id || '未填写' }}
-              · 文件空闲：{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s
-            </p>
-            <p class="hint">已确认接口：<span v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}；</span></p>
-            <p class="hint">待验证接口（未实现，不猜测参数）：<span v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}、</span></p>
+            <div class="info-chips">
+              <span class="info-chip" :class="mirrorStatus.config?.auto_create_dirs === false ? 'off' : 'on'">缺目录自动创建 <b>{{ mirrorStatus.config?.auto_create_dirs === false ? '关闭·会全部 blocked' : '开启' }}</b></span>
+              <span class="info-chip">主目录 · 标记 <b>{{ mirrorStatus.config?.star_naming === false ? '关闭' : '开启' }}</b></span>
+              <span class="info-chip" :class="mirrorStatus.config?.auto_identify === false ? 'off' : 'on'">同步后入库识别推送 <b>{{ mirrorStatus.config?.auto_identify === false ? '关闭' : '开启' }}</b></span>
+              <span class="info-chip" :class="mirrorStatus.config?.rename_files === false ? 'off' : 'on'">单集/电影英文改名 <b>{{ mirrorStatus.config?.rename_files === false ? '关闭' : '开启' }}</b></span>
+              <span class="info-chip">B 库目录 ID <b>{{ mirrorStatus.config?.target_root_id || '未填写' }}</b></span>
+              <span class="info-chip">文件空闲 <b>{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s</b></span>
+            </div>
+            <p class="hint" style="margin-top:14px">已确认接口（来自 HAR 取证）</p>
+            <div class="endpoint-list"><code v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}</code></div>
+            <p class="hint" style="margin-top:12px">待验证接口（未实现，不猜测参数）</p>
+            <div class="endpoint-list"><code v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}</code></div>
               </el-collapse-item>
             </el-collapse>
           </div>
@@ -1393,54 +1458,101 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </el-collapse>
         </section>
 
-        <section v-else-if="tab === '互动中心'" class="fade">
-          <div class="page-head"><div><h2>互动中心</h2><p>用户投稿 · 我想看关键词监控 · TgtoDrive OpenAPI · 打赏设置</p></div><el-tag size="small">待审 {{ interactionStatus.contributions_pending || 0 }}</el-tag></div>
+        <section v-else-if="tab === 'Bot 交互中心'" class="fade">
+          <div class="page-head"><div><h2>Bot 交互中心</h2><p>指令菜单 · 推送白名单 · 使用限制 · 投稿 / 搜索 / 求片 / 打赏</p></div><div class="head-tools"><el-tag size="small">待审投稿 {{ interactionStatus.contributions_pending || 0 }}</el-tag><el-button type="primary" size="small" :loading="interactionSaving" @click="saveInteraction">保存全部设置</el-button></div></div>
+
+          <!-- 内置指令速查：固定四项 + 后台自定义（参考 embyhub 卡片） -->
+          <div class="bot-card">
+            <div class="bot-card-head"><span class="bot-ico">&gt;_</span><h3>内置指令速查</h3><el-tag size="small" type="info">固定四项 · 不可删除</el-tag></div>
+            <div class="cmd-grid">
+              <div class="cmd-item" v-for="c in (interactionCfg.bot_commands || [])" :key="c.command">
+                <span class="cmd-chip">/{{ c.command }}</span><span class="cmd-desc">{{ c.description }}</span>
+                <el-button v-if="!c.builtin" size="small" text type="danger" @click="removeCustomCommand(c)">移除</el-button>
+              </div>
+            </div>
+            <div class="cmd-add">
+              <el-input v-model="newCmd.command" placeholder="指令名（如 sign）" style="width:180px"/>
+              <el-input v-model="newCmd.description" placeholder="说明（如 每日签到）" style="width:220px"/>
+              <el-input v-model="newCmd.reply" placeholder="回复文本" style="width:260px"/>
+              <el-button size="small" type="primary" plain @click="addCustomCommand">添加自定义指令</el-button>
+            </div>
+            <p class="hint">求片 / 投稿 / 搜索 / 打赏为内置固定指令，其实现不可改；这里只能追加「收到指令 → 返回固定文本」的自定义功能。所有内置与自定义指令都只回复指令来源的会话，不会主动私聊用户刷屏。</p>
+          </div>
+
+          <!-- 使用限制：关注频道 / 加入群聊（参考 embyhub 绿色卡片） -->
+          <div class="bot-card restrict-card">
+            <div class="bot-card-head"><span class="bot-ico">🔒</span><h3>使用限制</h3><span class="restrict-sub">要求用户关注频道 / 加入群聊</span><el-switch v-model="interactionCfg.bot_restrict_enabled" style="margin-left:auto"/></div>
+            <div class="restrict-row">
+              <div class="restrict-label"><b>检查结果缓存时间</b><small>用户通过校验后结果会被缓存，缓存期内无需重复检查。<br/>0=每次都检查（最严格但响应慢）；建议 60-120 秒；3600+ 秒可降低接口压力。</small></div>
+              <el-input-number v-model="interactionCfg.bot_restrict_cache_seconds" :min="0" :max="86400" controls-position="right" style="width:130px"/><span class="unit">秒</span>
+            </div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>必须关注的频道</b><small>一行一个，支持 @用户名 或 频道 ID（如 -1001234567890）。机器人需为该频道管理员才能校验成员状态。</small></div>
+              <el-input v-model="requiredChannelsText" type="textarea" :rows="3" placeholder="@EmbyHub_News&#10;-1001234567890"/>
+            </div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>必须加入的群聊</b><small>一行一个群聊 ID。未加入任一群聊的用户，其指令会被拒绝并提示。</small></div>
+              <el-input v-model="requiredGroupsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
+            </div>
+            <p class="hint warn">启用后即使用户取消关注 / 退群，缓存期内仍可使用机器人；缓存过期后需重新校验。</p>
+          </div>
+
+          <!-- 推送白名单：频道需管理员 / 群聊无需管理员 -->
+          <div class="bot-card">
+            <div class="bot-card-head"><span class="bot-ico">📢</span><h3>推送消息白名单</h3><span class="restrict-sub">Bot 只向白名单内的频道 / 群聊推送，不私聊用户</span></div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>频道 ID（需管理员）</b><small>一行一个。机器人必须是该频道管理员；留空表示不限制（保持兼容）。</small></div>
+              <el-input v-model="pushChannelsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
+            </div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>群聊 ID（无需管理员）</b><small>一行一个。群聊只需机器人已加入即可。</small></div>
+              <el-input v-model="pushGroupsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
+            </div>
+            <p class="hint">白名单为空时不拦截（兼容旧配置）；一旦填写，分发推送只会发到列出的频道 / 群聊，其余目标会在队列里标记「不在白名单」并跳过。</p>
+          </div>
+
+          <!-- Bot Token / TgtoDrive / 打赏：折叠收纳 -->
           <div class="panel narrow">
-            <div class="panel-head"><h3>TgtoDrive 与投稿 Bot</h3></div>
+            <div class="panel-head"><h3>Bot Token 与 TgtoDrive</h3><el-button :loading="tgtoTesting" size="small" @click="testTgto">测试连接（只读）</el-button></div>
             <div class="form-grid">
               <div class="field"><label>TgtoDrive 地址</label><el-input v-model="interactionCfg.tgto_base_url" placeholder="http://127.0.0.1:端口"/></div>
               <div class="field"><label>场景名</label><el-input v-model="interactionCfg.tgto_scene" placeholder="ENV_FILTER_GUANGYA"/></div>
               <div class="field"><label>OpenAPI Token（留空保持原值）</label><el-input v-model="interactionCfg.tgto_api_key" placeholder="已配置则留空" show-password/></div>
-              <div class="field"><label>投稿 Bot Token（留空保持原值）</label><el-input v-model="interactionCfg.contribution_bot_token" placeholder="已配置则留空" show-password/></div>
+              <div class="field"><label>交互 Bot Token（留空保持原值）</label><el-input v-model="interactionCfg.contribution_bot_token" placeholder="已配置则留空" show-password/></div>
             </div>
+            <div class="form-grid"><div class="field inline"><label>启用指令监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div><div class="field inline"><label>启用打赏</label><el-switch v-model="interactionCfg.donation_enabled"/></div></div>
             <div class="form-grid">
-              <div class="field inline"><label>启用投稿 / 想看监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
-              <div class="field inline"><label>启用打赏</label><el-switch v-model="interactionCfg.donation_enabled"/></div>
-            </div>
-            <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存设置</el-button><el-button :loading="tgtoTesting" @click="testTgto">测试连接（只读）</el-button></div>
-            <p class="hint">关键词规则采用「读取全量 → 合并 → 回写 → 回读校验」，只新增/更新本项目幂等 id 的规则，绝不覆盖原有关键词或其它项目规则。用户指令：/want、/contribute、/donate、/help。</p>
-          </div>
-          <div class="panel narrow">
-            <div class="panel-head"><h3>打赏设置</h3></div>
-            <div class="form-grid">
-              <div class="field"><label>二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
-              <div class="field"><label>按钮文字</label><el-input v-model="interactionCfg.donation_button_text"/></div>
+              <div class="field"><label>打赏二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
+              <div class="field"><label>打赏按钮文字</label><el-input v-model="interactionCfg.donation_button_text"/></div>
             </div>
             <div class="field"><label>打赏说明</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2"/></div>
+            <p class="hint">关键词规则采用「读取全量 → 合并 → 回写 → 回读校验」，只新增/更新本项目幂等 id 规则，不覆盖原有关键词。投稿转存接口待抓包验证，当前只登记与审核。</p>
           </div>
-          <div class="panel">
-            <div class="panel-head"><h3>添加「我想看」关键词</h3></div>
-            <div class="inline-form"><el-input v-model="wantTitle" placeholder="影视名称" style="width:260px"/><el-button type="primary" @click="addWant">加入监控</el-button></div>
-            <div class="table-scroll"><el-table :data="mediaRequests" size="small">
-              <el-table-column prop="title" label="影视名称" min-width="180"/>
-              <el-table-column prop="keyword_id" label="规则 ID" min-width="150"/>
-              <el-table-column prop="status" label="状态" width="110"/>
-              <el-table-column prop="note" label="备注" min-width="180"/>
-            </el-table></div>
+
+          <div class="two-col">
+            <div class="panel">
+              <div class="panel-head"><h3>我想看关键词</h3></div>
+              <div class="inline-form"><el-input v-model="wantTitle" placeholder="影视名称" style="width:220px"/><el-button type="primary" @click="addWant">加入监控</el-button></div>
+              <div class="table-scroll"><el-table :data="mediaRequests" size="small">
+                <el-table-column prop="title" label="影视名称" min-width="160"/>
+                <el-table-column prop="status" label="状态" width="100"/>
+                <el-table-column prop="note" label="备注" min-width="140"/>
+              </el-table></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><h3>用户投稿</h3></div>
+              <div class="table-scroll"><el-table :data="contributions" size="small">
+                <el-table-column prop="title" label="标题" min-width="150"/>
+                <el-table-column prop="tg_username" label="用户" width="110"/>
+                <el-table-column prop="status" label="状态" width="100"/>
+                <el-table-column label="操作" width="160"><template #default="s">
+                  <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
+                  <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
+                </template></el-table-column>
+              </el-table></div>
+            </div>
           </div>
-          <div class="panel">
-            <div class="panel-head"><h3>用户投稿</h3></div>
-            <div class="table-scroll"><el-table :data="contributions" size="small">
-              <el-table-column prop="title" label="标题" min-width="180"/>
-              <el-table-column prop="tg_username" label="用户" width="120"/>
-              <el-table-column prop="status" label="状态" width="110"/>
-              <el-table-column label="操作" width="200"><template #default="s">
-                <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
-                <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
-              </template></el-table-column>
-            </el-table></div>
-            <p class="hint">投稿转存到光鸭所用的接口在需求文档 8.6 仍待抓包验证，当前仅登记与审核，不自动入库、不自动推送。</p>
-          </div>
+          <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存全部设置</el-button></div>
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
@@ -1812,15 +1924,40 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
 
 <style>
 :root{
-  --yg-bg:#f4f6fb;--yg-surface:#fff;--yg-ink:#1c2442;--yg-muted:#7e88a8;--yg-line:#e9edf6;
+  --yg-bg:#f5f6fb;--yg-surface:#fff;--yg-ink:#1e2745;--yg-muted:#8992ac;--yg-line:#edf0f7;
   --yg-primary:#5b5bd6;--yg-primary-2:#8271ef;--yg-teal:#19b3a6;--yg-amber:#f2a33c;--yg-rose:#e5526b;
-  --yg-shadow:0 12px 34px rgba(28,36,66,.07);--yg-radius:16px;
+  --yg-shadow:0 1px 2px rgba(30,39,69,.03),0 12px 32px rgba(30,39,69,.06);
+  --yg-shadow-lg:0 2px 4px rgba(30,39,69,.04),0 20px 48px rgba(30,39,69,.10);
+  --yg-radius:20px;--yg-radius-sm:14px;
   --el-color-primary:#5b5bd6;--el-border-radius-base:10px;--el-font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--yg-bg);color:var(--yg-ink);font-family:var(--el-font-family);font-size:14px;-webkit-font-smoothing:antialiased}
+body{margin:0;background:radial-gradient(1200px 600px at 100% -10%,#eef0ff 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,#e9f8f5 0%,transparent 55%),var(--yg-bg);background-attachment:fixed;color:var(--yg-ink);font-family:var(--el-font-family);font-size:14px;-webkit-font-smoothing:antialiased}
 button{font-family:inherit}
 .ico{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex:none}
+/* ============ v0.9.0 全站设计语言：embyhub 图标块 + 大圆角白卡 ============ */
+/* 所有面板标题统一带渐变图标块，卡片获得柔和双层阴影与悬浮反馈 */
+.panel-head h3{display:flex;align-items:center;gap:11px}
+.panel-head h3::before{content:"";width:24px;height:24px;border-radius:8px;flex:none;
+  background:linear-gradient(135deg,var(--yg-primary-2),var(--yg-primary));
+  box-shadow:0 4px 10px rgba(91,91,214,.26),inset 0 0 0 1px rgba(255,255,255,.18);
+  background-image:radial-gradient(circle at 50% 50%,#fff 0 2.6px,transparent 3px)}
+/* 页面主标题：左侧双色竖条，层次更清晰 */
+.page-head h2{display:flex;align-items:center;gap:11px}
+.page-head h2::before{content:"";width:5px;height:23px;border-radius:4px;flex:none;
+  background:linear-gradient(180deg,var(--yg-primary-2),var(--yg-primary));box-shadow:0 2px 6px rgba(91,91,214,.28)}
+/* 顶栏、表格、表单控件全站统一圆角与留白 */
+.topbar{box-shadow:0 1px 0 var(--yg-line),0 6px 20px rgba(30,39,69,.03)}
+.el-table{--el-table-border-color:var(--yg-line);border-radius:12px;overflow:hidden}
+.el-table th.el-table__cell{background:#fafbfe!important;color:#5b6484;font-weight:650;font-size:12px}
+.el-input__wrapper,.el-select__wrapper{border-radius:10px;box-shadow:0 0 0 1px var(--yg-line) inset}
+.el-button{border-radius:10px;font-weight:600}
+.el-tag{border-radius:8px}
+/* 二级数据卡：授权摘要 / 凭证条 / 分享会话，圆角阴影对齐主卡 */
+.auth-summary-item,.credential-bar,.method-card,.kv-grid>div{border-radius:var(--yg-radius-sm)}
+.auth-summary-item{box-shadow:var(--yg-shadow);border-color:var(--yg-line)}
+/* 概览「最近操作」卡片标题图标块颜色随卡片语义微调 */
+.stat-card .stat-bar i{opacity:.9}
 .app-shell{display:flex;min-height:100vh}
 .sidebar{width:238px;flex:none;background:linear-gradient(180deg,#252a4e 0%,#171b35 100%);color:#e9ecff;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
 .brand{display:flex;align-items:center;gap:12px;padding:24px 20px 22px;border-bottom:1px solid rgba(255,255,255,.09)}
@@ -1845,23 +1982,24 @@ button{font-family:inherit}
 .top-actions .ico{margin-right:5px}
 .content{max-width:1480px;margin:0 auto;padding:26px 28px 60px}
 .fade{animation:fade .3s ease}@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.page-head{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:20px;gap:16px;flex-wrap:wrap}
-.page-head h2{margin:0 0 5px;font-size:22px;letter-spacing:-.3px}.page-head p{margin:0;color:var(--yg-muted);font-size:12px}
-.head-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.page-head{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:22px;gap:16px;flex-wrap:wrap;padding-bottom:16px;border-bottom:1px solid var(--yg-line)}
+.page-head h2{margin:0 0 6px;font-size:23px;letter-spacing:-.4px;font-weight:750}.page-head p{margin:0 0 0 16px;color:var(--yg-muted);font-size:12px}
+.head-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .hero{border-radius:20px;background:linear-gradient(120deg,#4f4fc4 0%,#6b5ce0 52%,#3aa9c9 100%);color:#fff;padding:26px 30px;display:flex;justify-content:space-between;align-items:center;gap:20px;box-shadow:0 18px 40px rgba(91,91,214,.22);position:relative;overflow:hidden}
 .hero:after{content:"";position:absolute;width:280px;height:280px;border-radius:50%;border:40px solid rgba(255,255,255,.07);right:-70px;top:-120px}
 .hero-tag{font-size:10px;letter-spacing:2px;opacity:.75;margin-bottom:6px}.hero h2{margin:0 0 6px;font-size:26px}.hero p{margin:0;opacity:.82;font-size:12px}
 .hero-actions{display:flex;align-items:center;gap:14px;z-index:1}.hero-pill{padding:6px 13px;border-radius:20px;font-size:12px;font-weight:600}.pill-on{background:rgba(57,212,176,.22);color:#b9f7e6}.pill-off{background:rgba(255,255,255,.18)}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:14px;margin:20px 0}
-.stat-card{background:var(--yg-surface);border-radius:var(--yg-radius);padding:18px;box-shadow:var(--yg-shadow);position:relative;overflow:hidden;transition:.2s}
-.stat-card:hover{transform:translateY(-3px);box-shadow:0 18px 40px rgba(28,36,66,.11)}
-.stat-icon{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;margin-bottom:12px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:15px;margin:20px 0}
+.stat-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:20px;box-shadow:var(--yg-shadow);position:relative;overflow:hidden;transition:.22s}
+.stat-card:hover{transform:translateY(-4px);box-shadow:var(--yg-shadow-lg)}
+.stat-icon{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;margin-bottom:14px}
+.stat-icon .ico{width:20px;height:20px}
 .tone-indigo .stat-icon{background:#eeedff;color:#5b5bd6}.tone-teal .stat-icon{background:#e5f8f5;color:#19b3a6}.tone-amber .stat-icon{background:#fff3e2;color:#e29328}.tone-violet .stat-icon{background:#f2edff;color:#8b6cf0}.tone-rose .stat-icon{background:#ffedf0;color:#e5526b}.tone-slate .stat-icon{background:#eef1f7;color:#8a93aa}
-.stat-num{font-size:27px;font-weight:750;line-height:1.1;font-variant-numeric:tabular-nums}.stat-label{color:var(--yg-muted);font-size:12px;margin-top:5px}
-.stat-bar{height:3px;background:#f0f2f8;border-radius:3px;margin-top:14px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:3px}
+.stat-num{font-size:30px;font-weight:780;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.5px}.stat-label{color:var(--yg-muted);font-size:12px;margin-top:6px}
+.stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-.panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px;box-shadow:var(--yg-shadow);margin-bottom:18px}
-.panel.narrow{max-width:760px}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.panel-head h3{margin:0;font-size:15px}.panel-head span{font-size:11px;color:var(--yg-muted)}
+.panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}
+.panel.narrow{max-width:780px}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
 .link-btn{border:0;background:transparent;color:var(--yg-primary);cursor:pointer;font-size:12px}
 .check-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--yg-line)}.check-row:last-child{border:0}
 .check-dot{width:24px;height:24px;border-radius:8px;display:grid;place-items:center}.check-dot.ok{background:#e5f8f5;color:#19b3a6}.check-dot.no{background:#fff3e2;color:#e29328}.check-dot .ico{width:14px;height:14px}
@@ -1905,12 +2043,52 @@ button{font-family:inherit}
 .hint{color:#929bb5;font-size:11px;line-height:1.8;margin:12px 0 0}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
-/* v0.8.9：镜像同步页折叠分区，长说明与诊断表格不再堆满一屏 */
-.mirror-fold{margin-top:14px;border-top:1px dashed var(--yg-line);border-bottom:0}
-.mirror-fold .el-collapse-item__header{font-size:12px;font-weight:600;color:#4b5270;min-height:38px;height:auto;padding:8px 0}
-.mirror-fold .el-collapse-item__content{padding-bottom:8px}
-.fold-title{font-size:12px;font-weight:600;color:#4b5270}
+/* v0.9.0：镜像同步页分区治理——状态数字按语义分组，配置/接口改成结构化 chip */
+.mirror-fold{margin-top:16px;border-top:1px solid var(--yg-line);border-bottom:0}
+.mirror-fold .el-collapse-item__header{font-size:13px;font-weight:650;color:#3b4361;min-height:42px;height:auto;padding:10px 4px}
+.mirror-fold .el-collapse-item__content{padding-bottom:10px}
+.fold-title{font-size:13px;font-weight:650;color:#3b4361;display:inline-flex;align-items:center;gap:8px}
+.fold-title::before{content:"";width:18px;height:18px;border-radius:6px;flex:none;background:linear-gradient(135deg,#8271ef,#5b5bd6);background-image:radial-gradient(circle at 50% 50%,#fff 0 2px,transparent 2.4px)}
 .fold-sub{margin-left:8px;font-size:11px;color:#929bb5;font-weight:400}
+/* 状态分组：标题 + 网格，一组一类，不再一屏 15 个数字 */
+.stat-group{margin-bottom:16px}.stat-group:last-child{margin-bottom:0}
+.stat-group-title{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#4b5270;margin:0 0 10px}
+.stat-group-title .grp-ico{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;font-size:11px;background:#eef1fb;color:#5b5bd6;flex:none}
+.stat-group-title .grp-ico.g-teal{background:#e5f8f5;color:#12897f}
+.stat-group-title .grp-ico.g-amber{background:#fff3e2;color:#c47b12}
+.stat-group-title .grp-ico.g-violet{background:#f2edff;color:#8b6cf0}
+.mini-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
+.mini-stat{background:#fafbfe;border:1px solid var(--yg-line);border-radius:11px;padding:11px 13px;transition:.16s}
+.mini-stat:hover{background:#fff;border-color:#d9dcf5}
+.mini-stat small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px;line-height:1.3}
+.mini-stat b{font-size:18px;font-variant-numeric:tabular-nums;font-weight:750}
+/* 生效配置 / 接口清单：结构化 chip 行，替代长串小字 */
+.info-chips{display:flex;flex-wrap:wrap;gap:8px 10px;margin:2px 0 0}
+.info-chip{display:inline-flex;align-items:center;gap:6px;background:#f6f7fb;border:1px solid var(--yg-line);border-radius:9px;padding:6px 11px;font-size:12px;color:#4b5270}
+.info-chip b{font-weight:700;color:var(--yg-ink)}
+.info-chip.on b{color:#12897f}.info-chip.off b{color:var(--yg-rose)}
+.endpoint-list{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 0}
+.endpoint-list code{font-size:11px;background:#eef1fb;color:#4b5270;border:1px solid #e2e6f5;border-radius:6px;padding:3px 8px;word-break:break-all}
+/* v0.9.0：Bot 交互中心卡片（参考 embyhub） */
+.bot-card{background:#fff;border:1px solid var(--yg-line);border-radius:16px;padding:22px 24px;margin-bottom:16px;box-shadow:0 2px 12px rgba(28,36,72,.04)}
+.bot-card-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.bot-card-head h3{font-size:16px;margin:0;font-weight:700}
+.bot-ico{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:#eef1fb;color:#4b5270;font-size:16px;font-weight:700}
+.restrict-sub{font-size:12px;color:#929bb5}
+.cmd-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.cmd-item{display:flex;align-items:center;gap:12px;background:#f6f7fb;border:1px solid #eef0f6;border-radius:11px;padding:12px 14px}
+.cmd-chip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#3b5bdb;background:#eaf0ff;border:1px solid #d6e0ff;border-radius:7px;padding:4px 10px;white-space:nowrap}
+.cmd-desc{font-size:12px;color:#5a6178;flex:1}
+.cmd-add{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;padding-top:16px;border-top:1px dashed var(--yg-line)}
+.restrict-card{background:linear-gradient(180deg,#f4fbf6,#fff);border-color:#d8efdd}
+.restrict-card .bot-ico{background:#e3f6e8;color:#1f8a4c}
+.restrict-row{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px dashed #e2f0e6}
+.restrict-row.col{flex-direction:column;align-items:stretch;gap:8px}
+.restrict-row:last-of-type{border-bottom:0}
+.restrict-label b{display:block;font-size:12px;color:#2f6b45;margin-bottom:4px}
+.restrict-label small{display:block;font-size:11px;color:#6f9279;line-height:1.7}
+.restrict-row .unit{font-size:12px;color:#2f6b45}
+.hint.warn{color:#b8860b}
 .cursor-box{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.cursor-box small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.cursor-box b{font-size:18px}
 .view-switch{display:flex;border:1px solid var(--yg-line);border-radius:9px;overflow:hidden}.view-switch button{border:0;background:#fff;padding:7px 10px;cursor:pointer;color:#9aa3bd}.view-switch button.on{background:#eeedff;color:var(--yg-primary)}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:14px}
