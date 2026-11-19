@@ -8,7 +8,44 @@
 
 ---
 
-## v0.9.12 (2026-11-19)
+## v0.9.13 (2026-11-20)
+
+6 项优化合集：搜索卡片 HTML 外泄修复、项目图标进浏览器/管理页、手机端卡片防溢出、刷新保持当前页、删除无用审核中心，以及 TgtoDrive 频道监控白名单联动（求片审核写入 / 删单联动移除 / 投稿审核转发）。**不改 A→B 镜像主链路、不改认证协议，海报仍优先**。
+
+### 一、Bot 搜索卡片 HTML 代码外泄修复
+- 真机反馈：私聊搜索返回的卡片把 `<b>片名</b>`、`<a href="...">频道</a>` 等标签当纯文本显示，海报却正常。根因是搜索卡片复用 `publisher._build_message()` 渲染出 HTML，但 `bot_listener._send_photo()` 的 `sendPhoto` 未带 `parse_mode: HTML`（正式推送的 `_send_telegram()` 已带）。
+- 修复：`_send_photo()` 新增 `parse_mode` 参数，`_send_search_cards()` 传 `HTML`；无海报降级 `sendMessage`、图片失败降级纯文字两条分支都保留 parse_mode。打赏 caption 是纯文本，保持默认不带 parse_mode，避免文案里的 `< >` 触发 Telegram 解析错误。
+
+### 二、项目图标接入浏览器 / 管理页
+- `frontend/public/` 新增 `logo.svg` / `logo.png` / `favicon.png`（由 `assets/` 复制），`index.html` 加 `<link rel="icon">`（SVG + PNG 兜底）+ `apple-touch-icon`，theme-color 改光鸭橙 `#FF6800`。
+- 管理页侧栏品牌区与登录页的 `YT` 文字标记换成 `<img class="brand-logo" src="/logo.svg">`，并补响应式尺寸（窄屏 30px）。
+
+### 三、手机端卡片防溢出
+- grid 子项默认 `min-width:auto` 会被内容撑破：统一给 `.stats-cards / .pipeline-flow / .manage-grid / .stat-grid / .media-grid / .form-grid / .two-col / .three-col` 及其子项加 `min-width:0`，面板/统计卡 `overflow:hidden`，长文本 `overflow-wrap:anywhere`。
+- 5 列统计/进度条在 ≤1100px 降为 3 列、≤680px 降为 2 列，表格统一横向滚动，不再顶出屏幕。
+
+### 四、刷新保持当前页面
+- `tab` 从 `ref('概览')` 改为 localStorage（`ya_tg_current_tab`）读写，统一走 `setTab()`；导航点击与 TMDB 报错跳转都改为 `setTab()`。历史残留的「审核中心」值自动回退到概览。
+
+### 五、删除审核中心模块
+- 删除「分发与互动」导航组的「审核中心」项与对应 section（该模块已无用）；后端 `/api/review/*` 与概览队列分布计数保留，不影响现有数据。
+
+### 六、TgtoDrive 频道监控白名单联动（核心）
+参考 embyhub `tg_whitelist_sync` 插件实测契约（`docs/tg-whitelist-sync-design.md` 4.5/4.5.1/第九节）移植，确认频道监控白名单即 `visual-filter` 的 `ENV_FILTER_GUANGYA` 场景规则。
+- **字段契约**：分辨率 `resolution`（4k/1080p/720p/all）、画面效果 `effect`（all/dolby/hdr/sdr）、必含关键词 `required_keyword` + 开关 `include_required_keyword`（值+开关必须同时写，否则后端不编译进正则）。真机样本确认 `resolution` 取 `4k`/`all`、`effect` 取 `all`。提供中文下拉值→真机英文值的归一化映射。
+- **求片联动（审核通过才写）**：改动此前"提交即写白名单"的行为——Bot 提交 / 候选点选只登记 `pending`，白名单写入后移到管理员「采纳」时执行，携带 a/b/c 字段；拒绝时若此前已同步则联动移除本项目规则。同步成功/失败只写后台 note，绝不发给用户。
+- **删单联动**：删除求片端点改为 async，联动移除白名单。安全护栏对齐 embyhub：只删 `source=ya-tg` 且 id 匹配 `kw_<tmdb>_<season>` 的规则，GET 失败/结构未知/未命中一律不 POST，绝不覆盖/清空 TgtoDrive 原有关键词。
+- **投稿联动**：管理员「通过」投稿后，把分享链接转发到配置的 TgtoDrive 绑定 Bot chat_id（用交互 Bot 发送），由监控 Bot 转存；未配置或失败只写后台 note，不影响审核与用户通知。
+- **OpenAPI 边界**：`POST /api/media/resources/transfer` 字段由静态分析推导、未验证必填性，本版不直接调用，走"转发给监控 Bot"路径；真实端点以真机为准。
+- 新增配置项：`tgto_rule_resolution` / `tgto_rule_effect` / `tgto_rule_required_keyword` / `tgto_contribute_bot_chat_id`（管理页 c 板块填入 + 独立「保存 TgtoDrive 配置」按钮）。
+- **待真机验证**：白名单写入与投稿转发需连真实 TgtoDrive 实例验证；沙箱内只用模拟契约测试覆盖，需求矩阵标 🟡。
+
+### 七、测试
+- 新增 `tests/test_v0913_front_fixes_tgto_link.py`（13 项）：parse_mode、图标/favicon、tab 持久化、审核中心删除、响应式、a/b/c 字段契约与配置注入、删单联动护栏、审核/删除/投稿钩子。
+- 更新 `test_v080`（提交改 pending）、`test_v098_heal_b`（删除端点改 async、提交态断言）、`test_v098_tmdb_candidates`（补 flush）。
+- 全量 pytest 476 passed；前端 build 成功。
+
+### 镜像
 
 v0.9.11 发布后的全量优化合集：低风险性能精简、消息跳转标签化 + 图标 + 文档开源声明，以及 Bot 搜索/打赏交互升级。**不改 A→B 镜像主链路、不改认证协议、不私聊刷屏，海报仍优先**。
 

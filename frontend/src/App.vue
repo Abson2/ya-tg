@@ -5,7 +5,14 @@ import QRCode from 'qrcode'
 
 const password = ref(localStorage.getItem('ya_tg_password') || '')
 const authed = ref(false)
-const tab = ref('概览')
+// v0.9.13 #252：刷新后保留当前页面。审核中心已删除，历史残留值回退到概览。
+const TAB_STORAGE_KEY = 'ya_tg_current_tab'
+const _savedTab = localStorage.getItem(TAB_STORAGE_KEY) || '概览'
+const tab = ref(_savedTab === '审核中心' ? '概览' : _savedTab)
+function setTab(name) {
+  tab.value = name
+  localStorage.setItem(TAB_STORAGE_KEY, name)
+}
 const clock = ref('')
 const viewMode = ref('series')  // v0.6.4：作品视图为默认，单集按剧聚合，不再散落
 const keyword = ref('')
@@ -51,6 +58,8 @@ const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 const showScanPanel = ref(false)
 // v0.9.4：Bot 交互配置——交互 Bot 复用 bots 表 token、白名单复用推送目标；内置四指令固定
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
+  // v0.9.13 #254：TgtoDrive 频道监控白名单规则 a/b/c + 投稿转存监控 chat
+  tgto_rule_resolution: '4k', tgto_rule_effect: 'all', tgto_rule_required_keyword: '265', tgto_contribute_bot_chat_id: '',
   bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [],
   // v0.9.5：使用限制跳转链接 + 推送消息频道/群跳转（模板变量 channel_link/group_link）
   // v0.9.10：新增机器人跳转链接（推送 Bot 本身），渲染层统一追加三行文字链接
@@ -282,7 +291,6 @@ const navGroups = [
   ] },
   { label: '分发与互动', items: [
     { key: '分发与互动中心', icon: 'link', label: '分发与互动中心' },
-    { key: '审核中心', icon: 'check', label: '审核中心' },
     { key: '推送队列', icon: 'send', label: '推送队列' }
   ] },
   { label: '系统', items: [
@@ -807,6 +815,11 @@ async function postInteractionConfig() {
   const c = interactionCfg.value
   const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
     tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
+    // v0.9.13 #254：白名单规则 a/b/c + 投稿转存监控 chat
+    tgto_rule_resolution: c.tgto_rule_resolution || '4k',
+    tgto_rule_effect: c.tgto_rule_effect || 'all',
+    tgto_rule_required_keyword: c.tgto_rule_required_keyword || '',
+    tgto_contribute_bot_chat_id: c.tgto_contribute_bot_chat_id || '',
     donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
     donation_button_text: c.donation_button_text || '打赏支持',
     // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
@@ -859,6 +872,16 @@ async function testTgto() {
   catch (e) { ElMessage.error(e.message) }
   finally { tgtoTesting.value = false }
 }
+async function saveTgto() {
+  // v0.9.13 #254：TgtoDrive 板块独立保存按钮（只提交联动配置，复用互动配置接口）
+  interactionSaving.value = true
+  try {
+    await postInteractionConfig()
+    ElMessage.success('TgtoDrive 联动配置已保存')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { interactionSaving.value = false }
+}
 async function handleContribution(id, status) {
   let note = ''
   if (status === 'rejected') {
@@ -889,7 +912,7 @@ async function handleMediaRequest(row, review) {
   } catch (e) { ElMessage.error(e.message) }
 }
 async function deleteMediaRequest(row) {
-  const ok = await confirmBox(`确认删除求片「${row.title}」？只删登记记录，不影响 TgtoDrive 关键词规则。`)
+  const ok = await confirmBox(`确认删除求片「${row.title}」？将同时移除本项目写入的 TgtoDrive 白名单规则（不影响 TgtoDrive 原有关键词）。`)
   if (!ok) return
   try { await api(`/media-requests/${row.id}`, { method: 'DELETE' }); ElMessage.success('已删除'); await load() }
   catch (e) { ElMessage.error(e.message) }
@@ -1138,7 +1161,7 @@ async function identify(row, auto) {
         await ElMessageBox.confirm(
           `${msg}\n\n识别只影响海报和简介，资源入库、建分享与推送不受影响。现在去「TMDB 设置」页配置密钥？`,
           'TMDB 无法识别', { confirmButtonText: '去设置', cancelButtonText: '稍后', type: 'warning' })
-        tab.value = 'TMDB 设置'
+        setTab('TMDB 设置')
         await loadTmdb()
       } catch (_2) {}
     } else ElMessage.error(msg)
@@ -1301,7 +1324,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
   <div v-if="!authed" class="login-screen">
     <div class="login-deco d1"></div><div class="login-deco d2"></div>
     <div class="login-card">
-      <div class="login-brand"><div class="brand-mark lg">YT</div><div><h1>Ya-TG</h1><p>光鸭资源分发工作台</p></div></div>
+      <div class="login-brand"><img class="brand-logo lg" src="/logo.svg" alt="Ya-TG"/><div><h1>Ya-TG</h1><p>光鸭资源分发工作台</p></div></div>
       <div class="login-divider"></div>
       <h3>欢迎回来</h3>
       <p class="login-hint">请输入管理员密码以访问控制台</p>
@@ -1314,23 +1337,22 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
   <div v-else class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">YT</div>
+        <img class="brand-logo" src="/logo.svg" alt="Ya-TG"/>
         <div><div class="brand-name">Ya-TG</div><div class="brand-sub">资源分发工作台</div></div>
       </div>
       <div class="nav-groups">
         <div v-for="g in navGroups" :key="g.label" class="nav-group">
           <div class="nav-group-label">{{ g.label }}</div>
-          <button v-for="it in g.items" :key="it.key" class="nav-item" :class="{ active: tab === it.key }" @click="tab = it.key">
+          <button v-for="it in g.items" :key="it.key" class="nav-item" :class="{ active: tab === it.key }" @click="setTab(it.key)">
             <svg class="ico" viewBox="0 0 24 24"><path :d="icon(it.icon)"/></svg>
             <span class="nav-text">{{ it.label }}</span>
-            <span v-if="it.key === '审核中心' && overview.review" class="nav-badge">{{ overview.review }}</span>
           </button>
         </div>
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v0.9.12 · Asia/Shanghai</span>
+          <span>v0.9.13 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -1861,7 +1883,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <!-- v0.9.6.1：打赏已移入「内置指令速查」；推送频道/群跳转已移入「消息模板」模块 -->
 
           <!-- ===== b 板块：用户投稿 / 用户求片 ===== -->
-          <div class="sec-band"><span class="sec-key">b</span><div><h3>用户投稿 · 用户求片</h3><p>私聊 Bot 提交投稿与求片；求片关键词可一键同步到 TgtoDrive 监控规则</p></div><span class="sec-line"></span></div>
+          <div class="sec-band"><span class="sec-key">b</span><div><h3>用户投稿 · 用户求片</h3><p>私聊 Bot 提交投稿与求片；求片审核通过后自动写入 TgtoDrive 监控规则，删除/拒绝时联动移除</p></div><span class="sec-line"></span></div>
           <div class="two-col">
             <div class="panel">
               <div class="panel-head"><h3>用户求片（我想看）</h3></div>
@@ -1904,18 +1926,27 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           </div>
 
           <!-- ===== c 板块：TgtoDrive 项目联动调用配置 ===== -->
-          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片 / 投稿关键词同步到 TgtoDrive 监控规则；仅配置联动地址与凭证，与 Bot Token、打赏无关</p></div><span class="sec-line"></span></div>
+          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片审核通过后写入频道监控白名单、删单联动移除；投稿审核通过后转发链接给绑定 Bot 监控转存</p></div><span class="sec-line"></span></div>
           <div class="panel narrow">
-            <div class="panel-head"><h3>TgtoDrive 联动配置</h3><el-button :loading="tgtoTesting" size="small" @click="testTgto">测试连接（只读）</el-button></div>
+            <div class="panel-head"><h3>TgtoDrive 联动配置</h3>
+              <div class="head-tools">
+                <el-button :loading="tgtoTesting" size="small" @click="testTgto">测试连接（只读）</el-button>
+                <el-button type="primary" :loading="interactionSaving" size="small" @click="saveTgto">保存 TgtoDrive 配置</el-button>
+              </div>
+            </div>
             <div class="form-grid">
               <div class="field"><label>TgtoDrive 地址</label><el-input v-model="interactionCfg.tgto_base_url" placeholder="http://127.0.0.1:端口"/></div>
               <div class="field"><label>场景名</label><el-input v-model="interactionCfg.tgto_scene" placeholder="ENV_FILTER_GUANGYA"/></div>
               <div class="field"><label>OpenAPI Token（留空保持原值）</label><el-input v-model="interactionCfg.tgto_api_key" placeholder="已配置则留空" show-password/></div>
+              <div class="field"><label>a. 分辨率</label><el-select v-model="interactionCfg.tgto_rule_resolution" style="width:100%"><el-option label="4K" value="4k"/><el-option label="1080p" value="1080p"/><el-option label="720p" value="720p"/><el-option label="不限" value="all"/></el-select></div>
+              <div class="field"><label>b. 画面效果</label><el-select v-model="interactionCfg.tgto_rule_effect" style="width:100%"><el-option label="全部效果" value="all"/><el-option label="杜比视界" value="dolby"/><el-option label="HDR" value="hdr"/><el-option label="SDR" value="sdr"/></el-select></div>
+              <div class="field"><label>c. 自定义必含关键词</label><el-input v-model="interactionCfg.tgto_rule_required_keyword" placeholder="默认 265；留空则不启用必含条件"/></div>
+              <div class="field"><label>投稿转存监控 Bot chat_id</label><el-input v-model="interactionCfg.tgto_contribute_bot_chat_id" placeholder="投稿审核通过后把分享链接发到此 chat，留空则不转发"/></div>
             </div>
-            <p class="hint">关键词规则采用「读取全量 → 合并 → 回写 → 回读校验」，只新增/更新本项目幂等 id 规则，不覆盖原有关键词。投稿转存接口待抓包验证，当前只登记与审核。</p>
+            <p class="hint">白名单采用「读取全量 → 合并 → 回写 → 回读校验」，只增量新增/删除本项目 kw_ 幂等规则，不覆盖、不清空 TgtoDrive 原有关键词；管理员在求片列表删除或拒绝时联动移除本项目规则。投稿审核通过后转发链接到上方 chat_id（用交互 Bot 发送），由监控 Bot 转存。</p>
           </div>
 
-          <p class="hint" style="text-align:right;margin:0">上述互动配置已并入页面顶部「保存分发与互动配置」统一保存，无需重复点击。</p>
+          <p class="hint" style="text-align:right;margin:0">a/b/c 与 chat_id 也可随页面顶部「保存分发与互动配置」一起保存。</p>
 
         </section>
 
@@ -2035,14 +2066,6 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column label="允许对账" width="100"><template #default="s">{{ s.row.reconcile_allowed ? '是' : '否' }}</template></el-table-column>
             </el-table></div>
             <p class="hint">分页不完整、断点续扫、空结果或接口异常时，一律跳过对账，不会误删资源或取消分享。</p>
-          </div>
-        </section>
-
-        <section v-else-if="tab === '审核中心'" class="fade">
-          <div class="page-head"><div><h2>审核中心</h2><p>通过后的条目将自动建分享并进入推送队列</p></div><el-tag type="warning">{{ reviews.length }} 条待审</el-tag></div>
-          <div class="panel">
-            <el-table :data="reviews"><el-table-column prop="resource" label="资源名称" min-width="260"/><el-table-column prop="channel" label="目标频道"/><el-table-column prop="identified" label="识别状态" width="120"/><el-table-column label="操作" width="180"><template #default="s"><el-button type="success" size="small" @click="approve(s.row.id)">通过</el-button><el-button size="small" @click="reject(s.row.id)">拒绝</el-button></template></el-table-column></el-table>
-            <div v-if="!reviews.length" class="empty big">没有待审核内容</div>
           </div>
         </section>
 
@@ -2310,6 +2333,9 @@ button{font-family:inherit}
 .brand{display:flex;align-items:center;gap:12px;padding:24px 20px 22px;border-bottom:1px solid rgba(255,255,255,.09)}
 .brand-mark{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,var(--yg-primary-2),#43c9bd);display:grid;place-items:center;font-weight:800;font-size:14px;letter-spacing:.5px;color:#fff;box-shadow:0 6px 16px rgba(91,91,214,.35)}
 .brand-mark.lg{width:52px;height:52px;border-radius:15px;font-size:18px}
+/* v0.9.13 #250：品牌区使用项目图标（光鸭橙 + 纸飞机） */
+.brand-logo{width:38px;height:38px;border-radius:11px;object-fit:cover;box-shadow:0 6px 16px rgba(242,78,0,.28);flex:none}
+.brand-logo.lg{width:52px;height:52px;border-radius:15px}
 .brand-name{font-size:18px;font-weight:750;letter-spacing:.3px}
 .brand-sub{font-size:11px;color:#9ea6d4;margin-top:2px}
 .nav-groups{flex:1;padding:16px 12px;overflow-y:auto}
@@ -2571,7 +2597,7 @@ button{font-family:inherit}
 .preset-btn.on{background:var(--yg-primary);border-color:var(--yg-primary);color:#fff;font-weight:600}
 .inline-label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:400}
 .inline-form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}}
+@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}.stats-cards,.pipeline-flow{grid-template-columns:repeat(3,1fr)}}
 
 /* ============ v0.6.5 手机 / 触屏适配 ============ */
 /* ≤900px：侧栏从左侧竖排改为顶部横向导航，主区占满宽度 */
@@ -2580,6 +2606,7 @@ button{font-family:inherit}
   .sidebar{width:100%;height:auto;position:sticky;top:0;z-index:30;flex-direction:column;border-radius:0;box-shadow:0 4px 16px rgba(23,27,53,.18)}
   .brand{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
   .brand-mark{width:30px;height:30px;border-radius:9px;font-size:12px}
+  .brand-logo{width:30px;height:30px;border-radius:9px}
   .brand-name{font-size:15px}
   .nav-groups{display:flex;flex-direction:row;gap:6px;padding:8px 10px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;-webkit-overflow-scrolling:touch}
   .nav-group{display:flex;flex-direction:row;gap:6px;margin:0;flex:none}
@@ -2602,6 +2629,16 @@ button{font-family:inherit}
 .table-scroll .el-table{min-width:560px}
 /* 固定宽度内联控件的通用兜底：窄屏不要溢出 */
 .head-tools .el-input,.head-tools .el-select{max-width:100%}
+/* v0.9.13 #251：手机端卡片防溢出。grid 子项默认 min-width:auto 会被内容撑破，
+   统一改为 minmax(0,1fr) 语义；面板/统计卡强制 min-width:0 并允许长文本换行。 */
+.stats-cards,.pipeline-flow,.manage-grid,.stat-grid,.media-grid,.var-grid,.tg-extra-grid,
+.credential-bar,.auth-summary,.kv-grid,.form-grid,.two-col,.three-col{min-width:0}
+.stats-cards>*,.pipeline-flow>*,.manage-grid>*,.stat-grid>*,.media-grid>*,
+.two-col>*,.three-col>*,.form-grid>*{min-width:0}
+.panel,.stat-card,.manage-card{width:100%;min-width:0;overflow:hidden}
+.panel p,.panel .hint,.stat-card,.el-table .cell{overflow-wrap:anywhere;word-break:break-word}
+/* 超宽表格统一横向滚动，不撑破卡片 */
+.panel .el-table{width:100%}
 /* ≤680px：单列 + 海报墙两列 + 表单堆叠 */
 @media(max-width:680px){
   .content{padding:14px 10px 44px}
@@ -2612,6 +2649,9 @@ button{font-family:inherit}
   .head-tools{width:100%;justify-content:flex-start}
   .head-tools .el-input,.head-tools .el-select{width:100%!important;flex:1 1 100%}
   .stat-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+  /* 5 列进度/统计条在手机上折行，避免卡片超出屏幕 */
+  .stats-cards{grid-template-columns:repeat(2,1fr);gap:8px}
+  .pipeline-flow{grid-template-columns:repeat(2,1fr);gap:8px}
   .stat-num{font-size:22px}
   .hero{padding:18px;gap:14px}
   .hero h2{font-size:20px}

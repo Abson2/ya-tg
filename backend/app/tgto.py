@@ -62,6 +62,30 @@ def _rules_of(scene: dict) -> list[dict]:
     return rules if isinstance(rules, list) else []
 
 
+# v0.9.13 #254：下拉值 → TgtoDrive 真机字段值。真机样本(gugangya_visual_filter.json)
+# 里 resolution 取 "4k"/"all"、effect 取 "all"，其余为页面下拉候选；统一小写英文串。
+_RESOLUTION_MAP = {
+    "4k": "4k", "2160p": "4k", "1080p": "1080p", "720p": "720p",
+    "all": "all", "全部": "all", "": "all",
+}
+_EFFECT_MAP = {
+    "all": "all", "全部效果": "all", "": "all",
+    "dolby": "dolby", "dolby vision": "dolby", "杜比视界": "dolby", "杜比": "dolby",
+    "hdr": "hdr", "hdr10": "hdr",
+    "sdr": "sdr",
+}
+
+
+def norm_resolution(value: str) -> str:
+    v = str(value or "").strip().lower()
+    return _RESOLUTION_MAP.get(v, v or "all")
+
+
+def norm_effect(value: str) -> str:
+    v = str(value or "").strip().lower()
+    return _EFFECT_MAP.get(v, v or "all")
+
+
 def keyword_id(tmdb_id: int | None, season: int | None, title: str = "") -> str:
     if tmdb_id:
         return f"kw_{int(tmdb_id)}_{int(season or 1)}"
@@ -71,11 +95,17 @@ def keyword_id(tmdb_id: int | None, season: int | None, title: str = "") -> str:
 
 
 def build_rule(*, title: str, tmdb_id: int | None = None, media_type: str = "tv",
-               season: int | None = None, year: str = "", resolution: str = "") -> dict:
-    """构造一条结构化关键词规则，字段对齐 TgtoDrive 现有规则，来源标记为 ya-tg。"""
+               season: int | None = None, year: str = "", resolution: str = "",
+               effect: str = "", required_keyword: str = "") -> dict:
+    """构造一条结构化关键词规则，字段对齐 TgtoDrive 现有规则，来源标记为 ya-tg。
+
+    v0.9.13 #254：新增 effect / required_keyword 两个真机字段。必含关键词必须同时
+    写值（required_keyword）并打开开关（include_required_keyword），否则后端不编译进正则。
+    """
     display = title.strip()
     if season and media_type == "tv":
         display = f"{title.strip()} S{int(season)}"
+    req = str(required_keyword or "").strip()
     return {
         "id": keyword_id(tmdb_id, season, title),
         "aliases": [display],
@@ -88,11 +118,11 @@ def build_rule(*, title: str, tmdb_id: int | None = None, media_type: str = "tv"
         "keywords": [display],
         "keyword_groups_any": [[display]],
         "exclude_keywords": [],
-        "required_keyword": "",
-        "include_required_keyword": False,
+        "required_keyword": req,
+        "include_required_keyword": bool(req),
         "include_year": bool(year),
-        "effect": "all",
-        "resolution": resolution or "",
+        "effect": norm_effect(effect),
+        "resolution": norm_resolution(resolution) if resolution else "",
         "rule_type": "structured",
         "source": RULE_SOURCE,
         "sharer": "",
@@ -141,8 +171,19 @@ async def save_config(db: Session, data: dict, scene: str, scene_obj: dict) -> N
 
 async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
                          media_type: str = "tv", season: int | None = None,
-                         year: str = "", resolution: str = "") -> dict:
-    """合并一条「我想看」关键词，并回读验证。任何异常都不改动其它规则。"""
+                         year: str = "", resolution: str = "", effect: str = "",
+                         required_keyword: str = "") -> dict:
+    """合并一条「我想看」关键词，并回读验证。任何异常都不改动其它规则。
+
+    v0.9.13 #254：a/b/c 三字段未显式传入时从管理页配置读取（审核通过路径调用时
+    只传影视信息，字段由这里统一注入），保证前端配置真正生效。
+    """
+    if not resolution:
+        resolution = runtime_config.get(db, "tgto_rule_resolution") or "4k"
+    if not effect:
+        effect = runtime_config.get(db, "tgto_rule_effect") or "all"
+    if not required_keyword:
+        required_keyword = runtime_config.get(db, "tgto_rule_required_keyword") or ""
     data, scene = await fetch_config(db)
     obj = _scene_obj(data, scene)
     if obj is None:
@@ -150,7 +191,8 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
     rules = _rules_of(obj)
     before = len(rules)
     rule = build_rule(title=title, tmdb_id=tmdb_id, media_type=media_type,
-                      season=season, year=year, resolution=resolution)
+                      season=season, year=year, resolution=resolution,
+                      effect=effect, required_keyword=required_keyword)
     rid = rule["id"]
     hit = next((x for x in rules if isinstance(x, dict) and str(x.get("id")) == rid), None)
     if hit is not None:
@@ -160,7 +202,8 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
         # 只更新本项目自己创建的规则，且仅覆盖关键词相关字段
         for k in ("keywords", "keyword_groups_any", "aliases", "media_name",
                   "preferred_name", "title", "tmdb_id", "media_type", "year",
-                  "resolution", "source"):
+                  "resolution", "effect", "required_keyword",
+                  "include_required_keyword", "include_year", "source"):
             hit[k] = rule[k]
         action = "updated"
     else:
@@ -183,6 +226,42 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
         raise TgtoError("回写后规则数量异常减少，已中止（可能覆盖失败）")
     return {"ok": True, "status": action, "rule_id": rid,
             "rules_before": before, "rules_after": len(after_rules)}
+
+
+async def remove_keyword(db: Session, *, tmdb_id: int | None,
+                         season: int | None = None, title: str = "") -> dict:
+    """v0.9.13 #254：删除求片时联动移除本项目写入的白名单规则（增量、精准）。
+
+    安全护栏（对齐 embyhub remove_rules 的实测经验，绝不误删他人规则）：
+      1. 只匹配幂等 id kw_<tmdb>_<season> 且 source==ya-tg 的规则；
+      2. GET 失败 / 结构未知 / 场景缺失 → 中止，绝不 POST（避免写出空规则列表）；
+      3. 未命中 → 零净改动，不 POST；
+      4. 同步 current 副本，保留所有其它规则原顺序。
+    """
+    rid = keyword_id(tmdb_id, season, title)
+    data, scene = await fetch_config(db)
+    obj = _scene_obj(data, scene)
+    if obj is None:
+        return {"ok": False, "changed": False, "message": "场景配置缺失，已中止删除"}
+    rules = _rules_of(obj)
+    kept, removed = [], []
+    for r in rules:
+        is_target = (isinstance(r, dict) and str(r.get("id")) == rid
+                     and str(r.get("source") or "") == RULE_SOURCE)
+        if is_target:
+            removed.append(rid)
+        else:
+            kept.append(r)
+    if not removed:
+        return {"ok": True, "changed": False, "removed": [], "rule_id": rid,
+                "message": "未找到本项目规则，无需删除"}
+    obj["rules"] = kept
+    if isinstance(data.get("current"), dict) and (
+            not data["current"].get("key") or data["current"].get("key") == scene):
+        data["current"]["rules"] = kept
+    await save_config(db, data, scene, obj)
+    return {"ok": True, "changed": True, "removed": removed, "rule_id": rid,
+            "kept_count": len(kept)}
 
 
 async def test_connection(db: Session) -> dict:

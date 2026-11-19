@@ -61,6 +61,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tgto_base_url": ("tgto_base_url", ""),
     "tgto_api_key": ("tgto_api_key", ""),
     "tgto_scene": ("tgto_scene", "ENV_FILTER_GUANGYA"),
+    # v0.9.13 #254：求片审核通过后写入白名单时的三档规则字段（真机取值：
+    # resolution=4k/all，effect=all/dolby/hdr/sdr，required_keyword 小写英文串）。
+    "tgto_rule_resolution": ("tgto_rule_resolution", "4k"),       # 4k/1080p/720p
+    "tgto_rule_effect": ("tgto_rule_effect", "all"),              # all/dolby/hdr/sdr
+    "tgto_rule_required_keyword": ("tgto_rule_required_keyword", "265"),  # 必含关键词
+    # 投稿审核通过后把分享链接转发到该 TgtoDrive 绑定 Bot（chat_id），由其监控转存
+    "tgto_contribute_bot_chat_id": ("tgto_contribute_bot_chat_id", ""),
     # v0.8.0：用户互动 / 打赏
     "contribution_enabled": ("contribution_enabled", "false"),
     "contribution_bot_token": ("contribution_bot_token", ""),  # v0.9.4 起仅作旧配置回退

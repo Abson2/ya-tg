@@ -47,8 +47,9 @@ def test_want_reply_hides_admin_tgto_error(session):
     assert "已登记" in reply
     rows = session.query(MediaRequest).all()
     assert len(rows) == 1
-    assert rows[0].status == "failed"
-    assert "TgtoDrive" in rows[0].note  # 管理员错误只进后台 note
+    # v0.9.13 #254：提交阶段不再写 TgtoDrive，note 标「待审核」；
+    # 白名单错误只会出现在审核通过后的后台 note，绝不在用户回复里。
+    assert rows[0].status == "pending"
     assert rows[0].tg_user_id == "123" and rows[0].tg_username == "alice"
 
 
@@ -64,7 +65,8 @@ def test_want_reply_hides_keyword_sync_fail_message(session):
 
 def rows_ok(session):
     r = session.query(MediaRequest).first()
-    return r is not None and r.review_status == "pending" and r.status == "failed"
+    # v0.9.13 #254：提交只登记待审核（status=pending），白名单写入移到审核后
+    return r is not None and r.review_status == "pending" and r.status == "pending"
 
 
 def test_contribution_records_user_account(session):
@@ -118,7 +120,8 @@ def test_delete_media_request(session):
     r = MediaRequest(title="待删", status="failed", review_status="pending")
     session.add(r)
     session.commit()
-    assert main.delete_media_request(r.id, db=session)["ok"] is True
+    # v0.9.13 #254：删除端点改为 async（联动移除白名单需 await）
+    assert _run(main.delete_media_request(r.id, db=session))["ok"] is True
     assert session.get(MediaRequest, r.id) is None
 
 

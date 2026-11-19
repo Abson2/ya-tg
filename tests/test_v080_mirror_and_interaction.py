@@ -455,7 +455,9 @@ def test_bot_listener_want_and_contribute(db):
         assert act2 == "contribute" and "登记" in reply2
     db.commit()
     req = db.scalar(select(MediaRequest))
-    assert req.status == "synced" and req.title == "伟大的长征" and req.tmdb_id == 297253
+    # v0.9.13 #254：提交只登记待审核，白名单写入后移到管理员审核通过时执行
+    assert req.status == "pending" and "审核" in req.note
+    assert req.title == "伟大的长征" and req.tmdb_id == 297253
     assert req.season == 1 and req.keyword_id == "kw_297253_1"
     c = db.scalar(select(UserContribution))
     assert c.status == "pending" and "待验证" in c.note  # 转存接口未验证，不自动入库

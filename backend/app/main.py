@@ -313,13 +313,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.12", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.13", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.12", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.13", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -3805,6 +3805,11 @@ class InteractionConfigInput(BaseModel):
     tgto_base_url: str | None = None
     tgto_scene: str | None = None
     tgto_api_key: str | None = None
+    # v0.9.13 #254：白名单规则 a/b/c + 投稿转存监控 chat
+    tgto_rule_resolution: str | None = None
+    tgto_rule_effect: str | None = None
+    tgto_rule_required_keyword: str | None = None
+    tgto_contribute_bot_chat_id: str | None = None
     contribution_bot_token: str | None = None
     interaction_bot_id: str | None = None       # v0.9.4：交互 Bot 引用 bots 表 id（token 去重）；"" = 不选用
     donation_image_url: str | None = None
@@ -3832,7 +3837,9 @@ class InteractionConfigInput(BaseModel):
 def interaction_config_get(db: Session = Depends(get_db)):
     plain = ["tgto_base_url", "tgto_scene", "donation_image_url", "donation_text",
              "donation_button_text", "bot_required_channel_link", "bot_required_group_link",
-             "tg_channel_link", "tg_group_link", "tg_bot_link"]
+             "tg_channel_link", "tg_group_link", "tg_bot_link",
+             "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
+             "tgto_contribute_bot_chat_id"]
     out = {k: runtime_config.get(db, k) for k in plain}
     out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
@@ -3866,7 +3873,9 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
     for k in ("tgto_base_url", "tgto_scene", "tgto_api_key", "contribution_bot_token",
               "donation_image_url", "donation_text", "donation_button_text",
               "bot_required_channel_link", "bot_required_group_link",
-              "tg_channel_link", "tg_group_link", "tg_bot_link"):
+              "tg_channel_link", "tg_group_link", "tg_bot_link",
+              "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
+              "tgto_contribute_bot_chat_id"):
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
@@ -4134,6 +4143,15 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     notice = ""
     if p.status == "approved":
         notice = f"你的投稿「{c.title}」已通过审核，感谢支持！"
+        # v0.9.13 #254：审核通过把分享链接转发到 TgtoDrive 绑定 Bot 监控转存。
+        # 结果只写后台 note，转发失败不影响审核与用户通知。
+        try:
+            sent, info = await bot_listener.forward_contribution_to_tgto(
+                db, c.share_url, c.title)
+            c.note = (c.note + " | " if c.note else "") + info[:200]
+            db.commit()
+        except Exception:
+            pass
     elif p.status == "rejected":
         notice = f"你的投稿「{c.title}」未通过审核。" + (f"原因：{p.note}" if p.note else "")
     elif p.status == "transferred":
@@ -4225,7 +4243,33 @@ async def handle_media_request(rid: int, p: MediaRequestHandleInput,
     r.handled_at = utcnow()
     add_audit(db, "media_request_handled", target_type="media_request", target_id=str(rid),
               detail=json_dumps({"review_status": p.review_status, "note": p.note[:200]}))
-    db.commit()
+    db.commit()  # 先落审核态，再做外部网络调用，绝不跨 await 持写事务
+
+    # v0.9.13 #254：审核通过才把影视信息 + a/b/c 字段增量写入 TgtoDrive 白名单；
+    # 拒绝时若此前已同步，则联动移除本项目规则。任何失败只写后台 note，不发用户。
+    sync_info = ""
+    if p.review_status == "adopted":
+        try:
+            res = await tgto.upsert_keyword(
+                db, title=r.title, tmdb_id=r.tmdb_id,
+                media_type=r.media_type or "tv", season=r.season, year=r.year or "")
+            r.status = "synced" if res.get("ok") else "failed"
+            r.note = (res.get("message") or res.get("status") or "")[:300]
+            if res.get("ok"):
+                r.synced_at = utcnow()
+            sync_info = f"；白名单{res.get('status', 'ok')}"
+        except Exception as exc:
+            r.status, r.note = "failed", str(exc)[:300]
+            sync_info = "；白名单同步失败（仅后台可见）"
+        db.commit()
+    elif p.review_status == "rejected" and r.status == "synced":
+        try:
+            await tgto.remove_keyword(db, tmdb_id=r.tmdb_id, season=r.season, title=r.title)
+            r.status, r.note = "pending", "审核拒绝，已移除白名单规则"
+        except Exception as exc:
+            r.note = f"拒绝后移除白名单失败：{str(exc)[:200]}"
+        db.commit()
+
     notice = ""
     if p.review_status == "adopted":
         notice = f"你求片的「{r.title}」已采纳，我们会尽快安排，感谢支持！"
@@ -4234,19 +4278,32 @@ async def handle_media_request(rid: int, p: MediaRequestHandleInput,
     notified = False
     if notice and r.tg_user_id:
         notified = await bot_listener.notify_user(db, r.tg_user_id, notice)
-    return {"ok": True, "notified": notified, "review_status": r.review_status}
+    return {"ok": True, "notified": notified, "review_status": r.review_status,
+            "sync": sync_info or "ok"}
 
 
 @app.delete("/api/media-requests/{rid}", dependencies=ADMIN)
-def delete_media_request(rid: int, db: Session = Depends(get_db)):
-    """v0.9.8：删除求片记录（只删登记行，不动 TgtoDrive 关键词规则）。"""
+async def delete_media_request(rid: int, db: Session = Depends(get_db)):
+    """v0.9.13 #254：删除求片记录，并联动移除本项目写入的白名单规则。
+
+    只删本项目 source=ya-tg 且 id 匹配的规则，绝不覆盖/清空 TgtoDrive 原有关键词；
+    联动失败只记日志，不阻断删除主流程。
+    """
     r = db.get(MediaRequest, rid)
     if not r:
         raise HTTPException(404, "求片记录不存在")
+    tmdb_id, season, title, synced = r.tmdb_id, r.season, r.title, r.status == "synced"
     db.delete(r)
     add_audit(db, "media_request_deleted", target_type="media_request", target_id=str(rid))
     db.commit()
-    return {"ok": True}
+    removed = False
+    if synced:
+        try:
+            res = await tgto.remove_keyword(db, tmdb_id=tmdb_id, season=season, title=title)
+            removed = bool(res.get("changed"))
+        except Exception:
+            pass  # 联动失败只记日志，删除主流程不受影响
+    return {"ok": True, "keyword_removed": removed}
 
 
 @app.get("/api/interaction/status", dependencies=ADMIN)

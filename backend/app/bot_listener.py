@@ -360,10 +360,13 @@ def restriction_keyboard(db: Session) -> dict | None:
 
 
 async def _reply(db: Session, token: str, chat_id: str, text: str,
-                 reply_markup: dict | None = None) -> None:
+                 reply_markup: dict | None = None,
+                 parse_mode: str | None = None) -> None:
     """只回复指令来源的 chat（频道 / 群聊 / 私聊由 poll_once 决定），不主动私推用户。"""
     payload = {"chat_id": str(chat_id), "text": text[:4000],
                "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
@@ -373,19 +376,28 @@ async def _reply(db: Session, token: str, chat_id: str, text: str,
 
 
 async def _send_photo(db: Session, token: str, chat_id: str, photo: str,
-                      caption: str = "") -> None:
-    """v0.9.12：给用户发一张图片（打赏码 / 资源海报），失败静默不影响 offset。"""
+                      caption: str = "", parse_mode: str = "") -> None:
+    """v0.9.12：给用户发一张图片（打赏码 / 资源海报），失败静默不影响 offset。
+
+    v0.9.13 #249：搜索卡片复用 publisher._build_message() 渲染出的是 HTML（<b>/<a>），
+    必须带 parse_mode=HTML 才会被 Telegram 解析；否则标签会以纯文本外泄。打赏 caption
+    是纯文本，保持默认不带 parse_mode，避免文案里的 < > 触发 Telegram 解析错误。
+    无海报降级 sendMessage 时同样要带 parse_mode，否则正文标签仍会外泄。
+    """
     if not photo:
-        await _reply(db, token, chat_id, caption)
+        await _reply(db, token, chat_id, caption, parse_mode=parse_mode or None)
         return
     payload = {"chat_id": str(chat_id), "photo": photo}
     if caption:
         payload["caption"] = caption[:1000]
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         await _api(db, token, "sendPhoto", payload)
     except Exception:
-        # 图片发送失败降级为纯文字，至少把说明送到
-        await _reply(db, token, chat_id, caption or "图片发送失败，请稍后重试。")
+        # 图片发送失败降级为纯文字，至少把说明送到（保留 parse_mode）
+        await _reply(db, token, chat_id, caption or "图片发送失败，请稍后重试。",
+                     parse_mode=parse_mode or None)
 
 
 async def _send_search_cards(db: Session, token: str, chat_id: str,
@@ -403,7 +415,8 @@ async def _send_search_cards(db: Session, token: str, chat_id: str,
             continue
         caption, _ = publisher._build_message(db, res, res.share_url)
         poster = tmdb.poster_url(res.poster_path) if res.poster_path else ""
-        await _send_photo(db, token, chat_id, poster, caption)
+        # v0.9.13 #249：卡片正文是 HTML，必须带 parse_mode=HTML，否则 <b>/<a> 外泄成代码
+        await _send_photo(db, token, chat_id, poster, caption, parse_mode="HTML")
 
 
 async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[bool, str]:
@@ -586,6 +599,32 @@ async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
         return False
 
 
+async def forward_contribution_to_tgto(db: Session, share_url: str, title: str = "") -> tuple[bool, str]:
+    """v0.9.13 #254：投稿审核通过后，把分享链接转发到配置的 TgtoDrive 绑定 Bot chat。
+
+    由该 Bot 监控链接自动转存。目标 chat_id 由管理页配置（tgto_contribute_bot_chat_id），
+    发送用交互 Bot 的 token；未配置或失败只返回状态供后台 note，绝不影响审核主流程。
+    返回 (是否发送, 说明)。
+    """
+    chat_id = (runtime_config.get(db, "tgto_contribute_bot_chat_id") or "").strip()
+    if not chat_id:
+        return False, "未配置 TgtoDrive 投稿监控 chat_id"
+    share_url = (share_url or "").strip()
+    if not share_url:
+        return False, "投稿无分享链接，跳过转发"
+    token = effective_token(db)
+    if not token:
+        return False, "未配置交互 Bot Token，无法转发"
+    text = f"📥 投稿转存\n{title}\n{share_url}" if title else f"📥 投稿转存\n{share_url}"
+    try:
+        await _api(db, token, "sendMessage",
+                   {"chat_id": chat_id, "text": text[:4000],
+                    "disable_web_page_preview": False})
+        return True, "已转发至 TgtoDrive 监控 Bot"
+    except Exception as exc:
+        return False, f"转发失败：{str(exc)[:160]}"
+
+
 def main_keyboard() -> dict:
     """inline 主菜单：供已有 inline 消息与 callback 路由使用。"""
     return {"inline_keyboard": [
@@ -737,21 +776,14 @@ async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id:
 
     if flow == FLOW_WANT:
         kid = tgto.keyword_id(tmdb_id, None, title)
+        # v0.9.13 #254：白名单写入后移到「管理员审核通过」时执行（见 main.handle_media_request），
+        # 提交阶段只登记，避免未审核的求片占用频道监控。
         req = MediaRequest(tg_user_id=str(uid), tg_username=tg_username,
                            title=title, tmdb_id=tmdb_id, media_type=media_type,
                            year=year, season=None, keyword_id=kid, status="pending",
-                           review_status="pending")
+                           review_status="pending", note="待管理员审核通过后同步白名单")
         db.add(req)
-        db.flush()
-        try:
-            r = await tgto.upsert_keyword(db, title=title, tmdb_id=tmdb_id,
-                                          media_type=media_type, season=None)
-            req.status = "synced" if r.get("ok") else "failed"
-            req.note = r.get("message") or r.get("status") or ""
-            if r.get("ok"):
-                req.synced_at = utcnow()
-        except Exception as exc:
-            req.status, req.note = "failed", str(exc)[:300]
+        db.flush()  # autoflush=False：写完即查必须显式 flush
         _pick_clear(uid)
         return await _edit_or_send(db, token, chat_id, message_id,
                                    f"已登记「{title}」，我们会尽快处理，感谢支持！", main_keyboard())
@@ -1051,23 +1083,14 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                 _pick_set(tg_user_id, FLOW_WANT, title, candidates)
                 return "want_pick", _candidate_caption(FLOW_WANT, title, candidates)
         kid = tgto.keyword_id(tmdb_id, season, title)
+        # v0.9.13 #254：白名单写入后移到「审核通过」时执行；提交只登记待审核。
+        # 同步细节（成功/失败）只写后台 note，绝不发给用户。
         req = MediaRequest(tg_user_id=str(tg_user_id), tg_username=tg_username,
                            title=title, tmdb_id=tmdb_id, media_type="tv" if season else "",
-                           season=season, keyword_id=kid, status="pending")
+                           season=season, keyword_id=kid, status="pending",
+                           review_status="pending", note="待管理员审核通过后同步白名单")
         db.add(req)
-        db.flush()
-        # v0.9.8：TgtoDrive 同步是管理员侧的事，失败原因只写 note 供后台排查，
-        # 绝不能发给用户（用户反馈第 4 项）。用户只看到「已登记，等待审核」。
-        req.review_status = "pending"
-        try:
-            r = await tgto.upsert_keyword(db, title=title, tmdb_id=tmdb_id,
-                                          media_type=req.media_type or "tv", season=season)
-            req.status = "synced" if r.get("ok") else "failed"
-            req.note = r.get("message") or r.get("status") or ""
-            if r.get("ok"):
-                req.synced_at = utcnow()
-        except Exception as exc:
-            req.status, req.note = "failed", str(exc)[:300]
+        db.flush()  # autoflush=False：写完即查必须显式 flush
         reply = f"已登记「{title}」，我们会尽快处理，感谢支持！"
         return "want", reply
 
