@@ -36,7 +36,7 @@ HELP = ("Ya-TG 指令说明\n\n"
         "/搜索 关键词               — 搜索资源库中的影视\n"
         "/打赏                     — 查看打赏方式\n"
         "/help                     — 查看本说明\n\n"
-        "也可用下方按钮直达频道、群组、投稿求片与搜索。\n"
+        "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏。\n"
         "其它指令以管理员在后台配置的为准。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
@@ -320,7 +320,7 @@ async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
 
 
 def main_keyboard() -> dict:
-    """两列主菜单：频道 / 群组 / 投稿求片 / 搜索 / 打赏。"""
+    """inline 主菜单：供已有 inline 消息与 callback 路由使用。"""
     return {"inline_keyboard": [
         [{"text": "📺 官方频道", "callback_data": CB_CHANNELS},
          {"text": "👥 交流群组", "callback_data": CB_GROUPS}],
@@ -328,6 +328,19 @@ def main_keyboard() -> dict:
          {"text": "🔍 搜索资源", "callback_data": CB_SEARCH}],
         [{"text": "💝 打赏支持", "callback_data": CB_DONATE}],
     ]}
+
+
+def main_reply_keyboard() -> dict:
+    """v0.9.6.1：/start 后弹出的 Telegram 私聊 Reply 键盘。
+
+    用户明确要的是 Telegram 软件里 Bot 界面的菜单按钮（输入框上方的键盘），
+    不是 setMyCommands 注册的底部指令栏，也不是 inline callback 按钮。
+    按钮文字用中文指令名（不带斜杠），`_match_builtin()` 已同时接受两种写法。
+    只回复 /start 的来源 chat，不主动私推；one_time_keyboard=False 保持常驻。
+    """
+    return {"keyboard": [["求片", "投稿"], ["搜索", "打赏"]],
+            "resize_keyboard": True, "one_time_keyboard": False,
+            "selective": True}
 
 
 def actions_keyboard() -> dict:
@@ -626,9 +639,10 @@ async def poll_once(db: Session) -> dict:
                 stats["handled"] += 1
                 stats["actions"].append(action)
             if reply and chat_id:
-                # /start、/help 附带 inline 主菜单，让用户真正看到可点的功能入口
+                # /start、/help 附带 Telegram 私聊 Reply 键盘（输入框上方菜单）。
+                # 不调用 setMyCommands，不改 Telegram 底部指令栏；只回来源 chat。
                 if action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
-                    await _reply(db, token, chat_id, reply, reply_markup=main_keyboard())
+                    await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
                 else:
                     await _reply(db, token, chat_id, reply)
         except Exception as exc:

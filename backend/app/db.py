@@ -1,5 +1,5 @@
 import json
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, event, inspect, or_, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
 
@@ -280,6 +280,54 @@ def _converge_legacy_queue(db) -> int:
     return removed
 
 
+def _backfill_pruned_dirs(db) -> int:
+    """v0.9.6.1：给历史无标记 prune 行补 [pruned]。只改 error 文案，不删行。"""
+    from .models import AppConfig, MirrorDir, utcnow
+    from .mirror import PRUNED_DIR_MARK, is_pruned_dir_error
+
+    marker_key = "pruned_dir_backfill_v0961"
+    if db.get(AppConfig, marker_key):
+        return 0
+    changed = 0
+    for d in db.query(MirrorDir).filter(MirrorDir.status == "missing").all():
+        err = str(getattr(d, "error", "") or "")
+        if err.startswith(PRUNED_DIR_MARK) or not is_pruned_dir_error(err):
+            continue
+        d.error = PRUNED_DIR_MARK + err
+        d.updated_at = utcnow()
+        changed += 1
+    db.add(AppConfig(key=marker_key, value_enc=str(changed), updated_at=utcnow()))
+    db.commit()
+    return changed
+
+
+def _mark_legacy_rename_skipped(db) -> int:
+    """v0.9.6.1：升级前未完成的单集改名行标记「历史不回刷」。
+
+    用户明确修正口径：旧版只改文件夹不改单集，新版不应回刷历史清单。
+    只标记 synced 且尚未 done 的行；新复制的行仍是 pending，照常改名。
+    force=True 可显式解除，保留人工入口。
+    """
+    from .models import AppConfig, MirrorFile, utcnow
+
+    marker_key = "rename_legacy_skip_v0961"
+    if db.get(AppConfig, marker_key):
+        return 0
+    rows = db.query(MirrorFile).filter(
+        MirrorFile.status == "synced",
+        or_(MirrorFile.rename_status.is_(None),
+            MirrorFile.rename_status.in_(["", "pending_visible", "failed"]))).all()
+    changed = 0
+    for f in rows:
+        f.rename_status = "skipped_legacy"
+        f.rename_error = "历史条目不回刷英文单集改名；如需处理请点「重新解析英文名并改名」"
+        f.updated_at = utcnow()
+        changed += 1
+    db.add(AppConfig(key=marker_key, value_enc=str(changed), updated_at=utcnow()))
+    db.commit()
+    return changed
+
+
 def migrate() -> None:
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
@@ -297,6 +345,11 @@ def migrate() -> None:
     from .models import AppConfig, MessageTemplate, utcnow
 
     with SessionLocal() as db:
+        # v0.9.6.1：一次性历史迁移（助手函数各自用 AppConfig 标记保证只跑一次）。
+        # 运行期 mirror.is_pruned_dir_error() 已能识别旧文案，落盘补标记只为口径一致。
+        _backfill_pruned_dirs(db)
+        _mark_legacy_rename_skipped(db)
+
         tpl = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").first()
         # v0.9.6：去重——历史上「一键恢复默认模板」在并发 / 空表时可能写入多条同名
         # 「默认图文模板」（用户截图出现 5 条）。这里保留第一条（优先 is_default），

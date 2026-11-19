@@ -58,6 +58,7 @@ const interactionCfg = ref({ contribution_enabled: false, donation_enabled: fals
 const pushCfg = ref({ bot: null, max_routes: 10 })
 const pushRoutes = ref([{ dir_id: '', kind: 'channel', chat_id: '', note: '' }])
 const pushSaving = ref(false), pushBotToken = ref('')
+const broadcastText = ref(''), broadcastSending = ref(false)
 function addPushRoute() {
   if (pushRoutes.value.length >= (pushCfg.value.max_routes || 10)) { ElMessage.warning('推送白名单最多 10 条'); return }
   pushRoutes.value.push({ dir_id: '', kind: 'channel', chat_id: '', note: '' })
@@ -226,6 +227,15 @@ async function deleteTpl(t) {
   if (!ok) return
   try { await api(`/templates/${t.id}`, { method: 'DELETE' }); ElMessage.success('模板已删除'); await load() }
   catch (e) { ElMessage.error(e.message) }
+}
+async function setDefaultTpl(t) {
+  if (t.is_default) { ElMessage.info('该模板已是默认'); return }
+  try {
+    await api(`/templates/${t.id}`, { method: 'PUT',
+      body: JSON.stringify({ name: t.name, content: t.content, enabled: t.enabled, is_default: true }) })
+    ElMessage.success(`「${t.name}」已设为默认，后续推送按此模板渲染`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
 }
 
 let clockTimer = null, webqrTimer = null
@@ -651,17 +661,38 @@ async function pruneMirrorMappings() {
 }
 // ---------- 用户互动 ----------
 async function savePushRoutes() {
-  // v0.9.5：保存目录路由表 + 全局单 Bot token（token 留空表示不改）
+  // v0.9.6.1：交互 Bot / 目录路由 / 使用限制 / 打赏统一保存，避免填了使用限制却没保存。
   const routes = (pushRoutes.value || []).map(r => ({ dir_id: String(r.dir_id || '').trim(), kind: r.kind || 'channel', chat_id: String(r.chat_id || '').trim(), note: String(r.note || '').trim() })).filter(r => r.chat_id)
-  if (!routes.length) { ElMessage.warning('请至少配置一条推送目标（频道 ID 或群 ID）'); return }
   const body = { routes }
   const token = String(pushBotToken.value || '').trim()
   if (token) body.bot_token = token
   pushSaving.value = true
+  let routeInfo = ''
   try {
-    const d = await api('/push/routes', { method: 'POST', body: JSON.stringify(body) })
+    // 路由为空也允许保存使用限制 / 打赏，不让「至少一条路由」挡住其它配置
+    if (routes.length) {
+      const d = await api('/push/routes', { method: 'POST', body: JSON.stringify(body) })
+      pushBotToken.value = ''
+      routeInfo = ` · ${d.count} 条路由`
+    } else {
+      routeInfo = ' · 未改路由'
+    }
+    await postInteractionConfig()
+    await api('/reward/config', { method: 'POST', body: JSON.stringify(rewardCfg.value || { code: '' }) })
+    ElMessage.success(`分发与互动配置已保存（Bot + 白名单 + 使用限制 + 打赏）${routeInfo}`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { pushSaving.value = false }
+}
+async function clearPushBotToken() {
+  if (!pushCfg.value.bot?.token_masked) { ElMessage.info('当前没有已配置的 Bot Token'); return }
+  const ok = await confirmBox('确认清除 Bot Token？清除后 Bot 停用、测试推送不可用；目录路由 / 频道 / 投稿配置全部保留，重新填 Token 即可恢复。')
+  if (!ok) return
+  pushSaving.value = true
+  try {
+    await api('/push/bot/token/clear', { method: 'POST' })
     pushBotToken.value = ''
-    ElMessage.success(`推送配置已保存：${d.count} 条路由`)
+    ElMessage.success('Bot Token 已清除，Bot 已停用')
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { pushSaving.value = false }
@@ -675,28 +706,51 @@ async function testPushRoute(r) {
     ElMessage[d.ok ? 'success' : 'error'](d.message || (d.ok ? '测试消息已发送' : '测试失败'))
   } catch (e) { ElMessage.error(e.message) }
 }
+async function postInteractionConfig() {
+  const c = interactionCfg.value
+  const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
+    tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
+    donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
+    donation_button_text: c.donation_button_text || '打赏支持',
+    // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
+    interaction_bot_id: String(c.interaction_bot_id || ''),
+    bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
+    bot_gate_mode: c.bot_gate_mode || 'whitelist',
+    bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
+    // v0.9.5：使用限制跳转 + 推送消息频道/群跳转
+    bot_required_channel_link: c.bot_required_channel_link || '', bot_required_group_link: c.bot_required_group_link || '',
+    tg_channel_link: c.tg_channel_link || '', tg_group_link: c.tg_group_link || '',
+    // 自定义指令不含内置四项，内置由后端固定注入
+    bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
+  // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
+  if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
+  await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
+}
+async function sendBroadcastNotice() {
+  // 管理员侧群发通知：只发目录路由表里的频道 / 群聊，不私聊用户、不进队列。
+  const text = String(broadcastText.value || '').trim()
+  if (!text) { ElMessage.warning('请先填写通知内容'); return }
+  broadcastSending.value = true
+  try {
+    const d = await api('/broadcast/notify', { method: 'POST', body: JSON.stringify({ text }) })
+    ElMessage[d.ok ? 'success' : 'error'](d.message || (d.ok ? '通知已发送' : '通知发送失败'))
+  } catch (e) { ElMessage.error(e.message) }
+  finally { broadcastSending.value = false }
+}
 async function saveInteraction() {
   interactionSaving.value = true
   try {
-    const c = interactionCfg.value
-    const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
-      tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
-      donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
-      donation_button_text: c.donation_button_text || '打赏支持',
-      // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
-      interaction_bot_id: String(c.interaction_bot_id || ''),
-      bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
-      bot_gate_mode: c.bot_gate_mode || 'whitelist',
-      bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
-      // v0.9.5：使用限制跳转 + 推送消息频道/群跳转
-      bot_required_channel_link: c.bot_required_channel_link || '', bot_required_group_link: c.bot_required_group_link || '',
-      tg_channel_link: c.tg_channel_link || '', tg_group_link: c.tg_group_link || '',
-      // 自定义指令不含内置四项，内置由后端固定注入
-      bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
-    // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
-    if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
-    await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
+    await postInteractionConfig()
     ElMessage.success('互动设置已保存（密钥加密存储）')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { interactionSaving.value = false }
+}
+async function saveJumpLinks() {
+  interactionSaving.value = true
+  try {
+    await postInteractionConfig()
+    ElMessage.success('消息跳转链接已保存；留空的一侧不会出现在推送消息里')
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { interactionSaving.value = false }
@@ -1021,8 +1075,8 @@ async function saveTpl() {
 async function restoreDefaultTpl() {
   try {
     const d = await api('/templates/default', { method: 'POST' })
-    tpl.value = { name: '默认图文模板', content: d.content, enabled: true, is_default: true }
-    ElMessage.success('已载入整剧风格默认模板（含分类标签），保存后生效')
+    tpl.value = { id: d.id || 0, name: '默认图文模板', content: d.content, enabled: true, is_default: true }
+    ElMessage.success('已载入整剧风格默认模板（含分类标签），已设为默认')
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -1086,9 +1140,9 @@ async function saveReward() {
   rewardSaving.value = true
   try {
     rewardCfg.value = await api('/reward/config', { method: 'POST', body: JSON.stringify(rewardCfg.value) })
-    // v0.9.5：打赏卡同时保存「推送消息频道/群跳转」与打赏说明、使用限制跳转链接
-    await saveInteraction()
-    ElMessage.success('打赏配置与消息跳转已保存')
+    await postInteractionConfig()
+    ElMessage.success('打赏配置已保存')
+    await load()
   }
   catch (e) { ElMessage.error(e.message) }
   finally { rewardSaving.value = false }
@@ -1141,7 +1195,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.6 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.7 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1414,6 +1468,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             </el-table></div>
             <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
           </div>
+          <div v-if="mirrorStatus.counts?.dirs_pruned_zombie" class="panel">
+            <div class="panel-head"><h3>已清理待重建目录映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条</el-tag><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearPrunedMappings">清空已清理映射</el-button></div>
+            <p class="hint">这些是历史「清理无效映射」留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。旧版本无标记的行现在同样识别；确认后点「清空已清理映射」即可从清单彻底移除，不影响资源 / 分享 / 队列。</p>
+          </div>
           <div v-if="mirrorStatus.file_errors?.length" class="panel">
             <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.file_errors" size="small">
@@ -1425,7 +1483,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>下一轮「立即同步」会自动重试这些文件</b>，重试前会先核对 B 库，确认已存在的不会重复复制。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
           </div>
           <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length" class="panel">
-            <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag></div>
+            <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag><el-tag v-if="mirrorStatus.counts?.files_rename_skipped_legacy" type="info" size="small">历史不回刷 {{ mirrorStatus.counts.files_rename_skipped_legacy }} 个</el-tag></div>
             <div v-if="mirrorStatus.untranslated_works?.length" class="table-scroll"><el-table :data="mirrorStatus.untranslated_works" size="small">
               <el-table-column prop="work" label="作品（A 库原名）" min-width="220"/>
               <el-table-column prop="reason" label="原因 / 处理建议" min-width="340"/>
@@ -1437,7 +1495,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
             <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button><el-button v-if="mirrorStatus.untranslated_works?.length" :loading="mirrorBusy" :disabled="mirrorBusy" plain @click="clearUntranslated">清空待处理清单</el-button></div>
-            <p class="hint">英文剧名按 TMDB en-US 官方片名优先、<b>查不到就直接直译</b>（AI 直译 → 本地拼音兜底），<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。v0.8.9 起 TMDB 单次 6 秒、AI 单次 10 秒硬超时，查不到立即走下一层，绝不会卡住整轮同步。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库，也不影响入库与分享</b>。</p>
+            <p class="hint">英文剧名按 TMDB en-US 官方片名优先、<b>查不到就直接直译</b>（AI 直译 → 本地拼音兜底），<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。v0.9.6.1 按你的口径改为：<b>旧版只改文件夹、不改单集的历史条目不再回刷</b>，升级前未完成改名的行标记「历史不回刷」，只有升级后新同步的文件自动改英文名；确需处理历史行时点「重新解析英文名并改名」显式解除。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库，也不影响入库与分享</b>。</p>
           </div>
             </el-collapse-item>
             <el-collapse-item name="mappings">
@@ -1483,7 +1541,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div class="form-grid">
               <div class="field">
                 <label>Bot Token（@BotFather 获取，加密存储）</label>
-                <el-input v-model="pushBotToken" type="password" show-password placeholder="留空表示不修改当前 Token；如 123456:ABC-DEF..."/>
+                <el-input v-model="pushBotToken" type="password" show-password placeholder="留空表示不修改当前 Token；如 123456:ABC-DEF...；要删除请点下方「清除 Bot Token」"/>
                 <small>{{ pushCfg.bot ? ('当前 Bot：' + pushCfg.bot.name + ' · ' + (pushCfg.bot.token_masked || '未配置')) : '尚未配置 Bot，请填写 Token 后点「保存推送配置」' }}</small>
               </div>
               <div class="field inline"><label>启用指令监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
@@ -1497,8 +1555,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
                 </div>
                 <small>验证只检查 Token 有效性；测试推送会向目标频道 / 群真实发一条消息。</small>
               </div>
+              <div class="field">
+                <label>管理员自定义群发通知（仅频道 / 群，不私聊用户）</label>
+                <el-input v-model="broadcastText" type="textarea" :rows="2" placeholder="输入要发到全部推送目标的通知内容"/>
+                <small>用户侧测试直接私聊 Bot 点 Reply 键盘按钮即可；这里只给管理员发通知，目标取「推送白名单（目录路由）」里的频道 / 群，不进队列。</small>
+                <el-button size="small" type="primary" plain :disabled="!pushCfg.bot || !broadcastText" :loading="broadcastSending" @click="sendBroadcastNotice">发送到全部推送目标</el-button>
+              </div>
             </div>
-            <div class="panel-foot"><el-button type="primary" :loading="pushSaving" @click="savePushRoutes">保存推送配置（Bot + 白名单）</el-button></div>
+            <div class="panel-foot"><el-button type="primary" :loading="pushSaving" @click="savePushRoutes">保存分发与互动配置（Bot + 白名单 + 使用限制 + 打赏）</el-button><el-button type="danger" plain :loading="pushSaving" :disabled="!pushCfg.bot?.token_masked" @click="clearPushBotToken">清除 Bot Token</el-button><span class="hint" style="margin-left:10px">上方三块配置共用此按钮；保存后刷新页面仍保留。</span></div>
           </div>
 
           <!-- ===== 推送白名单 = 目录路由表（默认1条，+添加最多10条） ===== -->
@@ -1533,6 +1597,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <el-button size="small" type="primary" plain @click="addCustomCommand">添加自定义指令</el-button>
             </div>
             <p class="hint">求片 / 投稿 / 搜索 / 打赏为内置固定指令，其实现不可改；这里只能追加「收到指令 → 返回固定文本」的自定义功能。</p>
+
+            <!-- v0.9.6.1：打赏模块归入内置指令速查（/reward 内置指令） -->
+            <div class="panel narrow" style="margin-top:14px">
+              <div class="panel-head"><h3 style="font-size:14px">打赏（内置指令 /reward）</h3><span>收款码与按钮文案；与上方 Bot / 白名单 / 使用限制共用顶部统一保存按钮</span><el-switch v-model="interactionCfg.donation_enabled" style="margin-left:auto"/></div>
+              <div class="form-grid">
+                <div class="field"><label>打赏二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
+                <div class="field"><label>打赏按钮文字</label><el-input v-model="interactionCfg.donation_button_text" placeholder="打赏支持"/></div>
+              </div>
+              <div class="field"><label>打赏说明</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2"/></div>
+              <div class="field"><label>赞赏码（图片 URL 或文字说明）</label><el-input v-model="rewardCfg.code" placeholder="如 https://.../reward.png 或文字说明"/></div>
+              <p class="hint">赞赏码可插入模板的 <code>reward_code</code> 变量；关闭开关后 /reward 不再展示打赏入口。也可点下方按钮单独保存打赏。</p>
+              <div class="panel-foot"><el-button size="small" type="primary" plain :loading="rewardSaving" @click="saveReward">单独保存打赏</el-button></div>
+            </div>
           </div>
 
           <!-- 使用限制：独立功能，关注频道 / 加群任填其一即可（v0.9.5 不再与白名单二选一） -->
@@ -1566,22 +1643,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div class="match-controls" style="margin-top:12px"><el-input v-model="telegramBase" placeholder="Telegram API 地址，默认 https://api.telegram.org（国内网络可填反代）"/><el-button :loading="telegramSaving" @click="saveTelegramBase">保存地址</el-button></div>
           </div>
 
-          <!-- 打赏与消息跳转配置（推送消息频道/群跳转与打赏放一起，关联模板变量） -->
-          <div class="panel narrow">
-            <div class="panel-head"><h3>打赏与消息跳转配置</h3><span>打赏收款码 + 推送消息里的频道 / 群跳转按钮</span><el-switch v-model="interactionCfg.donation_enabled" style="margin-left:auto"/></div>
-            <div class="form-grid">
-              <div class="field"><label>打赏二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
-              <div class="field"><label>打赏按钮文字</label><el-input v-model="interactionCfg.donation_button_text"/></div>
-            </div>
-            <div class="field"><label>打赏说明</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2"/></div>
-            <div class="field"><label>赞赏码（图片 URL 或文字说明）</label><el-input v-model="rewardCfg.code" placeholder="如 https://.../reward.png 或文字说明"/></div>
-            <div class="form-grid" style="margin-top:10px;border-top:1px dashed var(--yg-line);padding-top:12px">
-              <div class="field"><label>推送消息·官方频道跳转</label><el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/><small>推送消息加「📢 官方频道」按钮；模板可用 &#123;&#123;channel_link&#125;&#125; 变量</small></div>
-              <div class="field"><label>推送消息·交流群跳转</label><el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/><small>推送消息加「👥 交流群」按钮；模板可用 &#123;&#123;group_link&#125;&#125; 变量</small></div>
-            </div>
-            <p class="hint">赞赏码可插入模板的 reward_code 变量；频道 / 群跳转写 @用户名 或 t.me 链接，留空则不显示对应按钮。</p>
-            <div class="panel-foot"><el-button type="primary" :loading="rewardSaving" @click="saveReward">保存打赏与跳转配置</el-button></div>
-          </div>
+          <!-- v0.9.6.1：打赏已移入「内置指令速查」；推送频道/群跳转已移入「消息模板」模块 -->
 
           <!-- ===== b 板块：用户投稿 / 用户求片 ===== -->
           <div class="sec-band"><span class="sec-key">b</span><div><h3>用户投稿 · 用户求片</h3><p>私聊 Bot 提交投稿与求片；求片关键词可一键同步到 TgtoDrive 监控规则</p></div><span class="sec-line"></span></div>
@@ -1621,7 +1683,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint">关键词规则采用「读取全量 → 合并 → 回写 → 回读校验」，只新增/更新本项目幂等 id 规则，不覆盖原有关键词。投稿转存接口待抓包验证，当前只登记与审核。</p>
           </div>
 
-          <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存全部互动设置</el-button></div>
+          <p class="hint" style="text-align:right;margin:0">上述互动配置已并入页面顶部「保存分发与互动配置」统一保存，无需重复点击。</p>
 
         </section>
 
@@ -1835,6 +1897,21 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         <section v-else-if="tab === '消息模板'" class="fade">
           <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
 
+          <!-- v0.9.6.1：推送消息频道 / 群跳转从打赏卡迁出，并列卡片；留空=不启用 -->
+          <div class="two-col" style="margin-bottom:10px">
+            <div class="panel narrow">
+              <div class="panel-head"><h3>推送消息 · 官方频道跳转</h3><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
+              <el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/>
+              <p class="hint">填值后推送消息追加「📢 官方频道」按钮，模板可用 <code>&#123;&#123;channel_link&#125;&#125;</code>；<b>留空则不显示按钮、不注入该变量</b>。</p>
+            </div>
+            <div class="panel narrow">
+              <div class="panel-head"><h3>推送消息 · 交流群跳转</h3><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
+              <el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/>
+              <p class="hint">填值后推送消息追加「👥 交流群」按钮，模板可用 <code>&#123;&#123;group_link&#125;&#125;</code>；<b>留空则不显示按钮、不注入该变量</b>。</p>
+            </div>
+          </div>
+          <div class="panel-foot" style="margin-bottom:14px"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button><span class="hint" style="margin-left:10px">也可在「分发与互动中心」点顶部统一保存按钮一起保存。</span></div>
+
           <!-- v0.9.6：推送渲染选项（从已删除的 TG 推送配置卡迁入，后端逻辑不变） -->
           <div class="panel narrow" style="margin-bottom:14px">
             <div class="panel-head"><h3>推送渲染选项</h3><span>分享链接样式 · 详情篇幅（影响所有模板的推送消息）</span></div>
@@ -1847,13 +1924,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
 
           <div class="two-col tpl-layout">
             <div class="panel">
-              <div class="field"><label>内置模板（一键载入，可改后另存）</label><el-select v-model="tplPresetPick" placeholder="选择一套内置模板" style="width:100%" @change="applyTplPreset"><el-option v-for="p in tplPresets" :key="p.name" :label="p.name" :value="p.name"/></el-select></div>
+              <div class="field"><label>内置模板（一键载入，可改后另存）</label><el-select v-model="tplPresetPick" placeholder="选择一套内置模板" style="width:100%" @change="applyTplPreset"><el-option v-for="p in tplPresets" :key="p.name" :label="p.name" :value="p.name"/></el-select><small>推送只使用「默认」模板：载入后请勾选「设为默认」再保存，或保存后在下方列表点「设为默认」；只保存不设默认不会改变推送样式。</small></div>
               <div class="field mt"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
               <div class="field mt"><label>消息内容</label><el-input v-model="tpl.content" type="textarea" :rows="10" placeholder="在这里编写 Telegram 消息内容"/></div>
               <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch v-model="tpl.is_default" active-text="设为默认" class="ml"/></div>
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
               <el-button v-if="tpl.id" class="mt" plain @click="tpl = { name:'', content:'', enabled:true, is_default:false }; tplPresetPick=''">新建空模板</el-button>
-              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="danger" :disabled="t.is_default" @click="deleteTpl(t)">删除</el-button></div></div>
+              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="primary" :disabled="t.is_default" @click="setDefaultTpl(t)">设为默认</el-button><el-button size="small" text type="danger" :disabled="t.is_default" @click="deleteTpl(t)">删除</el-button></div></div>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>

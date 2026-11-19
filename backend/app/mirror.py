@@ -97,6 +97,24 @@ RETRYABLE_FILE_STATUS = {"pending", "copying", "failed", "unknown"}
 # 下轮同步从 A 库重建」的僵尸行，不需用户手工建目录；展示层据此从「待创建目录」排除，
 # 并在用户确认后由 /api/mirror/mappings/clear-pruned 真正删除（不违反自动 prune 不删行的红线）。
 PRUNED_DIR_MARK = "[pruned]"
+# v0.9.6.1：v0.8.9 起 prune 写入的旧文案没有 [pruned] 标记。历史库里这类行
+# 仍会混进「待创建目录」、也无法被清空端点识别。这里保留旧文案特征，运行期
+# 与启动迁移都按同一口径识别，不要求用户先升级到某一版再等下一轮 prune。
+PRUNED_DIR_LEGACY_TEXT = "B 库该目录已不存在，映射已清理，下轮同步自动重建"
+PRUNED_DIR_TEXT_HINT = "B 库该目录已不存在，映射已清理"
+
+
+def is_pruned_dir_error(error: object) -> bool:
+    """判断一条 missing 目录错误是否属于「已清理、下轮自动重建」僵尸行。
+
+    两种都认：v0.9.6 新写的 `[pruned]` 前缀，和 v0.8.9 无标记的历史文案。
+    只用精确业务文案判断，不按「missing」宽泛猜——真正 create_dir 失败的
+    行仍要留在待创建目录里让用户处理。
+    """
+    text = str(error or "")
+    if text.startswith(PRUNED_DIR_MARK):
+        return True
+    return PRUNED_DIR_TEXT_HINT in text or PRUNED_DIR_LEGACY_TEXT in text
 
 _TMDB_TAG = re.compile(r"\{?\s*tmdb[-_:：]?(\d+)\s*\}?", re.I)
 # 影视主目录强特征：{tmdb-xxx} / (2021) 这类标记
@@ -1231,7 +1249,8 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                               force: bool = False, max_media: int = 100,
                               max_files: int | None = None,
-                              max_seconds: float | None = None) -> dict:
+                              max_seconds: float | None = None,
+                              only_pending: bool = False) -> dict:
     """把 B 库已同步的单集 / 单电影文件按英文剧名改名（只换中文片名段）。
 
     边界：
@@ -1241,6 +1260,11 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
       - `MirrorFile.file_name` 保持 A 原名，改名结果写 `target_name`；
         增量比对仍走 `source_file_id + fingerprint(size:utime)`，
         后期 A 库文件变量更新照常能识别出来并触发更新。
+      - v0.9.6.1：`rename_status='skipped_legacy'` 的历史行默认不回刷。用户口径：
+        旧版只改文件夹、不改单集；新版单集英文名改名只作用于升级后新同步的文件。
+        只有 force=True 才清掉标记、重新处理历史行。
+      - only_pending=True：后台复查专用，只看仍未改名的文件，并卡紧时长预算，
+        避免后台任务长期持有全局镜像锁导致「立即同步」报 409。
     """
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
     file_budget = int(max_files if max_files is not None else RENAME_MAX_FILES)
@@ -1252,6 +1276,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
              "remaining": 0, "truncated_reason": "", "attempts": 0,
+             "skipped_legacy": 0,
              "untranslated_works": [], "idle_seconds": idle,
              "file_budget": file_budget, "time_budget": time_budget}
     started_all = time.monotonic()
@@ -1259,13 +1284,22 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     consecutive_failures = 0
     stop_reason = ""
     api = GuangYaWebFiles(db)
-    medias = list(db.scalars(select(MirrorMedia).where(
-        MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")).all())
+    media_q = select(MirrorMedia).where(
+        MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")
+    if only_pending:
+        # v0.9.6.1：后台复查只看还有活要干的作品，别为已经 done 的整库
+        # 白跑 TMDB/AI 解析与列目录——那正是后台任务持锁 134 秒的主因。
+        media_q = media_q.where(MirrorMedia.id.in_(
+            select(MirrorFile.media_id).where(
+                MirrorFile.status == "synced",
+                or_(MirrorFile.rename_status.is_(None),
+                    MirrorFile.rename_status.in_(["", "pending_visible", "failed"])))))
+    medias = list(db.scalars(media_q).all())
     for media in medias[:max_media]:
-        # v0.8.9：预算/熔断一旦触发，后续作品本轮一律不处理。旧写法会继续
-        # 为每部作品解析英文名（TMDB/AI 网络等待）却一个文件都不改，还逐部
-        # 堆一条 errors —— 百集剧目录里会拖出几十秒无谓等待。
-        if stop_reason:
+        # v0.9.6.1：预算在「每部作品开始前」也要查。旧版只在内层逐文件查，
+        # 一部作品的 TMDB(6s)+AI(10s)+递归列目录 就能把后台锁拖到两分钟。
+        if stop_reason or time.monotonic() - started_all >= time_budget:
+            stop_reason = stop_reason or "time_budget"
             break
         eng, source = await _resolve_english_title(db, media, force=force)
         # v0.8.9：让用户看得到「TMDB 查不到 → 直接用直译」有没有生效
@@ -1286,25 +1320,54 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         rows = list(db.scalars(select(MirrorFile).where(
             MirrorFile.media_id == media.id,
             MirrorFile.status == "synced")).all())
+        legacy_rows = [r for r in rows
+                       if str(getattr(r, "rename_status", "") or "") == "skipped_legacy"]
+        if legacy_rows and force:
+            # 用户显式点「重新解析英文名并改名」：只对这一批历史行解除回刷保护。
+            for row in legacy_rows:
+                row.rename_status, row.rename_error = "", ""
+            db.commit()
+        elif legacy_rows:
+            stats["skipped_legacy"] += len(legacy_rows)
+            rows = [r for r in rows
+                    if str(getattr(r, "rename_status", "") or "") != "skipped_legacy"]
+        if only_pending:
+            rows = [r for r in rows
+                    if str(getattr(r, "rename_status", "") or "") in ("", "pending_visible", "failed")]
         if not rows:
             stats["no_rows"] += 1
             continue
-        # v0.9.2：复制任务返回 done 后，B 库文件可见仍可能有秒级延迟。
-        # 先用只读列目录确认所有待改文件都真的可见，再发 rename_file；
+        # v0.9.6.1：再查一次预算，避免刚解析完英文名/列目录已超时还继续发改名请求。
+        if time.monotonic() - started_all >= time_budget:
+            stop_reason = "time_budget"
+            break
+        # v0.9.2：复制任务返回 done 后，B 库文件可见可能有秒级延迟。
+        # 先用只读列目录确认 fileId 真的可见，再发 rename_file；
         # 不拿 DB 里可能过期的 fileId 冒险，避免「文件有了但没改名」断层。
-        candidates, b_verified, all_visible = await _visible_b_candidates(api, media, rows)
+        candidates, b_verified, _all_visible = await _visible_b_candidates(api, media, rows)
         name_fids = {k: v for k, v in candidates.items() if ":" not in k}
-        if not all_visible:
+        # v0.9.6.1：从「整部作品全可见才改名」改为「逐文件按可见 fileId 改名」。
+        # 旧口径只要有一集暂时不可见，整部剧全被标 pending_visible，用户看到
+        # 「文件复制进来了但中文名没换」；现在 B 库列目录完整可信时，可见的先改，
+        # 不可见的单独等复查，不拿未知 fileId 冒险。verified=False 仍然一个都不动。
+        if not b_verified:
             for row in rows:
                 row.rename_status = "pending_visible"
-                row.rename_error = "B 库文件尚未全部可见，等待后台短任务复查后改名"
+                row.rename_error = "B 库列目录不完整，未据此改名，等待后台复查"
             db.commit()
             stats["waiting_visible"] += len(rows)
             continue
-        # v0.8.8：以 B 库**实际文件名**判断是否已经改过名，不再只信 DB 状态。
-        # v0.8.7 空目录补复制会把文件恢复成 A 库中文原名，而复用的同一行里
-        # rename_status / target_name 可能仍停在 done / 英文名，旧逻辑会整批跳过，
-        # 用户看到的就是「现在文件是有了，不过影视单集、电影文件汉字名称没有翻译」。
+        visible_rows = [r for r in rows if _lookup_b_file(candidates, r)]
+        invisible_rows = [r for r in rows if not _lookup_b_file(candidates, r)]
+        for row in invisible_rows:
+            row.rename_status = "pending_visible"
+            row.rename_error = "B 库列目录暂未命中该文件（可能尚未可见），下一轮自动重试"
+        if invisible_rows:
+            db.commit()
+            stats["waiting_visible"] += len(invisible_rows)
+        rows = visible_rows
+        if not rows:
+            continue
         fid_to_norm: dict[str, str] = {}
         for k, v in name_fids.items():
             fid_to_norm.setdefault(str(v), k)
@@ -1521,7 +1584,7 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
             # v0.9.6：加 [pruned] 标记区分「已清理待重建的僵尸行」与「真正建目录失败」。
             # 前者不需要用户手工介入（下轮同步会从 A 库重建），从「待创建目录」清单里
             # 排除；管理页另给「清空已清理映射」按钮让用户在确认后彻底删除这些行。
-            d.error = PRUNED_DIR_MARK + "B 库该目录已不存在，映射已清理，下轮同步自动重建"
+            d.error = PRUNED_DIR_MARK + PRUNED_DIR_LEGACY_TEXT
             d.updated_at = utcnow()
             db.commit()
     return stats

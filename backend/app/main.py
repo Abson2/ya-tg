@@ -189,7 +189,8 @@ async def _job_rename_pending():
                     MirrorFile.rename_status == "failed"))) or 0
             if not pending:
                 return
-            out = await _safe_rename(db, r)
+            out = await _safe_rename(db, r, only_pending=True, max_media=5,
+                                     max_files=10, max_seconds=20)
             db.commit()
             if out.get("renamed") or out.get("waiting_visible"):
                 logger.info("[mirror] 待改名复查：改名 %s / 仍待可见 %s",
@@ -299,13 +300,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.6", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.7", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.6", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.7", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -758,7 +759,7 @@ def _mirror_guard():
         # 超过阈值的残留由 _TimedMirrorLock.acquire 自动回收，这里只报真实在跑的。
         raise HTTPException(
             409, f"已有镜像同步 / 改名任务「{owner}」正在运行（已持续约 {held} 秒）；"
-                 "多为后台改名复查或本轮同步尚未结束，请稍候重试。"
+                 "后台改名复查已限制为短任务（最多约 20 秒），稍候重试即可；"
                  f"若长时间（>30 分钟）仍报此错，重启容器即可清除残留锁。")
     _mirror_lock.set_owner("手动同步 / 改名")
     try:
@@ -767,7 +768,7 @@ def _mirror_guard():
         _mirror_lock.release()
 
 
-async def _safe_rename(db: Session, r: MirrorRule) -> dict:
+async def _safe_rename(db: Session, r: MirrorRule, **kwargs) -> dict:
     """v0.8.6：改名是可选优化，整体失败绝不能拖垮已完成的复制与后续入库 / 推送。
 
     `rename_mirror_files()` 已逐文件捕获 `rename_file` 异常；这里再兜住「列 B 库 /
@@ -776,7 +777,7 @@ async def _safe_rename(db: Session, r: MirrorRule) -> dict:
     让 session 状态与后续扫描管线互相干扰。
     """
     try:
-        return await mirror.rename_mirror_files(db, r)
+        return await mirror.rename_mirror_files(db, r, **kwargs)
     except Exception as exc:
         logger.warning("[mirror] 文件改名整体失败，不阻断同步：%s", exc)
         msg = f"{type(exc).__name__}: {exc}"[:300]
@@ -968,8 +969,7 @@ def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
     只删带 [pruned] 标记的 missing 行，不碰真正建目录失败的 missing 与任何正常映射。
     """
     rows = list(db.scalars(select(MirrorDir).where(MirrorDir.status == "missing")).all())
-    targets = [d for d in rows
-               if str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
+    targets = [d for d in rows if mirror.is_pruned_dir_error(getattr(d, "error", ""))]
     removed = len(targets)
     for d in targets:
         db.delete(d)
@@ -991,9 +991,9 @@ def mirror_status(db: Session = Depends(get_db)):
     # 真正建目录失败的 missing 才作为待办展示。用户可在映射清单里点「清空已清理映射」
     # 彻底删除僵尸行（需二次确认）。
     missing = [d for d in dirs if d.status == "missing"
-               and not str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
+               and not mirror.is_pruned_dir_error(getattr(d, "error", ""))]
     pruned_dirs = [d for d in dirs if d.status == "missing"
-                   and str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
+                   and mirror.is_pruned_dir_error(getattr(d, "error", ""))]
     # v0.8.4：文件复制失败的诊断不再只存在于「立即同步」那一次响应里。
     # MirrorFile.error / MirrorTask.error 落库持久化，刷新页面依然可查。
     failed_files = list(db.scalars(select(MirrorFile).where(
@@ -1068,6 +1068,9 @@ def mirror_status(db: Session = Depends(get_db)):
                 MirrorFile.rename_status == "done").count(),
             "files_rename_failed": db.query(MirrorFile).filter(
                 MirrorFile.rename_status == "failed").count(),
+            # v0.9.6.1：历史条目不回刷的单集改名行，默认不参与任何自动改名
+            "files_rename_skipped_legacy": db.query(MirrorFile).filter(
+                MirrorFile.rename_status == "skipped_legacy").count(),
             "works_without_english": db.query(MirrorMedia).filter(
                 or_(MirrorMedia.english_title.is_(None),
                     MirrorMedia.english_title == "")).count(),
@@ -1094,7 +1097,7 @@ def mirror_status(db: Session = Depends(get_db)):
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
                   "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id,
-                  "pruned": str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK),
+                  "pruned": mirror.is_pruned_dir_error(getattr(d, "error", "")),
                   "error": getattr(d, "error", "") or ""}
                  for d in dirs],
         # v0.8.2：tip 不再硬编码成「请手工建立」，直接回显 create_dir 的真实报错
@@ -2689,6 +2692,11 @@ class TestMessageInput(BaseModel):
     chat_id: str = ""
 
 
+class BroadcastInput(BaseModel):
+    text: str = ""
+    chat_ids: list[str] | None = None   # 不传=全部推送目标（频道/群），永不私聊用户
+
+
 class TelegramConfigInput(BaseModel):
     base_url: str = ""
 
@@ -2867,6 +2875,65 @@ async def test_bot_message(bid: int, p: TestMessageInput, db: Session = Depends(
                                  "message": r.get("message", "")[:200]}))
     db.commit()
     return r
+
+
+@app.post("/api/broadcast/notify", dependencies=ADMIN)
+async def broadcast_notify(p: BroadcastInput, db: Session = Depends(get_db)):
+    """v0.9.6.1：管理员自定义群发通知。
+
+    边界（用户明确口径）：TG Bot 面向普通用户，私聊只由用户指令触发；
+    这里是管理员侧的「通知到推送目标」，只发目录路由表里的频道 / 群聊，
+    **绝不私聊用户、不写队列、不改资源或分享**。chat_ids 不传 = 全部路由目标。
+    """
+    text = (p.text or "").strip()
+    if not text:
+        raise HTTPException(400, "通知内容不能为空")
+    bot = _global_bot(db)
+    if not bot or not bot.enabled:
+        return {"ok": False, "sent": 0, "message": "Bot 未配置或已停用"}
+    try:
+        token = decrypt_secret(bot.token)
+    except Exception as exc:
+        return {"ok": False, "sent": 0, "message": f"Bot Token 解密失败：{exc}"}
+    if not token:
+        return {"ok": False, "sent": 0, "message": "Bot Token 为空，请重新配置"}
+
+    routes = bot_listener.push_routes(db)
+    allowed = {str(r.get("chat_id") or "").strip() for r in routes
+               if str(r.get("chat_id") or "").strip()}
+    if p.chat_ids is not None:
+        picked = {str(x).strip() for x in p.chat_ids if str(x).strip()}
+        targets = sorted(x for x in picked if x in allowed)
+    else:
+        targets = sorted(allowed)
+    if not targets:
+        return {"ok": False, "sent": 0,
+                "message": "没有可发送的频道 / 群：请先在「推送白名单（目录路由）」配置目标"}
+
+    sent, failures = 0, []
+    for chat_id in targets:
+        try:
+            r = await _telegram_call(token, "sendMessage",
+                                     {"chat_id": chat_id, "text": text,
+                                      "disable_web_page_preview": True}, db)
+            if r["http_status"] == 429:
+                wait = retry_after_seconds(r["retry_after"]) or 60
+                failures.append(f"{chat_id}：限流 429，约 {wait} 秒后重试")
+            elif r["http_status"] >= 400 or not r["data"].get("ok"):
+                desc = str(r["data"].get("description") or r["data"])[:160]
+                failures.append(f"{chat_id}：{desc}")
+            else:
+                sent += 1
+        except Exception as exc:
+            failures.append(f"{chat_id}：{str(exc)[:160]}")
+    add_audit(db, "broadcast_notify", target_type="config",
+              detail=json_dumps({"sent": sent, "targets": len(targets),
+                                 "content": text[:200], "failures": failures[:5]}))
+    db.commit()
+    msg = f"已发送 {sent}/{len(targets)} 个推送目标"
+    if failures:
+        msg += "；失败：" + "；".join(failures[:3])
+    return {"ok": sent > 0, "sent": sent, "targets": len(targets), "message": msg}
 
 
 @app.get("/api/telegram/config", dependencies=ADMIN)
@@ -3264,6 +3331,26 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
               detail=json_dumps({"count": len(routes)}))
     db.commit()
     return {"ok": True, "routes": routes, "count": len(routes)}
+
+
+@app.post("/api/push/bot/token/clear", dependencies=ADMIN)
+def push_bot_token_clear(db: Session = Depends(get_db)):
+    """v0.9.6.1：清除全局单 Bot Token。
+
+    留空保存 = 不改 Token（历史语义），所以删除必须走独立端点。
+    只清空凭证并停用 Bot，保留 Bot 记录、目录路由、Channel、队列与互动配置；
+    下次填入新 Token 会复用同一条 Bot，不会重复建记录或丢历史。
+    """
+    bot = _global_bot(db)
+    if not bot:
+        return {"ok": True, "cleared": False}
+    bot.token = ""
+    bot.enabled = False
+    add_audit(db, "push_bot_token_cleared", target_type="config", target_id=str(bot.id))
+    db.commit()
+    return {"ok": True, "cleared": True,
+            "bot": {"id": bot.id, "name": bot.name, "enabled": bot.enabled,
+                    "token_masked": _mask_stored_token(bot.token)}}
 
 
 @app.post("/api/tgto/test", dependencies=ADMIN)
