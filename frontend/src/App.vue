@@ -261,7 +261,17 @@ async function setDefaultTpl(t) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
-let clockTimer = null, webqrTimer = null
+let clockTimer = null, webqrTimer = null, mirrorPollTimer = null
+// v0.9.10.2：进度看板实时轮询——任务运行中每 2 秒只拉 /mirror/status（不复跑整页 load），
+// 展示复制/改名/入库/分享/入队各阶段真实数量变化；空闲时降为 5 秒轻量刷新。
+function stageLabel(s) {
+  return ({ copy: '复制到 B 库', rename: '英文改名', identify: '入库识别',
+            share: '生成分享 / 推送', done: '收尾', failed: '失败' })[s] || '处理中'
+}
+async function pollMirrorStatus() {
+  if (!authed.value) return
+  try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
+}
 
 const navGroups = [
   { label: '工作台', items: [{ key: '概览', icon: 'grid', label: '概览' }] },
@@ -1279,8 +1289,12 @@ function tick() {
   if (authed.value && smsStatus.value && smsStatus.value.logged_in) updateCountdown()
 }
 
-onMounted(() => { tick(); clockTimer = setInterval(tick, 1000); if (password.value) login() })
-onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
+onMounted(() => {
+  tick(); clockTimer = setInterval(tick, 1000); if (password.value) login()
+  // v0.9.10.2：实时进度轮询，登录后才启动；2 秒一次不影响服务器（单条只读查询）
+  mirrorPollTimer = setInterval(pollMirrorStatus, 2000)
+})
+onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearInterval(mirrorPollTimer) })
 </script>
 
 <template>
@@ -1315,7 +1329,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.10 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.11 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1542,10 +1556,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
           <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；单集/电影文件按英文剧名改名 → 自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
           <!-- v0.9.8 #195：流程节点 + 同步进度，用户能看出卡在哪一步 -->
           <div class="panel">
-            <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中' : '实时状态' }}</span></div>
+            <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中 · 每 2 秒自动刷新' : '实时状态 · 每 2 秒自动刷新' }}</span></div>
             <div class="sync-progress">
               <div class="sync-progress-track"><i :style="{ width: (mirrorStatus.progress?.percent || 0) + '%' }"></i></div>
-              <span>{{ mirrorStatus.progress?.percent || 0 }}%（{{ mirrorStatus.progress?.synced || 0 }}/{{ mirrorStatus.progress?.total || 0 }} 文件已同步）</span>
+              <span>{{ mirrorStatus.progress?.percent || 0 }}%<template v-if="mirrorStatus.progress?.running"> · {{ stageLabel(mirrorStatus.progress?.stage) }}</template><template v-else>（{{ mirrorStatus.progress?.synced || 0 }}/{{ mirrorStatus.progress?.total || 0 }} 文件已同步）</template></span>
             </div>
             <div class="pipeline-flow">
               <div v-for="node in (mirrorStatus.pipeline || [])" :key="node.key" class="pipe-node" :class="'is-' + (node.status || 'idle')">
@@ -1554,7 +1568,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
                 <div class="pipe-detail">{{ node.detail }}</div>
               </div>
             </div>
-            <p class="hint" style="margin-top:12px">推送由定时调度消费队列：识别成功且有海报的影视入队后，等待队列检查（默认 30 秒）创建目录分享并推送；此处「推送入队」显示的是累积队列数，不代表本轮已全部发出。</p>
+            <p class="hint" style="margin-top:12px">任务运行中每 2 秒自动刷新，实时显示复制 / 改名 / 入库 / 分享 / 入队各阶段数量。「入库识别 / 生成分享 / 推送入队」按 TMDB 作品去重显示<b>剧集部数 / 电影部数</b>（非集数）；进度条只有分享队列清空、全部推送完成后才到 100%。若本轮入队为 0，节点会显示拦截原因（无海报 / 路由未匹配 / 未配置目标等）。</p>
           </div>
           <!-- v0.9.9 #200：A/B 库设置与同步状态并列，减少纵向滚动 -->
           <div class="two-col mirror-two-col">
@@ -2137,24 +2151,24 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         <section v-else-if="tab === '消息模板'" class="fade">
           <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
 
-          <!-- v0.9.10：跳转卡片与保存按钮合并为同一张 panel；三行文字链接在渲染层统一追加，按钮只保留「获取资源」 -->
+          <!-- v0.9.10.2：三个跳转按钮并排同一行（频道/群聊/投稿·求片），渲染层统一追加到所有模板；「获取资源」单独一行 -->
           <div class="panel" style="margin-bottom:14px">
-            <div class="panel-head"><h3>推送消息 · 跳转链接</h3><span>三行文字链接在渲染层统一追加到所有模板，留空的不显示；下方按钮只保留「获取资源」</span></div>
+            <div class="panel-head"><h3>推送消息 · 跳转链接</h3><span>三个入口做成并排按钮（频道 / 群聊 / 投稿·求片），渲染层统一追加到所有模板，留空的不显示；「获取资源」按钮单独一行</span></div>
             <div class="three-col">
               <div class="panel narrow">
-                <div class="panel-head"><h4>官方频道跳转</h4><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
-                <el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/>
-                <p class="hint">填值后推送消息正文追加「📢 官方频道」文字链接。</p>
+                <div class="panel-head"><h4>频道跳转</h4><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
+                <el-input v-model="interactionCfg.tg_channel_link" placeholder="@频道 或 https://t.me/频道"/>
+                <p class="hint">填值后推送消息追加「频道」按钮。</p>
               </div>
               <div class="panel narrow">
-                <div class="panel-head"><h4>交流群跳转</h4><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
-                <el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/>
-                <p class="hint">填值后推送消息正文追加「👥 交流群」文字链接。</p>
+                <div class="panel-head"><h4>群聊跳转</h4><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
+                <el-input v-model="interactionCfg.tg_group_link" placeholder="@群聊 或 https://t.me/群聊"/>
+                <p class="hint">填值后推送消息追加「群聊」按钮。</p>
               </div>
               <div class="panel narrow">
-                <div class="panel-head"><h4>机器人跳转</h4><el-tag size="small" :type="interactionCfg.tg_bot_link ? 'success' : 'info'">{{ interactionCfg.tg_bot_link ? '已启用' : '未启用' }}</el-tag></div>
+                <div class="panel-head"><h4>投稿·求片跳转</h4><el-tag size="small" :type="interactionCfg.tg_bot_link ? 'success' : 'info'">{{ interactionCfg.tg_bot_link ? '已启用' : '未启用' }}</el-tag></div>
                 <el-input v-model="interactionCfg.tg_bot_link" placeholder="@推送机器人 或 https://t.me/推送机器人"/>
-                <p class="hint">填值后推送消息正文追加「🤖 机器人」文字链接（指向推送 Bot 本身）。</p>
+                <p class="hint">填值后推送消息追加「投稿·求片」按钮（指向推送 Bot 本身）。</p>
               </div>
             </div>
             <div class="panel-foot"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button><span class="hint" style="margin-left:10px">也可在「分发与互动中心」点顶部统一保存按钮一起保存。</span></div>

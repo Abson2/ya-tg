@@ -139,13 +139,25 @@ async def _job_token_refresh():
         db.close()
 
 
+_bot_poll_lock = asyncio.Lock()
+
+
 async def _job_bot_poll():
-    """v0.8.0：投稿/我想看 Bot 消息轮询（Telegram 官方 getUpdates）。"""
-    with SessionLocal() as db:
-        try:
-            await bot_listener.poll_once(db)
-        except Exception:
-            db.rollback()
+    """v0.8.0：投稿/我想看 Bot 消息轮询（Telegram 官方 getUpdates）。
+
+    v0.9.11：加进程内非阻塞锁——真机偶发 `maximum number of running instances
+    reached` 是上一轮 poll_once（getUpdates 网络等待）未结束、下一轮 10 秒已到，
+    APScheduler max_instances=1 拒绝新实例并记 warning。这里抢不到锁直接跳过本轮，
+    杜绝 warning，且下一轮仍会正常轮询，不影响收消息（与推送故障无关，顺手加固）。
+    """
+    if _bot_poll_lock.locked():
+        return
+    async with _bot_poll_lock:
+        with SessionLocal() as db:
+            try:
+                await bot_listener.poll_once(db)
+            except Exception:
+                db.rollback()
 
 
 async def _job_log_prune():
@@ -301,13 +313,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.10", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.11", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.10", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.11", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -651,22 +663,54 @@ def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
 def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
                              mode: str, copied: int = 0, renamed: int = 0,
                              identified: int = 0, queued: int = 0,
-                             total_files: int = 0) -> None:
+                             total_files: int = 0,
+                             enqueue_diag: dict | None = None,
+                             works: dict | None = None,
+                             running: bool = False, stage: str = "") -> None:
     """v0.9.10：把本轮任务各节点处理量写入 MirrorRule.last_pipeline_json。
 
     「处理流程与进度」只读这个快照显示当前任务量，不再拿全库累计计数冒充进度。
     任何一轮任务完成都覆盖写；没有快照时前端显示「尚无任务记录」。
+    v0.9.10.1：带 enqueue_diag——真机「识别成功却没入队」必须把拦截原因
+    写进快照，前端节点直接显示，不再靠 last_message 字符串解析（会被截断/覆盖）。
+    v0.9.10.2：带 works（按 TMDB 去重的剧集/电影部数）、running/stage（实时阶段），
+    供「进度看板」实时轮询展示各阶段真实数量变化；进度条只有分享+推送全完成才 100%。
     """
     if not r:
         return
     snap = {"mode": mode, "copied": int(copied or 0), "renamed": int(renamed or 0),
             "identified": int(identified or 0), "queued": int(queued or 0),
-            "total_files": int(total_files or 0), "at": utcnow().isoformat()}
+            "total_files": int(total_files or 0), "at": utcnow().isoformat(),
+            "enqueue_diag": dict(enqueue_diag or {}),
+            "works": dict(works or {}), "running": bool(running), "stage": str(stage or "")}
     try:
         r.last_pipeline_json = json_dumps(snap)
         db.flush()
     except Exception:
         pass
+
+
+def _work_type_key(media_type, tmdb_id) -> tuple[str, str] | None:
+    """按 (media_type, tmdb_id) 归一作品键——「剧集 N 部 / 电影 M 部」去重口径。
+
+    只有拿得到 TMDB ID 且类型明确的才算一部作品；未识别 / 无 ID 的不计入，
+    避免把「集数」误当「部数」（用户明确：入库识别/生成分享/推送入队显示部数）。
+    """
+    mt = str(media_type or "").strip().lower()
+    tid = tmdb_id
+    if mt not in ("tv", "movie") or not tid:
+        return None
+    try:
+        return (mt, str(int(tid)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _work_breakdown(keys) -> dict:
+    """作品键集合 → {tv, movie, total}，供进度看板节点显示「剧集/电影」部数。"""
+    tv = sum(1 for k in keys if k[0] == "tv")
+    movie = sum(1 for k in keys if k[0] == "movie")
+    return {"tv": tv, "movie": movie, "total": tv + movie}
 
 
 async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
@@ -748,10 +792,13 @@ async def _scheduled_mirror() -> None:
                         # v0.9.10：定时同步也写本轮任务快照（复制量定时路径不细究，记 0）
                         ident = p.get("identify") or {}
                         _write_pipeline_snapshot(
-                            db, r, mode="定时同步", copied=0, renamed=0,
+                            db, r, mode="定时同步", stage="done", running=False,
+                            copied=0, renamed=0,
                             identified=int(ident.get("identified", 0) or 0),
                             queued=int(p.get("queued", 0) or 0),
-                            total_files=int(p.get("files", 0) or 0))
+                            total_files=int(p.get("files", 0) or 0),
+                            enqueue_diag=dict(p.get("enqueue_diag") or {}),
+                            works=dict(ident.get("work_stats") or {}))
                         db.commit()
                         # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message
                         tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
@@ -921,8 +968,17 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
     do_pipeline = (bool(getattr(r, "auto_identify", True))
                    if post_identify is None else bool(post_identify))
     try:
+        # v0.9.10.2：任务开始即写「运行中·复制到 B 库」阶段快照并立即落盘，
+        # 前端 2 秒轮询能立刻看到任务启动与各节点数量推进，不再等整轮结束才更新。
+        _write_pipeline_snapshot(db, r, mode="镜像同步", stage="copy", running=True)
+        db.commit()
         stats = await mirror.sync_rule(db, r)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+        # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
+        _write_pipeline_snapshot(db, r, mode="镜像同步", stage="rename", running=True,
+                                 copied=int(stats.get("done", 0) or 0),
+                                 total_files=int(stats.get("done", 0) or 0))
+        db.commit()
         # v0.8.6：改名赶在「扫描入库」之前，只动 B 库单集/单电影文件名；
         # A 库与 B 库目录名不变，A→B 映射靠 MirrorFile 保持。
         stats["rename_enabled"] = bool(getattr(r, "rename_files", True))
@@ -937,6 +993,12 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
                                   + " · 首个改名错误：" + str(rename_errors[0])[:300])
         stats["pipeline_enabled"] = do_pipeline
         if do_pipeline:
+            # 改名完成 → 写「入库识别中」阶段帧
+            _write_pipeline_snapshot(db, r, mode="镜像同步", stage="identify", running=True,
+                                     copied=int(stats.get("done", 0) or 0),
+                                     renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
+                                     total_files=int(stats.get("done", 0) or 0))
+            db.commit()
             # v0.8.9：找不到官方英文名的作品在改名环节已直接直译兜底，绝不在这里
             # 再补跑一次解析（会重复触发 TMDB / AI 网络等待）。复制 → 入库 →
             # 识别 → 分享/推送 主链路必须照常走完，改名只是可选优化。
@@ -944,13 +1006,23 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
             # v0.9.10：写本轮任务快照，进度节点只显示本轮量不显示历史累计
             pipe = stats["pipeline"] or {}
             ident = pipe.get("identify") or {}
+            # v0.9.10.2：works 用识别/入队这两组 TMDB 去重作品数（剧集/电影部数）；
+            # stage=done + running=False 表示本轮管线已跑完，进度条据此判断是否可到 100%。
             _write_pipeline_snapshot(
-                db, r, mode="镜像同步",
+                db, r, mode="镜像同步", stage="done", running=False,
                 copied=int(stats.get("done", 0) or 0),
                 renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
                 identified=int(ident.get("identified", 0) or 0),
                 queued=int(pipe.get("queued", 0) or 0),
-                total_files=int(pipe.get("files", 0) or 0))
+                total_files=int(pipe.get("files", 0) or 0),
+                enqueue_diag=dict(pipe.get("enqueue_diag") or {}),
+                works=dict(ident.get("work_stats") or {}))
+        else:
+            # 仅同步 / 定时关入库：也要把 running 归位，避免进度条永远显示「运行中」
+            _write_pipeline_snapshot(db, r, mode="镜像同步", stage="done", running=False,
+                                     copied=int(stats.get("done", 0) or 0),
+                                     renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
+                                     total_files=int(stats.get("done", 0) or 0))
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
                                      "done": stats.get("done"), "unknown": stats.get("unknown"),
@@ -964,6 +1036,8 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
         rr = db.scalar(select(MirrorRule).limit(1))
         if rr:
             rr.last_status, rr.last_message = "failed", str(exc)[:1000]
+            # v0.9.10.2：失败也要让快照 running 归位，杜绝进度条永久「运行中」
+            _write_pipeline_snapshot(db, rr, mode="镜像同步", stage="failed", running=False)
             db.commit()
         raise HTTPException(400, str(exc))
     except Exception as exc:
@@ -977,6 +1051,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
         rr = db.scalar(select(MirrorRule).limit(1))
         if rr:
             rr.last_status, rr.last_message = "failed", detail[:1000]
+            _write_pipeline_snapshot(db, rr, mode="镜像同步", stage="failed", running=False)
             db.commit()
         raise HTTPException(502, f"镜像同步失败：{detail}")
 
@@ -1285,13 +1360,8 @@ def mirror_status(db: Session = Depends(get_db)):
     #   全库累计计数移到 counts.* 保留给其它面板，不再冒充本轮进度。
     total_files = db.query(MirrorFile).count()
     synced_files = db.query(MirrorFile).filter(MirrorFile.status == "synced").count()
-    # v0.9.9 #206：从最近一次同步的 last_message 里取入队诊断，让「⑤推送入队=0」
-    # 的节点直接说明卡在哪（无海报 / 路由未匹配 / 未配置目标）。
-    enqueue_diag_text = ""
-    _lm = str(getattr(r, "last_message", "") or "") if r else ""
-    if "入队诊断：" in _lm:
-        enqueue_diag_text = _lm.split("入队诊断：", 1)[-1].split(" ·", 1)[0].strip()
-    # 解析本轮快照
+    # v0.9.10.1：入队诊断优先读本轮快照 enqueue_diag（结构化、不会被截断）；
+    # 老库无该字段时回退解析 last_message 字符串，保持升级兼容。
     snap = {}
     try:
         snap = json.loads(str(getattr(r, "last_pipeline_json", "") or "{}") or "{}")
@@ -1305,26 +1375,110 @@ def mirror_status(db: Session = Depends(get_db)):
     snap_files = int(snap.get("total_files", 0) or 0) if has_snap else 0
     mode_label = str(snap.get("mode") or "上轮任务") if has_snap else ""
     idle_detail = "尚无任务记录，点「立即同步」或扫描后显示本轮处理量"
+    # 诊断文案：快照 enqueue_diag 优先，回退 last_message 字符串
+    diag = dict(snap.get("enqueue_diag") or {}) if has_snap else {}
+    label_map = {"skip_unidentified": "未识别", "skip_no_poster": "无海报闸门",
+                 "skip_route_no_match": "目录路由未匹配", "skip_no_channel": "目标无启用频道",
+                 "skip_dedup_or_disabled": "去重/停用", "skip_no_target": "未配置推送目标",
+                 "skip_rule_dir_mismatch": "规则目录不符", "skip_rule_keyword_mismatch": "规则关键词不符",
+                 "enqueued": "已入队"}
+    enqueue_diag_text = "、".join(f"{label_map.get(k, k)} {v}" for k, v in diag.items() if v)
+    if not enqueue_diag_text:
+        _lm = str(getattr(r, "last_message", "") or "") if r else ""
+        if "入队诊断：" in _lm:
+            enqueue_diag_text = _lm.split("入队诊断：", 1)[-1].split(" ·", 1)[0].strip()
+    # v0.9.10.2：作品数口径——入库识别/生成分享/推送入队显示「剧集 N 部·电影 M 部」，
+    # 按 (media_type, tmdb_id) 去重，不再是整体集数/文件数。
+    works = dict(snap.get("works") or {}) if has_snap else {}
+    ws_ident = dict(works.get("identified") or {})
+    ws_queued = dict(works.get("queued") or {})
+    # 老库兼容：v0.9.10 及以前快照没有 works/stage 字段，保留旧的「条数 + copied/files 进度」
+    # 语义，避免升级后历史快照显示空部数 / 进度突变。
+    legacy = has_snap and not works and not str(snap.get("stage") or "")
+
+    def _works_text(w: dict) -> str:
+        """剧集/电影部数文案；作品键缺失（老快照）时回退显示 '-'。"""
+        tv, movie = int(w.get("tv", 0) or 0), int(w.get("movie", 0) or 0)
+        if not tv and not movie:
+            return ""
+        parts = []
+        if tv:
+            parts.append(f"剧集 {tv} 部")
+        if movie:
+            parts.append(f"电影 {movie} 部")
+        return " · ".join(parts)
+
+    # 队列实时状态：按作品键去重统计待分享 / 已推送部数（同一剧集多集只算一部）
+    queue_rows = list(db.execute(
+        select(QueueItem.status, Resource.id, Resource.media_type, Resource.tmdb_id).join(
+            Resource, Resource.id == QueueItem.resource_id
+        ).where(QueueItem.status.in_(("pending", "retry", "sent")))).all())
+    q_pending_works, q_sent_works = set(), set()
+    for q_status, q_rid, q_mt, q_tid in queue_rows:
+        wk = _work_type_key(q_mt, q_tid) or ("res", str(q_rid))  # 无 TMDB 时用资源 id 兜底
+        (q_sent_works if q_status == "sent" else q_pending_works).add(wk)
+    queue_pending = len(q_pending_works)
+    queue_sent = len(q_sent_works)
+    share_total = len(q_pending_works | q_sent_works)
+    stage = str(snap.get("stage") or "") if has_snap else ""
+    running = bool(snap.get("running", False)) if has_snap else False
+
+    # 阶段 active 判定：任务运行中，当前节点尚未推进完即为 active
+    copy_active = (copied < snap_files) if legacy else (running and stage in ("", "copy"))
+    rename_active = running and stage == "rename"
+    identify_active = running and stage == "identify"
+    # ③入库识别：新快照用去重部数；老快照沿用 identified 条数
+    ident_value = int(ws_ident.get("total", 0) or 0) if not legacy else identified
+    ident_total = ident_value
+    ident_disp = (_works_text(ws_ident) if not legacy else "") or f"{identified} 部"
+    queued_value = int(ws_queued.get("total", 0) or 0) if not legacy else queued
+    queued_disp = (_works_text(ws_queued) if not legacy else "") or f"{queued} 项"
+
     pipeline = [
         {"key": "copy", "label": "① 复制到 B 库", "value": copied, "total": snap_files,
-         "status": "idle" if not has_snap else ("active" if copied < snap_files else "done"),
+         "status": ("active" if copy_active else "done") if has_snap else "idle",
          "detail": (f"{mode_label}：本轮复制 {copied} 项" if has_snap else idle_detail)},
         {"key": "rename", "label": "② 英文改名", "value": renamed, "total": snap_files,
-         "status": "idle" if not has_snap else "done",
+         "status": ("active" if rename_active else ("done" if (renamed or stage) else "idle")) if has_snap else "idle",
          "detail": (f"本轮改名 {renamed} 项（可选步骤）" if has_snap else idle_detail)},
-        {"key": "identify", "label": "③ 入库识别", "value": identified, "total": snap_files,
-         "status": "idle" if not has_snap else ("active" if identified < snap_files else "done"),
-         "detail": (f"本轮识别 {identified} 部" if has_snap else idle_detail)},
-        {"key": "share", "label": "④ 生成分享", "value": 0, "total": identified,
-         "status": "idle" if not has_snap else "active",
-         "detail": (f"本轮入队 {queued} 部，分享由推送队列按需创建" if has_snap else idle_detail)},
-        {"key": "push", "label": "⑤ 推送入队", "value": queued, "total": 0,
-         "status": "idle" if not has_snap else ("active" if queued else "idle"),
-         "detail": ((f"本轮入队 {queued} 项" + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else ""))
-                    if has_snap else (idle_detail + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else "")))},
+        {"key": "identify", "label": "③ 入库识别", "value": ident_value, "total": ident_total,
+         "status": ("active" if identify_active else ("done" if (ws_ident or legacy and identified) else "idle")) if has_snap else "idle",
+         "detail": ((f"本轮识别 {ident_disp}" + ("" if legacy else "（按 TMDB 作品去重）"))
+                    if has_snap else idle_detail)},
+        # v0.9.10.2：④生成分享按队列作品去重显示部数；worker 每 30 秒消费，实时变化靠前端轮询
+        {"key": "share", "label": "④ 生成分享", "value": queue_sent, "total": share_total,
+         "status": "idle" if share_total == 0 else ("active" if queue_pending else "done"),
+         "detail": (f"已分享/推送 {queue_sent} 部 · 待处理 {queue_pending} 部（队列每 30 秒消费）"
+                    if share_total else "队列空闲，无待处理分享")},
+        {"key": "push", "label": "⑤ 推送入队", "value": queued_value, "total": queued_value,
+         "status": ("active" if running and stage in ("", "copy", "rename", "identify")
+                    else ("done" if (queued_value or queued) else "idle")),
+         "detail": ((f"本轮入队 {queued_disp}" + ("" if legacy else "（按 TMDB 作品去重）")
+                     + (f" · 拦截：{enqueue_diag_text}" if enqueue_diag_text else ""))
+                    if has_snap else (idle_detail
+                                      + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else "")))},
     ]
-    # 同步进度百分比：本轮复制项 / 本轮扫描文件；无快照则视为未开始
-    progress = round(copied / snap_files * 100, 1) if snap_files else 0.0
+    # 同步进度百分比。无本轮快照直接 0（不拿历史队列冒充任务进度）；
+    # 老快照沿用 copied/files；新快照走五节点综合完成度，
+    # 只有非运行 + 分享队列清空才 100%（分享/推送没完成绝不显示 100%）。
+    if not has_snap:
+        progress = 0.0
+    elif legacy:
+        progress = round(copied / snap_files * 100, 1) if snap_files else 0.0
+    else:
+        all_done = (has_snap and not running and queue_pending == 0)
+        if all_done:
+            progress = 100.0
+        else:
+            steps = []
+            steps.append(min(copied / snap_files, 1.0) if snap_files else 0.0)
+            steps.append(1.0 if (renamed or stage in ("identify", "done")) else 0.0)
+            steps.append(1.0 if ws_ident else 0.0)
+            steps.append((queue_sent / share_total) if share_total else 0.0)
+            steps.append(1.0 if (queued_value or queued) else 0.0)
+            progress = round(sum(steps) / len(steps) * 100, 1)
+            if progress >= 100:
+                progress = 99.0  # 未完成分享/推送时不显示 100%
     lock_info = _mirror_lock.info()
 
     return {
@@ -1411,7 +1565,8 @@ def mirror_status(db: Session = Depends(get_db)):
         # v0.9.8 #195：全流程节点 + 同步进度，首页/镜像页据此展示流程条与进度
         "pipeline": pipeline,
         "progress": {"percent": progress, "synced": synced_files, "total": total_files,
-                     "running": bool(lock_info.get("busy")),
+                     "running": bool(lock_info.get("busy")) or running,
+                     "stage": stage,
                      "owner": lock_info.get("owner", "")},
         # v0.8.2：回显实际生效配置，一眼看出「自动创建是不是被关掉了」
         "config": {
@@ -1458,7 +1613,10 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     """
     stats = {"identified": 0, "failed": 0, "queued": 0, "finish_backfilled": 0,
              # v0.9.9 #201/#206：入队拦截诊断，逐条累积后供镜像管线与前端进度节点展示
-             "enqueue_diag": {}}
+             "enqueue_diag": {},
+             # v0.9.10.2：本轮识别 / 入队的作品键集合（按 TMDB 去重），
+             # 供进度看板显示「剧集 N 部 / 电影 M 部」而非集数。
+             "identified_work_keys": set(), "queued_work_keys": set()}
     diag = stats["enqueue_diag"]
     pending = list(db.scalars(select(Resource).where(
         Resource.identify_status.in_(["unidentified", "ambiguous", "failed", "none", ""])
@@ -1470,10 +1628,16 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
                 _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
                                       note=r.get("reason") or "", hint=r.get("hint"))
                 stats["identified"] += 1
+                wkey = _work_type_key(x.media_type, x.tmdb_id)
+                if wkey:
+                    stats["identified_work_keys"].add(wkey)
                 # autoflush=False：同批次识别后立刻查队列去重，必须 flush
                 db.flush()
                 if publish_after_identify:
-                    stats["queued"] += _enqueue_after_identify(db, x, diag=diag)
+                    n_added = _enqueue_after_identify(db, x, diag=diag)
+                    stats["queued"] += n_added
+                    if n_added and wkey:
+                        stats["queued_work_keys"].add(wkey)
             else:
                 x.identify_status = r.get("status") or "none"
                 x.identify_source = r.get("source") or ""
@@ -1504,6 +1668,11 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
         if seen_tmdb[tid]:
             x.finish_status = seen_tmdb[tid]
             stats["finish_backfilled"] += 1
+    # v0.9.10.2：作品键集合转成 JSON 安全的部数统计（进度看板按 TMDB 去重显示部数）
+    stats["work_stats"] = {
+        "identified": _work_breakdown(stats.pop("identified_work_keys")),
+        "queued": _work_breakdown(stats.pop("queued_work_keys")),
+    }
     return stats
 
 
@@ -1734,10 +1903,13 @@ async def _run_async_scan(mode: str) -> None:
             if isinstance(out, dict):
                 ident = out.get("identify") or {}
                 _write_pipeline_snapshot(
-                    db, _mirror_rule(db), mode="手动扫描", copied=0, renamed=0,
+                    db, _mirror_rule(db), mode="手动扫描", stage="done", running=False,
+                    copied=0, renamed=0,
                     identified=int(ident.get("identified", 0) or 0),
                     queued=int(ident.get("queued", 0) or 0),
-                    total_files=int(out.get("files", 0) or 0))
+                    total_files=int(out.get("files", 0) or 0),
+                    enqueue_diag=dict(ident.get("enqueue_diag") or {}),
+                    works=dict(ident.get("work_stats") or {}))
                 db.commit()
         _async_scan["result"] = out if isinstance(out, dict) else {}
         _async_scan["stage"] = "完成"
@@ -2334,9 +2506,17 @@ def _ensure_route_channel(db: Session, route: dict):
     仍以路由表为配置真相源，不臆造未配置的 chat_id。
     """
     ch = bot_listener.route_target_channel(db, route)
-    if ch:
-        return ch
     bot = _global_bot(db)
+    if ch:
+        # v0.9.10.2：真机「群聊自动推送仍收不到」的结构性根因——
+        # v0.9.10 只在保存端点 push_routes_save 同步 bot_id，那是「保存时」的一次性动作；
+        # 运行时入队命中已存在的路由 Channel 时直接 return，bot_id 仍指向换 token 前的
+        # 旧 Bot（失效 / 不在群里），于是测试推送用新 Bot 能收、正式推送用旧 Bot 收不到。
+        # 这里在运行时真相源强制校准到全局 Bot，存量数据无需用户重新点保存即自愈。
+        if bot and ch.bot_id != bot.id:
+            ch.bot_id = bot.id
+            db.flush()
+        return ch
     if not bot:
         return None
     kind = str(route.get("kind") or "channel")
@@ -2370,7 +2550,9 @@ def _enqueue_after_identify(db: Session, x: Resource, diag: dict | None = None) 
     from types import SimpleNamespace
     routes = bot_listener.push_routes(db)
     if routes:
-        matched = bot_listener.match_push_routes(db, x)
+        # v0.9.11：把 B 库根 / 扫描根 ID 传给匹配器——填了根目录 ID 的路由视为整库通配，
+        # 修复真机「dir_id 是 B 库根、资源在季子目录、32 条全 skip_route_no_match」。
+        matched = bot_listener.match_push_routes(db, x, root_ids=bot_listener.scan_root_ids(db))
         if not matched:
             bump("skip_route_no_match")
             return 0
@@ -3248,15 +3430,39 @@ async def queue_run():
 
 @app.post("/api/resources/{rid}/publish", dependencies=ADMIN)
 async def publish_resource(rid: int, db: Session = Depends(get_db)):
-    """把单个资源按所有启用规则入队并立即推送一次。"""
+    """把单个资源按所有启用规则 + 目录路由（频道/群）入队并立即推送一次。
+
+    v0.9.11：真机根因「手动立即推送只到频道、不到群」——旧实现只读 Rule 表，
+    而群目标只存在于 push_routes（目录路由），Rule 表里根本没有群 Channel。
+    这里补上目录路由分支，让立即推送和自动识别走同一套目标口径（频道 + 群）。
+    """
     x = db.get(Resource, rid)
     if not x:
         raise HTTPException(404, "资源不存在")
     rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))).all())
-    if not rules:
-        raise HTTPException(400, "还没有启用的分发规则：请先在「分发规则」页完成 Bot → 频道 → 规则")
+    routes = bot_listener.push_routes(db)
+    if not rules and not routes:
+        raise HTTPException(400, "还没有启用的分发规则或目录路由：请先在「分发与互动中心」完成 Bot → 频道 / 群 → 路由配置")
     added = 0
     skipped = []
+
+    # v0.9.11：目录路由（频道 + 群）——手动强制动作，绕过海报闸门但尊重目录匹配。
+    if routes:
+        matched = bot_listener.match_push_routes(db, x, root_ids=bot_listener.scan_root_ids(db))
+        for route in matched:
+            ch = _ensure_route_channel(db, route)
+            if not ch:
+                skipped.append(f"路由目标 {route['chat_id']} 找不到可用 Bot")
+                continue
+            q = db.scalar(select(QueueItem).where(
+                QueueItem.resource_id == x.id, QueueItem.channel_id == ch.id))
+            if q:
+                q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+            else:
+                db.add(QueueItem(resource_id=x.id, channel_id=ch.id, status="pending"))
+            added += 1
+        if not matched:
+            skipped.append("资源目录未匹配任何推送路由（可在「目录路由」把 dir_id 留空做整库推送）")
     for r in rules:
         ch = db.get(Channel, r.channel_id)
         if not ch or not ch.enabled:
@@ -3289,7 +3495,7 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
     # 用户常在资源未建分享或 Telegram 未通时点推送，队列项立即进入 retry，
     # 若不回显错误，界面只显示"已入队 1 条"却收不到消息。
     recent = list(db.scalars(select(QueueItem).where(
-        QueueItem.resource_id == x.id).order_by(QueueItem.id.desc()).limit(len(rules) or 1)).all())
+        QueueItem.resource_id == x.id).order_by(QueueItem.id.desc()).limit(max(added, 1))).all())
     detail = [{"channel_id": q.channel_id, "status": q.status,
                "error": str(q.error or "")[:300]} for q in recent if q.error]
     return {"ok": True, "queued": added, "detail": detail, "skipped": skipped, **result}

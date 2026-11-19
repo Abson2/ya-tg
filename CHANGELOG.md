@@ -8,6 +8,33 @@
 
 ---
 
+## v0.9.11 (2026-11-19)
+
+真机实测定位的两处推送根因 + 进度看板实时化。**不改 A→B 镜像主链路、不改认证协议、不私聊刷屏，海报仍优先**。
+
+### 一、识别后不自动分享/推送：路由 dir_id 填了 B 库根目录 ID
+- 根因（用户实测）：`resource.parent_id` 是季子目录、`dir_chain_json` 不含 B 库目标根目录（scanner 把扫描根的链初始化成 `[]`，子目录链只到剧/季目录），而路由 `dir_id` 填的是 B 库根 ID → `match_push_routes()` 32/32 全不匹配 → `skip_route_no_match` → 一个都不入队。此前几版都在发送层找原因，方向错了。
+- 修复：`bot_listener.match_push_routes()` 新增 `root_ids`，`dir_id` 命中任一「B 库根 / 扫描根」时视为整库通配（等价用户直觉「我填 B 库根就是整库推」）；新增 `scan_root_ids()` 从 `MirrorRule.target_root_id` + `ScanTask.root_id` 收集。`_enqueue_after_identify()` 与手动推送都传入。dir_id 留空仍是通配，精确 parent_id / 目录链匹配不变。
+
+### 二、手动「立即推送」只推频道不推群
+- 根因（用户实测）：`publish_resource()`（`POST /api/resources/{rid}/publish`）只读旧 `Rule` 表，那张表只有频道 Channel；群目标只存在于 `push_routes`（目录路由），只有 `_enqueue_after_identify` 消费，因此被上面第一条拦死后，群永远收不到。发送层无问题（测试消息能到群、白名单 gate 全 True）。
+- 修复：`publish_resource()` 增加目录路由分支——按 `match_push_routes`（含 root_ids）匹配频道+群，`_ensure_route_channel()` 取目标，强制 pending 入队后立即 `process_queue`；无规则但配了路由也能用。前端即时结果按实际入队数回显。
+
+### 三、进度看板实时化 + 作品部数口径
+- 用户反馈：卡片显示有延迟；没完成生成分享/推送就显示 100%；入库识别/生成分享/推送入队应显示剧集/电影部数而非集数。
+- 修复：后端 `_write_pipeline_snapshot()` 增加 `stage/running/works`，`_do_mirror_run()` 在复制→改名→识别各阶段边界写快照并立即落盘，异常/完成都归位 `running`；`_post_scan_identify()` 按 `(media_type, tmdb_id)` 去重收集识别/入队作品键，`mirror_status()` 三节点显示「剧集 N 部 · 电影 M 部」。进度条只有「非运行 + 分享队列清空」才 100%，否则封顶 99%。前端 `setInterval(pollMirrorStatus, 2000)` 只轮询 `/api/mirror/status`，卸载时清理；加 `stageLabel()` 显示当前阶段。老快照（无 works/stage）保留旧条数与 copied/files 进度，升级兼容。
+
+### 四、消息模板三跳转改并排按钮 + 简介缩短
+- 用户实测截图：「官方频道/交流群/机器人」灰底按钮要改为「频道/群聊/投稿·求片」三个并排同一行。
+- 修复：`_send_telegram()` 在第二行 inline 键盘放三个并排跳转按钮（取自 `tg_channel_link`/`tg_group_link`/`tg_bot_link`，留空不生成），「📥 获取资源」仍在第一行单独显示；正文不再追加三行文字链接。compact 简介从 110 字压到 70 字。消息模板页三张卡片改名并同步提示文案。
+
+### 五、群聊推送健壮性加固（非本次主因，顺带修）
+- `_ensure_route_channel()` 命中已有路由 Channel 时运行时强制同步 `bot_id` 到全局 Bot（v0.9.10 只在保存端点同步，存量数据不会自愈）。
+- `process_queue()` 白名单 deny 不再 `next_retry_at=None` 永久卡死，改计退避重试到上限转 failed。
+- `_send_telegram()` sendPhoto 回退补 `HTTP 200 + ok=false` 场景（429 仍不回退）。
+
+---
+
 ## v0.9.10 (2026-11-19)
 
 真机 6 项反馈 + 消息模板诉求 + 群聊推送根因修复。**不改 A→B 镜像主链路、不改认证协议、不写死推送规则、不私聊刷屏**。海报仍优先发送（只在 Telegram 拉不到图时回退纯文字），确保「海报别漏」。

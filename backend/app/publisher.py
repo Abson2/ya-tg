@@ -109,11 +109,12 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     season_count = ""
     _parsed_eps: list = []
     tpl = _template(db)
-    # v0.7.0：精简详情——compact 模式把简介压到 110 字，缩短消息篇幅
+    # v0.7.0：精简详情——compact 模式压缩简介；v0.9.10.2 按真机反馈从 110 字再压到 70 字
     detail_level = (runtime_config.get(db, "tg_detail_level") or "compact").strip()
     overview_text = (res.overview or "").strip()
-    if detail_level == "compact" and len(overview_text) > 110:
-        overview_text = overview_text[:110].rstrip("，。、；：,;: ") + "…"
+    overview_limit = 70
+    if detail_level == "compact" and len(overview_text) > overview_limit:
+        overview_text = overview_text[:overview_limit].rstrip("，。、；：,;: ") + "…"
 
     genres = tmdb.as_list(res.genres)
     countries = tmdb.as_list(res.origin_country)
@@ -266,28 +267,7 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         # 模板里的 {{buttons_text}} 变量置空，避免旧模板重复出现纯文字标签。
         "buttons_text": "",
     }
-    from . import bot_listener
-    # v0.9.10：所有模板统一在正文追加三行跳转文字（频道 / 群 / 机器人），
-    # 链接取自消息模板模块配置；留空的那一项不输出。bot 链接指向推送 Bot 本身。
-    jump_lines: list[str] = []
-    for label, raw in (
-        ("📢 官方频道", runtime_config.get(db, "tg_channel_link")),
-        ("👥 交流群", runtime_config.get(db, "tg_group_link")),
-        ("🤖 机器人", runtime_config.get(db, "tg_bot_link")),
-    ):
-        link = bot_listener._normalize_tme_link(raw)
-        if link:
-            jump_lines.append(f'<a href="{html.escape(link, quote=True)}">{label}</a>')
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
-    if jump_lines:
-        # 插在末尾 share_url 之前；无 share_url 则直接追加到末尾
-        lines = text.split("\n")
-        if lines and re.match(r"^https?://\S+$", lines[-1].strip()):
-            share_line = lines.pop()
-            body = "\n".join(lines).rstrip()
-            text = (body + "\n" + "\n".join(jump_lines) + "\n" + share_line).strip()
-        else:
-            text = (text.rstrip() + "\n" + "\n".join(jump_lines)).strip()
     return text[:1000], text[:1000]
 
 
@@ -310,8 +290,10 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
                "parse_mode": "HTML", "disable_web_page_preview": False}
     if poster:
         payload["photo"] = poster
-    # v0.9.10：inline 按钮只保留「获取资源」——频道/群/机器人的跳转改为正文文字链接
-    # （由 _build_message 统一追加，对所有模板生效），不再重复占按钮位。
+    # v0.9.10.2：真机截图口径——「频道 / 群聊 / 投稿·求片」三个跳转按钮并排同一行，
+    # 与用户截图里的灰底入口一致；「获取资源」保留为上方单独一行。
+    # 链接取自消息模板模块配置，留空的那一项不生成按钮（_normalize_tme_link 归一化）。
+    from . import bot_listener
     keyboard_rows: list[list[dict]] = []
     link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
     if link_style == "button" and res.share_url:
@@ -322,6 +304,17 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
             payload["caption"] = caption
         else:
             payload["text"] = caption
+    jump_buttons: list[dict] = []
+    for label, raw in (
+        ("频道", runtime_config.get(db, "tg_channel_link")),
+        ("群聊", runtime_config.get(db, "tg_group_link")),
+        ("投稿·求片", runtime_config.get(db, "tg_bot_link")),
+    ):
+        link = bot_listener._normalize_tme_link(raw)
+        if link:
+            jump_buttons.append({"text": label, "url": link})
+    if jump_buttons:
+        keyboard_rows.append(jump_buttons)  # 三个按钮放进同一个 row = 并排一行，不换行
     if keyboard_rows:
         payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
     retry_after = None
@@ -345,7 +338,10 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
         # 国内网络常见）时自动回退 sendMessage——海报优先保留，但图拉不到也要让
         # 消息文字送达，避免「测试能收、正常推送收不到」。回退只做一次；
         # 429 限流不走回退（立即再打一次只会加剧限流），交给上层退避重试。
-        if method == "sendPhoto" and 400 <= r.status_code < 500 and r.status_code != 429:
+        # v0.9.10.2：补 HTTP 200 + ok=false（Telegram 业务失败也走回退），
+        # 但仍排除 429（限流回退只会加剧）。原条件只认 4xx，漏掉 200+ok=false。
+        photo_failed = (400 <= r.status_code < 500 or not data.get("ok"))
+        if method == "sendPhoto" and photo_failed and r.status_code != 429:
             fallback = {"chat_id": chat_id, "text": caption,
                         "parse_mode": "HTML", "disable_web_page_preview": False}
             if payload.get("reply_markup"):
@@ -440,8 +436,13 @@ async def process_queue(limit: int = 20) -> dict:
             from . import bot_listener
             allowed, deny_reason = bot_listener.is_push_allowed(db, channel.chat_id)
             if not allowed:
+                # v0.9.10.2：不再每轮原样取出永久卡死（旧逻辑 next_retry_at=None +
+                # status 仍 pending，队列看似有项却永不推进）。改为计一次退避重试，
+                # 到上限转 failed 并带可诊断原因，前端队列页能直接看到卡在哪。
+                q.attempts += 1
                 q.error = deny_reason
-                q.next_retry_at = None
+                q.next_retry_at = plus_seconds(utcnow(), backoff_seconds(q.attempts))
+                q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 db.commit()
                 continue
             # v0.9.10：下面两个 await 是网络请求。进网络前先把本条已写的字段落盘，

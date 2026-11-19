@@ -138,11 +138,18 @@ def push_routes(db: Session) -> list[dict]:
     return out
 
 
-def match_push_routes(db: Session, resource) -> list[dict]:
+def match_push_routes(db: Session, resource, root_ids=None) -> list[dict]:
     """返回与资源目录匹配的路由（可多条）。
 
     匹配规则：dir_id 为空 = 根目录通配（匹配所有资源，即整库推送）；
     否则精确匹配 resource.parent_id，或出现在 resource.dir_chain_json 目录链中。
+
+    v0.9.11：新增 root_ids——真机根因「路由 dir_id 填了 B 库目标根目录 ID 却
+    一个都匹配不上」。扫描入库时 dir_chain 从直接父目录往上，但**扫描根本身
+    不在链里**（scanner 把 root 的链初始化成 []），所以填 B 库根目录 ID 的路由
+    永远匹配不到任何季子目录资源。这里把「dir_id == 任一扫描根 ID」也视为通配，
+    等价用户直觉「我填的是 B 库根，就是要整库都推」。root_ids 由调用方从
+    MirrorRule.target_root_id / ScanTask.root_id 传入，避免本模块耦合镜像配置。
     """
     routes = push_routes(db)
     if not routes:
@@ -152,12 +159,33 @@ def match_push_routes(db: Session, resource) -> list[dict]:
         chain = set(str(x) for x in json.loads(getattr(resource, "dir_chain_json", "[]") or "[]"))
     except Exception:
         chain = set()
+    roots = {str(x).strip() for x in (root_ids or []) if str(x).strip()}
     matched = []
     for r in routes:
         dir_id = r["dir_id"]
-        if not dir_id or dir_id == parent or dir_id in chain:
+        if (not dir_id or dir_id == parent or dir_id in chain
+                or (roots and dir_id in roots)):
             matched.append(r)
     return matched
+
+
+def scan_root_ids(db: Session) -> list[str]:
+    """收集「视为整库根」的目录 ID：镜像 B 库根 + 扫描计划根。
+
+    供 match_push_routes 的 root_ids 参数使用。只读，不改变任何配置语义。
+    """
+    ids: list[str] = []
+    try:
+        from .models import MirrorRule, ScanTask
+        for r in db.scalars(select(MirrorRule)).all():
+            if getattr(r, "target_root_id", ""):
+                ids.append(str(r.target_root_id).strip())
+        for t in db.scalars(select(ScanTask)).all():
+            if getattr(t, "root_id", ""):
+                ids.append(str(t.root_id).strip())
+    except Exception:
+        pass
+    return ids
 
 
 def route_target_channel(db: Session, route: dict):

@@ -14,9 +14,11 @@ import pytest
 
 from app import bot_listener
 from app.db import SessionLocal, json_dumps, migrate
-from app.models import AppConfig, UserContribution
+from app.models import AppConfig, Bot, Channel, UserContribution
 
-TABLES = [UserContribution]
+# v0.9.11：补清 Bot/Channel——v0911 真机根因测试会建路由 Channel 与交互 Bot，
+# 若不在本文件 fixture 一并清理，_menu_text/notify_user 会读到残留目标而假失败。
+TABLES = [UserContribution, Bot, Channel]
 
 
 def _set(db, key, value):
@@ -44,7 +46,7 @@ def _fresh():
         # 清理互动相关配置，回到默认
         for k in ("bot_gate_mode", "bot_restrict_enabled", "bot_push_channels_json",
                   "bot_push_groups_json", "bot_required_channels_json",
-                  "bot_required_groups_json", "contribution_bot_token",
+                  "bot_required_groups_json",                   "contribution_bot_token", "interaction_bot_id",
                   "contribution_enabled", "donation_enabled", "donation_text"):
             row = db.get(AppConfig, k)
             if row:

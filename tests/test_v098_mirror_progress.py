@@ -75,12 +75,17 @@ def test_pipeline_nodes_present(session):
 
 
 def test_pipeline_idle_without_snapshot(session):
-    """v0.9.10：无本轮快照时五个节点全 0 + 空闲提示，不回退到全库累计。"""
-    _seed(session)  # 库里有 2 synced / 1 identified / 1 queued，但无快照
+    """v0.9.10：无本轮快照时 copy/rename/identify/push 全 0 + 空闲提示；
+    v0.9.10.1 起「生成分享」显示队列实时状态（_seed 有 1 条 sent）。"""
+    _seed(session)  # 库里有 2 synced / 1 identified / 1 queued(sent)，但无快照
     out = main.mirror_status(db=session)
-    for n in out["pipeline"]:
-        assert n["value"] == 0
-        assert n["status"] == "idle"
+    nodes = {n["key"]: n for n in out["pipeline"]}
+    for k in ("copy", "rename", "identify", "push"):
+        assert nodes[k]["value"] == 0
+        assert nodes[k]["status"] == "idle"
+    # 生成分享反映队列真实状态，不再恒 0+active
+    assert nodes["share"]["total"] == 1
+    assert nodes["share"]["status"] == "done"
     assert out["progress"]["percent"] == 0.0
 
 

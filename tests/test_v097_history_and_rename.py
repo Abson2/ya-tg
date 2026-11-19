@@ -240,11 +240,12 @@ def test_frontend_reward_moved_into_builtin_commands():
 
 
 def test_frontend_jump_links_moved_to_template_module():
-    # v0.9.10：三张跳转卡并入同一张「推送消息 · 跳转链接」panel（新增机器人跳转）
+    # v0.9.11：三张跳转卡并入同一张「推送消息 · 跳转链接」panel，
+    # 标签改为频道 / 群聊 / 投稿·求片，三个 inline 按钮并排同一行。
     assert "推送消息 · 跳转链接" in APP
-    assert "官方频道跳转" in APP
-    assert "交流群跳转" in APP
-    assert "机器人跳转" in APP
+    assert "频道跳转" in APP
+    assert "群聊跳转" in APP
+    assert "投稿·求片跳转" in APP
     assert "async function saveJumpLinks" in APP
     assert "渲染层统一追加" in APP
     # v0.9.10：跳转改由渲染层统一追加，hint 不再写模板变量；变量表保留兼容变量
