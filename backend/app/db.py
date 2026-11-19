@@ -101,6 +101,8 @@ _COLUMNS = {
         # v0.9.0：单次同步整部作品上限 + 轮转游标（0=不限量）
         "max_works_per_run": "INTEGER DEFAULT 0",
         "works_cursor": "TEXT DEFAULT ''",
+        # v0.9.10：本轮任务各节点处理量快照，进度条只显示当前任务不显示历史累计
+        "last_pipeline_json": "TEXT DEFAULT ''",
     },
     "mirror_media": {
         "category_path": "TEXT DEFAULT ''",

@@ -8,6 +8,45 @@
 
 ---
 
+## v0.9.10 (2026-11-19)
+
+真机 6 项反馈 + 消息模板诉求 + 群聊推送根因修复。**不改 A→B 镜像主链路、不改认证协议、不写死推送规则、不私聊刷屏**。海报仍优先发送（只在 Telegram 拉不到图时回退纯文字），确保「海报别漏」。
+
+### 一、影视映射清单清理真正生效（B 库核对口径）
+- 根因：旧口径只看本地 `MirrorFile.status==synced`，截图里映射行全是 synced+有文件，清理永远返回 0；前端按钮还被 `media_invalid` 禁用，看起来「只加按钮没动作」。
+- 修复：新增 `mirror.prune_missing_media_rows()` 联网只读核对 B 库，`verified=True` 且整部无文件的行判为「B 库文件已删」僵尸映射，删 `MirrorMedia` 及子 `MirrorFile`，每条立即 commit、列目录不可信一律跳过。端点 `mirror_media_clear_invalid_async()` 先跑 B 库核对再清本地僵尸，返回 `b_checked/b_deleted/skipped_has_files` 统计。
+- 前端清理按钮 disabled 从 `media_invalid` 改为「映射清单是否为空」；删除「X 条无效」与表格「无效待清理」标签，反馈显示核对统计。
+
+### 二、手动扫库改后台异步（Failed to fetch 卡死）
+- 根因：手动扫描是分钟级同步 HTTP 请求，浏览器/网关断连后前端 `Failed to fetch`、后端仍在跑并抢写锁。
+- 修复：新增 `POST /api/scan/async`（启动后立即返回）+ `GET /api/scan/async`（轮询状态），后台任务跑完前端自动 `load()`；`refreshAll/scan/rescanLibrary` 三入口统一走异步，扫描按钮 loading 绑定 `asyncScanRunning`。
+
+### 三、重新同步镜像 Internal Server Error（database is locked）
+- 根因：真机日志 `DELETE FROM push_queue` 报 `database is locked`——`process_queue()` 整轮 for 只在末尾 commit 一次，20 条 ×（2s 节流 + 建分享 + 发 TG）让一个写事务持锁几十秒，其它请求撞锁 500。
+- 修复：每条队列项开头/各 `continue` 分支/网络 await 前/发送结果后都立即 `db.commit()`，绝不跨 `asyncio.sleep`/光鸭网络/TG 网络持写事务。
+
+### 四、进度节点只显示本轮任务量（去掉历史累计）
+- 根因：进度节点用全库累计（MirrorFile 总数 / Resource 已识别总数 / QueueItem 总数）冒充进度，用户要求只看当前任务。
+- 修复：`MirrorRule` 新增 `last_pipeline_json` 列（含迁移）；`_write_pipeline_snapshot()` 在每轮任务写本轮各节点处理量，`mirror_status()` 只读快照，无快照时全节点 `idle/0` + 「尚无任务记录」。同步状态去掉「失效影视」数字。
+
+### 五、群聊推送收不到（测试能收、正常推送收不到）
+- 结构性差异：测试推送直发 `sendMessage`（无图、不建分享）；正常推送入队强制带海报→`sendPhoto`，且① `sendPhoto` 拉不到 `image.tmdb.org` 图片时无回退、② 建分享失败直接 `continue` 跳过发送、③ 路由 Channel 换 Bot 后 `bot_id` 不更新（旧条件跳过 `route:` 前缀）导致测试用新 Bot、正常用旧 bot_id。任一命中都会让群/频道一条都收不到。
+- 修复：`_send_telegram()` 在 sendPhoto 失败（HTTP<500）时自动回退 `sendMessage`，文字照常送达；`process_queue()` 建分享失败不再阻断发送（正文无链接、error 标 `[已送达·无资源链接]`）；`push_routes_save()` 路由 Channel 统一同步全局 Bot `bot_id`。
+
+### 六、消息模板统一跳转链接（所有模板）
+- 用户诉求：默认图文模板的频道文字改为跳转频道/群/Bot 的文字链接，下方按钮只留「获取资源」；所有模板、渲染层统一处理。
+- 修复：`_build_message()` 把 `buttons_text` 置空，渲染层统一在正文末尾（`share_url` 之前）追加三行带链接文字（📢官方频道/👥交流群/🤖机器人），取自 `tg_channel_link`/`tg_group_link`/`tg_bot_link`，留空不输出；`_send_telegram()` inline 按钮只保留「📥 获取资源」，去掉福袋/频道/群按钮。新增配置 `tg_bot_link`（含 runtime_config 默认值与交互配置读写），消息模板页跳转卡片改三列并加「机器人跳转」。
+
+### 七、投稿审核状态展示与删除
+- 真机反馈：投稿列表状态列直接显示英文原始值（approved），且没有删除按钮（求片已有）。
+- 修复：后端新增 `DELETE /api/contributions/{cid}`（只删登记行、不动用户与 TgtoDrive）；前端投稿状态列改中文标签带颜色（待处理/已通过/已拒绝/已转存），操作列加「删除」按钮（确认后调用端点）。
+- 投稿标题即资源链接：有 `share_url` 时剧名渲染为可点击超链接（新窗口打开），无链接保持纯文本；加 `safeHttpUrl` 协议白名单防 `javascript:` 注入。
+
+### 八、文档与测试
+- 新增 `tests/test_v0910_four_fixes.py`（6 项）、`tests/test_v0910_group_push.py`（8 项）、`tests/test_v0910_contribution_review.py`（3 项），更新 `test_v098_mirror_progress.py`/`test_v098_media_clear.py` 及两处前端文案断言。修复测试间 `interaction_bot_id` 配置残留污染（heal_a/v097 fixture 补清理）。全量测试 + 前端构建通过。
+
+---
+
 ## v0.9.9 (2026-11-19)
 
 真机 6 项反馈集中补修。核心是「消息模板换成用户指定样式」与「识别成功却没入队/没推送」的可观测性根因修复。**不改 A→B 镜像主链路、不改认证协议、不写死推送规则、不私聊刷屏**；海报发送逻辑保持不变（`_send_telegram` 仍以 TMDB 海报图为消息主体）。

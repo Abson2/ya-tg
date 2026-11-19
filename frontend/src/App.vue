@@ -48,12 +48,13 @@ const diagCount = computed(() => {
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
-const scanning = ref(false), showScanPanel = ref(false)
+const showScanPanel = ref(false)
 // v0.9.4：Bot 交互配置——交互 Bot 复用 bots 表 token、白名单复用推送目标；内置四指令固定
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
   bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [],
   // v0.9.5：使用限制跳转链接 + 推送消息频道/群跳转（模板变量 channel_link/group_link）
-  bot_required_channel_link: '', bot_required_group_link: '', tg_channel_link: '', tg_group_link: '' })
+  // v0.9.10：新增机器人跳转链接（推送 Bot 本身），渲染层统一追加三行文字链接
+  bot_required_channel_link: '', bot_required_group_link: '', tg_channel_link: '', tg_group_link: '', tg_bot_link: '' })
 // v0.9.5：推送白名单 = 目录路由表 + 全局单 Bot
 const pushCfg = ref({ bot: null, max_routes: 10 })
 // v0.9.8：一条路由的频道 ID 与群 ID 分别填写，可只填其一或两个都填
@@ -530,31 +531,44 @@ function pickScanInterval(v) { scanInterval.value = v; scanCustom.value = false 
 const intervalLabel = v => v >= 1440 ? '每天' : (v >= 60 ? `每 ${v / 60} 小时` : `每 ${v} 分钟`)
 // v0.8.7：三个入口统一「读取最新 B 库内容 → 按实际内容重建面板」
 // 顶部「刷新」= /library/refresh，「立即扫描」= /scan-now，「重新扫描库」= /library/rescan
-const refreshing = ref(false)
+// v0.9.10：三个扫描入口统一走后台异步任务（asyncScanRunning 见上方）。
 function reconcileTip(d) {
   const rc = d.reconcile || {}
   if (rc.skipped) return `对账已跳过（${rc.skipped}）`
   const empty = rc.empty_seen_allowed ? '（B 库为空，面板已按实际内容清空）' : ''
   return `移除 ${rc.removed || 0} 项、取消分享 ${rc.shares_cancelled || 0} 个${empty}`
 }
-async function refreshAll() {
-  refreshing.value = true
+// v0.9.10：后台异步扫描——立即返回，轮询状态，彻底避开 fetch 超时 / 页面卡死。
+const asyncScanRunning = ref(false), asyncScanStage = ref('')
+async function runAsyncScan(mode, label) {
+  if (asyncScanRunning.value) { ElMessage.warning('已有扫描任务在运行'); return }
+  asyncScanRunning.value = true
+  asyncScanStage.value = '启动'
   try {
-    const d = await api('/library/refresh', { method: 'POST' }, 180000)
-    ElMessage.success(`已按 B 库最新内容刷新：${d.files || 0} 个文件 · ${reconcileTip(d)}`)
-    await load()
+    await api('/scan/async?mode=' + mode, { method: 'POST' })
+    ElMessage.info(`${label}已在后台开始，完成后自动刷新页面，可继续使用其它功能`)
+    let ticks = 0
+    while (true) {
+      await new Promise(r => setTimeout(r, 1500))
+      const s = await api('/scan/async')
+      asyncScanStage.value = s.stage || ''
+      if (!s.running) {
+        if (s.error) { ElMessage.error(`${label}失败：${s.error}`); break }
+        const d = s.result || {}
+        const parts = [`${label}完成：${d.files || 0} 个文件`, reconcileTip(d)]
+        const idf = d.identify || {}
+        if (idf.identified) parts.push(`识别 ${idf.identified} 项`)
+        ElMessage.success(parts.join(' · '))
+        await load()
+        break
+      }
+      if (++ticks > 2400) { ElMessage.warning('扫描耗时较长，仍在后台运行，请稍后刷新查看'); break }
+    }
   } catch (e) { ElMessage.error(e.message) }
-  finally { refreshing.value = false }
+  finally { asyncScanRunning.value = false; asyncScanStage.value = '' }
 }
-async function scan() {
-  scanning.value = true
-  try {
-    const d = await api('/scan-now', { method: 'POST' }, 180000)
-    ElMessage.success(`扫描完成：${d.files || 0} 个文件 · ${reconcileTip(d)}`)
-    await load()
-  } catch (e) { ElMessage.error(e.message) }
-  finally { scanning.value = false }
-}
+async function refreshAll() { await runAsyncScan('refresh', '刷新') }
+async function scan() { await runAsyncScan('scan', '扫描') }
 // ---------- A/B 镜像 ----------
 async function saveMirror() {
   mirrorSaving.value = true
@@ -670,19 +684,22 @@ async function clearPrunedMappings() {
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
-// v0.9.8：清理历史无效影视映射（failed/blocked 且无 synced 文件的僵尸行）。
+// v0.9.10：清理影视映射清单的无效行——口径改为「核对 B 库，删除网盘文件已整部删除的历史行」。
 async function clearInvalidMedia() {
-  const n = mirrorStatus.value.counts?.media_invalid || 0
-  if (!n) { ElMessage.info('当前没有可清理的无效影视映射'); return }
+  if (!mirrorStatus.value.media?.length) { ElMessage.info('影视映射清单为空，无需清理'); return }
   const ok = await confirmBox(
-    `将物理删除 ${n} 条历史无效影视映射（状态失败/阻断且没有任何已同步文件，属历史遗留僵尸行）。\n\n` +
-    '只删 A→B 映射登记及其文件映射，不删资源 / 分享 / 推送队列 / B 库文件。' +
-    'A 库仍有源文件时，下一轮「立即同步」会自动重建映射。')
+    '将只读核对 B 库真实内容，把网盘上已整部删除文件的历史影视映射行清理掉。\n\n' +
+    '只有确认列目录完整可信、且 B 库确实一个文件都没有才清理；接口异常或有文件的行一律跳过。' +
+    '同时清理本地失败/阻断且无已同步文件的僵尸行。\n\n' +
+    '只删 A→B 映射登记，不删资源 / 分享 / 推送队列 / B 库文件。')
   if (!ok) return
   mirrorBusy.value = true
   try {
-    const d = await api('/mirror/media/clear-invalid', { method: 'POST' })
-    ElMessage.success(`已清理 ${d.removed_media || 0} 条无效影视映射（${d.removed_files || 0} 个文件映射）`)
+    const d = await api('/mirror/media/clear-invalid', { method: 'POST' }, 300000)
+    const parts = [`已核对 B 库 ${d.b_checked || 0} 部，删除 ${d.removed_media || 0} 条无效影视映射（${d.removed_files || 0} 个文件映射）`]
+    if (d.skipped_has_files) parts.push(`${d.skipped_has_files} 部 B 库仍有文件，已保留`)
+    if (d.skipped_unverified > 0) parts.push(`${d.skipped_unverified} 部列目录不可信，已跳过`)
+    ElMessage.success(parts.join('；'))
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -790,6 +807,7 @@ async function postInteractionConfig() {
     // v0.9.5：使用限制跳转 + 推送消息频道/群跳转
     bot_required_channel_link: c.bot_required_channel_link || '', bot_required_group_link: c.bot_required_group_link || '',
     tg_channel_link: c.tg_channel_link || '', tg_group_link: c.tg_group_link || '',
+    tg_bot_link: c.tg_bot_link || '',
     // 自定义指令不含内置四项，内置由后端固定注入
     bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
   // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
@@ -820,7 +838,7 @@ async function saveJumpLinks() {
   interactionSaving.value = true
   try {
     await postInteractionConfig()
-    ElMessage.success('消息跳转链接已保存；留空的一侧不会出现在推送消息里')
+    ElMessage.success('已保存；推送消息正文将统一追加频道/群/机器人三行文字链接，留空的不显示，按钮只保留「获取资源」')
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { interactionSaving.value = false }
@@ -867,6 +885,17 @@ async function deleteMediaRequest(row) {
   catch (e) { ElMessage.error(e.message) }
 }
 function wantReviewLabel(s) { return ({ pending: '待处理', adopted: '已采纳', rejected: '已拒绝' })[s] || '待处理' }
+// v0.9.10：投稿审核状态中文映射（真实状态 pending/approved/rejected/transferred），不再显示英文原始值
+function contributionStatusLabel(s) { return ({ pending: '待处理', approved: '已通过', rejected: '已拒绝', transferred: '已转存' })[s] || s || '待处理' }
+function contributionStatusTag(s) { return ({ approved: 'success', transferred: 'success', rejected: 'danger', pending: 'warning' })[s] || 'info' }
+// v0.9.10：投稿标题直接作为资源链接展示——只对 http/https 放行，杜绝 javascript: 注入
+function safeHttpUrl(u) { const s = String(u || '').trim(); return /^https?:\/\//i.test(s) ? s : '' }
+async function deleteContribution(row) {
+  const ok = await confirmBox(`确认删除投稿「${row.title}」？只删登记记录，不影响用户与其它数据。`)
+  if (!ok) return
+  try { await api(`/contributions/${row.id}`, { method: 'DELETE' }); ElMessage.success('已删除'); await load() }
+  catch (e) { ElMessage.error(e.message) }
+}
 async function addWant() {
   const t = String(wantTitle.value || '').trim()
   if (!t) { ElMessage.warning('请填写影视名称'); return }
@@ -956,19 +985,8 @@ async function cancelShare(row) {
   } catch (e) { ElMessage.error(e.message) }
 }
 // v0.7.1：重新扫描库——全量重扫 B 库 + 对账移除已删除影视（并取消其分享）+ 自动识别
-const rescanning = ref(false)
-async function rescanLibrary() {
-  rescanning.value = true
-  try {
-    const d = await api('/library/rescan', { method: 'POST' }, 180000)
-    const idf = d.identify || {}
-    const parts = [`扫描 ${d.files || 0} 个文件`, reconcileTip(d)]
-    parts.push(`识别 ${idf.identified || 0} 项、完结回填 ${idf.finish_backfilled || 0} 项`)
-    ElMessage.success(parts.join(' · '))
-    await load()
-  } catch (e) { ElMessage.error(e.message) }
-  finally { rescanning.value = false }
-}
+// v0.9.10：统一走后台异步任务
+async function rescanLibrary() { await runAsyncScan('rescan', '重新扫描库') }
 // v0.6.4：清空当前扫描结果，避免旧的识别失败/重试残留干扰重新扫描
 async function clearLibrary() {
   try {
@@ -1297,7 +1315,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.9 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.10 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1307,7 +1325,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         <div class="top-actions">
           <span class="clock">{{ clock }}</span>
           <el-button size="small" plain @click="verify">验证连接</el-button>
-          <el-button size="small" type="primary" plain :loading="refreshing" @click="refreshAll">
+          <el-button size="small" type="primary" plain :loading="asyncScanRunning" @click="refreshAll">
             <svg class="ico" viewBox="0 0 24 24"><path :d="icon('refresh')"/></svg> 刷新
           </el-button>
           <el-button size="small" text @click="logout">
@@ -1692,16 +1710,16 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint">分类目录保持 A 库原名、不加标记；只有影视主目录按 · 规则命名，括号里的年份与 TMDB 标记保持原样。</p>
           </div>
           <div class="panel">
-            <div class="panel-head"><h3>影视映射清单</h3><el-tag v-if="mirrorStatus.counts?.media_invalid" size="small" type="warning">{{ mirrorStatus.counts.media_invalid }} 条无效</el-tag><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.counts?.media_invalid" @click="clearInvalidMedia">清理无效影视映射</el-button></div>
+            <div class="panel-head"><h3>影视映射清单</h3><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.media?.length" @click="clearInvalidMedia">清理无效影视映射</el-button></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.media || []" size="small">
               <el-table-column prop="category_path" label="分类目录" min-width="140"/>
               <el-table-column prop="title" label="标准影视名" min-width="180"/>
               <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
               <el-table-column prop="media_type" label="类型" width="90"/>
               <el-table-column prop="files" label="文件" width="80"/>
-              <el-table-column label="状态" width="120"><template #default="s"><el-tag v-if="s.row.invalid" type="warning" size="small">无效待清理</el-tag><span v-else>{{ s.row.status }}</span></template></el-table-column>
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。<b>状态为失败/阻断且没有任何已同步文件的历史遗留映射</b>可点「清理无效影视映射」移除；只删 A→B 映射登记，不删资源 / 分享 / 队列，A 库仍有文件时下轮同步会自动重建。</p>
+            <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。<b>点「清理无效影视映射」会只读核对 B 库</b>，把网盘上已整部删除文件的历史映射行清掉（列目录不可信或有文件的行一律保留）；只删 A→B 映射登记，不删资源 / 分享 / 队列 / B 库文件。</p>
           </div>
             </el-collapse-item>
           </el-collapse>
@@ -1852,15 +1870,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div class="panel">
               <div class="panel-head"><h3>用户投稿</h3></div>
               <div class="table-scroll"><el-table :data="contributions" size="small">
-                <el-table-column label="标题（TMDB 候选）" min-width="170"><template #default="s">
-                  {{ s.row.title }}<span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
+                <el-table-column label="标题（点击剧名打开资源）" min-width="180"><template #default="s">
+                  <a v-if="safeHttpUrl(s.row.share_url)" :href="safeHttpUrl(s.row.share_url)" target="_blank" rel="noopener noreferrer" class="title-link" :title="s.row.share_url">{{ s.row.title || '未命名投稿' }}</a>
+                  <span v-else>{{ s.row.title || '未命名投稿' }}</span><span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
                   <el-tag v-if="s.row.tmdb_id" size="small" type="info" effect="plain">#{{ s.row.tmdb_id }}</el-tag>
                 </template></el-table-column>
                 <el-table-column label="用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
-                <el-table-column prop="status" label="状态" width="96"/>
-                <el-table-column label="操作" width="160"><template #default="s">
+                <el-table-column label="状态" width="96"><template #default="s">
+                  <el-tag size="small" :type="contributionStatusTag(s.row.status)">{{ contributionStatusLabel(s.row.status) }}</el-tag>
+                </template></el-table-column>
+                <el-table-column label="操作" width="230"><template #default="s">
                   <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
                   <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
+                  <el-button size="small" type="danger" plain @click="deleteContribution(s.row)">删除</el-button>
                 </template></el-table-column>
               </el-table></div>
             </div>
@@ -1883,7 +1905,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="scanning" @click="scan">立即扫描</el-button><el-button size="small" :loading="rescanning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="asyncScanRunning" @click="scan">立即扫描</el-button><el-button size="small" :loading="asyncScanRunning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">
@@ -1983,7 +2005,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <div class="field inline"><label>启用定时扫描</label><el-switch v-model="task.enabled"/></div>
             </div>
             <p class="hint">扫描根目录自动引用「镜像同步」里填的 B 库目录 ID，无需在此填写；改 B 库 ID 后下一次扫描立即生效。</p>
-            <div class="panel-foot"><el-button type="primary" @click="saveTask">保存扫描计划</el-button><el-button :loading="scanning" @click="scan">立即扫描</el-button></div>
+            <div class="panel-foot"><el-button type="primary" @click="saveTask">保存扫描计划</el-button><el-button :loading="asyncScanRunning" @click="scan">立即扫描</el-button></div>
             <div class="cursor-box"><div><small>游标状态</small><b>{{ task.cursor_status }}</b></div><div><small>已处理文件</small><b>{{ task.cursor_files }}</b></div><div><small>遍历目录</small><b>{{ task.cursor_dirs }}</b></div><div><small>上次结果</small><b>{{ task.last_status || 'never' }}</b></div></div>
             <p class="hint">{{ task.last_message || '尚未执行扫描' }}{{ task.cursor_error ? ' · 错误：' + task.cursor_error : '' }}</p>
           </div>
@@ -2115,19 +2137,24 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         <section v-else-if="tab === '消息模板'" class="fade">
           <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
 
-          <!-- v0.9.8：跳转卡片与保存按钮合并为同一张 panel，按钮紧贴卡片，增强整体性 -->
+          <!-- v0.9.10：跳转卡片与保存按钮合并为同一张 panel；三行文字链接在渲染层统一追加，按钮只保留「获取资源」 -->
           <div class="panel" style="margin-bottom:14px">
-            <div class="panel-head"><h3>推送消息 · 跳转按钮</h3><span>留空则不启用对应的按钮与模板变量</span></div>
-            <div class="two-col">
+            <div class="panel-head"><h3>推送消息 · 跳转链接</h3><span>三行文字链接在渲染层统一追加到所有模板，留空的不显示；下方按钮只保留「获取资源」</span></div>
+            <div class="three-col">
               <div class="panel narrow">
                 <div class="panel-head"><h4>官方频道跳转</h4><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
                 <el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/>
-                <p class="hint">填值后推送消息追加「📢 官方频道」按钮，模板可用 <code>&#123;&#123;channel_link&#125;&#125;</code>。</p>
+                <p class="hint">填值后推送消息正文追加「📢 官方频道」文字链接。</p>
               </div>
               <div class="panel narrow">
                 <div class="panel-head"><h4>交流群跳转</h4><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
                 <el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/>
-                <p class="hint">填值后推送消息追加「👥 交流群」按钮，模板可用 <code>&#123;&#123;group_link&#125;&#125;</code>。</p>
+                <p class="hint">填值后推送消息正文追加「👥 交流群」文字链接。</p>
+              </div>
+              <div class="panel narrow">
+                <div class="panel-head"><h4>机器人跳转</h4><el-tag size="small" :type="interactionCfg.tg_bot_link ? 'success' : 'info'">{{ interactionCfg.tg_bot_link ? '已启用' : '未启用' }}</el-tag></div>
+                <el-input v-model="interactionCfg.tg_bot_link" placeholder="@推送机器人 或 https://t.me/推送机器人"/>
+                <p class="hint">填值后推送消息正文追加「🤖 机器人」文字链接（指向推送 Bot 本身）。</p>
               </div>
             </div>
             <div class="panel-foot"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button><span class="hint" style="margin-left:10px">也可在「分发与互动中心」点顶部统一保存按钮一起保存。</span></div>
@@ -2518,6 +2545,7 @@ button{font-family:inherit}
 .fin-ended{background:rgba(25,179,166,.92)}.fin-returning{background:rgba(242,163,60,.95)}
 .dur-badge{position:absolute;top:8px;right:8px;padding:2px 7px;border-radius:9px;background:rgba(20,24,40,.72);color:#fff;font-size:9px;z-index:4}
 .tg-extra-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.title-link{color:var(--yg-primary);text-decoration:none;cursor:pointer}.title-link:hover{text-decoration:underline}
 /* ============ v0.8.0：间隔按钮 / 镜像 / 互动 ============ */
 .preset-row{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px}
 .preset-btn{border:1px solid var(--yg-line);background:var(--yg-surface);color:var(--yg-ink);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;transition:.15s}

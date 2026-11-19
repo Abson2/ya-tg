@@ -37,8 +37,14 @@ def session():
         try:
             yield s
         finally:
-            for t in (MirrorFile, MirrorDir, MirrorMedia, MirrorRule, AuditLog):
+            for t in (MirrorFile, MirrorDir, MirrorMedia, MirrorRule, AuditLog, Bot):
                 s.query(t).delete()
+            # v0.9.10：本文件写 interaction_bot_id 指向临时 Bot；Bot 清空后配置
+            # 必须一起清，否则 effective_token 指向失效 Bot 污染后续测试。
+            for _k in ("interaction_bot_id", "contribution_bot_token", "bot_commands_cleared_fp"):
+                _row = s.get(AppConfig, _k)
+                if _row:
+                    s.delete(_row)
             s.commit()
 
 
@@ -234,14 +240,15 @@ def test_frontend_reward_moved_into_builtin_commands():
 
 
 def test_frontend_jump_links_moved_to_template_module():
-    # v0.9.8：两张跳转卡并入同一张「推送消息 · 跳转按钮」panel，标题改为子标题
-    assert "推送消息 · 跳转按钮" in APP
+    # v0.9.10：三张跳转卡并入同一张「推送消息 · 跳转链接」panel（新增机器人跳转）
+    assert "推送消息 · 跳转链接" in APP
     assert "官方频道跳转" in APP
     assert "交流群跳转" in APP
+    assert "机器人跳转" in APP
     assert "async function saveJumpLinks" in APP
-    assert "留空则不启用对应的按钮与模板变量" in APP
-    assert "&#123;&#123;channel_link&#125;&#125;" in APP
-    assert "&#123;&#123;group_link&#125;&#125;" in APP
+    assert "渲染层统一追加" in APP
+    # v0.9.10：跳转改由渲染层统一追加，hint 不再写模板变量；变量表保留兼容变量
+    assert "'channel_link', 'group_link'" in APP
 
 
 def test_private_chat_reply_keyboard_on_start():

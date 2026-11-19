@@ -258,6 +258,9 @@ class MirrorRule(Base):
     last_run: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str] = mapped_column(String(24), default="never")
     last_message: Mapped[str] = mapped_column(Text, default="")
+    # v0.9.10：本轮任务各节点处理量快照（JSON），供「处理流程与进度」只显示当前任务，
+    # 不再拿全库累计冒充进度。写入方：镜像同步/手动扫描管线完成时。
+    last_pipeline_json: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

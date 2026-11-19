@@ -100,6 +100,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # v0.9.5：推送消息里的频道/群跳转按钮（与打赏配置放一起，模板变量 channel_link/group_link）。
     "tg_channel_link": ("tg_channel_link", ""),
     "tg_group_link": ("tg_group_link", ""),
+    # v0.9.10：推送消息正文里的机器人跳转文字链接（指向推送 Bot 本身），留空则不显示
+    "tg_bot_link": ("tg_bot_link", ""),
 }
 
 

@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from app import bot_listener, main
+from app import bot_listener, main, runtime_config
 from app.db import SessionLocal, migrate
-from app.models import Bot, MessageTemplate
+from app.models import AppConfig, Bot, MessageTemplate
 from app.publisher import _template
 from app.security import encrypt_secret
 
@@ -27,12 +27,23 @@ def session():
     with SessionLocal() as s:
         s.query(MessageTemplate).delete()
         s.query(Bot).delete()
+        # v0.9.10：本文件会写 interaction_bot_id 指向临时 Bot；测试结束 Bot 表被清，
+        # 若配置残留，后续 effective_token 会指向不存在的 Bot 返回空，污染其它测试
+        # （如 notify_user）。这里连同配置键一起清，保证测试间隔离。
+        for _k in ("interaction_bot_id", "contribution_bot_token", "bot_commands_cleared_fp"):
+            _row = s.get(AppConfig, _k)
+            if _row:
+                s.delete(_row)
         s.commit()
         try:
             yield s
         finally:
             s.query(MessageTemplate).delete()
             s.query(Bot).delete()
+            for _k in ("interaction_bot_id", "contribution_bot_token", "bot_commands_cleared_fp"):
+                _row = s.get(AppConfig, _k)
+                if _row:
+                    s.delete(_row)
             s.commit()
 
 
@@ -92,11 +103,11 @@ def select_alive():
 
 # ---- 2. 跳转按钮与卡片整体性 ----
 def test_jump_link_button_inside_card():
-    assert "推送消息 · 跳转按钮" in APP
-    # 保存按钮所在 panel-foot 与 two-col 卡片同处一个 panel
-    seg = APP.split("推送消息 · 跳转按钮", 1)[1].split("推送渲染选项", 1)[0]
+    assert "推送消息 · 跳转链接" in APP
+    # 保存按钮所在 panel-foot 与 three-col 卡片同处一个 panel
+    seg = APP.split("推送消息 · 跳转链接", 1)[1].split("推送渲染选项", 1)[0]
     assert '<div class="panel-foot"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button>' in seg
-    assert "two-col" in seg
+    assert "three-col" in seg
 
 
 # ---- 3. Bot 指令栏同步 / 清空 ----

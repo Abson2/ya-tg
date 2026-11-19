@@ -262,10 +262,32 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         # 季集范围：共 N 季 / S01 E01-E13（按本地已收录最后一季算）
         "season_count": esc(season_count),
         "episode_range": esc(episode_range),
-        # 纯文字按钮标签（用户选「仅文字标签」，保持消息为纯文本卡片）
-        "buttons_text": "📢 频道　👥 群组　🔍 投稿/搜索",
+        # v0.9.10：入口文字改由渲染层统一追加（频道/群/Bot 三行带链接文字），
+        # 模板里的 {{buttons_text}} 变量置空，避免旧模板重复出现纯文字标签。
+        "buttons_text": "",
     }
+    from . import bot_listener
+    # v0.9.10：所有模板统一在正文追加三行跳转文字（频道 / 群 / 机器人），
+    # 链接取自消息模板模块配置；留空的那一项不输出。bot 链接指向推送 Bot 本身。
+    jump_lines: list[str] = []
+    for label, raw in (
+        ("📢 官方频道", runtime_config.get(db, "tg_channel_link")),
+        ("👥 交流群", runtime_config.get(db, "tg_group_link")),
+        ("🤖 机器人", runtime_config.get(db, "tg_bot_link")),
+    ):
+        link = bot_listener._normalize_tme_link(raw)
+        if link:
+            jump_lines.append(f'<a href="{html.escape(link, quote=True)}">{label}</a>')
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
+    if jump_lines:
+        # 插在末尾 share_url 之前；无 share_url 则直接追加到末尾
+        lines = text.split("\n")
+        if lines and re.match(r"^https?://\S+$", lines[-1].strip()):
+            share_line = lines.pop()
+            body = "\n".join(lines).rstrip()
+            text = (body + "\n" + "\n".join(jump_lines) + "\n" + share_line).strip()
+        else:
+            text = (text.rstrip() + "\n" + "\n".join(jump_lines)).strip()
     return text[:1000], text[:1000]
 
 
@@ -288,32 +310,18 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
                "parse_mode": "HTML", "disable_web_page_preview": False}
     if poster:
         payload["photo"] = poster
-    # v0.7.0：分享链接按钮化 + 福袋 bot 跳转入口（inline keyboard）
-    # v0.9.5：频道/群跳转按钮（与打赏配置一起维护），独立一行，plain/button 模式都可显示。
-    from . import bot_listener
+    # v0.9.10：inline 按钮只保留「获取资源」——频道/群/机器人的跳转改为正文文字链接
+    # （由 _build_message 统一追加，对所有模板生效），不再重复占按钮位。
     keyboard_rows: list[list[dict]] = []
     link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
     if link_style == "button" and res.share_url:
-        buttons = [{"text": "📥 获取资源", "url": res.share_url}]
-        fubao = (runtime_config.get(db, "tg_fubao_bot") or "").strip().lstrip("@")
-        if fubao:
-            buttons.append({"text": "🎁 福袋/入库", "url": f"https://t.me/{fubao}?start=library"})
-        keyboard_rows.append(buttons)
+        keyboard_rows.append([{"text": "📥 获取资源", "url": res.share_url}])
         # 按钮模式下去掉正文末行的纯文本链接，避免重复
         caption = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
         if poster:
             payload["caption"] = caption
         else:
             payload["text"] = caption
-    jump_buttons = []
-    ch_link = bot_listener._normalize_tme_link(runtime_config.get(db, "tg_channel_link"))
-    grp_link = bot_listener._normalize_tme_link(runtime_config.get(db, "tg_group_link"))
-    if ch_link:
-        jump_buttons.append({"text": "📢 官方频道", "url": ch_link})
-    if grp_link:
-        jump_buttons.append({"text": "👥 交流群", "url": grp_link})
-    if jump_buttons:
-        keyboard_rows.append(jump_buttons)
     if keyboard_rows:
         payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
     retry_after = None
@@ -332,7 +340,25 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
     if r.status_code == 429:
         retry_after = retry_after_seconds((data.get("parameters") or {}).get("retry_after"))
     if r.status_code >= 400 or not data.get("ok"):
-        return False, "", f"Telegram {method} 失败 HTTP {r.status_code}：{str(data.get('description') or data)[:300]}", retry_after
+        desc = str(data.get("description") or data)[:300]
+        # v0.9.10：sendPhoto 失败（多为 Telegram 拉不到 image.tmdb.org 的图片，
+        # 国内网络常见）时自动回退 sendMessage——海报优先保留，但图拉不到也要让
+        # 消息文字送达，避免「测试能收、正常推送收不到」。回退只做一次；
+        # 429 限流不走回退（立即再打一次只会加剧限流），交给上层退避重试。
+        if method == "sendPhoto" and 400 <= r.status_code < 500 and r.status_code != 429:
+            fallback = {"chat_id": chat_id, "text": caption,
+                        "parse_mode": "HTML", "disable_web_page_preview": False}
+            if payload.get("reply_markup"):
+                fallback["reply_markup"] = payload["reply_markup"]
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r2 = await client.post(f"{base}/bot{token}/sendMessage", json=fallback)
+                d2 = r2.json()
+            except Exception:
+                d2 = {"ok": False}
+            if r2.status_code < 400 and d2.get("ok"):
+                return True, str((d2.get("result") or {}).get("message_id", "")), "", None
+        return False, "", f"Telegram {method} 失败 HTTP {r.status_code}：{desc}", retry_after
     return True, str((data.get("result") or {}).get("message_id", "")), "", retry_after
 
 
@@ -366,6 +392,12 @@ async def process_queue(limit: int = 20) -> dict:
             ).order_by(QueueItem.id).limit(limit)
         ).all())
         for idx, q in enumerate(rows):
+            # v0.9.10：进入每条前先落盘上一条的写——绝不让未提交写事务跨下面的
+            # asyncio.sleep / ensure_share(光鸭网络) / _send_telegram(TG 网络) await。
+            # 真机根因：此前整轮 for 只在本末尾 commit 一次，20 条 × (2s 间隔 + 建分享 +
+            # 发 TG) 可让一个写事务持锁几十秒，别的请求 DELETE push_queue 撞
+            # `database is locked` 500、后台 job 被 missed。每条处理完立即 commit。
+            db.commit()
             if idx and delay:
                 await asyncio.sleep(delay)  # v0.6.5：与上一条消息保持间隔，规避 TG 风控
             res = db.get(Resource, q.resource_id)
@@ -374,6 +406,7 @@ async def process_queue(limit: int = 20) -> dict:
             if not res or not channel or not bot:
                 q.status, q.error = "failed", "资源、频道或 Bot 已不存在（可能被删除）"
                 failed += 1
+                db.commit()
                 continue
             # v0.6.5 兜底：同一作品同一频道只要已有 sent 项（整剧已推过），
             # 其余同作品残留项一律跳过，绝不逐集再推。即便旧队列/手动入队漏收敛也拦得住。
@@ -393,12 +426,14 @@ async def process_queue(limit: int = 20) -> dict:
                 q.status = "sent"
                 q.error = f"同作品已由队列项 #{dup_sent} 整剧推送，本单集跳过（去重）"
                 q.sent_at = utcnow()
+                db.commit()
                 continue
             if not bot.enabled or not channel.enabled:
                 # v0.6.1：Bot 与频道各自独立启停。停用不算失败、不消耗重试次数，
                 # 重新启用后下一轮 worker 会自动继续，且不影响其它链路。
                 q.error = "Bot 或频道已停用，暂不推送；启用后自动继续"
                 q.next_retry_at = None
+                db.commit()
                 continue
             # v0.9.0：推送白名单闸门。Bot 只向管理员配置的频道 / 群聊主动推送，
             # 不私聊刷屏。白名单为空时保持兼容不拦截；非空时只放行列出的 chat_id。
@@ -407,26 +442,34 @@ async def process_queue(limit: int = 20) -> dict:
             if not allowed:
                 q.error = deny_reason
                 q.next_retry_at = None
+                db.commit()
                 continue
+            # v0.9.10：下面两个 await 是网络请求。进网络前先把本条已写的字段落盘，
+            # 确保等待期间不持有 SQLite 写锁。
+            db.commit()
             need_share = not res.share_url
+            share_error = ""
             try:
                 await ensure_share(db, res)
                 if need_share:
                     shared += 1
             except Exception as exc:
-                q.attempts += 1
-                q.error = f"建分享失败：{str(exc)[:600]}"
-                q.next_retry_at = plus_seconds(utcnow(), backoff_seconds(q.attempts))
-                q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
-                failed += 1
-                continue
+                # v0.9.10：建分享失败不再跳过发送——分享只是消息里的「获取资源」入口，
+                # 失败时仍要把资源通知送出去（正文无链接、无按钮），否则群/频道一条都
+                # 收不到，正好命中真机「测试能收、正常推送收不到」。错误记为 q.error，
+                # 发送成功后再清掉，仅保留为本次诊断痕迹。
+                share_error = f"建分享失败：{str(exc)[:600]}"
+                q.error = share_error
+            # v0.9.10：ensure_share 内部已 commit；发 TG 前再确保无悬挂写事务。
+            db.commit()
             ok, message_id, error, retry_after = await _send_telegram(
                 db, q, res, channel, bot)
             if ok:
                 q.status = "sent"
                 q.telegram_message_id = message_id
                 q.sent_at = utcnow()
-                q.error = ""
+                # 分享失败但消息送达：保留分享诊断（带前缀），便于前端查「为何没链接」
+                q.error = (f"[已送达·无资源链接] {share_error}" if share_error else "")
                 q.next_retry_at = None
                 sent += 1
                 db.add(AuditLog(action="push_sent", target_type="queue", target_id=str(q.id),
@@ -440,7 +483,8 @@ async def process_queue(limit: int = 20) -> dict:
                 q.next_retry_at = plus_seconds(utcnow(), retry_delay)
                 q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
-        db.commit()
+            # v0.9.10：本条发送结果立即落盘，绝不把写事务带进下一轮的 sleep / 网络 await。
+            db.commit()
         return {"sent": sent, "failed": failed, "shares_created": shared}
     finally:
         db.close()

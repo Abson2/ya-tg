@@ -57,23 +57,46 @@ def _seed(session):
 
 def test_pipeline_nodes_present(session):
     _seed(session)
+    # v0.9.10：进度节点只读本轮任务快照，不再用全库累计计数冒充进度
+    rule = session.query(MirrorRule).first()
+    rule.last_pipeline_json = ('{"mode":"镜像同步","copied":2,"renamed":2,"identified":1,'
+                               '"queued":1,"total_files":3,"at":"2026-11-19T20:00:00"}')
+    session.commit()
     out = main.mirror_status(db=session)
     nodes = {n["key"]: n for n in out["pipeline"]}
     assert set(nodes) == {"copy", "rename", "identify", "share", "push"}
     assert nodes["copy"]["value"] == 2 and nodes["copy"]["total"] == 3
-    assert nodes["copy"]["status"] == "active"
+    assert nodes["copy"]["status"] == "active"  # 本轮 2/3，未完成
     assert nodes["identify"]["value"] == 1
-    assert nodes["share"]["value"] == 1
     assert nodes["push"]["value"] == 1
+    assert "镜像同步" in nodes["copy"]["detail"]
     for n in nodes.values():
         assert n["label"] and n["detail"]
+
+
+def test_pipeline_idle_without_snapshot(session):
+    """v0.9.10：无本轮快照时五个节点全 0 + 空闲提示，不回退到全库累计。"""
+    _seed(session)  # 库里有 2 synced / 1 identified / 1 queued，但无快照
+    out = main.mirror_status(db=session)
+    for n in out["pipeline"]:
+        assert n["value"] == 0
+        assert n["status"] == "idle"
+    assert out["progress"]["percent"] == 0.0
 
 
 def test_progress_percent(session):
     _seed(session)
     out = main.mirror_status(db=session)
+    # synced/total 仍是全库计数（兼容其它面板），但 percent 是「本轮任务进度」，
+    # 无快照时为 0。写入快照后按本轮 copied/total_files 计算。
     assert out["progress"]["synced"] == 2
     assert out["progress"]["total"] == 3
+    assert out["progress"]["percent"] == 0.0
+    rule = session.query(MirrorRule).first()
+    rule.last_pipeline_json = ('{"mode":"镜像同步","copied":2,"renamed":0,"identified":1,'
+                               '"queued":1,"total_files":3,"at":"2026-11-19T20:00:00"}')
+    session.commit()
+    out = main.mirror_status(db=session)
     assert out["progress"]["percent"] == 66.7
 
 

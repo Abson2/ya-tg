@@ -1607,6 +1607,63 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
     return stats
 
 
+async def prune_missing_media_rows(db: Session, rule: MirrorRule, *,
+                                   dry_run: bool = False,
+                                   max_media: int = 200) -> dict:
+    """v0.9.10：影视映射清单「清理无效影视映射」——只读核对 B 库，删除整部已不存在的映射行。
+
+    用户口径（2026-11-19 确认）：影视映射清单要清的是「B 库网盘文件已删除」的历史遗留行，
+    不是按本地 MirrorFile.status 猜。此前只按「无 synced 文件」判定，synced+有文件的
+    僵尸行一条都清不掉，用户看到「按钮点了没反应」。
+
+    红线：
+      1. 逐部递归列 B 库该作品目录（复用 `_b_file_candidates`）；只有 `verified=True`
+         （列目录完整可信、未截断）且整部确实一个文件都没有时，才判为「B 库已删除」。
+         接口异常 / 分页截断 / 有任一文件 → 一律跳过，绝不误删。
+      2. 只删本地 MirrorMedia 行及其子 MirrorFile 行；不动 Resource / share_url /
+         QueueItem / DistributionEvent，不删 B 库文件。
+      3. 每次删立即 `db.commit()`，绝不跨 await 持有写事务（设计红线 8）。
+      4. dry_run 只返回清单不写库，供预览确认。
+    """
+    api = GuangYaWebFiles(db)
+    stats = {"ok": True, "dry_run": bool(dry_run), "media_checked": 0,
+             "media_deleted": 0, "skipped_verified_has_files": 0,
+             "skipped_unverified": 0, "files_deleted": 0,
+             "samples": [], "errors": []}
+    medias = list(db.scalars(select(MirrorMedia).where(
+        MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id.desc())).all())
+    for media in medias[:max_media]:
+        stats["media_checked"] += 1
+        try:
+            candidates, verified = await _b_file_candidates(api, media)
+        except Exception as exc:
+            stats["skipped_unverified"] += 1
+            stats["errors"].append(f"{media.title_standard}：列 B 库失败 {str(exc)[:120]}")
+            continue
+        if not verified:
+            stats["skipped_unverified"] += 1
+            continue
+        visible = {str(v) for v in candidates.values() if str(v)}
+        if visible:
+            # B 库仍有文件：这不是「已删除」的僵尸行，保留
+            stats["skipped_verified_has_files"] += 1
+            continue
+        # verified 且整部为空 → B 库确实已无文件，判定为可清理的历史遗留映射
+        if len(stats["samples"]) < 20:
+            stats["samples"].append(media.title_standard)
+        if dry_run:
+            stats["media_deleted"] += 1
+            continue
+        file_count = db.query(MirrorFile).filter(MirrorFile.media_id == media.id).count()
+        db.query(MirrorFile).filter(MirrorFile.media_id == media.id).delete(
+            synchronize_session=False)
+        db.delete(media)
+        stats["media_deleted"] += 1
+        stats["files_deleted"] += file_count
+        db.commit()
+    return stats
+
+
 async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
                              max_polls: int = 5, interval: float = 2.0) -> dict:
     """继续轮询此前 status 未确认的复制任务（其它 status 取值含义未验证，不猜）。"""

@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import logging
@@ -300,13 +301,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.9", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.10", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.9", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.10", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -647,6 +648,27 @@ def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
                           id="mirror_sync", replace_existing=True, max_instances=1, coalesce=True)
 
 
+def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
+                             mode: str, copied: int = 0, renamed: int = 0,
+                             identified: int = 0, queued: int = 0,
+                             total_files: int = 0) -> None:
+    """v0.9.10：把本轮任务各节点处理量写入 MirrorRule.last_pipeline_json。
+
+    「处理流程与进度」只读这个快照显示当前任务量，不再拿全库累计计数冒充进度。
+    任何一轮任务完成都覆盖写；没有快照时前端显示「尚无任务记录」。
+    """
+    if not r:
+        return
+    snap = {"mode": mode, "copied": int(copied or 0), "renamed": int(renamed or 0),
+            "identified": int(identified or 0), "queued": int(queued or 0),
+            "total_files": int(total_files or 0), "at": utcnow().isoformat()}
+    try:
+        r.last_pipeline_json = json_dumps(snap)
+        db.flush()
+    except Exception:
+        pass
+
+
 async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
     """v0.8.5：镜像完成 → B 库刷新入库 → 识别 → 只推本轮识别成功且有海报的影视。
 
@@ -723,6 +745,13 @@ async def _scheduled_mirror() -> None:
                         await _safe_rename(db, r)
                     if bool(getattr(r, "auto_identify", True)):
                         p = await _mirror_post_sync_pipeline(db, r)
+                        # v0.9.10：定时同步也写本轮任务快照（复制量定时路径不细究，记 0）
+                        ident = p.get("identify") or {}
+                        _write_pipeline_snapshot(
+                            db, r, mode="定时同步", copied=0, renamed=0,
+                            identified=int(ident.get("identified", 0) or 0),
+                            queued=int(p.get("queued", 0) or 0),
+                            total_files=int(p.get("files", 0) or 0))
                         db.commit()
                         # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message
                         tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
@@ -912,6 +941,16 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
             # 再补跑一次解析（会重复触发 TMDB / AI 网络等待）。复制 → 入库 →
             # 识别 → 分享/推送 主链路必须照常走完，改名只是可选优化。
             stats["pipeline"] = await _mirror_post_sync_pipeline(db, r)
+            # v0.9.10：写本轮任务快照，进度节点只显示本轮量不显示历史累计
+            pipe = stats["pipeline"] or {}
+            ident = pipe.get("identify") or {}
+            _write_pipeline_snapshot(
+                db, r, mode="镜像同步",
+                copied=int(stats.get("done", 0) or 0),
+                renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
+                identified=int(ident.get("identified", 0) or 0),
+                queued=int(pipe.get("queued", 0) or 0),
+                total_files=int(pipe.get("files", 0) or 0))
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
                                      "done": stats.get("done"), "unknown": stats.get("unknown"),
@@ -1070,18 +1109,71 @@ def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
 
 
 @app.post("/api/mirror/media/clear-invalid", dependencies=ADMIN)
-def mirror_media_clear_invalid(db: Session = Depends(get_db)):
-    """v0.9.8：清理历史无效影视映射（failed/blocked 且无任何 synced 文件）。
+async def mirror_media_clear_invalid_async(dry_run: bool = False,
+                                           db: Session = Depends(get_db)):
+    """v0.9.10：清理影视映射清单的无效行——口径改为「B 库网盘文件已删除」。
 
-    只删 A→B 映射登记（连同子 MirrorFile），不删资源 / 分享 / 队列 / B 库文件。
-    A 库仍有源文件时，下轮「立即同步」会按 A 库重新识别并重建映射；这是安全的。
+    用户 2026-11-19 明确：截图里全是 synced+有文件的历史行，按旧的「无 synced 文件」
+    判定一条都清不掉，看起来「按钮没动作」。改为两步：
+      ① 联网只读核对 B 库（复用 mirror.prune_missing_media_rows），整部已无文件的行删除；
+      ② 再清本地无任何 synced 文件且非进行中的僵尸行（旧口径，覆盖 failed/blocked/unknown）。
+    只删 A→B 映射登记（连同子 MirrorFile），不动资源 / 分享 / 队列 / B 库文件。
+    列目录不可信时一律跳过该类，绝不误删；每步立即 commit，不跨 await 持写事务。
+    dry_run=true 只返回预览清单不写库。
+    """
+    r = _mirror_rule(db)
+    checked = {"checked": 0, "b_deleted": 0, "b_files": 0, "skipped_has_files": 0,
+               "skipped_unverified": 0, "samples": [], "errors": []}
+    if r and (r.target_root_id or "").strip():
+        try:
+            p = await mirror.prune_missing_media_rows(db, r, dry_run=dry_run)
+            checked = {"checked": p.get("media_checked", 0),
+                       "b_deleted": p.get("media_deleted", 0),
+                       "b_files": p.get("files_deleted", 0),
+                       "skipped_has_files": p.get("skipped_verified_has_files", 0),
+                       "skipped_unverified": p.get("skipped_unverified", 0),
+                       "samples": p.get("samples", []), "errors": p.get("errors", [])}
+        except Exception as exc:
+            checked["errors"].append(f"B 库核对失败：{str(exc)[:200]}")
+            checked["skipped_unverified"] = -1  # 标记核对整体失败，不让本地清理冒充成功
+    # ② 本地口径僵尸行（无 synced 文件）只在真正执行时删；dry_run 仅统计
+    targets = _invalid_media_rows(db)
+    local_media = len(targets)
+    local_files = sum(db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
+                      for m in targets)
+    removed_media = checked["b_deleted"] + (0 if dry_run else local_media)
+    removed_files = (checked["b_files"] if not dry_run else 0) + (0 if dry_run else local_files)
+    if not dry_run and local_media:
+        for m in targets:
+            db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
+                synchronize_session=False)
+            db.delete(m)
+        db.commit()
+    if not dry_run and (removed_media or removed_files):
+        add_audit(db, "mirror_media_clear_invalid", target_type="mirror",
+                  detail=json_dumps({"b_deleted": checked["b_deleted"],
+                                     "local_media": local_media,
+                                     "media": removed_media, "files": removed_files}))
+        db.commit()
+    return {"ok": True, "removed_media": removed_media,
+            "removed_files": removed_files,
+            "b_checked": checked["checked"],
+            "b_deleted": checked["b_deleted"],
+            "skipped_has_files": checked["skipped_has_files"],
+            "skipped_unverified": checked["skipped_unverified"],
+            "samples": checked["samples"], "errors": checked["errors"],
+            "dry_run": bool(dry_run)}
+
+
+def mirror_media_clear_invalid(db: Session) -> dict:
+    """v0.9.8 同步内部实现（本地口径：无 synced 文件的僵尸行），供内部/测试复用。
+
+    HTTP 端点 v0.9.10 起走 `mirror_media_clear_invalid_async`（联网核对 B 库）。
+    这里保留同步版只为兼容既有调用（不联网、不持锁），不影响前端行为。
     """
     targets = _invalid_media_rows(db)
     removed_media = len(targets)
     removed_files = 0
-    # v0.9.9 #205：这里只删本地僵尸映射行，不联网、不写 B 库、不碰文件，
-    # 因此不再占用 _mirror_lock——否则后台「改名复查」持锁时按钮报「有任务在进行」，
-    # 用户以为清理没生效。与目录映射的 clear-pruned 保持一致（那个也不持锁）。
     for m in targets:
         removed_files += db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
         db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
@@ -1187,44 +1279,52 @@ def mirror_status(db: Session = Depends(get_db)):
                                   "target": t.task_id, "status": t.status,
                                   "detail": (t.error or "")[:300]})
 
-    # v0.9.8 #195：入库→识别→分享→推送 全流程节点（实时从库里算，用户能看出卡在哪一步）
+    # v0.9.8 #195：入库→识别→分享→推送 全流程节点
+    # v0.9.10：用户要求「只显示当前任务处理的数量和进度，不要历史累计」——
+    #   优先读 MirrorRule.last_pipeline_json（本轮任务快照）；无快照时全 0 + 空闲提示。
+    #   全库累计计数移到 counts.* 保留给其它面板，不再冒充本轮进度。
     total_files = db.query(MirrorFile).count()
     synced_files = db.query(MirrorFile).filter(MirrorFile.status == "synced").count()
-    identified_res = db.query(Resource).filter(
-        Resource.identify_status == "identified").count()
-    shared_res = db.query(Resource).filter(
-        Resource.share_url.isnot(None), Resource.share_url != "").count()
-    queued_items = db.query(QueueItem).count()
-    sent_items = db.query(QueueItem).filter(QueueItem.status == "sent").count()
     # v0.9.9 #206：从最近一次同步的 last_message 里取入队诊断，让「⑤推送入队=0」
-    # 的节点直接说明卡在哪（无海报 / 路由未匹配 / 未配置目标），不再是一个孤立的 0。
+    # 的节点直接说明卡在哪（无海报 / 路由未匹配 / 未配置目标）。
     enqueue_diag_text = ""
     _lm = str(getattr(r, "last_message", "") or "") if r else ""
     if "入队诊断：" in _lm:
         enqueue_diag_text = _lm.split("入队诊断：", 1)[-1].split(" ·", 1)[0].strip()
+    # 解析本轮快照
+    snap = {}
+    try:
+        snap = json.loads(str(getattr(r, "last_pipeline_json", "") or "{}") or "{}")
+    except Exception:
+        snap = {}
+    has_snap = bool(snap) and str(snap.get("at") or "")
+    copied = int(snap.get("copied", 0) or 0) if has_snap else 0
+    renamed = int(snap.get("renamed", 0) or 0) if has_snap else 0
+    identified = int(snap.get("identified", 0) or 0) if has_snap else 0
+    queued = int(snap.get("queued", 0) or 0) if has_snap else 0
+    snap_files = int(snap.get("total_files", 0) or 0) if has_snap else 0
+    mode_label = str(snap.get("mode") or "上轮任务") if has_snap else ""
+    idle_detail = "尚无任务记录，点「立即同步」或扫描后显示本轮处理量"
     pipeline = [
-        {"key": "copy", "label": "① 复制到 B 库", "value": synced_files, "total": total_files,
-         "status": "done" if total_files and synced_files >= total_files else ("active" if synced_files else "idle"),
-         "detail": f"{synced_files}/{total_files} 文件已同步"},
-        {"key": "rename", "label": "② 英文改名", "value": db.query(MirrorFile).filter(
-            MirrorFile.rename_status == "done").count(), "total": total_files,
-         "status": "done" if total_files and db.query(MirrorFile).filter(
-             MirrorFile.rename_status == "done").count() >= total_files else "active",
-         "detail": f"{db.query(MirrorFile).filter(MirrorFile.rename_status == 'done').count()}/{total_files} 已改名（可选步骤）"},
-        {"key": "identify", "label": "③ 入库识别", "value": identified_res,
-         "total": db.query(Resource).count(),
-         "status": "done" if identified_res else "active",
-         "detail": f"{identified_res} 部已识别 / 共 {db.query(Resource).count()} 资源"},
-        {"key": "share", "label": "④ 生成分享", "value": shared_res, "total": identified_res,
-         "status": "done" if identified_res and shared_res >= identified_res else "active",
-         "detail": f"{shared_res}/{identified_res} 已建分享（推送时按需创建）"},
-        {"key": "push", "label": "⑤ 推送入队", "value": queued_items, "total": 0,
-         "status": "done" if sent_items else ("active" if queued_items else "idle"),
-         "detail": (f"队列 {queued_items} 项 / 已推送 {sent_items}（由定时调度消费）"
-                    + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else ""))},
+        {"key": "copy", "label": "① 复制到 B 库", "value": copied, "total": snap_files,
+         "status": "idle" if not has_snap else ("active" if copied < snap_files else "done"),
+         "detail": (f"{mode_label}：本轮复制 {copied} 项" if has_snap else idle_detail)},
+        {"key": "rename", "label": "② 英文改名", "value": renamed, "total": snap_files,
+         "status": "idle" if not has_snap else "done",
+         "detail": (f"本轮改名 {renamed} 项（可选步骤）" if has_snap else idle_detail)},
+        {"key": "identify", "label": "③ 入库识别", "value": identified, "total": snap_files,
+         "status": "idle" if not has_snap else ("active" if identified < snap_files else "done"),
+         "detail": (f"本轮识别 {identified} 部" if has_snap else idle_detail)},
+        {"key": "share", "label": "④ 生成分享", "value": 0, "total": identified,
+         "status": "idle" if not has_snap else "active",
+         "detail": (f"本轮入队 {queued} 部，分享由推送队列按需创建" if has_snap else idle_detail)},
+        {"key": "push", "label": "⑤ 推送入队", "value": queued, "total": 0,
+         "status": "idle" if not has_snap else ("active" if queued else "idle"),
+         "detail": ((f"本轮入队 {queued} 项" + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else ""))
+                    if has_snap else (idle_detail + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else "")))},
     ]
-    # 同步进度百分比：按文件 synced/total；无文件时看锁状态
-    progress = round(synced_files / total_files * 100, 1) if total_files else 0.0
+    # 同步进度百分比：本轮复制项 / 本轮扫描文件；无快照则视为未开始
+    progress = round(copied / snap_files * 100, 1) if snap_files else 0.0
     lock_info = _mirror_lock.info()
 
     return {
@@ -1591,6 +1691,83 @@ async def scan_now(resume: bool = True, auto_identify: bool = True,
         return out
     except Exception as e:
         raise HTTPException(502, str(e))
+
+
+# ---------- v0.9.10：手动扫描异步化（解决 Failed to fetch / 页面卡死） ----------
+# 真机根因：手动扫描是「列整个 B 库 + 对账 + 识别 + 变更处理」的分钟级同步请求，
+# 前端 fetch 等不到响应就被网关/浏览器断连 -> "Failed to fetch"，而后端仍在跑，
+# 期间持有的 db 会话与其它 job 抢 SQLite 写锁，进一步触发 database is locked。
+# 改为后台任务立即返回，前端轮询状态；原同步端点保留供内部/测试使用。
+_async_scan: dict = {"running": False, "started_at": None, "finished_at": None,
+                     "mode": "", "error": "", "result": {}, "stage": ""}
+_async_scan_task: asyncio.Task | None = None
+
+
+def _async_scan_reset(mode: str) -> None:
+    _async_scan.update({"running": True, "started_at": utcnow().isoformat(),
+                        "finished_at": None, "mode": mode, "error": "",
+                        "result": {}, "stage": "启动"})
+
+
+async def _run_async_scan(mode: str) -> None:
+    """后台执行扫描管线，全程独立 Session；状态写内存，任何异常都落到 error。"""
+    global _async_scan_task
+    try:
+        with SessionLocal() as db:
+            if mode == "refresh":
+                _async_scan["stage"] = "扫描并重建资源库"
+                out = await _refresh_library_from_b(db, auto_identify=True,
+                                                    allow_empty_reconcile=True)
+                add_audit(db, "library_refresh_async", target_type="scan", detail=json_dumps(out))
+            elif mode == "rescan":
+                _async_scan["stage"] = "重新扫描库"
+                out = await _refresh_library_from_b(db, reconcile=True, auto_identify=True,
+                                                    allow_empty_reconcile=True)
+                add_audit(db, "library_rescan_async", target_type="scan", detail=json_dumps(out))
+            else:  # scan
+                _async_scan["stage"] = "立即扫描"
+                out = await _refresh_library_from_b(db, auto_identify=True,
+                                                    allow_empty_reconcile=True)
+                add_audit(db, "scan_manual_async", target_type="scan", detail=json_dumps(out))
+            db.commit()
+            # v0.9.10：手动扫描也写本轮任务快照，进度节点反映本次扫描处理量
+            if isinstance(out, dict):
+                ident = out.get("identify") or {}
+                _write_pipeline_snapshot(
+                    db, _mirror_rule(db), mode="手动扫描", copied=0, renamed=0,
+                    identified=int(ident.get("identified", 0) or 0),
+                    queued=int(ident.get("queued", 0) or 0),
+                    total_files=int(out.get("files", 0) or 0))
+                db.commit()
+        _async_scan["result"] = out if isinstance(out, dict) else {}
+        _async_scan["stage"] = "完成"
+    except Exception as exc:
+        logger.exception("[async-scan] 后台扫描失败")
+        _async_scan["error"] = f"{type(exc).__name__}: {exc}"[:1000]
+        _async_scan["stage"] = "失败"
+    finally:
+        _async_scan["running"] = False
+        _async_scan["finished_at"] = utcnow().isoformat()
+        _async_scan_task = None
+
+
+@app.post("/api/scan/async", dependencies=ADMIN)
+async def scan_async(mode: str = "scan"):
+    """v0.9.10：启动后台扫描，立即返回；mode=scan|rescan|refresh。"""
+    global _async_scan_task
+    if _async_scan.get("running"):
+        raise HTTPException(409, "已有扫描任务在运行，请等待完成")
+    if mode not in ("scan", "rescan", "refresh"):
+        raise HTTPException(400, "mode 只能是 scan / rescan / refresh")
+    _async_scan_reset(mode)
+    _async_scan_task = asyncio.create_task(_run_async_scan(mode))
+    return {"started": True, "mode": mode}
+
+
+@app.get("/api/scan/async", dependencies=ADMIN)
+def scan_async_status():
+    """轮询后台扫描状态：running/stage/result/error。"""
+    return dict(_async_scan)
 
 
 @app.post("/api/library/rescan", dependencies=ADMIN)
@@ -3442,13 +3619,14 @@ class InteractionConfigInput(BaseModel):
     bot_required_group_link: str | None = None
     tg_channel_link: str | None = None
     tg_group_link: str | None = None
+    tg_bot_link: str | None = None       # v0.9.10：推送消息正文里的机器人跳转链接（指向推送 Bot 本身）
 
 
 @app.get("/api/interaction/config", dependencies=ADMIN)
 def interaction_config_get(db: Session = Depends(get_db)):
     plain = ["tgto_base_url", "tgto_scene", "donation_image_url", "donation_text",
              "donation_button_text", "bot_required_channel_link", "bot_required_group_link",
-             "tg_channel_link", "tg_group_link"]
+             "tg_channel_link", "tg_group_link", "tg_bot_link"]
     out = {k: runtime_config.get(db, k) for k in plain}
     out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
@@ -3482,7 +3660,7 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
     for k in ("tgto_base_url", "tgto_scene", "tgto_api_key", "contribution_bot_token",
               "donation_image_url", "donation_text", "donation_button_text",
               "bot_required_channel_link", "bot_required_group_link",
-              "tg_channel_link", "tg_group_link"):
+              "tg_channel_link", "tg_group_link", "tg_bot_link"):
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
@@ -3639,7 +3817,11 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
         else:
             ch.enabled = True
             ch.kind = r["kind"]
-            if bot and not ch.name.startswith(_ROUTE_CHANNEL_PREFIX):
+            # v0.9.10：推送 Bot 换 token/重建后，路由 Channel 的 bot_id 必须同步到
+            # 全局 Bot，否则测试用新 Bot（能发）、正常推送用旧 bot_id（失效/不在群）
+            # 造成「测试能收、正常推送收不到」。原条件跳过 route: 前缀 Channel，
+            # 恰恰把路由自动建的群/频道排除在外，是真机错配根因之一；这里统一同步。
+            if bot:
                 ch.bot_id = bot.id
         keep_ids.add(ch.id)
     # 清理路由自动创建、但已不再引用的 Channel（连带其规则/队列交由数据库外键与 worker 处理）
@@ -3754,6 +3936,18 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     if notice and c.tg_user_id:
         notified = await bot_listener.notify_user(db, c.tg_user_id, notice)
     return {"ok": True, "notified": notified}
+
+
+@app.delete("/api/contributions/{cid}", dependencies=ADMIN)
+def delete_contribution(cid: int, db: Session = Depends(get_db)):
+    """v0.9.10：删除投稿登记行（不动用户、不动 TgtoDrive，纯管理侧清理）。"""
+    c = db.get(UserContribution, cid)
+    if not c:
+        raise HTTPException(404, "投稿不存在")
+    db.delete(c)
+    add_audit(db, "contribution_deleted", target_type="contribution", target_id=str(cid))
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/media-requests", dependencies=ADMIN)
