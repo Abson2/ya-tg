@@ -141,6 +141,8 @@ class Channel(Base):
     name: Mapped[str] = mapped_column(String(128))
     chat_id: Mapped[str] = mapped_column(String(128))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v0.9.4：频道 / 群聊统一为一条推送目标；kind 只用于菜单分类展示，推送逻辑不区分。
+    kind: Mapped[str] = mapped_column(String(16), default="channel")
 
 
 class Rule(Base):

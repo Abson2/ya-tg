@@ -8,6 +8,26 @@
 
 ---
 
+## v0.9.4 (2026-11-19)
+
+按用户反馈把「分发与互动中心」里功能重复的六个模块融合成一张配置卡，并做数据去重：同一份 Bot Token、同一份推送目标不再重复填写。不改 A→B 镜像主链路、不改推送口径（仍由 Bot 推到频道/群聊）、不改白名单/限制二选一语义。
+
+### 一、数据去重（后端）
+- 交互 Bot Token 复用 Bot 管理：新增 `interaction_bot_id` 引用 bots 表 id；`bot_listener.effective_token()` 取所选 Bot 的解密 token 用于监听私聊指令与事务性回复，未选/停用回退旧 `contribution_bot_token`（老配置兼容）。管理页只选 Bot，不再单填 token。
+- 推送白名单复用推送目标：`push_whitelist()` 改为读 channels 表 enabled 记录，按新增的 `Channel.kind`（channel/group，仅菜单分类用）分频道/群聊；channels 为空时回退旧 `bot_push_*_json`。publisher 闸门 `is_push_allowed()`、私聊菜单「官方频道/交流群组」都随之读同一份数据。
+- 老库轻量迁移：channels 表补 `kind TEXT DEFAULT 'channel'`；老库未选交互 Bot 时行为不变。
+- 兼容：`/api/interaction/config` 回显 `interaction_bot_id` 与 `bot_options`（token 仅掩码）；保存可写入/清空 bot 引用，非法 id 返回 400。add_channel 归一化 kind。
+
+### 二、UI 融合为一张卡（前端）
+- 交互 Bot、推送目标（频道/群聊）、分发规则、推送白名单、使用限制合并到同一张「交互 Bot 与推送配置」卡：选 Bot 下拉（复用 Bot 管理 token）、限制方式二选一、白名单来源说明（=推送目标启用记录）。
+- 删除重复的「交互 Bot Token」输入框与「推送白名单 ID」textarea；推送目标表新增「类型」列（频道/群），添加目标时可选类型。
+- 使用限制（关注/加群）保留为其 membership 分支，内置指令速查、TG 推送配置、推送调度、打赏、投稿求片、TgtoDrive 联动维持原位置。
+
+### 验证
+- 全套 pytest 297 passed（新增 `test_v094_merge_config.py` 11 项锁死去重红线），前端 vite build 1448 modules 通过。
+
+---
+
 ## v0.9.3 (2026-11-19)
 
 v0.9.2 发版后的两处收尾：后台扫码二维码渲染修复、分发与互动中心 UI 三板块重构。不改后端主链路、不改推送口径、不改认证协议。

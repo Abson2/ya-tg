@@ -263,13 +263,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.4", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -2276,11 +2276,13 @@ class ChannelInput(BaseModel):
     name: str
     chat_id: str
     enabled: bool = True
+    kind: str = "channel"   # v0.9.4：channel/group，仅菜单分类展示用
 
 
 @app.get("/api/channels", dependencies=ADMIN)
 def channels(db: Session = Depends(get_db)):
-    return [{"id": x.id, "bot_id": x.bot_id, "name": x.name, "chat_id": x.chat_id, "enabled": x.enabled}
+    return [{"id": x.id, "bot_id": x.bot_id, "name": x.name, "chat_id": x.chat_id, "enabled": x.enabled,
+             "kind": getattr(x, "kind", "channel") or "channel"}
             for x in db.scalars(select(Channel)).all()]
 
 
@@ -2288,7 +2290,9 @@ def channels(db: Session = Depends(get_db)):
 def add_channel(p: ChannelInput, db: Session = Depends(get_db)):
     if not db.get(Bot, p.bot_id):
         raise HTTPException(404, "Bot 不存在")
-    x = Channel(**p.model_dump())
+    data = p.model_dump()
+    data["kind"] = "group" if str(data.get("kind") or "").lower() == "group" else "channel"
+    x = Channel(**data)
     db.add(x)
     add_audit(db, "channel_added", target_type="channel", detail=p.name)
     db.commit()
@@ -2957,6 +2961,7 @@ class InteractionConfigInput(BaseModel):
     tgto_scene: str | None = None
     tgto_api_key: str | None = None
     contribution_bot_token: str | None = None
+    interaction_bot_id: str | None = None       # v0.9.4：交互 Bot 引用 bots 表 id（token 去重）；"" = 不选用
     donation_image_url: str | None = None
     donation_text: str | None = None
     donation_button_text: str | None = None
@@ -2992,6 +2997,11 @@ def interaction_config_get(db: Session = Depends(get_db)):
     out["bot_required_groups"] = bot_listener._json_list("bot_required_groups_json", db)
     out["bot_commands"] = bot_listener.builtin_and_custom(db)
     out["bot_gate_mode"] = bot_listener.gate_mode(db)
+    # v0.9.4：交互 Bot 去重——回显选中的 bot id 与可选 bot 列表（不含 token 明文）
+    out["interaction_bot_id"] = (runtime_config.get(db, "interaction_bot_id") or "").strip()
+    out["bot_options"] = [{"id": b.id, "name": b.name, "enabled": b.enabled,
+                           "token_masked": _mask_stored_token(b.token)}
+                          for b in db.scalars(select(Bot).order_by(Bot.id)).all()]
     out["scene_default"] = "ENV_FILTER_GUANGYA"
     out["unverified_endpoints"] = ["投稿分享转存（光鸭接口，8.6 待验证）"]
     return out
@@ -3006,6 +3016,13 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
+    # v0.9.4：交互 Bot 引用（token 去重）。传 "" 表示清空引用、回退 contribution_bot_token。
+    if p.interaction_bot_id is not None:
+        bid = str(p.interaction_bot_id).strip()
+        if bid:
+            if not bid.isdigit() or not db.get(Bot, int(bid)):
+                raise HTTPException(400, "interaction_bot_id 必须指向一个已存在的 Bot")
+        values["interaction_bot_id"] = bid
     # v0.9.0：Bot 交互配置。列表序列化为 JSON，缺省 None 表示保持原值。
     if p.bot_push_channels is not None:
         values["bot_push_channels_json"] = json_dumps([str(x).strip() for x in p.bot_push_channels if str(x).strip()])

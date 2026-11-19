@@ -116,6 +116,10 @@ _COLUMNS = {
     "mirror_dirs": {
         "error": "TEXT DEFAULT ''",
     },
+    # v0.9.4：推送目标统一表增加类型标记（频道/群聊），仅菜单分类展示用。
+    "channels": {
+        "kind": "TEXT DEFAULT 'channel'",
+    },
 }
 
 

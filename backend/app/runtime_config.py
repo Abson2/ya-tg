@@ -56,7 +56,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tgto_scene": ("tgto_scene", "ENV_FILTER_GUANGYA"),
     # v0.8.0：用户互动 / 打赏
     "contribution_enabled": ("contribution_enabled", "false"),
-    "contribution_bot_token": ("contribution_bot_token", ""),
+    "contribution_bot_token": ("contribution_bot_token", ""),  # v0.9.4 起仅作旧配置回退
+    "interaction_bot_id": ("interaction_bot_id", ""),  # v0.9.4：交互 Bot 直接引用 bots 表 id（token 去重）
     "contribution_update_offset": ("contribution_update_offset", "0"),
     "donation_enabled": ("donation_enabled", "false"),
     "donation_image_url": ("donation_image_url", ""),

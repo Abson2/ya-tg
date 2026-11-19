@@ -20,7 +20,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto
-from .models import MediaRequest, Resource, UserContribution, utcnow
+from .models import Bot, Channel, MediaRequest, Resource, UserContribution, utcnow
+from .security import decrypt_secret
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
 BUILTIN_COMMANDS = [
@@ -67,9 +68,40 @@ def builtin_and_custom(db: Session) -> list[dict]:
 
 
 def push_whitelist(db: Session) -> tuple[list[str], list[str]]:
-    """返回 (需管理员的频道 ID, 无需管理员的群聊 ID)。"""
+    """v0.9.4：白名单与推送目标去重——直接读 channels 表已启用的目标。
+
+    返回 (频道 ID 列表, 群聊 ID 列表)，按 Channel.kind 分类（default=channel）。
+    老数据若仍只填了 runtime_config 的 bot_push_*_json 且 channels 表为空，
+    则回退读旧配置，保持升级兼容。
+    """
+    rows = db.scalars(select(Channel).where(Channel.enabled.is_(True))).all()
+    chans = [str(c.chat_id).strip() for c in rows
+             if (getattr(c, "kind", "channel") or "channel") != "group" and str(c.chat_id or "").strip()]
+    groups = [str(c.chat_id).strip() for c in rows
+              if (getattr(c, "kind", "channel") or "channel") == "group" and str(c.chat_id or "").strip()]
+    if chans or groups:
+        return chans, groups
+    # 兼容旧配置：channels 为空时仍认 runtime_config 白名单
     return ([str(x).strip() for x in _json_list("bot_push_channels_json", db) if str(x).strip()],
             [str(x).strip() for x in _json_list("bot_push_groups_json", db) if str(x).strip()])
+
+
+def effective_token(db: Session) -> str:
+    """v0.9.4：交互 Bot token 与 Bot 管理去重。
+
+    优先用 interaction_bot_id 指向的 Bot（从 bots 表解密）的 token；
+    未配置 / Bot 不存在 / 未启用时回退旧 contribution_bot_token。
+    """
+    raw_id = (runtime_config.get(db, "interaction_bot_id") or "").strip()
+    if raw_id.isdigit():
+        bot = db.get(Bot, int(raw_id))
+        if bot and bot.enabled:
+            try:
+                return decrypt_secret(bot.token) or ""
+            except Exception:
+                return ""
+        return ""
+    return runtime_config.get(db, "contribution_bot_token") or ""
 
 
 def gate_mode(db: Session) -> str:
@@ -103,7 +135,7 @@ def is_push_allowed(db: Session, chat_id: str) -> tuple[bool, str]:
     if chat in allowed:
         return True, ""
     return False, (f"目标 {chat or '空'} 不在 Bot 推送白名单；"
-                   "请到「Bot 交互中心 → 推送白名单」添加该频道 / 群聊 ID")
+                   "请到「分发与互动中心 → 推送目标」添加并启用该频道 / 群聊")
 
 
 async def _api(db: Session, token: str, method: str, payload: dict) -> dict:
@@ -186,7 +218,7 @@ async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
 
     交互 Bot Token 由管理页配置；失败只返回 False，不影响审核主链路。
     """
-    token = runtime_config.get(db, "contribution_bot_token") or ""
+    token = effective_token(db)
     if not token or not tg_user_id or not text:
         return False
     try:
@@ -446,9 +478,9 @@ async def poll_once(db: Session) -> dict:
     """
     if (runtime_config.get(db, "contribution_enabled") or "").lower() != "true":
         return {"enabled": False, "messages": 0}
-    token = runtime_config.get(db, "contribution_bot_token") or ""
+    token = effective_token(db)
     if not token:
-        return {"enabled": False, "messages": 0, "error": "未配置投稿 Bot Token"}
+        return {"enabled": False, "messages": 0, "error": "未配置交互 Bot（请在 Bot 管理添加并选用，或配置投稿 Bot Token）"}
     try:
         offset = int(runtime_config.get(db, "contribution_update_offset") or 0)
     except ValueError:

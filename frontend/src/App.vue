@@ -49,17 +49,15 @@ const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const scanning = ref(false), showScanPanel = ref(false)
-// v0.9.0：Bot 交互配置——内置四指令固定、自定义指令、推送白名单、使用限制
-const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
-  bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist' })
+// v0.9.4：Bot 交互配置——交互 Bot 复用 bots 表 token、白名单复用推送目标；内置四指令固定
+const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
+  bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [] })
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
 // v0.9.0：多行文本框 ↔ 数组 的双向映射，避免用户直接编辑数组
 const newCmd = ref({ command: '', description: '', reply: '' })
 const _linesToArr = (v) => String(v || '').split('\n').map(s => s.trim()).filter(Boolean)
 const _arrToLines = (a) => (a || []).join('\n')
-const pushChannelsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_push_channels), set: v => interactionCfg.value.bot_push_channels = _linesToArr(v) })
-const pushGroupsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_push_groups), set: v => interactionCfg.value.bot_push_groups = _linesToArr(v) })
 const requiredChannelsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_required_channels), set: v => interactionCfg.value.bot_required_channels = _linesToArr(v) })
 const requiredGroupsText = computed({ get: () => _arrToLines(interactionCfg.value.bot_required_groups), set: v => interactionCfg.value.bot_required_groups = _linesToArr(v) })
 function addCustomCommand() {
@@ -193,7 +191,7 @@ async function refreshSms() {
 }
 function resetSms() { smsStep.value = 1; smsCode.value = '' }
 const bot = ref({ name: '', token: '' })
-const channel = ref({ bot_id: null, name: '', chat_id: '' })
+const channel = ref({ bot_id: null, name: '', chat_id: '', kind: 'channel' })
 const rule = ref({ name: '', directory_id: '', keyword: '', channel_id: null, auto_publish: true })
 const tpl = ref({ name: '', content: '', enabled: true, is_default: false })
 
@@ -589,7 +587,8 @@ async function saveInteraction() {
       tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
       donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
       donation_button_text: c.donation_button_text || '打赏支持',
-      bot_push_channels: c.bot_push_channels || [], bot_push_groups: c.bot_push_groups || [],
+      // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
+      interaction_bot_id: String(c.interaction_bot_id || ''),
       bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
       bot_gate_mode: c.bot_gate_mode || 'whitelist',
       bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
@@ -597,7 +596,6 @@ async function saveInteraction() {
       bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
     // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
     if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
-    if (c.contribution_bot_token) body.contribution_bot_token = c.contribution_bot_token
     await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
     ElMessage.success('互动设置已保存（密钥加密存储）')
     await load()
@@ -629,7 +627,7 @@ async function addBot() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function addChannel() {
-  try { await api('/channels', { method: 'POST', body: JSON.stringify(channel.value) }); channel.value = { bot_id: null, name: '', chat_id: '' }; manageDialog.value = false; ElMessage.success('频道已添加'); await load() }
+  try { await api('/channels', { method: 'POST', body: JSON.stringify(channel.value) }); channel.value = { bot_id: null, name: '', chat_id: '', kind: 'channel' }; manageDialog.value = false; ElMessage.success('推送目标已添加'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function addRule() {
@@ -1167,7 +1165,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer); clearIn
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.3 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.4 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1521,59 +1519,38 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer); clearIn
           <!-- ===== a 板块：交互 Bot / 频道 / 群聊 / 推送白名单 / 打赏配置 ===== -->
           <div class="sec-band"><span class="sec-key">a</span><div><h3>交互 Bot · 频道 / 群聊 · 推送白名单 · 打赏</h3><p>所有推送由 Bot 发往其管理的频道与群聊；私聊只提供求片 / 投稿 / 搜索 / 打赏，不主动推送</p></div><span class="sec-line"></span></div>
 
-          <!-- v0.9.2：限制方式二选一 -->
+          <!-- ===== 融合配置卡：交互 Bot / 推送目标 / 白名单 / 规则 / 使用限制 一处完成 ===== -->
           <div class="bot-card">
-            <div class="bot-card-head"><span class="bot-ico">🧭</span><h3>限制方式（二选一）</h3></div>
-            <div class="restrict-row col">
-              <div class="restrict-label"><b>选择一种限制方式</b><small>「推送白名单」= 只限制 Bot 往哪些频道/群聊推送，用户用指令不受约束；「关注/加群限制」= 只校验用户是否关注频道或入群，推送不按白名单过滤；「都不启用」= 两者都不拦截。不必两个都配置。</small></div>
+            <div class="bot-card-head"><span class="bot-ico">🧩</span><h3>交互 Bot 与推送配置</h3><span class="restrict-sub">一个 Bot 既推送又收指令；推送目标即白名单，无需重复填写</span></div>
+
+            <!-- ① 选择 Bot 与指令监听 -->
+            <div class="form-grid">
+              <div class="field">
+                <label>交互 Bot（复用下方 Bot 管理的 Token，无需再填一遍）</label>
+                <el-select v-model="interactionCfg.interaction_bot_id" placeholder="选择一个 Bot（推送与私聊指令共用）" style="width:100%" clearable>
+                  <el-option v-for="b in (interactionCfg.bot_options || [])" :key="b.id"
+                    :label="b.name + (b.enabled ? '' : '（停用）') + ' · ' + (b.token_masked || '未配置')" :value="String(b.id)"/>
+                </el-select>
+                <small>取所选 Bot 的 Token 监听私聊指令；不选则回退旧「投稿 Bot Token」配置。私聊只回应用户指令，不主动推送影视。</small>
+              </div>
+              <div class="field inline"><label>启用指令监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
+            </div>
+
+            <!-- ② 限制方式二选一 + 白名单来源说明 -->
+            <div class="restrict-row col" style="margin-top:14px">
+              <div class="restrict-label"><b>限制方式（二选一）</b><small>「推送白名单」= 按下方「推送目标」的启用记录过滤，用户用指令不受约束；「关注/加群限制」= 校验用户是否关注频道或入群，推送不按白名单过滤；「都不启用」= 两者都不拦截。</small></div>
               <el-radio-group v-model="interactionCfg.bot_gate_mode" size="small">
                 <el-radio-button value="whitelist">推送白名单</el-radio-button>
                 <el-radio-button value="membership">关注/加群限制</el-radio-button>
                 <el-radio-button value="off">都不启用</el-radio-button>
               </el-radio-group>
             </div>
-            <p class="hint">私聊 Bot 发送 <b>/start</b> 会出现「频道 / 群组 / 投稿求片 / 搜索 / 打赏」两列按钮菜单；点按钮即可使用，无需手动注册。</p>
+            <p class="hint" style="margin:6px 0 0">推送白名单 = 下方「推送目标」中已启用的频道 / 群聊，增删勾选在下方表格完成，不再单独填 ID。私聊 Bot 发 <b>/start</b> 得两列按钮菜单。</p>
           </div>
 
-          <!-- 推送消息白名单：频道需管理员 / 群聊无需管理员（whitelist 模式生效） -->
+          <!-- 内置指令速查（交互 Bot 的一部分） -->
           <div class="bot-card">
-            <div class="bot-card-head"><span class="bot-ico">📢</span><h3>推送消息白名单</h3><span class="restrict-sub">Bot 只向白名单内的频道 / 群聊推送，不私聊用户</span></div>
-            <div class="restrict-row col">
-              <div class="restrict-label"><b>频道 ID（需管理员）</b><small>一行一个。机器人必须是该频道管理员；留空表示不限制（保持兼容）。</small></div>
-              <el-input v-model="pushChannelsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
-            </div>
-            <div class="restrict-row col">
-              <div class="restrict-label"><b>群聊 ID（无需管理员）</b><small>一行一个。群聊只需机器人已加入即可。</small></div>
-              <el-input v-model="pushGroupsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
-            </div>
-            <p class="hint">白名单为空时不拦截（兼容旧配置）；一旦填写，分发推送只会发到列出的频道 / 群聊，其余目标会在队列里标记「不在白名单」并跳过。</p>
-          </div>
-
-          <!-- 使用限制：关注频道 / 加入群聊（membership 模式生效） -->
-          <div class="bot-card restrict-card">
-            <div class="bot-card-head"><span class="bot-ico">🔒</span><h3>使用限制</h3><span class="restrict-sub">要求用户关注频道 / 加入群聊</span><el-switch v-model="interactionCfg.bot_restrict_enabled" style="margin-left:auto"/></div>
-            <div class="restrict-row">
-              <div class="restrict-label"><b>检查结果缓存时间</b><small>用户通过校验后结果会被缓存，缓存期内无需重复检查。<br/>0=每次都检查（最严格但响应慢）；建议 60-120 秒；3600+ 秒可降低接口压力。</small></div>
-              <el-input-number v-model="interactionCfg.bot_restrict_cache_seconds" :min="0" :max="86400" controls-position="right" style="width:130px"/><span class="unit">秒</span>
-            </div>
-            <div class="restrict-row col">
-              <div class="restrict-label"><b>必须关注的频道</b><small>一行一个，支持 @用户名 或 频道 ID（如 -1001234567890）。机器人需为该频道管理员才能校验成员状态。</small></div>
-              <el-input v-model="requiredChannelsText" type="textarea" :rows="3" placeholder="@EmbyHub_News&#10;-1001234567890"/>
-            </div>
-            <div class="restrict-row col">
-              <div class="restrict-label"><b>必须加入的群聊</b><small>一行一个群聊 ID。未加入任一群聊的用户，其指令会被拒绝并提示。</small></div>
-              <el-input v-model="requiredGroupsText" type="textarea" :rows="3" placeholder="-1001234567890"/>
-            </div>
-            <p class="hint warn">启用后即使用户取消关注 / 退群，缓存期内仍可使用机器人；缓存过期后需重新校验。此卡与上方白名单二选一，无需同时配置。</p>
-          </div>
-
-          <!-- 交互 Bot：Token / 指令监听 / 内置指令速查（参考 embyhub 卡片） -->
-          <div class="bot-card">
-            <div class="bot-card-head"><span class="bot-ico">🤖</span><h3>交互 Bot</h3><span class="restrict-sub">私聊指令入口 · 只回复指令来源，不主动推送</span></div>
-            <div class="form-grid">
-              <div class="field"><label>交互 Bot Token（留空保持原值）</label><el-input v-model="interactionCfg.contribution_bot_token" placeholder="已配置则留空" show-password/></div>
-              <div class="field inline"><label>启用指令监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
-            </div>
+            <div class="bot-card-head"><span class="bot-ico">&gt;_</span><h3>内置指令速查</h3><span class="restrict-sub">私聊指令入口 · 只回复指令来源，不主动推送</span><el-tag size="small" type="info" style="margin-left:auto">固定四项 · 不可删除</el-tag></div>
             <div class="cmd-add" style="border-top:1px dashed var(--yg-line);margin-top:14px;padding-top:14px">
               <div class="bot-card-head" style="margin-bottom:10px"><h3 style="font-size:14px">内置指令速查</h3><el-tag size="small" type="info">固定四项 · 不可删除</el-tag></div>
             </div>
@@ -1600,14 +1577,32 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer); clearIn
             </div>
             <div class="panel manage-card">
               <div class="panel-head"><div><h3>推送目标（频道 / 群聊）</h3><span class="hint">{{ channels.filter(c => c.enabled).length }} / {{ channels.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('channel')">+ 添加目标</el-button></div>
-              <el-table :data="channels" size="small" empty-text="还没有推送目标，点右上角添加"><el-table-column label="名称" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="chat_id" min-width="110"><template #default="s">{{ s.row.chat_id }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="160"><template #default="s"><el-button size="small" text :loading="testingChannel === s.row.id" @click="testChannel(s.row)">测试推送</el-button><el-button size="small" text @click="toggleChannel(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delChannel(s.row)">删除</el-button></template></el-table-column></el-table>
-              <p class="hint" style="margin:10px 0 0">频道 / 群聊都在这里添加，chat_id 填频道或群聊 ID，绑定一个有发送权限的 Bot；推送逻辑相同，并受下方白名单控制。</p>
+              <el-table :data="channels" size="small" empty-text="还没有推送目标，点右上角添加"><el-table-column label="名称" min-width="80"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="类型" width="64"><template #default="s"><el-tag size="small" :type="s.row.kind === 'group' ? 'warning' : 'primary'">{{ s.row.kind === 'group' ? '群' : '频道' }}</el-tag></template></el-table-column><el-table-column label="chat_id" min-width="105"><template #default="s">{{ s.row.chat_id }}</template></el-table-column><el-table-column label="状态" width="60"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="150"><template #default="s"><el-button size="small" text :loading="testingChannel === s.row.id" @click="testChannel(s.row)">测试</el-button><el-button size="small" text @click="toggleChannel(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delChannel(s.row)">删除</el-button></template></el-table-column></el-table>
+              <p class="hint" style="margin:10px 0 0">这里就是推送白名单：已启用的目标才会被推送，也是私聊菜单「官方频道 / 交流群组」的来源。频道需 Bot 为管理员，群聊只需 Bot 已加入。</p>
             </div>
             <div class="panel manage-card">
               <div class="panel-head"><div><h3>分发规则</h3><span class="hint">{{ rules.filter(r => r.enabled).length }} / {{ rules.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('rule')">+ 添加规则</el-button></div>
               <el-table :data="rules" size="small" empty-text="还没有规则，点右上角添加"><el-table-column label="规则名" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="模式" width="72"><template #default="s"><el-tag :type="s.row.auto_publish ? 'success' : 'warning'" size="small">{{ s.row.auto_publish ? '自动' : '审核' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="90"><template #default="s"><el-button size="small" text type="danger" @click="delRule(s.row)">删除</el-button></template></el-table-column></el-table>
               <p class="hint" style="margin:10px 0 0">保存规则时会自动把已扫描资源补入分发队列；规则未启用时不参与推送。</p>
             </div>
+          </div>
+
+          <!-- 使用限制（membership 模式生效）：要求用户关注频道 / 加入群聊 -->
+          <div class="bot-card restrict-card">
+            <div class="bot-card-head"><span class="bot-ico">🔒</span><h3>使用限制</h3><span class="restrict-sub">「关注/加群限制」模式下生效，与推送白名单二选一</span><el-switch v-model="interactionCfg.bot_restrict_enabled" style="margin-left:auto"/></div>
+            <div class="restrict-row">
+              <div class="restrict-label"><b>检查结果缓存时间</b><small>用户通过校验后结果会被缓存，缓存期内无需重复检查。<br/>0=每次都检查（最严格但响应慢）；建议 60-120 秒。</small></div>
+              <el-input-number v-model="interactionCfg.bot_restrict_cache_seconds" :min="0" :max="86400" controls-position="right" style="width:130px"/><span class="unit">秒</span>
+            </div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>必须关注的频道</b><small>一行一个，支持 @用户名 或频道 ID。机器人需为该频道管理员。</small></div>
+              <el-input v-model="requiredChannelsText" type="textarea" :rows="2" placeholder="@EmbyHub_News&#10;-1001234567890"/>
+            </div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>必须加入的群聊</b><small>一行一个群聊 ID。未加入的用户指令会被拒绝并提示。</small></div>
+              <el-input v-model="requiredGroupsText" type="textarea" :rows="2" placeholder="-1001234567890"/>
+            </div>
+            <p class="hint warn">此项只在「关注/加群限制」模式下校验用户；选「推送白名单」或「都不启用」时此项不生效。</p>
           </div>
 
           <!-- TG 推送配置 -->
@@ -1692,6 +1687,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer); clearIn
             </div>
             <div v-if="manageKind === 'channel'">
               <div class="field"><label>所属 Bot</label><el-select v-model="channel.bot_id" placeholder="选择 Bot" style="width:100%"><el-option v-for="b in bots" :key="b.id" :label="b.name" :value="b.id"/></el-select></div>
+              <div class="field"><label>类型</label><el-radio-group v-model="channel.kind" size="small"><el-radio-button value="channel">频道（需管理员）</el-radio-button><el-radio-button value="group">群聊（无需管理员）</el-radio-button></el-radio-group></div>
               <div class="field"><label>名称</label><el-input v-model="channel.name" placeholder="例如：影视发布频道 / 交流群"/></div>
               <div class="field"><label>chat_id（频道或群聊 ID）</label><el-input v-model="channel.chat_id" placeholder="形如 -1001234567890"/></div>
             </div>
