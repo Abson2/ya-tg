@@ -164,6 +164,46 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
     return out
 
 
+def work_key_of(work: dict) -> str:
+    """作品稳定键，与 sync_rule / MirrorMedia.work_key 同口径（供轮转游标持久化）。"""
+    return "work:" + normalize_work_name(work.get("name") or "")
+
+
+def plan_work_batch(works: list, max_works: int, cursor: str = "",
+                    hard_max: int = 100) -> tuple[list, str, bool]:
+    """v0.9.0：把一次镜像要处理的作品按「单轮上限 + 轮转游标」切成一批。
+
+    - max_works<=0：不限量，返回全部（仍受 hard_max 防御性上限约束，保持旧行为）。
+    - max_works>0：从 cursor 之后接着取，取满 max_works 部为止；到末尾则从头回绕。
+      返回 (本批作品, 新的游标=本批最后一部作品的 key, 是否发生回绕)。
+    - 游标是「上一轮最后处理完的作品 key」，因此同一部剧绝不会被拆到两轮中间：
+      sync_rule 对每部作品是原子处理（文件复制 + 批量轮询完成才进入下一部），
+      正好满足用户「第一部剧不要间断，整理完再休息」。
+    - 到上限即停，剩余作品留给下一次定时同步接着做，不铺满一屏、不瞬时压满网盘。
+    """
+    if not works:
+        return [], "", False
+    if max_works <= 0:
+        return works[:hard_max], "", False
+    keys = [work_key_of(w) for w, _ in works]
+    start = 0
+    if cursor:
+        try:
+            start = keys.index(cursor) + 1
+        except ValueError:
+            start = 0  # 游标指向的作品已不在 A 库，从头开始
+        if start >= len(works):
+            start = 0  # 上一轮已到末尾，回绕
+    end = start + max_works
+    batch = works[start:end]
+    wrapped = end > len(works)
+    if wrapped and len(batch) < max_works:
+        # 尾部不足，用头部补齐，凑满一整批
+        batch = batch + works[:max_works - len(batch)]
+    new_cursor = work_key_of(batch[-1][0]) if batch else ""
+    return batch, new_cursor, wrapped
+
+
 def _relative_dir_names(node: dict, work: dict, nodes: dict) -> list[str]:
     """从影视主目录到文件所在目录之间的子目录名（Season 1 等），B 库同名映射。"""
     names: list[str] = []
@@ -514,7 +554,8 @@ async def _poll_task(api: GuangYaWebFiles, task: MirrorTask, *,
 
 
 async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
-                    poll_interval: float = 2.0, max_media: int = 100) -> dict:
+                    poll_interval: float = 2.0, max_media: int = 100,
+                    max_works: int | None = None) -> dict:
     """执行一次 A→B 增量同步。逐部影视完成后立即提交，不等整库结束。
 
     v0.8.1：
@@ -522,11 +563,22 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
       - B 库缺目录时自动 create_dir（抓包已确认，可用 auto_create_dirs 关闭）。
       - 每次文件复制之间留可配置空闲时间，硬下限 MIN_FILE_IDLE_SECONDS 不可调低。
       - 本模块绝不写 push_queue、绝不调用 _enqueue_* / process_queue。
+    v0.9.0：
+      - max_works 单轮整部作品上限；None 时取 rule.max_works_per_run。
+        由 plan_work_batch 按轮转游标切批，做到「一次不铺太多、下次接着做、
+        同一部剧不拆两轮」。
     """
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
+    if max_works is None:
+        try:
+            max_works = max(0, int(getattr(rule, "max_works_per_run", 0) or 0))
+        except (TypeError, ValueError):
+            max_works = 0
     stats = {"media": 0, "new": 0, "changed": 0, "unchanged": 0, "skipped": 0,
              "tasks": 0, "done": 0, "unknown": 0, "blocked": 0,
              "retries": 0, "failed": 0,
+             # v0.9.0：单轮作品上限与轮转游标回显
+             "max_works": max_works, "batch_size": 0, "works_cursor": "", "wrapped": False,
              # v0.8.7：DB 标记 synced 但 B 库实际没有 → 自动补复制的计数
              "missing_in_b": 0, "name_mismatch": 0,
              "dirs_created": 0, "dirs_mapped": 0, "dirs_fallback": 0,
@@ -646,7 +698,19 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         return fid, None, effective
 
     works = _discover_works(nodes, root)
-    for work, cats in works[:max_media]:
+    # v0.9.0：按单轮上限 + 轮转游标切批。max_works<=0 时退化为旧行为（全量，
+    # 仍受 max_media 防御上限约束）；>0 时本批最多 max_works 部，剩余下轮继续。
+    if max_works > 0:
+        batch, new_cursor, wrapped = plan_work_batch(
+            works, max_works, str(getattr(rule, "works_cursor", "") or ""),
+            hard_max=max_media)
+    else:
+        batch, new_cursor, wrapped = works[:max_media], "", False
+    stats["batch_size"] = len(batch)
+    stats["works_cursor"] = new_cursor
+    stats["wrapped"] = wrapped
+    stats["total_works"] = len(works)
+    for work, cats in batch:
         cat_path = "/".join(n for n, _ in cats) or "__root__"
         title = standard_media_name(work["name"])
         expected = star_media_name(title) if rule.star_naming else title
@@ -888,6 +952,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         db.commit()
         stats["media"] += 1
 
+    # v0.9.0：轮转游标落库，下一次定时同步从本批最后一部之后接着做。
+    # 仅在配置了单轮上限时写；0（不限量）时清空，避免升级后残留旧游标。
+    if max_works > 0 and batch:
+        rule.works_cursor = new_cursor
+    elif max_works <= 0:
+        rule.works_cursor = ""
     rule.last_run = utcnow()
     if stats["errors"]:
         rule.last_status = "partial"
@@ -902,6 +972,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         f"跳过 {stats['skipped']} · B库缺失补复制 {stats['missing_in_b']} · "
         f"名称不符 {stats['name_mismatch']} · 建目录 {stats['dirs_created']} · "
         f"待建目录 {len(stats['missing_dirs'])} · 文件间隔 {idle}s")
+    if max_works > 0:
+        _left = max(0, stats.get("total_works", 0) - stats["batch_size"])
+        rule.last_message += (f" · 本轮限额 {max_works} 部 / 实处理 {stats['batch_size']} 部"
+                              f"（A 库共 {stats.get('total_works', 0)} 部，余 {_left} 部下轮继续）")
     if stats["dir_errors"]:
         rule.last_message += " · 首个建目录错误：" + stats["dir_errors"][0][:300]
     # v0.8.4：文件级错误必须落到 last_message，刷新页面后仍看得到，

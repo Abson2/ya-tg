@@ -5,6 +5,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 const password = ref(localStorage.getItem('ya_tg_password') || '')
 const authed = ref(false)
 const tab = ref('概览')
+// v0.9.0：分发规则并入 Bot 交互中心，用一个二级子标签在同一个页面内切换
+const distSub = ref('interact')  // 'interact'=指令/白名单/限制；'rules'=Bot→频道→规则 + 推送间隔
 const clock = ref('')
 const viewMode = ref('series')  // v0.6.4：作品视图为默认，单集按剧聚合，不再散落
 const keyword = ref('')
@@ -35,7 +37,7 @@ const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([]), testingBotMsg = ref(0)
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
-const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, interval_presets: [], unverified_endpoints: [], note: '' })
+const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, interval_presets: [], unverified_endpoints: [], note: '' })
 const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [] })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 const mirrorDiagOpen = ref([])
@@ -206,8 +208,7 @@ const navGroups = [
     { key: '资源库', icon: 'folder', label: '资源库' }
   ] },
   { label: '分发与互动', items: [
-    { key: '分发规则', icon: 'route', label: '分发规则' },
-    { key: 'Bot 交互中心', icon: 'link', label: 'Bot 交互中心' },
+    { key: '分发与互动中心', icon: 'link', label: '分发与互动中心' },
     { key: '审核中心', icon: 'check', label: '审核中心' },
     { key: '推送队列', icon: 'send', label: '推送队列' }
   ] },
@@ -246,7 +247,7 @@ const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件�
 // 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
 const tagHint = computed(() => 'TMDB 分类打标：{{type}}=movie/tv，{{type_label}}=电影/剧集，{{origin_country}}=制片地区，{{genres}}=类型，{{tags}}=组合标签（示例 #保镖恋人 #电影 #爱情 #惊悚）。按示例打标可写：type={{type}} · origin_country={{origin_country}} · genres={{genres}}')
 // v0.8.9：剧集状态 / 集数进度变量，说明含 {{}} 字面量必须由 computed 返回
-const episodeHint = computed(() => '剧集状态：{{episode_status}}=更新至第 N 集 / 共 M 集（完结剧显示「全 M 集 · 已完结」），{{episode_progress}}=N/M，{{updated_to_episode}}=已更新集号，{{total_episodes}}=TMDB 官方总集数，{{current_episode}}=当前集，{{episode_count}}=本地已收录集数。电影时这些变量为空，配合 {{#if}} 条件块使用')
+const episodeHint = computed(() => '剧集状态：{{episode_status}}=追更「更新至 S01E07 · 连载中」/ 收齐「S01E24 · 完结」，{{episode_progress}}=N/M（如 12/24），{{updated_to_episode}}=已更新集号，{{total_episodes}}=TMDB 官方总集数，{{current_episode}}=当前集，{{episode_count}}=本地已收录集数。电影时这些变量为空，配合 {{#if}} 条件块使用')
 const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'reward_code', 'size', 'share_url',
   'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
   'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename',
@@ -484,7 +485,8 @@ async function saveMirror() {
   try {
     // 清空数字框会给出 null，兜底为 1.0 秒，避免后端 422
     const body = { ...mirrorCfg.value,
-      file_idle_seconds: Number(mirrorCfg.value.file_idle_seconds) || 1.0 }
+      file_idle_seconds: Number(mirrorCfg.value.file_idle_seconds) || 1.0,
+      max_works_per_run: Number(mirrorCfg.value.max_works_per_run) || 0 }
     await api('/mirror/config', { method: 'POST', body: JSON.stringify(body) })
     ElMessage.success('镜像设置已保存')
     await load()
@@ -1131,7 +1133,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.0 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.1 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1317,6 +1319,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="field inline"><label>同步后自动入库识别并推送</label><el-switch v-model="mirrorCfg.auto_identify"/></div>
               <div class="field inline"><label>B 库单集/电影文件英文改名</label><el-switch v-model="mirrorCfg.rename_files"/></div>
               <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、改名、变化更新的每个文件操作前都会等待。</small></div>
+              <div class="field"><label>单轮最多整理整部剧 / 电影（部）</label><el-input-number v-model="mirrorCfg.max_works_per_run" :min="0" :max="1000" :step="1" controls-position="right" style="width:150px"/><small>0 = 不限量（一次整理全部）。设 N 则每轮只整理 N 部就停，剩余等下一次定时同步接着做；同一部剧会一次整理完再休息，不会拆到两轮。进度按作品轮转，每部都能轮到。</small></div>
             </div>
             <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
               <el-collapse-item name="config-help">
@@ -1376,6 +1379,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <span class="info-chip" :class="mirrorStatus.config?.rename_files === false ? 'off' : 'on'">单集/电影英文改名 <b>{{ mirrorStatus.config?.rename_files === false ? '关闭' : '开启' }}</b></span>
               <span class="info-chip">B 库目录 ID <b>{{ mirrorStatus.config?.target_root_id || '未填写' }}</b></span>
               <span class="info-chip">文件空闲 <b>{{ mirrorStatus.config?.file_idle_seconds ?? 1.0 }}s</b></span>
+              <span class="info-chip">单轮作品上限 <b>{{ mirrorStatus.config?.max_works_per_run ? mirrorStatus.config.max_works_per_run + ' 部' : '不限量' }}</b></span>
             </div>
             <p class="hint" style="margin-top:14px">已确认接口（来自 HAR 取证）</p>
             <div class="endpoint-list"><code v-for="e in (mirrorCfg.confirmed_endpoints || [])" :key="e">{{ e }}</code></div>
@@ -1458,8 +1462,13 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </el-collapse>
         </section>
 
-        <section v-else-if="tab === 'Bot 交互中心'" class="fade">
-          <div class="page-head"><div><h2>Bot 交互中心</h2><p>指令菜单 · 推送白名单 · 使用限制 · 投稿 / 搜索 / 求片 / 打赏</p></div><div class="head-tools"><el-tag size="small">待审投稿 {{ interactionStatus.contributions_pending || 0 }}</el-tag><el-button type="primary" size="small" :loading="interactionSaving" @click="saveInteraction">保存全部设置</el-button></div></div>
+        <section v-else-if="tab === '分发与互动中心' && distSub === 'interact'" class="fade">
+          <div class="page-head"><div><h2>分发与互动中心</h2><p>Bot 统一分发 · 指令菜单 · 推送白名单 · 使用限制 · 频道 / 规则 · 推送间隔</p></div><div class="head-tools"><el-tag size="small">待审投稿 {{ interactionStatus.contributions_pending || 0 }}</el-tag></div></div>
+          <!-- v0.9.0：二级切换——互动设置 / 分发配置（两个子页共用同一个导航入口） -->
+          <div class="sub-tabs">
+            <button :class="{on: distSub === 'interact'}" @click="distSub = 'interact'">互动设置 · 指令 / 白名单 / 投稿</button>
+            <button :class="{on: distSub === 'rules'}" @click="distSub = 'rules'">分发配置 · Bot / 频道 / 规则 / 推送间隔</button>
+          </div>
 
           <!-- 内置指令速查：固定四项 + 后台自定义（参考 embyhub 卡片） -->
           <div class="bot-card">
@@ -1552,7 +1561,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               </el-table></div>
             </div>
           </div>
-          <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存全部设置</el-button></div>
+          <div class="panel-foot"><el-button type="primary" :loading="interactionSaving" @click="saveInteraction">保存全部互动设置</el-button></div>
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
@@ -1674,8 +1683,17 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           </div>
         </section>
 
-        <section v-else-if="tab === '分发规则'" class="fade">
-          <div class="page-head"><div><h2>分发规则</h2><p>Bot → 频道 → 路由规则，三步建立推送链路</p></div></div>
+        <section v-else-if="tab === '分发与互动中心' && distSub === 'rules'" class="fade">
+          <!-- 二级切换放在顶部，与互动设置互跳；条件链要求此 section 仅在该子标签下渲染 -->
+          <div class="sub-tabs">
+            <button :class="{on: distSub === 'interact'}" @click="distSub = 'interact'">互动设置 · 指令 / 白名单 / 投稿</button>
+            <button :class="{on: distSub === 'rules'}" @click="distSub = 'rules'">分发配置 · Bot / 频道 / 规则 / 推送间隔</button>
+          </div>
+          <div class="bot-card" style="margin-bottom:14px">
+            <div class="bot-card-head"><span class="bot-ico">📤</span><h3>推送调度 · 间隔时间</h3><el-button size="small" type="primary" :loading="runningQueue" @click="runQueue">立即推送队列</el-button></div>
+            <div class="schedule-controls"><span class="schedule-label">检查队列</span><el-input-number v-model="queueSchedule.interval_seconds" :min="5" :max="86400" controls-position="right" style="width:110px"/><span class="schedule-label">秒 · 或 Cron</span><el-input v-model="queueSchedule.cron" placeholder="留空用间隔；如 */1 * * * * 每分钟" style="max-width:230px"/><span class="schedule-label">每条间隔</span><el-input-number v-model="queueSchedule.send_delay" :min="0" :max="60" controls-position="right" style="width:100px"/><span class="schedule-label">秒</span><el-button type="primary" :loading="scheduleSaving" @click="saveQueueSchedule">保存调度</el-button></div>
+            <p class="hint" style="margin:10px 0 0">「检查队列」= 多久扫一次待推队列（默认 30 秒）；「每条间隔」= 两条 TG 消息之间隔几秒（防风控，默认 2 秒）。Cron 5 段（分 时 日 月 周，北京时间），非空时优先于检查间隔；保存即生效，无需重启。</p>
+          </div>
           <div class="panel" style="margin-bottom:14px">
             <div class="panel-head"><h3>链路自检</h3><el-button size="small" type="primary" :loading="runningQueue" @click="runQueue">立即推送队列</el-button></div>
             <div class="cursor-box"><div><small>启用 Bot</small><b>{{ diagnostics.bots?.enabled ?? 0 }} / {{ diagnostics.bots?.total ?? 0 }}</b></div><div><small>启用频道</small><b>{{ diagnostics.channels?.enabled ?? 0 }} / {{ diagnostics.channels?.total ?? 0 }}</b></div><div><small>启用规则</small><b>{{ diagnostics.rules_enabled ?? 0 }}</b></div><div><small>待推送</small><b>{{ diagnostics.queue?.pending ?? 0 }}</b></div><div><small>待审核</small><b>{{ diagnostics.queue?.review ?? 0 }}</b></div><div><small>已推送</small><b>{{ diagnostics.queue?.sent ?? 0 }}</b></div></div>
@@ -1683,8 +1701,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
             <p v-else class="hint" style="margin:8px 0">链路完整：Bot / 频道 / 规则均已启用，队列每 30 秒自动推送一次；也可点「立即推送队列」马上验证。</p>
             <p v-if="diagnostics.last_error" class="hint" style="color:#c0392b;margin:8px 0">最近失败：{{ diagnostics.last_error }}</p>
             <div class="match-controls"><el-input v-model="telegramBase" placeholder="Telegram API 地址，默认 https://api.telegram.org（国内网络可填反代）"/><el-button :loading="telegramSaving" @click="saveTelegramBase">保存地址</el-button></div>
-            <div class="match-controls schedule-controls"><span class="schedule-label">检查队列</span><el-input-number v-model="queueSchedule.interval_seconds" :min="5" :max="86400" controls-position="right" style="width:110px"/><span class="schedule-label">秒 · 或 Cron</span><el-input v-model="queueSchedule.cron" placeholder="留空用间隔；如 */1 * * * * 每分钟" style="max-width:230px"/><span class="schedule-label">每条间隔</span><el-input-number v-model="queueSchedule.send_delay" :min="0" :max="60" controls-position="right" style="width:100px"/><span class="schedule-label">秒</span><el-button type="primary" :loading="scheduleSaving" @click="saveQueueSchedule">保存调度</el-button></div>
-            <p class="hint" style="margin:6px 0 0">「检查队列」= 多久扫一次待推队列；「每条间隔」= 两条 TG 消息之间隔几秒（防风控，默认 2 秒）。Cron 5 段（分 时 日 月 周，北京时间），非空时优先于检查间隔；保存即生效，无需重启。</p>
+            <p class="hint" style="margin:6px 0 0">推送检查间隔与每条间隔在上方「推送调度 · 间隔时间」卡片里设置。</p>
           </div>
 
           <!-- v0.7.0：TG 分发配置升级 -->
@@ -2069,6 +2086,11 @@ button{font-family:inherit}
 .info-chip.on b{color:#12897f}.info-chip.off b{color:var(--yg-rose)}
 .endpoint-list{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 0}
 .endpoint-list code{font-size:11px;background:#eef1fb;color:#4b5270;border:1px solid #e2e6f5;border-radius:6px;padding:3px 8px;word-break:break-all}
+/* v0.9.0：分发与互动中心二级切换（互动设置 / 分发配置） */
+.sub-tabs{display:flex;gap:8px;margin:0 0 18px;padding:5px;background:#eef0f8;border-radius:13px;flex-wrap:wrap}
+.sub-tabs button{flex:1 1 240px;border:0;background:transparent;color:#6b74a8;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:650;cursor:pointer;transition:.18s;white-space:nowrap}
+.sub-tabs button:hover{color:var(--yg-primary)}
+.sub-tabs button.on{background:#fff;color:var(--yg-primary);box-shadow:0 2px 10px rgba(30,39,69,.09)}
 /* v0.9.0：Bot 交互中心卡片（参考 embyhub） */
 .bot-card{background:#fff;border:1px solid var(--yg-line);border-radius:16px;padding:22px 24px;margin-bottom:16px;box-shadow:0 2px 12px rgba(28,36,72,.04)}
 .bot-card-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
@@ -2226,6 +2248,8 @@ button{font-family:inherit}
   .media-actions .el-button{margin:0 3px 4px 0;padding:5px 8px;font-size:11px}
   .credential-bar,.auth-summary,.kv-grid,.var-grid,.tg-extra-grid{grid-template-columns:repeat(2,1fr);gap:10px}
   .status-tabs{gap:8px 12px;padding:8px 10px}
+  .sub-tabs{gap:4px;padding:4px}
+  .sub-tabs button{flex:1 1 100%;font-size:12px;padding:9px 8px}
   .batch-bar{gap:6px}
   .cursor-box{grid-template-columns:repeat(2,1fr);gap:10px}
   .connect-steps{flex-wrap:wrap}

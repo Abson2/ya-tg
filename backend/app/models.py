@@ -245,6 +245,11 @@ class MirrorRule(Base):
     # v0.8.6：B 库单集/单电影文件按英文剧名改名（只换中文片名段）。
     # A 库只读、B 库目录命名不变；改名结果落在 MirrorFile.target_name。
     rename_files: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v0.9.0：单次同步最多整理多少部整部剧/电影（0=不限量）。到上限即停，
+    # 剩余作品等下一次定时同步继续；works_cursor 记上一轮最后处理完的作品 key，
+    # 用轮转保证每部作品都会被覆盖，不会每轮都只处理前面几部。
+    max_works_per_run: Mapped[int] = mapped_column(Integer, default=0)
+    works_cursor: Mapped[str] = mapped_column(String(256), default="")
     last_run: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_status: Mapped[str] = mapped_column(String(24), default="never")
     last_message: Mapped[str] = mapped_column(Text, default="")

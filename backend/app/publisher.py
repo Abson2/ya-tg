@@ -92,7 +92,8 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     另有 vote_average/original_title/season/episode/episode_tag/media_type。
     v0.8.9 剧集状态组：episode_count（本地已收录集数）/ total_episodes（TMDB 官方总集数）
     / updated_to_episode（已更新到第几集）/ current_episode（当前集）
-    / episode_progress（如 12/24）/ episode_status（如「更新至第 12 集 / 共 24 集 · 连载中」）。
+    / episode_progress（如 12/24）/ episode_status（v0.9.0 改为季集标签格式：
+      追更「更新至 S01E12 · 连载中」/ 收齐「S01E24 · 完结」）。
     """
     esc = lambda v: html.escape(str(v if v is not None else ""), quote=False)
     title = res.media_title or res.name
@@ -120,7 +121,9 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     whole_season_label = f"第{int(season)}季" if season else ""
     episode_count = ""
     # v0.8.9：剧集状态与集数进度。episode_count 一直是「本地已收录集数」，
-    # 这里补上 TMDB 官方总集数、已更新到第几集，追更剧才能显示「更新至 12/24 集」。
+    # 这里补上 TMDB 官方总集数、已更新到第几集。v0.9.0：episode_status 改用
+    # 季集标签——追更「更新至 S01E07 · 连载中」、收齐「S01E24 · 完结」，
+    # 进度与总集数仍由 episode_progress / total_episodes 单独承载，不重复。
     total_episodes = 0
     updated_ep = 0
     cur_ep = 0
@@ -161,17 +164,23 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
             finish = (str(res.finish_status or "")
                       or next((str(s.finish_status or "") for s in sibs
                                if str(s.finish_status or "")), ""))
-            if total_episodes > 0:
-                if finish == "ended" and updated_ep >= total_episodes:
-                    episode_status = f"全 {total_episodes} 集 · 已完结"
-                else:
-                    episode_status = f"更新至第 {updated_ep} 集 / 共 {total_episodes} 集"
-                    if finish == "returning":
-                        episode_status += " · 连载中"
+            # v0.9.0：按用户要求改为季集标签格式。
+            # 季号取「本地已收录的最后一集」所在季（多季剧用最后一季），
+            # 集号取该季最大集号；总集数/进度仍由 episode_progress 单独承载。
+            status_season = (int(last_season) if eps and last_season
+                             else int(season or 1) or 1)
+            status_ep_tag = f"S{status_season:02d}E{int(updated_ep):02d}"
+            ended = finish == "ended" and (total_episodes <= 0
+                                           or updated_ep >= total_episodes)
+            if ended:
+                episode_status = f"{status_ep_tag} · 完结"
+            elif finish == "returning":
+                episode_status = f"更新至 {status_ep_tag} · 连载中"
+            elif total_episodes > 0 and updated_ep > 0:
+                # 官方有总集数但未标连载：只报进度标签，不臆断连载/完结
+                episode_status = f"更新至 {status_ep_tag}"
             elif updated_ep > 0:
-                episode_status = f"更新至第 {updated_ep} 集 · 已收录 {n} 集"
-                if finish == "ended":
-                    episode_status += " · 已完结"
+                episode_status = f"更新至 {status_ep_tag} · 已收录 {n} 集"
     season_label = whole_season_label  # v0.6.4：整剧展示用「第N季」而非单集信息
     version = version_spec(res.name)
 

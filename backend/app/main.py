@@ -227,13 +227,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.1", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.1", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -618,6 +618,8 @@ class MirrorConfigInput(BaseModel):
     auto_create_dirs: bool = True
     # v0.8.6：B 库单集/单电影文件按英文剧名改名（只换中文片名段）
     rename_files: bool = True
+    # v0.9.0：单次同步最多整理多少部整部剧/电影（0=不限量，到上限下轮接着做）
+    max_works_per_run: int = 0
 
 
 @app.get("/api/mirror/config", dependencies=ADMIN)
@@ -638,6 +640,9 @@ def mirror_config_get(db: Session = Depends(get_db)):
         # v0.8.6：改名开关；NULL 一律按默认开启（与 auto_create_dirs 同一防御口径）
         "rename_files": (True if getattr(r, "rename_files", None) is None
                          else bool(r.rename_files)) if r else True,
+        # v0.9.0：单轮作品上限与当前轮转游标（0=不限量）
+        "max_works_per_run": max(0, int(getattr(r, "max_works_per_run", 0) or 0)) if r else 0,
+        "works_cursor": str(getattr(r, "works_cursor", "") or "") if r else "",
         "interval_presets": MIRROR_INTERVAL_PRESETS,
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
@@ -671,11 +676,18 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
     r.star_naming, r.auto_identify = p.star_naming, p.auto_identify
     r.file_idle_seconds, r.auto_create_dirs = float(p.file_idle_seconds), p.auto_create_dirs
     r.rename_files = p.rename_files
+    # v0.9.0：单轮作品上限。改为 0（不限量）时清空轮转游标，避免残留；
+    # 调整上限时游标保留，继续按上次进度轮转。
+    new_cap = max(0, min(int(p.max_works_per_run or 0), 1000))
+    if new_cap == 0:
+        r.works_cursor = ""
+    r.max_works_per_run = new_cap
     add_audit(db, "mirror_config_saved", target_type="mirror",
               detail=json_dumps({"source": r.source_root_id, "target": r.target_root_id,
                                  "interval": r.interval_minutes,
                                  "idle": r.file_idle_seconds, "auto_dirs": r.auto_create_dirs,
-                                 "rename_files": r.rename_files}))
+                                 "rename_files": r.rename_files,
+                                 "max_works_per_run": r.max_works_per_run}))
     db.commit()
     _schedule_mirror_job(r.interval_minutes, r.enabled)
     return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
@@ -1002,6 +1014,9 @@ def mirror_status(db: Session = Depends(get_db)):
             "source_root_id": r.source_root_id if r else "",
             "target_root_id": r.target_root_id if r else "",
             "file_idle_seconds": float(r.file_idle_seconds or 1.0) if r else 1.0,
+            # v0.9.0：单轮作品上限生效值 + 当前轮转游标
+            "max_works_per_run": max(0, int(getattr(r, "max_works_per_run", 0) or 0)) if r else 0,
+            "works_cursor": str(getattr(r, "works_cursor", "") or "") if r else "",
         },
     }
 

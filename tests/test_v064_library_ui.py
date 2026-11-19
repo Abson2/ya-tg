@@ -150,7 +150,11 @@ def test_build_message_hides_single_episode_filename():
              vote_average=9.0, identify_status="identified")
     db.add(r); db.commit()
     text, _ = _build_message(db, r, "https://share/x")
-    assert "S01E04" not in text and ".mkv" not in text
+    # v0.9.0：剧集状态会显示「更新至 S01E04 · 已收录 1 集」这类进度标签，
+    # 这是用户明确要的季集进度，不再是「单集文件名泄漏」。真正要防的是
+    # 完整文件名 / 扩展名进入推送文案。
+    assert ".mkv" not in text
+    assert "The.Silent.Storm.S01E04" not in text
     assert "🎬" in text and "第1季" in text and "2026" in text
     assert "9.0/10" in text and "https://share/x" in text
     db.close()

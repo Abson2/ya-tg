@@ -96,6 +96,9 @@ _COLUMNS = {
         "auto_create_dirs": "BOOLEAN DEFAULT 1",
         # v0.8.6：B 库单集/电影文件按英文剧名改名开关
         "rename_files": "BOOLEAN DEFAULT 1",
+        # v0.9.0：单次同步整部作品上限 + 轮转游标（0=不限量）
+        "max_works_per_run": "INTEGER DEFAULT 0",
+        "works_cursor": "TEXT DEFAULT ''",
     },
     "mirror_media": {
         "category_path": "TEXT DEFAULT ''",
@@ -117,8 +120,9 @@ _COLUMNS = {
 
 
 # v0.6.5 默认模板：参考「保镖恋人」示例，整剧/整季展示，不暴露单集文件名。
-# v0.8.9 补「剧集状态 / 集数进度」两行：追更剧显示「更新至第 N 集 / 共 M 集」，
-# 完结剧显示「全 M 集 · 已完结」； episode_count 改为「已收录」，避免与总集数重复。
+# v0.8.9 补「剧集状态 / 集数进度」两行；v0.9.0 剧集状态改季集标签：
+# 追更剧「📡 更新至 S01E07 · 连载中」，完结剧「📡 S01E24 · 完结」，
+# 进度由 episode_progress（N/M）单独承载；episode_count 为「已收录」，避免重复。
 DEFAULT_TEMPLATE = (
     "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
     "{{#if season_label}}📺 {{season_label}}\n{{/if}}"

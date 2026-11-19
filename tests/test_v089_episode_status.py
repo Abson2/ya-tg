@@ -1,9 +1,11 @@
-"""v0.8.9 回归：推送模板「剧集状态 / 更新至第 N 集 / 当前集·总集数」变量。
+"""v0.8.9 回归 / v0.9.0 改版：推送模板「剧集状态 / 季集标签 / 当前集·总集数」变量。
 
 用户反馈：推送模板希望增加剧集状态，比如更新至多少集、当前集/总集数。
+v0.9.0 用户进一步要求季集标签格式：追更「更新至 S01E07 · 连载中」、
+收齐「S01E24 · 完结」；总集数/进度仍由 episode_progress 单独承载。
 本组测试锁死三件事：
   1. TMDB 官方总集数与本地已收录集数分开，追更剧能显示 12/24；
-  2. 完结剧收齐后显示「全 N 集 · 已完结」，电影不输出任何剧集状态；
+  2. 完结剧收齐后显示「S01E24 · 完结」，电影不输出任何剧集状态；
   3. 存量默认模板自动升级，用户自定义模板绝不被覆盖。
 """
 from pathlib import Path
@@ -114,7 +116,8 @@ def test_returning_series_shows_updated_to_and_progress(db):
                         identified=(i == 1), episode=1 if i == 1 else None))
     db.commit()
     text = _render(db)
-    assert "更新至第 12 集 / 共 24 集 · 连载中" in text, text
+    # v0.9.0：剧集状态改为季集标签「更新至 S01E12 · 连载中」
+    assert "更新至 S01E12 · 连载中" in text, text
     assert "进度：12/24" in text, text
     assert "共 12 集" in text, text          # 兼容既有「本地已收录集数」口径
     assert "📡" in text and "🔢" in text, text
@@ -126,7 +129,8 @@ def test_ended_series_shows_full_episode_count(db):
                         identified=(i == 1), episode=1 if i == 1 else None))
     db.commit()
     text = _render(db, "v089-f01")
-    assert "全 24 集 · 已完结" in text, text
+    # v0.9.0：收齐显示「S01E24 · 完结」
+    assert "S01E24 · 完结" in text, text
     assert "进度：24/24" in text, text
 
 
@@ -137,7 +141,7 @@ def test_no_tmdb_total_falls_back_to_local_count(db):
                         identified=(i == 1), episode=1 if i == 1 else None))
     db.commit()
     text = _render(db, "v089-g1")
-    assert "更新至第 3 集 · 已收录 3 集" in text, text
+    assert "更新至 S01E03 · 已收录 3 集" in text, text
     assert "0/" not in text, text
 
 
@@ -166,7 +170,7 @@ def test_episode_vars_render_with_custom_template(db):
     db.commit()
     text = _render(db, "v089-h7")
     assert "7/24" in text, text
-    assert "更新至第 7 集 / 共 24 集" in text, text
+    assert "更新至 S01E07 · 连载中" in text, text
     assert text.rstrip().endswith("| 7"), text
 
 
