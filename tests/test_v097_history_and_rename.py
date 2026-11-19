@@ -230,18 +230,22 @@ def test_frontend_unified_save_covers_restrictions():
     assert "await api('/reward/config'" in APP
     assert "保存分发与互动配置（Bot + 白名单 + 使用限制 + 打赏）" in APP
     assert "保存全部互动设置" not in APP
-    assert "上方三块配置共用此按钮" in APP
+    assert "共用顶部统一保存按钮" in APP
 
 
 def test_frontend_reward_moved_into_builtin_commands():
     assert "打赏（内置指令 /reward）" in APP
-    assert "单独保存打赏" in APP
+    # v0.9.12：合并打赏为单一图片地址配置，去掉重复的赞赏码窗与「单独保存打赏」按钮
+    assert "赞赏码图片地址（直接发给用户）" in APP
+    assert "单独保存打赏" not in APP
     assert "打赏与消息跳转配置" not in APP
+    assert "赞赏码（图片 URL 或文字说明）" not in APP
 
 
 def test_frontend_jump_links_moved_to_template_module():
     # v0.9.11：三张跳转卡并入同一张「推送消息 · 跳转链接」panel，
-    # 标签改为频道 / 群聊 / 投稿·求片，三个 inline 按钮并排同一行。
+    # 标签为频道 / 群聊 / 投稿·求片；v0.9.10.1 起这三个入口在推送正文里渲染成
+    # 标签式超链接（不再是 inline 按钮），配置卡文案不变。
     assert "推送消息 · 跳转链接" in APP
     assert "频道跳转" in APP
     assert "群聊跳转" in APP

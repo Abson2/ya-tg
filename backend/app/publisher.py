@@ -263,11 +263,36 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         # 季集范围：共 N 季 / S01 E01-E13（按本地已收录最后一季算）
         "season_count": esc(season_count),
         "episode_range": esc(episode_range),
-        # v0.9.10：入口文字改由渲染层统一追加（频道/群/Bot 三行带链接文字），
-        # 模板里的 {{buttons_text}} 变量置空，避免旧模板重复出现纯文字标签。
+        # v0.9.10.1：入口文字由渲染层统一追加（频道 / 群聊 / 投稿·求片 三个标签式
+        # 超链接），对所有模板生效；模板里的 {{buttons_text}} 变量保持置空避免重复。
         "buttons_text": "",
     }
+    # v0.9.10.1：所有模板统一在正文追加三个标签式文字超链接，替代 v0.9.11 的
+    # 灰底 inline 按钮。链接取自消息模板模块配置，留空的那一项不输出。
+    # 「标签形式」= Telegram HTML <a href> 可点击文字（与截图 #标签 同类观感），
+    # 不是 reply_markup 按钮；bot 链接指向推送 Bot 本身。
+    from . import bot_listener
+    jump_lines: list[str] = []
+    for label, raw in (
+        ("频道", runtime_config.get(db, "tg_channel_link")),
+        ("群聊", runtime_config.get(db, "tg_group_link")),
+        ("投稿·求片", runtime_config.get(db, "tg_bot_link")),
+    ):
+        link = bot_listener._normalize_tme_link(raw)
+        if link:
+            jump_lines.append(f'<a href="{html.escape(link, quote=True)}">{label}</a>')
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
+    if jump_lines:
+        # 插在末尾 share_url 之前；无 share_url 则直接追加到末尾。
+        # 用 「 · 」把三标签排在同一行，避免三个独占三行显得冗长。
+        tags_line = " · ".join(jump_lines)
+        lines = text.split("\n")
+        if lines and re.match(r"^https?://\S+$", lines[-1].strip()):
+            share_line = lines.pop()
+            body = "\n".join(lines).rstrip()
+            text = (body + "\n" + tags_line + "\n" + share_line).strip()
+        else:
+            text = (text.rstrip() + "\n" + tags_line).strip()
     return text[:1000], text[:1000]
 
 
@@ -290,10 +315,8 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
                "parse_mode": "HTML", "disable_web_page_preview": False}
     if poster:
         payload["photo"] = poster
-    # v0.9.10.2：真机截图口径——「频道 / 群聊 / 投稿·求片」三个跳转按钮并排同一行，
-    # 与用户截图里的灰底入口一致；「获取资源」保留为上方单独一行。
-    # 链接取自消息模板模块配置，留空的那一项不生成按钮（_normalize_tme_link 归一化）。
-    from . import bot_listener
+    # v0.9.10.1：频道/群聊/投稿·求片 三个入口已改为正文标签式超链接（_build_message
+    # 对所有模板统一追加），不再是灰底 inline 按钮；inline 键盘只保留「获取资源」。
     keyboard_rows: list[list[dict]] = []
     link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
     if link_style == "button" and res.share_url:
@@ -304,17 +327,6 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
             payload["caption"] = caption
         else:
             payload["text"] = caption
-    jump_buttons: list[dict] = []
-    for label, raw in (
-        ("频道", runtime_config.get(db, "tg_channel_link")),
-        ("群聊", runtime_config.get(db, "tg_group_link")),
-        ("投稿·求片", runtime_config.get(db, "tg_bot_link")),
-    ):
-        link = bot_listener._normalize_tme_link(raw)
-        if link:
-            jump_buttons.append({"text": label, "url": link})
-    if jump_buttons:
-        keyboard_rows.append(jump_buttons)  # 三个按钮放进同一个 row = 并排一行，不换行
     if keyboard_rows:
         payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
     retry_after = None
@@ -387,6 +399,23 @@ async def process_queue(limit: int = 20) -> dict:
                 or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
             ).order_by(QueueItem.id).limit(limit)
         ).all())
+        # v0.9.11.1：一次性预构建「本轮涉及频道」的 sent 作品键映射，消除原逐条
+        # O(N·M) 全表反查（每条 pending 都按 channel_id 扫全部 sent，再逐条
+        # db.get(Resource) + 算键）。作品键 _work_group_key 只依赖 share_dir_id /
+        # tmdb_id / id，这三项在识别阶段固定、发送阶段（ensure_share 只写 share_url）
+        # 不再变化，可安全缓存。本轮新 sent 的项在发送成功后即时写回映射，保持
+        # 「同一轮内后续同作品单集能看到前面已发送项」的原语义，避免重复推送回归。
+        involved_channels = {q.channel_id for q in rows}
+        sent_keys_by_channel: dict[int, dict[str, int]] = {}
+        if involved_channels:
+            for sid, sch, srid in db.execute(
+                select(QueueItem.id, QueueItem.channel_id, QueueItem.resource_id).where(
+                    QueueItem.status == "sent",
+                    QueueItem.channel_id.in_(involved_channels))
+            ).all():
+                sres = db.get(Resource, srid)
+                if sres:
+                    sent_keys_by_channel.setdefault(int(sch), {})[_work_group_key(sres)] = int(sid)
         for idx, q in enumerate(rows):
             # v0.9.10：进入每条前先落盘上一条的写——绝不让未提交写事务跨下面的
             # asyncio.sleep / ensure_share(光鸭网络) / _send_telegram(TG 网络) await。
@@ -406,18 +435,9 @@ async def process_queue(limit: int = 20) -> dict:
                 continue
             # v0.6.5 兜底：同一作品同一频道只要已有 sent 项（整剧已推过），
             # 其余同作品残留项一律跳过，绝不逐集再推。即便旧队列/手动入队漏收敛也拦得住。
+            # v0.9.11.1：命中从预构建映射取（含本轮刚写回的项），不再逐条扫库。
             wkey = _work_group_key(res)
-            dup_sent = None
-            for other_id, other_rid in db.execute(
-                select(QueueItem.id, QueueItem.resource_id).where(
-                    QueueItem.channel_id == q.channel_id,
-                    QueueItem.status == "sent",
-                    QueueItem.id != q.id)
-            ).all():
-                other_res = db.get(Resource, other_rid)
-                if other_res and _work_group_key(other_res) == wkey:
-                    dup_sent = other_id
-                    break
+            dup_sent = sent_keys_by_channel.get(q.channel_id, {}).get(wkey)
             if dup_sent:
                 q.status = "sent"
                 q.error = f"同作品已由队列项 #{dup_sent} 整剧推送，本单集跳过（去重）"
@@ -469,6 +489,9 @@ async def process_queue(limit: int = 20) -> dict:
                 q.status = "sent"
                 q.telegram_message_id = message_id
                 q.sent_at = utcnow()
+                # v0.9.11.1：写回映射——本轮后续同作品单集要能看到这条刚发的 sent，
+                # 与旧逻辑「每条实时查库」语义一致，否则同剧多集会在同一轮重复推送。
+                sent_keys_by_channel.setdefault(q.channel_id, {}).setdefault(wkey, int(q.id))
                 # 分享失败但消息送达：保留分享诊断（带前缀），便于前端查「为何没链接」
                 q.error = (f"[已送达·无资源链接] {share_error}" if share_error else "")
                 q.next_retry_at = None

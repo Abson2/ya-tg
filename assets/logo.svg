@@ -1,0 +1,28 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Ya-TG 项目图标：光鸭品牌基因（橙色圆角方块 + 渐变）+ 纸飞机（Telegram 推送）+ 播放三角（影视） -->
+  <defs>
+    <linearGradient id="bg" x1="32" y1="16" x2="224" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF8A1F"/>
+      <stop offset="0.55" stop-color="#FF6800"/>
+      <stop offset="1" stop-color="#F24E00"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="40" y1="24" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD24A" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#FFC30E" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方块底：沿用光鸭 logo 的圆角矩形轮廓与橙色主色 -->
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#sheen)"/>
+
+  <!-- 纸飞机主体（Telegram）：白色折纸飞机，朝右上飞出，象征推送分发 -->
+  <path d="M52 120.5 L205 60 C211 57.6 216.4 63 214 69 L166.5 196 C164.4 201.4 157.6 201.9 155 196.8 L128 152 L92.6 142.3 C86.2 140.6 86 132.4 92.2 130.2 L52 120.5 Z"
+        fill="#FFFFFF"/>
+  <!-- 纸飞机折痕（灰白，体现折纸层次） -->
+  <path d="M128 152 L214 69 L166.5 196 C164.4 201.4 157.6 201.9 155 196.8 L128 152 Z" fill="#F2F5FA"/>
+  <path d="M92.6 142.3 L128 152 L155 196.8" stroke="#FFB23E" stroke-width="3" stroke-linejoin="round" fill="none"/>
+
+  <!-- 播放三角（影视）：机身内嵌橙色播放键，点明"影视推送"定位 -->
+  <path d="M120 104 L120 148 L156 126 Z" fill="#FF6800"/>
+</svg>

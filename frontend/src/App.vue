@@ -1329,7 +1329,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.11 · Asia/Shanghai</div>
+        <div class="foot-version">
+          <span>v0.9.12 · Asia/Shanghai</span>
+          <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
+        </div>
       </div>
     </aside>
 
@@ -1814,15 +1817,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
             <!-- v0.9.6.1：打赏模块归入内置指令速查（/reward 内置指令） -->
             <div class="panel narrow" style="margin-top:14px">
-              <div class="panel-head"><h3 style="font-size:14px">打赏（内置指令 /reward）</h3><span>收款码与按钮文案；与上方 Bot / 白名单 / 使用限制共用顶部统一保存按钮</span><el-switch v-model="interactionCfg.donation_enabled" style="margin-left:auto"/></div>
+              <div class="panel-head"><h3 style="font-size:14px">打赏（内置指令 /reward）</h3><span>用户点「打赏」后 Bot 直接把这张图片发给他；与上方配置共用顶部统一保存按钮</span><el-switch v-model="interactionCfg.donation_enabled" style="margin-left:auto"/></div>
               <div class="form-grid">
-                <div class="field"><label>打赏二维码 / 图片地址</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://..."/></div>
+                <div class="field"><label>赞赏码图片地址（直接发给用户）</label><el-input v-model="interactionCfg.donation_image_url" placeholder="https://.../reward.png"/></div>
                 <div class="field"><label>打赏按钮文字</label><el-input v-model="interactionCfg.donation_button_text" placeholder="打赏支持"/></div>
               </div>
-              <div class="field"><label>打赏说明</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2"/></div>
-              <div class="field"><label>赞赏码（图片 URL 或文字说明）</label><el-input v-model="rewardCfg.code" placeholder="如 https://.../reward.png 或文字说明"/></div>
-              <p class="hint">赞赏码可插入模板的 <code>reward_code</code> 变量；关闭开关后 /reward 不再展示打赏入口。也可点下方按钮单独保存打赏。</p>
-              <div class="panel-foot"><el-button size="small" type="primary" plain :loading="rewardSaving" @click="saveReward">单独保存打赏</el-button></div>
+              <div class="field"><label>打赏说明（随图片一起发送）</label><el-input v-model="interactionCfg.donation_text" type="textarea" :rows="2" placeholder="感谢支持！"/></div>
+              <p class="hint">只需填上面一个图片地址：用户点「打赏」时 Bot 直接发送该图片，不再显示网址文字。关闭开关后打赏入口不启用。</p>
             </div>
           </div>
 
@@ -2320,6 +2321,9 @@ button{font-family:inherit}
 .nav-badge{margin-left:auto;background:var(--yg-rose);color:#fff;border-radius:9px;padding:1px 7px;font-size:10px;font-weight:700}
 .sidebar-foot{padding:16px 20px;border-top:1px solid rgba(255,255,255,.09);font-size:11px;color:#98a1ce}
 .foot-status{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.foot-version{display:flex;align-items:center;gap:10px}
+.foot-gh{color:#8a9cff;text-decoration:none;font-weight:600;border-bottom:1px dashed rgba(138,156,255,.5)}
+.foot-gh:hover{color:#b9c4ff;border-bottom-style:solid}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}.dot.on{background:#39d4b0;box-shadow:0 0 0 4px rgba(57,212,176,.14)}.dot.off{background:#f0a33c;box-shadow:0 0 0 4px rgba(240,163,60,.14)}
 .main-wrap{flex:1;min-width:0}
 .topbar{height:66px;background:rgba(255,255,255,.88);backdrop-filter:blur(10px);border-bottom:1px solid var(--yg-line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0;z-index:20}

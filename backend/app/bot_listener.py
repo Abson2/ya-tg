@@ -17,11 +17,11 @@ import re
 import time
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto, tmdb
-from .models import Bot, Channel, MediaRequest, Resource, UserContribution, utcnow
+from .models import Bot, Channel, MediaRequest, QueueItem, Resource, UserContribution, utcnow
 from .security import decrypt_secret
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
@@ -36,10 +36,11 @@ HELP = ("Ya-TG 指令说明\n\n"
         "/求片 剧名 TMDB_ID 季    — 精确提交，跳过候选\n"
         "/投稿 剧名               — 选 TMDB 候选后补光鸭链接\n"
         "/投稿 标题 分享链接      — 一步提交投稿\n"
-        "/搜索 关键词             — 搜索资源库中的影视\n"
-        "/打赏                    — 查看打赏方式\n"
+        "/搜索 关键词             — 转发已推送、仍在库的资源卡片给你\n"
+        "/打赏                    — 直接收赞赏码图片\n"
         "/help                    — 查看本说明\n\n"
-        "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏。\n"
+        "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏，\n"
+        "点后再直接输入文字即可（不必加 /），回复「结束」退出交互。\n"
         "其它指令以管理员在后台配置的为准。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
@@ -371,6 +372,40 @@ async def _reply(db: Session, token: str, chat_id: str, text: str,
         pass  # 回复失败不影响主链路与 offset 推进
 
 
+async def _send_photo(db: Session, token: str, chat_id: str, photo: str,
+                      caption: str = "") -> None:
+    """v0.9.12：给用户发一张图片（打赏码 / 资源海报），失败静默不影响 offset。"""
+    if not photo:
+        await _reply(db, token, chat_id, caption)
+        return
+    payload = {"chat_id": str(chat_id), "photo": photo}
+    if caption:
+        payload["caption"] = caption[:1000]
+    try:
+        await _api(db, token, "sendPhoto", payload)
+    except Exception:
+        # 图片发送失败降级为纯文字，至少把说明送到
+        await _reply(db, token, chat_id, caption or "图片发送失败，请稍后重试。")
+
+
+async def _send_search_cards(db: Session, token: str, chat_id: str,
+                             resource_ids: list[int]) -> None:
+    """v0.9.12：把已推送过的资源卡片逐个发给发起搜索的用户（私聊）。
+
+    卡片正文复用 publisher 的统一渲染（海报 + 简介 + 分享），保证与频道推送的
+    消息一致；这是「转发已推送卡片」的实现——不重建分享、不改队列、不私聊刷屏
+    （只在用户主动搜索时回他自己的 chat）。
+    """
+    from . import publisher  # 延迟 import，避免 publisher → bot_listener 循环依赖
+    for rid in resource_ids:
+        res = db.get(Resource, rid)
+        if not res or not (res.share_url or "").strip():
+            continue
+        caption, _ = publisher._build_message(db, res, res.share_url)
+        poster = tmdb.poster_url(res.poster_path) if res.poster_path else ""
+        await _send_photo(db, token, chat_id, poster, caption)
+
+
 async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[bool, str]:
     """使用限制（v0.9.5 独立功能）：用户须关注指定频道 / 加入指定群聊之一。
 
@@ -436,6 +471,7 @@ _PICK_TTL = 600  # 10 分钟未选完则丢弃
 CB_PICK = "pk"
 FLOW_WANT = "want"
 FLOW_CONTRIB = "contribute"
+FLOW_SEARCH = "search"   # v0.9.12：搜索也走会话态，与求片/投稿一致
 
 # ---------- v0.9.9 #209：点 Reply 键盘进入会话态，后续直接输入文字即可 ----------
 # 与候选会话 _pick_sessions 分开：这里只记录「用户当前处于求片/投稿模式」，
@@ -601,11 +637,9 @@ def _chat_ref(raw: str) -> tuple[str, str]:
 def _donate_text(db: Session) -> str:
     if (runtime_config.get(db, "donation_enabled") or "").lower() != "true":
         return "暂未开启打赏，感谢支持。"
-    parts = [runtime_config.get(db, "donation_text") or "感谢支持！"]
-    img = runtime_config.get(db, "donation_image_url") or ""
-    if img:
-        parts.append(f"打赏码：{img}")
-    return "\n".join(parts)
+    # v0.9.12：打赏图片由 poll_once / callback 用 sendPhoto 直接发，这里只回说明文字，
+    # 不再把图片网址当纯文本塞给用户。
+    return runtime_config.get(db, "donation_text") or "感谢支持！"
 
 
 def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
@@ -641,7 +675,8 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
                 "也可一步提交：/投稿 标题 分享链接\n"
                 "也可直接把分享链接发给我，我会自动为你登记，感谢支持！", back_keyboard())
     if data == CB_SEARCH:
-        return "🔍 搜索用法：\n/搜索 关键词\n例：/搜索 保镖恋人", back_keyboard()
+        return ("🔍 搜索：直接输入剧名 / 关键词，我会把你之前推送过、仍在库的"
+                "资源卡片转发给你。\n也可发 /搜索 关键词。", back_keyboard())
     if data == CB_DONATE:
         return _donate_text(db), back_keyboard()
     return "未知操作，请重试。", main_keyboard()
@@ -772,6 +807,15 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
         return await _handle_pick(db, token, data, uid=user_id,
                                   chat_id=chat_id, message_id=message_id,
                                   tg_username=str(user.get("username") or ""))
+    # v0.9.12：点「搜索资源」inline 按钮也进入会话态，后续直接输关键词即可
+    if data == CB_SEARCH:
+        _flow_set(user_id, FLOW_SEARCH)
+    # v0.9.12：点「打赏支持」inline 按钮——编辑菜单为说明，再直接发打赏码图片
+    if data == CB_DONATE and (runtime_config.get(db, "donation_enabled") or "").lower() == "true":
+        img = runtime_config.get(db, "donation_image_url") or ""
+        if img:
+            await _send_photo(db, token, chat_id, img,
+                              runtime_config.get(db, "donation_text") or "感谢支持！")
     text, keyboard = _menu_text(db, data)
     payload = {"chat_id": chat_id, "message_id": message_id,
                "text": text[:4000], "disable_web_page_preview": True}
@@ -809,19 +853,40 @@ def _custom_command(db: Session, low: str):
     return None
 
 
-async def _do_search(db: Session, keyword: str) -> str:
+async def _do_search(db: Session, keyword: str) -> tuple[str, list[int]]:
+    """搜索已推送且仍在库的资源，返回 (提示文本, 命中资源 id 列表)。
+
+    v0.9.12：搜索不再只列文件名，而是返回「之前推送过、仍在库」的资源，
+    由 poll_once 把这些资源卡片转发给发起搜索的用户。
+    """
     kw = (keyword or "").strip()
     if not kw:
-        return "用法：/搜索 关键词\n例：/搜索 保镖恋人"
-    rows = list(db.scalars(select(Resource).where(
-        Resource.name.like(f"%{kw}%")).order_by(Resource.id.desc()).limit(10)).all())
-    if not rows:
-        return f"资源库中没有匹配「{kw}」的影视。"
-    lines = [f"搜索「{kw}」："]
+        return "请直接输入剧名 / 关键词搜索。", []
+    # 只取已成功推送（QueueItem.sent）且仍有分享链接的资源，按作品去重、
+    # 优先最近推送；用「作品键」收敛同一部剧的多个单集为一部。
+    rows = list(db.scalars(select(Resource).join(
+        QueueItem, QueueItem.resource_id == Resource.id).where(
+        QueueItem.status == "sent",
+        Resource.share_url != "",
+        or_(Resource.media_title.like(f"%{kw}%"),
+            Resource.name.like(f"%{kw}%"),
+            Resource.path_hint.like(f"%{kw}%")),
+    ).order_by(QueueItem.id.desc())).all())
+    # 去重：同一作品只保留一条（按 share_dir_id 或 tmdb_id+type 或文件 id）
+    seen: set[str] = set()
+    picked: list[Resource] = []
     for r in rows:
-        label = r.media_title or r.name
-        lines.append(f"· {label}（{r.media_type or '未知'}）")
-    return "\n".join(lines)
+        key = (str(getattr(r, "share_dir_id", "") or "")
+               or (f"tmdb:{r.media_type}:{r.tmdb_id}" if r.tmdb_id else f"file:{r.id}"))
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(r)
+        if len(picked) >= 5:
+            break
+    if not picked:
+        return f"没有找到已推送、仍在库且匹配「{kw}」的资源。", []
+    return f"找到 {len(picked)} 部与「{kw}」相关的资源，正在转发给你：", [int(r.id) for r in picked]
 
 
 async def search_candidates(db: Session, query: str, media_type: str = "") -> list[dict]:
@@ -920,8 +985,9 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     # v0.9.9 #209：会话态下，用户直接输入的文字（不含命令）当作当前 flow 的输入。
     # 这样点「求片」后发「凡人修仙传」= 求片剧名，点「投稿」后发剧名 = 投稿候选。
     active_flow = _flow_get(tg_user_id)
+    _flow_to_builtin = {FLOW_WANT: "求片", FLOW_CONTRIB: "投稿", FLOW_SEARCH: "搜索"}
     if active_flow and not builtin and not custom and not low.startswith("/"):
-        builtin = "求片" if active_flow == FLOW_WANT else "投稿"
+        builtin = _flow_to_builtin.get(active_flow, "求片")
         arg = raw
         low = builtin
 
@@ -930,30 +996,38 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
 
     # v0.9.9 #209：裸命令（点 Reply 键盘触发，无参数）→ 进入会话态，提示直接输入文字。
     # 不再回「用法：/求片 …」逼用户加命令，也不再让投稿落「未命名投稿」。
-    if builtin in ("求片", "投稿") and not arg:
+    if builtin in ("求片", "投稿", "搜索") and not arg:
         if builtin == "求片":
             _flow_set(tg_user_id, FLOW_WANT)
             return "flow_want", ("已进入求片模式。请直接输入剧名，我会列出 TMDB 候选让你点选。\n"
                                  "随时回复「结束」或点下方按钮退出。")
+        if builtin == "搜索":
+            _flow_set(tg_user_id, FLOW_SEARCH)
+            return "flow_search", ("已进入搜索模式。请直接输入剧名 / 关键词，我会把你之前"
+                                   "推送过、仍在库的资源卡片转发给你。\n随时回复「结束」退出。")
         _flow_set(tg_user_id, FLOW_CONTRIB)
         return "flow_contribute", ("已进入投稿模式。请直接输入剧名（我会列 TMDB 候选），"
                                    "或直接粘贴光鸭分享链接。\n随时回复「结束」或点下方按钮退出。")
 
     # 用户带了内容 → 该轮交互完成，退出文字会话态（后续走正常候选/落库流程）
-    if builtin in ("求片", "投稿") and active_flow:
+    if builtin in ("求片", "投稿", "搜索") and active_flow:
         _flow_clear(tg_user_id)
+
+    if builtin == "搜索":
+        text, ids = await _do_search(db, arg)
+        # v0.9.12：把命中资源 id 随 action 交给 poll_once 发卡片（避免此处无 token/chat_id）
+        return ("search_cards:" + ",".join(str(i) for i in ids)), text
 
     if builtin == "打赏" or (custom and str(custom.get("command") or "").lower() in ("donate", "打赏")):
         if (runtime_config.get(db, "donation_enabled") or "").lower() != "true":
             return "donate", "暂未开启打赏，感谢支持。"
-        parts = [runtime_config.get(db, "donation_text") or "感谢支持！"]
+        text = runtime_config.get(db, "donation_text") or "感谢支持！"
         img = runtime_config.get(db, "donation_image_url") or ""
         if img:
-            parts.append(f"打赏码：{img}")
-        return "donate", "\n".join(parts)
-
-    if builtin == "搜索":
-        return "search", await _do_search(db, arg)
+            # v0.9.12：直接把打赏图片发给用户，而不是把图片网址当文字输出。
+            # action 携带图片 URL，poll_once 用 sendPhoto 发送。
+            return "donate_photo:" + img, text
+        return "donate", text
 
     if builtin == "求片":
         if not arg:
@@ -1124,11 +1198,22 @@ async def poll_once(db: Session) -> dict:
                 tg_username=str(user.get("username") or ""))
             if action != "ignored":
                 stats["handled"] += 1
-                stats["actions"].append(action)
+                # 归一化带载荷的 action，避免把图片 URL / id 串写进统计
+                stats["actions"].append(action.split(":", 1)[0] if ":" in action else action)
             if reply and chat_id:
+                # v0.9.12：搜索——先回提示，再把已推送过的资源卡片逐个转发给用户
+                if action.startswith("search_cards:"):
+                    await _reply(db, token, chat_id, reply,
+                                 reply_markup=end_flow_keyboard() if _flow_get(user_id) else None)
+                    ids = [int(x) for x in action.split(":", 1)[1].split(",") if x.isdigit()]
+                    await _send_search_cards(db, token, chat_id, ids)
+                # v0.9.12：打赏——直接把打赏码图片发给用户，caption 是说明文字
+                elif action.startswith("donate_photo:"):
+                    await _send_photo(db, token, chat_id,
+                                      action.split(":", 1)[1], reply)
                 # /start、/help 附带 Telegram 私聊 Reply 键盘（输入框上方菜单）。
                 # 不调用 setMyCommands，不改 Telegram 底部指令栏；只回来源 chat。
-                if action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
+                elif action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
                     await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
                 elif action in ("want_pick", "contribute_pick"):
                     # v0.9.8：TMDB 候选列表附 inline 选择键盘
@@ -1138,7 +1223,7 @@ async def poll_once(db: Session) -> dict:
                 elif action == "flow_end":
                     # v0.9.9 #209：退出文字会话，回主 Reply 键盘
                     await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
-                elif action in ("flow_want", "flow_contribute", "contribute_await_url"):
+                elif action in ("flow_want", "flow_contribute", "flow_search", "contribute_await_url"):
                     # v0.9.9 #209：刚进入会话 / 等光鸭链接，附 inline「结束交互」按钮
                     await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
                 elif _flow_get(user_id) or _pick_get(user_id):

@@ -88,12 +88,14 @@ def _upsert_resource(db: Session, item: dict, parent: str,
         ctime=int(item.get("ctime", 0) or 0),
         utime=utime,
         thumbnail=item.get("thumbnail") or "",
-        scanned_at=utcnow(),
+        # v0.9.11.1：scanned_at 从 values 移出——它全项目只写不读，若每轮无条件
+        # utcnow() 会让全部行标记 dirty，稳定态每轮产生 N 条 UPDATE（真机两天 106
+        # 批 × 32 文件≈3400 次无效写、WAL 膨胀）。改为仅新建或指纹变化时写。
     )
     created = row is None
     change = None
     if created:
-        row = Resource(file_id=fid, **values)
+        row = Resource(file_id=fid, scanned_at=utcnow(), **values)
         db.add(row)
     else:
         old_fp = f"{int(row.size or 0)}:{int(row.utime or 0)}"
@@ -101,6 +103,7 @@ def _upsert_resource(db: Session, item: dict, parent: str,
         for k, v in values.items():
             setattr(row, k, v)
         if old_fp != new_fp:
+            row.scanned_at = utcnow()
             row.revision += 1
             db.add(AuditLog(action="resource_updated", target_type="resource", target_id=str(row.id),
                             detail=json_dumps({"file_id": fid, "utime": utime, "size": size})))

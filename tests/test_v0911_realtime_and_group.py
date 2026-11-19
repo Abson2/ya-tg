@@ -9,7 +9,8 @@
   5. 白名单 deny 队列永久卡死 —— next_retry_at=None + status 仍 pending，每轮取出每轮 deny。
      改为计退避重试。
   6. sendPhoto 的 HTTP 200 + ok=false 不走回退 —— 补条件。
-  7. 三个跳转按钮并排同一行、简介压到 70 字。
+  7. 三个跳转标签（频道/群聊/投稿·求片）v0.9.11 曾做成 inline 并排按钮，
+     v0.9.10.1 起改回正文标签式超链接；简介压到 70 字。
 """
 import asyncio
 import json

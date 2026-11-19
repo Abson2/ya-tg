@@ -154,8 +154,8 @@ def test_route_channel_bot_id_synced_on_bot_change(db):
     assert ch.bot_id == new.id, "路由 Channel 的 bot_id 必须同步到新全局 Bot"
 
 
-# ---------- v0.9.10.2：正文不再追加跳转文字；三个跳转做成 inline 按钮同一行 ----------
-def test_build_message_no_jump_links_in_body(db):
+# ---------- v0.9.10.1：正文三个标签式超链接；inline 按钮只保留「获取资源」 ----------
+def test_build_message_has_jump_tag_links_in_body(db):
     _, _, r, _ = _seed(db)
     runtime_config.set_many(db, {
         "tg_channel_link": "@official",
@@ -163,13 +163,16 @@ def test_build_message_no_jump_links_in_body(db):
         "tg_bot_link": "@push_bot",
     })
     text, _ = publisher._build_message(db, r, "https://share/x")
-    # v0.9.10.2 改版：三个入口是 inline 按钮，正文不再塞文字链接
-    assert "href=" not in text
+    # 三个入口改为正文 <a href> 标签式超链接，同一行用 · 分隔
+    assert '<a href="https://t.me/official">频道</a>' in text
+    assert '<a href="https://t.me/chatgroup">群聊</a>' in text
+    assert '<a href="https://t.me/push_bot">投稿·求片</a>' in text
+    assert " · " in text
+    # 旧 inline 按钮文案不再出现在正文
     assert "📢 官方频道" not in text and "🤖 机器人" not in text
-    assert "🔍 投稿/搜索" not in text
 
 
-def test_inline_keyboard_three_jump_buttons_same_row(db):
+def test_inline_keyboard_only_resource_button(db):
     b, c, r, q = _seed(db)
     runtime_config.set_many(db, {"tg_link_style": "button", "tg_channel_link": "@official",
                                  "tg_group_link": "@grp", "tg_bot_link": "@bot"})
@@ -182,17 +185,16 @@ def test_inline_keyboard_three_jump_buttons_same_row(db):
     with patch("httpx.AsyncClient.post", new=fake_post):
         asyncio.run(publisher._send_telegram(db, q, r, c, b))
     kb = captured["payload"]["reply_markup"]["inline_keyboard"]
-    # 第一行：获取资源（单独一行）；第二行：频道/群聊/投稿·求片三个并排同一行
-    assert len(kb) == 2
+    # inline 键盘只剩一行「获取资源」，三个跳转不再占按钮位
+    assert len(kb) == 1
     assert kb[0][0]["text"] == "📥 获取资源"
-    jump_row = kb[1]
-    assert [x["text"] for x in jump_row] == ["频道", "群聊", "投稿·求片"]
-    assert jump_row[0]["url"] == "https://t.me/official"
-    assert jump_row[1]["url"] == "https://t.me/grp"
-    assert jump_row[2]["url"] == "https://t.me/bot"
+    # 三个跳转以正文标签形式出现，不在 reply_markup 里
+    assert all("频道" not in btn["text"] and "群聊" not in btn["text"]
+               and "投稿" not in btn["text"] for row in kb for btn in row)
+    assert '<a href="https://t.me/official">频道</a>' in captured["payload"]["caption"]
 
 
-def test_inline_keyboard_skips_empty_jump_link(db):
+def test_jump_tag_links_skip_empty_link(db):
     b, c, r, q = _seed(db)
     runtime_config.set_many(db, {"tg_link_style": "button", "tg_channel_link": "@official",
                                  "tg_group_link": "", "tg_bot_link": ""})
@@ -204,6 +206,9 @@ def test_inline_keyboard_skips_empty_jump_link(db):
 
     with patch("httpx.AsyncClient.post", new=fake_post):
         asyncio.run(publisher._send_telegram(db, q, r, c, b))
+    caption = captured["payload"].get("caption") or captured["payload"].get("text")
+    # 只出现配了的频道标签，留空的两项不生成
+    assert '<a href="https://t.me/official">频道</a>' in caption
+    assert ">群聊</a>" not in caption and ">投稿·求片</a>" not in caption
     kb = captured["payload"]["reply_markup"]["inline_keyboard"]
-    assert len(kb) == 2
-    assert [x["text"] for x in kb[1]] == ["频道"]
+    assert len(kb) == 1 and kb[0][0]["text"] == "📥 获取资源"
