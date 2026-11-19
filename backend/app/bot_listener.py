@@ -35,6 +35,7 @@ HELP = ("Ya-TG 指令说明\n\n"
         "/搜索 关键词               — 搜索资源库中的影视\n"
         "/打赏                     — 查看打赏方式\n"
         "/help                     — 查看本说明\n\n"
+        "也可用下方按钮直达频道、群组、投稿求片与搜索。\n"
         "其它指令以管理员在后台配置的为准。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
@@ -71,8 +72,29 @@ def push_whitelist(db: Session) -> tuple[list[str], list[str]]:
             [str(x).strip() for x in _json_list("bot_push_groups_json", db) if str(x).strip()])
 
 
+def gate_mode(db: Session) -> str:
+    """v0.9.2：使用限制与推送白名单二选一。
+
+    whitelist（默认）= 只按白名单过滤推送目标，用户使用指令不受关注/加群限制；
+    membership = 只校验用户关注频道/加入群聊，推送不按白名单过滤；
+    off = 两者都不启用。
+    空值兼容旧配置：bot_restrict_enabled=true → membership，否则 whitelist。
+    """
+    mode = (runtime_config.get(db, "bot_gate_mode") or "").strip()
+    if mode in ("whitelist", "membership", "off"):
+        return mode
+    if (runtime_config.get(db, "bot_restrict_enabled") or "").lower() == "true":
+        return "membership"
+    return "whitelist"
+
+
 def is_push_allowed(db: Session, chat_id: str) -> tuple[bool, str]:
-    """推送白名单闸门：白名单为空时保持兼容不拦截；非空时只放行列出的 chat。"""
+    """推送白名单闸门：仅 whitelist 模式生效；其余模式不拦截。
+
+    白名单为空时保持兼容不拦截；非空时只放行列出的 chat。
+    """
+    if gate_mode(db) != "whitelist":
+        return True, ""
     channels, groups = push_whitelist(db)
     allowed = set(channels) | set(groups)
     if not allowed:
@@ -95,23 +117,30 @@ async def _api(db: Session, token: str, method: str, payload: dict) -> dict:
     return data if isinstance(data, dict) else {"ok": False}
 
 
-async def _reply(db: Session, token: str, chat_id: str, text: str) -> None:
+async def _reply(db: Session, token: str, chat_id: str, text: str,
+                 reply_markup: dict | None = None) -> None:
     """只回复指令来源的 chat（频道 / 群聊 / 私聊由 poll_once 决定），不主动私推用户。"""
+    payload = {"chat_id": str(chat_id), "text": text[:4000],
+               "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        await _api(db, token, "sendMessage",
-                   {"chat_id": str(chat_id), "text": text[:4000],
-                    "disable_web_page_preview": True})
+        await _api(db, token, "sendMessage", payload)
     except Exception:
         pass  # 回复失败不影响主链路与 offset 推进
 
 
 async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[bool, str]:
-    """使用限制：用户必须关注指定频道 / 加入指定群聊。结果按配置秒数缓存。"""
-    if (runtime_config.get(db, "bot_restrict_enabled") or "").lower() != "true":
+    """使用限制：仅 membership 模式生效，用户需关注指定频道 / 加入指定群聊。
+
+    v0.9.2：只校验管理员实际填写的项目（频道、群聊不必两类都配）；
+    与「推送白名单」二选一——由 gate_mode 决定本机制是否生效。结果按秒数缓存。
+    """
+    if gate_mode(db) != "membership":
         return True, ""
-    channels, groups = push_whitelist(db)
-    required = ([str(x).strip() for x in _json_list("bot_required_channels_json", db) if str(x).strip()]
-                + [str(x).strip() for x in _json_list("bot_required_groups_json", db) if str(x).strip()])
+    req_channels = [str(x).strip() for x in _json_list("bot_required_channels_json", db) if str(x).strip()]
+    req_groups = [str(x).strip() for x in _json_list("bot_required_groups_json", db) if str(x).strip()]
+    required = req_channels + req_groups
     if not required:
         return True, ""
     uid = str(tg_user_id or "")
@@ -140,6 +169,149 @@ async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[b
             return False, reason
     _restrict_cache[uid] = (now, True, "")
     return True, ""
+
+
+# ---------- v0.9.2：Bot 真交互菜单（inline keyboard + callback 路由） ----------
+# callback_data 全部用英文短码，控制在 64 字节内（Telegram 硬限制）。
+CB_HOME = "m.home"
+CB_CHANNELS = "m.ch"
+CB_GROUPS = "m.grp"
+CB_ACTIONS = "m.act"
+CB_WANT = "m.want"
+CB_CONTRIB = "m.contrib"
+CB_SEARCH = "m.search"
+CB_DONATE = "m.donate"
+async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
+    """v0.9.2：审核投稿 / 求片后主动回复用户一次（非刷屏，属事务性通知）。
+
+    交互 Bot Token 由管理页配置；失败只返回 False，不影响审核主链路。
+    """
+    token = runtime_config.get(db, "contribution_bot_token") or ""
+    if not token or not tg_user_id or not text:
+        return False
+    try:
+        await _api(db, token, "sendMessage",
+                   {"chat_id": str(tg_user_id), "text": text[:4000],
+                    "disable_web_page_preview": True})
+        return True
+    except Exception:
+        return False
+
+
+def main_keyboard() -> dict:
+    """两列主菜单：频道 / 群组 / 投稿求片 / 搜索 / 打赏。"""
+    return {"inline_keyboard": [
+        [{"text": "📺 官方频道", "callback_data": CB_CHANNELS},
+         {"text": "👥 交流群组", "callback_data": CB_GROUPS}],
+        [{"text": "📤 投稿 / 求片", "callback_data": CB_ACTIONS},
+         {"text": "🔍 搜索资源", "callback_data": CB_SEARCH}],
+        [{"text": "💝 打赏支持", "callback_data": CB_DONATE}],
+    ]}
+
+
+def actions_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "🎬 我要求片", "callback_data": CB_WANT},
+         {"text": "📤 我要投稿", "callback_data": CB_CONTRIB}],
+        [{"text": "« 返回主菜单", "callback_data": CB_HOME}],
+    ]}
+
+
+def back_keyboard() -> dict:
+    return {"inline_keyboard": [[{"text": "« 返回主菜单", "callback_data": CB_HOME}]]}
+
+
+def _chat_ref(raw: str) -> tuple[str, str]:
+    """把一个 chat 引用转成 (显示名, t.me 链接或空)。兼容 @用户名 / 数字 ID。"""
+    s = str(raw or "").strip()
+    if not s:
+        return "", ""
+    if s.startswith("@"):
+        uname = s.lstrip("@")
+        return s, f"https://t.me/{uname}"
+    # 数字频道/群 ID（-100...）无法生成可直接加入的 t.me 链接，展示为可复制文本
+    return s, ""
+
+
+def _donate_text(db: Session) -> str:
+    if (runtime_config.get(db, "donation_enabled") or "").lower() != "true":
+        return "暂未开启打赏，感谢支持。"
+    parts = [runtime_config.get(db, "donation_text") or "感谢支持！"]
+    img = runtime_config.get(db, "donation_image_url") or ""
+    if img:
+        parts.append(f"打赏码：{img}")
+    return "\n".join(parts)
+
+
+def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
+    """根据 callback_data 生成菜单回复文本与键盘。"""
+    if data == CB_HOME:
+        return ("请选择功能：\n\n求片/投稿/搜索用下方按钮；"
+                "也可直接发送 /求片 剧名、/投稿 标题 链接、/搜索 关键词。", main_keyboard())
+    if data == CB_ACTIONS:
+        return "求片：提交想看的影视，自动加入关键词监控。\n投稿：登记你的资源分享链接，等待管理员审核。", actions_keyboard()
+    if data == CB_CHANNELS:
+        channels, _ = push_whitelist(db)
+        if not channels:
+            return "管理员尚未配置官方频道。", back_keyboard()
+        lines = ["📺 官方频道（需管理员权限加入）："]
+        for c in channels:
+            name, link = _chat_ref(c)
+            lines.append(f"· {name}" + (f"  {link}" if link else ""))
+        return "\n".join(lines), back_keyboard()
+    if data == CB_GROUPS:
+        _, groups = push_whitelist(db)
+        if not groups:
+            return "管理员尚未配置交流群组。", back_keyboard()
+        lines = ["👥 交流群组（可直接加入）："]
+        for g in groups:
+            name, link = _chat_ref(g)
+            lines.append(f"· {name}" + (f"  {link}" if link else ""))
+        return "\n".join(lines), back_keyboard()
+    if data == CB_WANT:
+        return ("🎬 求片用法：\n/求片 剧名 [TMDB ID] [季]\n"
+                "例：/求片 伟大的长征 297253 1\n提交后自动加入关键词监控。", back_keyboard())
+    if data == CB_CONTRIB:
+        return ("📤 投稿用法：\n/投稿 标题 分享链接\n"
+                "也可直接把分享链接发给我，我会自动登记，管理员审核后处理。", back_keyboard())
+    if data == CB_SEARCH:
+        return "🔍 搜索用法：\n/搜索 关键词\n例：/搜索 保镖恋人", back_keyboard()
+    if data == CB_DONATE:
+        return _donate_text(db), back_keyboard()
+    return "未知操作，请重试。", main_keyboard()
+
+
+async def _handle_callback(db: Session, token: str, cb: dict) -> str:
+    """处理一个 callback_query：先 answer 消掉按钮 loading，再编辑原消息。"""
+    cb_id = str(cb.get("id") or "")
+    data = str(cb.get("data") or "")
+    msg = cb.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id") or "")
+    message_id = msg.get("message_id")
+    user = cb.get("from") or {}
+    user_id = str(user.get("id") or chat_id)
+    if cb_id:
+        await _api(db, token, "answerCallbackQuery", {"callback_query_id": cb_id})
+    ok, reason = await check_restriction(db, token, user_id)
+    if not ok:
+        await _api(db, token, "sendMessage",
+                   {"chat_id": chat_id, "text": reason[:4000]})
+        return "blocked"
+    text, keyboard = _menu_text(db, data)
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "text": text[:4000], "disable_web_page_preview": True}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    if message_id:
+        r = await _api(db, token, "editMessageText", payload)
+        if r.get("ok"):
+            return "menu"
+    # 编辑失败（消息太旧/未找到）则新发一条
+    payload.pop("message_id", None)
+    await _api(db, token, "sendMessage",
+               {"chat_id": chat_id, "text": text[:4000],
+                "reply_markup": keyboard or {}, "disable_web_page_preview": True})
+    return "menu"
 
 
 def _match_builtin(low: str) -> str:
@@ -268,7 +440,10 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
 
 
 async def poll_once(db: Session) -> dict:
-    """拉取一次 Bot 更新。返回统计；关闭或未配置时直接跳过，不产生网络请求。"""
+    """拉取一次 Bot 更新。返回统计；关闭或未配置时直接跳过，不产生网络请求。
+
+    v0.9.2：新增 callback_query（inline 菜单按钮点击路由）。
+    """
     if (runtime_config.get(db, "contribution_enabled") or "").lower() != "true":
         return {"enabled": False, "messages": 0}
     token = runtime_config.get(db, "contribution_bot_token") or ""
@@ -283,15 +458,28 @@ async def poll_once(db: Session) -> dict:
         async with httpx.AsyncClient(timeout=25) as client:
             r = await client.get(f"{base}/bot{token}/getUpdates",
                                  params={"offset": offset, "timeout": 2,
-                                         "allowed_updates": '["message"]'})
+                                         "allowed_updates": '["message","callback_query"]'})
         data = r.json()
     except Exception as exc:
         return {"enabled": True, "messages": 0, "error": str(exc)[:200]}
     updates = data.get("result") or [] if isinstance(data, dict) else []
-    stats = {"enabled": True, "messages": len(updates), "handled": 0, "blocked": 0, "actions": []}
+    stats = {"enabled": True, "messages": len(updates), "handled": 0,
+             "blocked": 0, "callbacks": 0, "actions": []}
     for upd in updates:
         uid = int(upd.get("update_id") or 0)
         offset = max(offset, uid + 1)
+        # v0.9.2：inline 菜单按钮点击
+        cb = upd.get("callback_query") or {}
+        if cb:
+            try:
+                out = await _handle_callback(db, token, cb)
+                if out == "blocked":
+                    stats["blocked"] += 1
+                else:
+                    stats["callbacks"] += 1
+            except Exception as exc:
+                stats.setdefault("errors", []).append(str(exc)[:120])
+            continue
         msg = upd.get("message") or upd.get("channel_post") or {}
         text = str(msg.get("text") or msg.get("caption") or "")
         chat = msg.get("chat") or {}
@@ -313,7 +501,11 @@ async def poll_once(db: Session) -> dict:
                 stats["handled"] += 1
                 stats["actions"].append(action)
             if reply and chat_id:
-                await _reply(db, token, chat_id, reply)
+                # /start、/help 附带 inline 主菜单，让用户真正看到可点的功能入口
+                if action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
+                    await _reply(db, token, chat_id, reply, reply_markup=main_keyboard())
+                else:
+                    await _reply(db, token, chat_id, reply)
         except Exception as exc:
             stats.setdefault("errors", []).append(str(exc)[:120])
     runtime_config.set_many(db, {"contribution_update_offset": str(offset)})

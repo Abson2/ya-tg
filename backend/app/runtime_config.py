@@ -76,6 +76,11 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "bot_restrict_cache_seconds": ("bot_restrict_cache_seconds", "120"),
     "bot_required_channels_json": ("bot_required_channels_json", "[]"),  # 必须关注频道
     "bot_required_groups_json": ("bot_required_groups_json", "[]"),      # 必须加入群聊
+    # v0.9.2：使用限制与推送白名单二选一。
+    # whitelist（默认）= 只按白名单过滤推送目标；
+    # membership = 只校验用户关注/加群，不按白名单过滤；
+    # off = 两者都不启用。空值时兼容旧 bot_restrict_enabled=true → membership。
+    "bot_gate_mode": ("bot_gate_mode", ""),
 }
 
 

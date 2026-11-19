@@ -16,7 +16,7 @@ const seriesGroups = ref([])   // v0.6.4：/api/library/series 聚合结果
 const overview = ref({}), task = ref({ cron: '*/30 * * * *', enabled: true })
 const resources = ref([]), bots = ref([]), channels = ref([]), rules = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
-const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref('')
+const auth = ref({}), shareStatus = ref({}), device = ref(null), pkceUrl = ref(''), webqr = ref(null)
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
 const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
@@ -52,7 +52,7 @@ const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 const scanning = ref(false), showScanPanel = ref(false)
 // v0.9.0：Bot 交互配置——内置四指令固定、自定义指令、推送白名单、使用限制
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', contribution_bot_token: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
-  bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [] })
+  bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist' })
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
 // v0.9.0：多行文本框 ↔ 数组 的双向映射，避免用户直接编辑数组
@@ -198,7 +198,7 @@ const channel = ref({ bot_id: null, name: '', chat_id: '' })
 const rule = ref({ name: '', directory_id: '', keyword: '', channel_id: null, auto_publish: true })
 const tpl = ref({ name: '', content: '', enabled: true, is_default: false })
 
-let pollTimer = null, clockTimer = null
+let pollTimer = null, clockTimer = null, webqrTimer = null
 
 const navGroups = [
   { label: '工作台', items: [{ key: '概览', icon: 'grid', label: '概览' }] },
@@ -592,6 +592,7 @@ async function saveInteraction() {
       donation_button_text: c.donation_button_text || '打赏支持',
       bot_push_channels: c.bot_push_channels || [], bot_push_groups: c.bot_push_groups || [],
       bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
+      bot_gate_mode: c.bot_gate_mode || 'whitelist',
       bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
       // 自定义指令不含内置四项，内置由后端固定注入
       bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
@@ -998,6 +999,30 @@ async function startPkce() {
   try { const d = await api('/auth/pkce/start'); pkceUrl.value = d.auth_url; window.open(d.auth_url, '_blank') }
   catch (e) { ElMessage.error(e.message) }
 }
+// v0.9.2：网页端扫码登录——光鸭 App 扫一扫，免开放平台应用凭证
+async function startWebqr() {
+  try {
+    webqr.value = await api('/auth/webqr/start', { method: 'POST' })
+    startWebqrPolling()
+    ElMessage.success('请用光鸭 App 扫一扫授权（二维码地址仅供 App 内打开）')
+  } catch (e) { ElMessage.error(e.message) }
+}
+function startWebqrPolling() {
+  clearInterval(webqrTimer)
+  const interval = Math.max(2, Number(webqr.value?.interval) || 2) * 1000
+  webqrTimer = setInterval(async () => {
+    try {
+      const d = await api('/auth/webqr/poll', { method: 'POST' })
+      if (d.status === 'authorized') { clearInterval(webqrTimer); webqr.value = null; ElMessage.success('扫码授权成功，凭证已加密保存'); await load() }
+      else if (d.status !== 'pending') clearInterval(webqrTimer)
+    } catch (e) { clearInterval(webqrTimer) }
+  }, interval)
+}
+function cancelWebqr() { clearInterval(webqrTimer); webqr.value = null }
+async function copyWebqrCode() {
+  try { await navigator.clipboard.writeText(webqr.value.user_code); ElMessage.success('授权码已复制') }
+  catch (e) { ElMessage.error('复制失败，请手动选择') }
+}
 async function refreshToken() {
   try { await api('/auth/refresh', { method: 'POST' }); ElMessage.success('Token 已刷新'); await loadAuth() }
   catch (e) { ElMessage.error(e.message) }
@@ -1098,7 +1123,7 @@ function tick() {
 }
 
 onMounted(() => { tick(); clockTimer = setInterval(tick, 1000); if (password.value) login() })
-onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
+onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer); clearInterval(webqrTimer) })
 </script>
 
 <template>
@@ -1133,7 +1158,7 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.1 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.2 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1244,6 +1269,24 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <el-tag v-if="smsStatus.logged_in" :type="smsStatus.auto_refresh ? 'success' : 'warning'" size="small" effect="plain">
                 {{ smsStatus.auto_refresh ? '自动刷新：开启' : '自动刷新：不可用' }}
               </el-tag>
+            </div>
+          </div>
+
+          <!-- v0.9.2：网页端扫码登录，与短信并列，免开放平台应用凭证 -->
+          <div class="panel connect-hero">
+            <div class="connect-head">
+              <div><h3>扫码登录（光鸭 App）</h3><p>无需手机号、无需申请开放平台应用；用光鸭 App 扫一扫，在 App 内确认即可完成授权</p></div>
+              <el-tag :type="auth.webqr_supported ? 'success' : 'info'" size="small">{{ auth.webqr_supported ? '可用' : '不可用' }}</el-tag>
+            </div>
+            <div v-if="!webqr" class="connect-form">
+              <div class="connect-actions"><el-button type="primary" :disabled="!auth.webqr_supported" @click="startWebqr">发起扫码登录</el-button></div>
+              <p class="hint">点击后系统会申请一个一次性授权码；用光鸭 App 扫一扫完成确认。二维码地址仅供 App 内授权，不能直接用浏览器打开。</p>
+            </div>
+            <div v-else class="device-panel">
+              <div class="panel-head"><h3>请在光鸭 App 中扫码授权</h3><span class="pulse">等待确认…</span></div>
+              <div class="device-code">{{ webqr.user_code }}</div>
+              <div class="device-actions"><el-button plain @click="copyWebqrCode">复制授权码</el-button><el-button plain @click="cancelWebqr">取消</el-button></div>
+              <p class="hint">授权码有效期 {{ webqr.expires_in }} 秒，系统每 {{ webqr.interval }} 秒自动查询一次；在光鸭 App 内确认后自动完成连接。</p>
             </div>
           </div>
 
@@ -1468,6 +1511,20 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           <div class="sub-tabs">
             <button :class="{on: distSub === 'interact'}" @click="distSub = 'interact'">互动设置 · 指令 / 白名单 / 投稿</button>
             <button :class="{on: distSub === 'rules'}" @click="distSub = 'rules'">分发配置 · Bot / 频道 / 规则 / 推送间隔</button>
+          </div>
+
+          <!-- v0.9.2：限制方式二选一 -->
+          <div class="bot-card">
+            <div class="bot-card-head"><span class="bot-ico">🧭</span><h3>限制方式（二选一）</h3></div>
+            <div class="restrict-row col">
+              <div class="restrict-label"><b>选择一种限制方式</b><small>「推送白名单」= 只限制 Bot 往哪些频道/群聊推送，用户用指令不受约束；「关注/加群限制」= 只校验用户是否关注频道或入群，推送不按白名单过滤；「都不启用」= 两者都不拦截。不必两个都配置。</small></div>
+              <el-radio-group v-model="interactionCfg.bot_gate_mode" size="small">
+                <el-radio-button value="whitelist">推送白名单</el-radio-button>
+                <el-radio-button value="membership">关注/加群限制</el-radio-button>
+                <el-radio-button value="off">都不启用</el-radio-button>
+              </el-radio-group>
+            </div>
+            <p class="hint">私聊 Bot 发送 <b>/start</b> 会出现「频道 / 群组 / 投稿求片 / 搜索 / 打赏」两列按钮菜单；点按钮即可使用，无需手动注册。</p>
           </div>
 
           <!-- 内置指令速查：固定四项 + 后台自定义（参考 embyhub 卡片） -->
@@ -1708,10 +1765,8 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
           <div class="panel">
             <div class="panel-head"><h3>TG 推送配置</h3><span>推送模式 · 消息样式 · 跳转入口</span></div>
             <div class="tg-extra-grid">
-              <div class="field"><label>推送模式</label><el-select v-model="tgExtra.push_mode" style="width:100%"><el-option label="频道自己推送" value="channel"/><el-option label="频道由 Bot 推送" value="bot_channel"/><el-option label="自定义 Bot 推送群聊" value="custom_bot_group"/></el-select><small>自定义模式需填下方 Bot Token 与目标群聊</small></div>
+              <div class="field"><label>推送方式</label><el-input value="由 Bot 推送（频道 / 群聊统一）" readonly/><small>所有影视分享都由 Bot 发送：频道、群聊各作为一条「频道」记录添加，Bot 用自己的 Token 推到对应 chat_id，并受推送白名单控制。无需也不再支持其它模式。</small></div>
               <div class="field"><label>福袋 Bot 用户名</label><el-input v-model="tgExtra.fubao_bot" placeholder="如 fubao_bot（不带@），推送消息加跳转按钮"/><small>留空则不显示福袋/入库跳转按钮</small></div>
-              <div class="field" v-if="tgExtra.push_mode==='custom_bot_group'"><label>自定义 Bot Token</label><el-input v-model="tgExtra.custom_bot_token" type="password" show-password placeholder="123456:AA..."/></div>
-              <div class="field" v-if="tgExtra.push_mode==='custom_bot_group'"><label>目标群聊 chat_id</label><el-input v-model="tgExtra.custom_chat_id" placeholder="-1001234567890"/></div>
               <div class="field"><label>分享链接样式</label><el-select v-model="tgExtra.link_style" style="width:100%"><el-option label="按钮（推荐）" value="button"/><el-option label="纯文本" value="plain"/></el-select></div>
               <div class="field"><label>详情篇幅</label><el-select v-model="tgExtra.detail_level" style="width:100%"><el-option label="精简" value="compact"/><el-option label="完整" value="full"/></el-select></div>
             </div>
@@ -1732,10 +1787,11 @@ onUnmounted(() => { clearInterval(pollTimer); clearInterval(clockTimer) })
               <div class="panel-head"><div><h3>Bot 管理</h3><span class="hint">{{ bots.filter(b => b.enabled).length }} / {{ bots.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('bot')">+ 添加 Bot</el-button></div>
               <el-table :data="bots" size="small" empty-text="还没有 Bot，点右上角添加"><el-table-column label="名称" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="210"><template #default="s"><el-button size="small" text :loading="testingBot === s.row.id" @click="testBot(s.row)">验证 Token</el-button><el-button size="small" text :loading="testingBotMsg === s.row.id" @click="sendBotTestMessage(s.row)">测试推送</el-button><el-button size="small" text @click="toggleBot(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delBot(s.row)">删除</el-button></template></el-table-column></el-table>
             </div>
-            <!-- 频道管理卡片 -->
+            <!-- 推送目标管理卡片：频道与群聊统一为一条记录 -->
             <div class="panel manage-card">
-              <div class="panel-head"><div><h3>频道管理</h3><span class="hint">{{ channels.filter(c => c.enabled).length }} / {{ channels.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('channel')">+ 添加频道</el-button></div>
-              <el-table :data="channels" size="small" empty-text="还没有频道，点右上角添加"><el-table-column label="频道" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="210"><template #default="s"><el-button size="small" text :loading="testingChannel === s.row.id" @click="testChannel(s.row)">测试推送</el-button><el-button size="small" text @click="toggleChannel(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delChannel(s.row)">删除</el-button></template></el-table-column></el-table>
+              <div class="panel-head"><div><h3>推送目标（频道 / 群聊）</h3><span class="hint">{{ channels.filter(c => c.enabled).length }} / {{ channels.length }} 启用</span></div><el-button type="primary" size="small" @click="openManage('channel')">+ 添加目标</el-button></div>
+              <el-table :data="channels" size="small" empty-text="还没有推送目标，点右上角添加"><el-table-column label="名称" min-width="90"><template #default="s">{{ s.row.name }}</template></el-table-column><el-table-column label="chat_id" min-width="110"><template #default="s">{{ s.row.chat_id }}</template></el-table-column><el-table-column label="状态" width="72"><template #default="s"><el-tag :type="s.row.enabled ? 'success' : 'info'" size="small">{{ s.row.enabled ? '启用' : '停用' }}</el-tag></template></el-table-column><el-table-column label="操作" min-width="160"><template #default="s"><el-button size="small" text :loading="testingChannel === s.row.id" @click="testChannel(s.row)">测试推送</el-button><el-button size="small" text @click="toggleChannel(s.row)">{{ s.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" text type="danger" @click="delChannel(s.row)">删除</el-button></template></el-table-column></el-table>
+              <p class="hint" style="margin:10px 0 0">频道或群聊都在这里添加：chat_id 填频道 ID 或群聊 ID，绑定一个有发送权限的 Bot。两者推送逻辑完全相同，并受「互动设置 → 推送白名单」控制。</p>
             </div>
             <!-- 规则管理卡片 -->
             <div class="panel manage-card">

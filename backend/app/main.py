@@ -128,6 +128,40 @@ async def _job_log_prune():
             logger.warning("[logs] 自动清理失败：%s", exc)
 
 
+async def _job_rename_pending():
+    """v0.9.2：后台复查「B 库暂未可见」的单文件改名，不复制、不入库、不推送。
+
+    复制任务完成后网盘文件可见可能有秒级延迟。改名只认只读列目录命中的 fileId，
+    每次仍走 file_idle_seconds 风控间隔与 rename 预算；拿不到镜像互斥锁就跳过，
+    不与「立即同步 / 手动改名」抢 SQLite 写锁。
+    """
+    if not _mirror_lock.acquire(blocking=False):
+        return
+    try:
+        with SessionLocal() as db:
+            r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
+            if not r or not bool(getattr(r, "rename_files", True)):
+                return
+            pending = db.scalar(select(func.count()).select_from(MirrorFile).where(
+                MirrorFile.rule_id == r.id,
+                MirrorFile.status == "synced",
+                or_(MirrorFile.rename_status.is_(None),
+                    MirrorFile.rename_status == "",
+                    MirrorFile.rename_status == "pending_visible",
+                    MirrorFile.rename_status == "failed"))) or 0
+            if not pending:
+                return
+            out = await _safe_rename(db, r)
+            db.commit()
+            if out.get("renamed") or out.get("waiting_visible"):
+                logger.info("[mirror] 待改名复查：改名 %s / 仍待可见 %s",
+                            out.get("renamed", 0), out.get("waiting_visible", 0))
+    except Exception as exc:
+        logger.warning("[mirror] 待改名复查失败：%s", exc)
+    finally:
+        _mirror_lock.release()
+
+
 def _queue_trigger(db: Session):
     """v0.6.4：按管理页配置生成队列推送触发器。cron 优先（5 段），否则用间隔秒数。"""
     cron = (runtime_config.get(db, "queue_cron") or "").strip()
@@ -218,6 +252,8 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
                       max_instances=1, coalesce=True)
+    scheduler.add_job(_job_rename_pending, "interval", seconds=120, id="rename_pending",
+                      max_instances=1, coalesce=True)
     scheduler.add_job(_job_log_prune,
                       CronTrigger.from_crontab("30 3 * * *", timezone="Asia/Shanghai"),
                       id="log_prune", replace_existing=True,
@@ -227,13 +263,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.2", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -267,6 +303,28 @@ async def auth_device_start(db: Session = Depends(get_db)):
 async def auth_device_poll_now(db: Session = Depends(get_db)):
     try:
         return await guangya_auth.poll_device(db)
+    except guangya_auth.AuthError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/auth/webqr/start", dependencies=ADMIN)
+async def auth_webqr_start(db: Session = Depends(get_db)):
+    """v0.9.2：网页端扫码登录——免开放平台应用凭证，光鸭 App 扫一扫授权。"""
+    try:
+        data = await guangya_auth.start_webqr(db)
+        add_audit(db, "auth_webqr_started", target_type="auth",
+                  detail=json_dumps({"user_code": data.get("user_code")}))
+        db.commit()
+        return data
+    except guangya_auth.AuthError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/auth/webqr/poll", dependencies=ADMIN)
+async def auth_webqr_poll(db: Session = Depends(get_db)):
+    """轮询扫码结果：pending 继续等；authorized 落 Token。"""
+    try:
+        return await guangya_auth.poll_webqr(db)
     except guangya_auth.AuthError as exc:
         raise HTTPException(400, str(exc))
 
@@ -2749,24 +2807,31 @@ _TG_EXTRA_KEYS = {
 
 @app.get("/api/tg/extra-config", dependencies=ADMIN)
 def tg_extra_config_get(db: Session = Depends(get_db)):
-    """v0.7.0：TG 分发扩展配置（推送模式/自定义 bot/福袋入口/消息样式）。"""
-    return {k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()}
+    """v0.9.2：推送模式统一为「由 Bot 推送」——频道/群聊都作为一条 Channel，
+    走同一 token + chat_id 路径。旧值（channel/custom_bot_group）归一回显为 bot_channel。"""
+    out = {k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()}
+    out["push_mode"] = "bot_channel"  # 唯一口径：由 Bot 推送（频道/群聊统一）
+    return out
 
 
 @app.post("/api/tg/extra-config", dependencies=ADMIN)
 def tg_extra_config_save(p: TgExtraConfigInput, db: Session = Depends(get_db)):
-    if p.push_mode not in ("channel", "bot_channel", "custom_bot_group"):
-        raise HTTPException(400, "推送模式仅支持 channel/bot_channel/custom_bot_group")
+    # v0.9.2：无论前端传什么旧值，一律归一为 bot_channel；custom_bot_* 不再参与发送，
+    # 保存时清空以免遗留"绕过 Channel"的隐患（存量用户升级后自动迁移）。
     if p.link_style not in ("button", "plain"):
         raise HTTPException(400, "链接样式仅支持 button/plain")
     if p.detail_level not in ("compact", "full"):
         raise HTTPException(400, "详情级别仅支持 compact/full")
     vals = {key: str(getattr(p, k) or "").strip() for k, key in _TG_EXTRA_KEYS.items()}
+    vals["tg_push_mode"] = "bot_channel"
+    vals["tg_custom_bot_token"] = ""
+    vals["tg_custom_chat_id"] = ""
     runtime_config.set_many(db, vals)
     add_audit(db, "tg_extra_config_saved", target_type="config",
-              detail=json_dumps({"push_mode": p.push_mode, "link_style": p.link_style}))
+              detail=json_dumps({"push_mode": "bot_channel", "link_style": p.link_style}))
     db.commit()
-    return {"ok": True, **{k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()}}
+    return {"ok": True, **{k: runtime_config.get(db, key) for k, key in _TG_EXTRA_KEYS.items()},
+            "push_mode": "bot_channel"}
 
 
 class RewardConfigInput(BaseModel):
@@ -2903,6 +2968,8 @@ class InteractionConfigInput(BaseModel):
     bot_required_channels: list[str] | None = None   # 必须关注频道
     bot_required_groups: list[str] | None = None     # 必须加入群聊
     bot_commands: list[dict] | None = None           # 自定义指令 [{command,description,reply}]
+    # v0.9.2：使用限制与推送白名单二选一 whitelist/membership/off
+    bot_gate_mode: str | None = None
 
 
 @app.get("/api/interaction/config", dependencies=ADMIN)
@@ -2924,6 +2991,7 @@ def interaction_config_get(db: Session = Depends(get_db)):
     out["bot_required_channels"] = bot_listener._json_list("bot_required_channels_json", db)
     out["bot_required_groups"] = bot_listener._json_list("bot_required_groups_json", db)
     out["bot_commands"] = bot_listener.builtin_and_custom(db)
+    out["bot_gate_mode"] = bot_listener.gate_mode(db)
     out["scene_default"] = "ENV_FILTER_GUANGYA"
     out["unverified_endpoints"] = ["投稿分享转存（光鸭接口，8.6 待验证）"]
     return out
@@ -2951,6 +3019,10 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
         values["bot_restrict_enabled"] = "true" if p.bot_restrict_enabled else "false"
     if p.bot_restrict_cache_seconds is not None:
         values["bot_restrict_cache_seconds"] = str(max(0, min(int(p.bot_restrict_cache_seconds), 86400)))
+    if p.bot_gate_mode is not None:
+        if p.bot_gate_mode not in ("whitelist", "membership", "off"):
+            raise HTTPException(400, "bot_gate_mode 仅支持 whitelist/membership/off")
+        values["bot_gate_mode"] = p.bot_gate_mode
     if p.bot_commands is not None:
         cmds = []
         for c in p.bot_commands:
@@ -2999,7 +3071,7 @@ class ContributionHandleInput(BaseModel):
 
 
 @app.post("/api/contributions/{cid}/handle", dependencies=ADMIN)
-def handle_contribution(cid: int, p: ContributionHandleInput, db: Session = Depends(get_db)):
+async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session = Depends(get_db)):
     if p.status not in ("approved", "rejected", "transferred", "pending"):
         raise HTTPException(400, "status 仅支持 approved/rejected/transferred/pending")
     c = db.get(UserContribution, cid)
@@ -3009,7 +3081,18 @@ def handle_contribution(cid: int, p: ContributionHandleInput, db: Session = Depe
     add_audit(db, "contribution_handled", target_type="contribution", target_id=str(cid),
               detail=json_dumps({"status": p.status, "note": p.note[:200]}))
     db.commit()
-    return {"ok": True}
+    # v0.9.2：审核结论主动回复投稿用户一次（事务性通知，不刷屏）
+    notice = ""
+    if p.status == "approved":
+        notice = f"你的投稿「{c.title}」已通过审核，感谢支持！"
+    elif p.status == "rejected":
+        notice = f"你的投稿「{c.title}」未通过审核。" + (f"原因：{p.note}" if p.note else "")
+    elif p.status == "transferred":
+        notice = f"你的投稿「{c.title}」已转存入库，感谢支持！"
+    notified = False
+    if notice and c.tg_user_id:
+        notified = await bot_listener.notify_user(db, c.tg_user_id, notice)
+    return {"ok": True, "notified": notified}
 
 
 @app.get("/api/media-requests", dependencies=ADMIN)

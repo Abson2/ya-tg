@@ -255,14 +255,17 @@ def test_b_already_english_skips_without_api_call(db):
     assert r2.rename_status == "done" and r2.target_name == EN_NAME
 
 
-def test_listing_failure_falls_back_to_db_state(db):
-    """列目录失败 = 没读到，不能据此乱改名；退回 DB 幂等判断。"""
+def test_listing_failure_marks_pending_visible_without_rename(db):
+    """列目录失败 = 没读到，不能据此乱改名；标待可见，下轮复查。"""
     rule, media, row = _seed(db)
     FakeAPI.reset(fail_listing=True)
     with _with_rename_mocks():
         out = _run(mirror.rename_mirror_files(db, rule))
-    assert out["renamed"] == 0 and out["skipped"] == 1, out
+    assert out["renamed"] == 0 and out["waiting_visible"] == 1, out
     assert FakeAPI.renamed == []
+    db.expire_all()
+    r2 = db.get(MirrorFile, row.id)
+    assert r2.rename_status == "pending_visible" and r2.target_name == EN_NAME
 
 
 def test_no_synced_rows_is_reported(db):
@@ -327,3 +330,45 @@ def test_rename_error_survives_null_last_message(db):
     assert out["rename"]["errors"], out
     db.expire_all()
     assert "首个改名错误" in (db.get(MirrorRule, rule.id).last_message or "")
+
+
+# ---------- 6. v0.9.2：复制完成后文件可见性延迟，改名必须等看见再发 ----------
+def test_rename_waits_for_b_visibility(db):
+    """第一次列目录还没看到文件 → 不调用 rename；复查看到后才改名。"""
+    class VisibilityAPI(FakeAPI):
+        calls = 0
+
+        async def list_files(self, parent_id="", page=0, page_size=50):
+            type(self).calls += 1
+            if self.calls == 1:
+                return {"list": [], "total": 0}
+            return {"list": [dict(f) for f in self.b_files], "total": len(self.b_files)}
+
+    rule, media, row = _seed(db, rename_status="", target_name="", target_file_id="")
+    FakeAPI.reset(files=[_b_file(ZH_NAME)])
+    VisibilityAPI.calls = 0
+    with patch("app.mirror.GuangYaWebFiles", VisibilityAPI), \
+         patch("app.mirror.tmdb.english_title", new=AsyncMock(return_value="The Drunk Hero")), \
+         patch("app.mirror.ai_assist.translate_title", new=AsyncMock(
+             return_value={"ok": True, "titles": {"en": "The Drunk Hero"}})), \
+         patch("app.mirror.asyncio.sleep", new=_noop_sleep()):
+        out = _run(mirror.rename_mirror_files(db, rule))
+    assert VisibilityAPI.calls >= 2
+    assert out["renamed"] == 1 and out["waiting_visible"] == 0, out
+    assert FakeAPI.renamed == [(B_FILE, EN_NAME)]
+    db.expire_all()
+    r2 = db.get(MirrorFile, row.id)
+    assert r2.rename_status == "done" and r2.target_name == EN_NAME
+
+
+def test_background_job_rechecks_pending_visible(db):
+    """后台短任务只复查 pending/failed 行，不重复扫已经 done 的文件。"""
+    rule, media, row = _seed(db, rename_status="pending_visible", target_name="")
+    with patch("app.main._safe_rename", new=AsyncMock(return_value={"renamed": 1})) as mock:
+        _run(main._job_rename_pending())
+    assert mock.await_count == 1
+    row.rename_status = "done"
+    db.commit()
+    with patch("app.main._safe_rename", new=AsyncMock(return_value={"renamed": 0})) as mock:
+        _run(main._job_rename_pending())
+    assert mock.await_count == 0

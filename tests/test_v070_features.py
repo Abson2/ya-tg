@@ -130,9 +130,12 @@ def test_tg_extra_and_reward_config():
         push_mode="custom_bot_group", custom_bot_token="1:TOKEN",
         custom_chat_id="-999", fubao_bot="fubao_bot", link_style="button",
         detail_level="compact"), db=db)
-    assert d["push_mode"] == "custom_bot_group" and d["fubao_bot"] == "fubao_bot"
+    # v0.9.2：推送模式统一为「由 Bot 推送」——旧 custom_bot_group 归一为 bot_channel，
+    # 且 custom_* 覆盖值被清空，避免绕过 Channel（频道/群聊走同一发送路径）。
+    assert d["push_mode"] == "bot_channel" and d["fubao_bot"] == "fubao_bot"
     got = tg_extra_config_get(db=db)
-    assert got["custom_chat_id"] == "-999"
+    assert got["push_mode"] == "bot_channel"
+    assert got["custom_chat_id"] == ""
     rw = reward_config_save(RewardConfigInput(code="https://img/reward.png"), db=db)
     assert "reward.png" in rw["code"]
     assert "reward.png" in reward_config_get(db=db)["code"]

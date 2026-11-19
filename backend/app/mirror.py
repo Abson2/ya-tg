@@ -1076,6 +1076,10 @@ async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
 # 一部剧就能把整轮同步卡几十秒，管理页直接打不开。
 ENGLISH_TITLE_TMDB_TIMEOUT = 6.0
 ENGLISH_TITLE_AI_TIMEOUT = 10.0
+# v0.9.2：复制任务成功后，B 库文件可见可能有秒级延迟。改名只认「列目录真的看到」，
+# 最多再确认 2 次（只读接口，不增加写请求），避免用过期 fileId 改名造成断层/误改。
+RENAME_VISIBILITY_RECHECKS = 2
+RENAME_VISIBILITY_SETTLE_SECONDS = 2.0
 
 
 async def _bounded(coro, timeout: float, label: str):
@@ -1085,6 +1089,27 @@ async def _bounded(coro, timeout: float, label: str):
     except Exception as exc:
         logger.debug("[mirror] %s 跳过（%s: %s）", label, type(exc).__name__, str(exc)[:120])
         return None
+
+
+async def _visible_b_candidates(api: "GuangYaWebFiles", media: MirrorMedia,
+                                rows: list) -> tuple[dict, bool, bool]:
+    """v0.9.2：改名前的可见性闸门。
+
+    返回 (candidates, verified, all_visible)。只读列目录最多重试
+    RENAME_VISIBILITY_RECHECKS 次，期间不调用任何写接口。只有所有待改文件
+    都能在 B 库当前列表里命中，才允许后续 rename_file；否则整部作品本轮跳过，
+    行状态标记 pending_visible，由后台短任务下轮再试。这样即使复制任务刚返回
+    done、文件还没在网盘可见，也不会拿旧 fileId 发出无效改名请求。
+    """
+    candidates: dict[str, str] = {}
+    verified = False
+    for attempt in range(RENAME_VISIBILITY_RECHECKS + 1):
+        candidates, verified = await _b_file_candidates(api, media)
+        if verified and rows and all(_lookup_b_file(candidates, row) for row in rows):
+            return candidates, True, True
+        if attempt < RENAME_VISIBILITY_RECHECKS:
+            await asyncio.sleep(RENAME_VISIBILITY_SETTLE_SECONDS)
+    return candidates, verified, False
 
 
 async def _resolve_english_title(db: Session, media: MirrorMedia, *,
@@ -1212,6 +1237,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     time_budget = float(max_seconds if max_seconds is not None else RENAME_MAX_SECONDS)
     stats = {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
              "untranslated": 0, "failed": 0, "no_rows": 0, "errors": [],
+             "waiting_visible": 0,
              # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
@@ -1253,9 +1279,18 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         if not rows:
             stats["no_rows"] += 1
             continue
-        # 只读列一次 B 库：既定位 fileId，也避免 A 库内容更新后新旧版本同名冲突
-        candidates, b_verified = await _b_file_candidates(api, media)
+        # v0.9.2：复制任务返回 done 后，B 库文件可见仍可能有秒级延迟。
+        # 先用只读列目录确认所有待改文件都真的可见，再发 rename_file；
+        # 不拿 DB 里可能过期的 fileId 冒险，避免「文件有了但没改名」断层。
+        candidates, b_verified, all_visible = await _visible_b_candidates(api, media, rows)
         name_fids = {k: v for k, v in candidates.items() if ":" not in k}
+        if not all_visible:
+            for row in rows:
+                row.rename_status = "pending_visible"
+                row.rename_error = "B 库文件尚未全部可见，等待后台短任务复查后改名"
+            db.commit()
+            stats["waiting_visible"] += len(rows)
+            continue
         # v0.8.8：以 B 库**实际文件名**判断是否已经改过名，不再只信 DB 状态。
         # v0.8.7 空目录补复制会把文件恢复成 A 库中文原名，而复用的同一行里
         # rename_status / target_name 可能仍停在 done / 英文名，旧逻辑会整批跳过，

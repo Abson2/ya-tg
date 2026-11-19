@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     guangya_account_base: str = "https://openapi-account.guangyapan.com"
     guangya_www_base: str = "https://www.guangyapan.com"
     guangya_timeout: float = 20.0
+    # v0.9.2：网页端扫码登录（与官方 OpenAPI Device 不同通道，无需 project_id/sign_secret）。
+    # 端点取自光鸭官方 Skill 1.0.3 的网页端设备码协议；client_id 为网页应用公开 ID，非隐私。
+    guangya_webqr_account_base: str = "https://account.guangyapan.com"
+    guangya_webqr_client_id: str = "atcFkeidp8ndm9yC"
 
     # 光鸭网页端分享接口（抓包适配，与 OpenAPI 认证无关，不在公开 OpenAPI 文档内）
     guangya_share_authorization: str = ""

@@ -228,11 +228,15 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     return text[:1000], text[:1000]
 
 
-async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Channel, bot: Bot,
-                         override_token: str = "", override_chat: str = "") -> tuple[bool, str, str]:
-    # v0.7.0：custom_bot_group 模式下用配置的自定义 bot token / 群聊覆盖
-    token = override_token or decrypt_secret(bot.token)
-    chat_id = override_chat or channel.chat_id
+async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Channel, bot: Bot) -> tuple[bool, str, str]:
+    """v0.9.2：统一发送入口——群聊与频道都走同一条路径。
+
+    目标恒为该 Channel 的 chat_id，发送身份恒为该 Channel 所属 Bot 的 token。
+    群聊只是一条 chat_id 为群号的 Channel，与频道在发送层无任何差别；
+    收发配置集中在「Bot 管理 / 频道管理」，不再有绕过 Channel 的全局覆盖分支。
+    """
+    token = decrypt_secret(bot.token)
+    chat_id = channel.chat_id
     if not token:
         return False, "", "Bot Token 为空", None
     caption, _ = _build_message(db, res, res.share_url)
@@ -295,12 +299,9 @@ async def process_queue(limit: int = 20) -> dict:
         delay = max(0, min(int(runtime_config.get(db, "telegram_send_delay") or 2), 60))
     except ValueError:
         delay = 2
-    # v0.7.0：推送模式。custom_bot_group 时用自定义 bot/群聊覆盖，其余用频道自身 bot
-    push_mode = (runtime_config.get(db, "tg_push_mode") or "channel").strip()
-    ov_token = ov_chat = ""
-    if push_mode == "custom_bot_group":
-        ov_token = (runtime_config.get(db, "tg_custom_bot_token") or "").strip()
-        ov_chat = (runtime_config.get(db, "tg_custom_chat_id") or "").strip()
+    # v0.9.2：推送口径统一——所有目标（频道/群聊）都是一条 Channel，
+    # 一律用该 Channel 所属 Bot 的 token 发到它的 chat_id，并经过白名单闸门。
+    # 旧 tg_push_mode / custom_bot_* 不再参与发送（字段保留仅为兼容存量配置读取，不报错）。
     try:
         now = utcnow()
         rows = list(db.scalars(
@@ -364,10 +365,8 @@ async def process_queue(limit: int = 20) -> dict:
                 q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
                 continue
-            use_token = ov_token if (ov_token and ov_chat) else ""
-            use_chat = ov_chat if (ov_token and ov_chat) else ""
             ok, message_id, error, retry_after = await _send_telegram(
-                db, q, res, channel, bot, override_token=use_token, override_chat=use_chat)
+                db, q, res, channel, bot)
             if ok:
                 q.status = "sent"
                 q.telegram_message_id = message_id

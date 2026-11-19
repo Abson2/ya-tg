@@ -57,6 +57,8 @@ def status(db: Session) -> dict:
         "pending_message": s.last_message if s.purpose else "",
         "device_supported": bool(settings.guangya_client_id and settings.guangya_project_id and settings.guangya_sign_secret),
         "pkce_supported": bool(settings.guangya_client_id and settings.guangya_oauth_redirect_uri),
+        # v0.9.2：网页端扫码登录无需开放平台应用凭证，默认即可用
+        "webqr_supported": bool(settings.guangya_webqr_account_base and settings.guangya_webqr_client_id),
     }
 
 
@@ -175,6 +177,96 @@ async def poll_device(db: Session) -> dict:
     return {"status": "authorized", "sub": payload.get("sub", "")}
 
 
+# ---------- v0.9.2：网页端扫码登录（官方 Skill 同款设备码协议，零配置） ----------
+# 与官方 OpenAPI Device 的区别：无需 project_id / sign_secret / IP 白名单，
+# 使用网页应用公开 client_id（非隐私），端点是 account.guangyapan.com 而非 openapi。
+# 协议经只读实测确认：code 申请无签名；token 换取 grant_type=device_code，
+# pending 时 HTTP 400 + "authorization_pending"文本，成功为 JSON。
+
+def _webqr_base() -> str:
+    return settings.guangya_webqr_account_base.rstrip("/")
+
+
+def _webqr_cid() -> str:
+    return settings.guangya_webqr_client_id
+
+
+async def start_webqr(db: Session) -> dict:
+    """申请网页端设备码，返回供光鸭 App 扫一扫的授权地址与 user_code。"""
+    cid = _webqr_cid()
+    if not cid or not _webqr_base():
+        raise AuthError("网页端扫码登录未配置 client_id / account base", "missing_config")
+    body = {"client_id": cid, "scope": "user",
+            "meta": {"scene": "skill_desktop_login", "device": "ya-tg"}}
+    async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+        r = await client.post(f"{_webqr_base()}/v1/auth/device/code", json=body)
+    payload = _json(r)
+    if r.status_code != 200 or not payload.get("device_code"):
+        msg = str(payload.get("msg") or payload.get("message") or r.text[:300])
+        raise AuthError(f"申请扫码授权失败：{msg}", str(payload.get("code", "")))
+    expires_in = int(payload.get("expires_in", 600) or 600)
+    s = _session(db)
+    s.purpose = "webqr"
+    s.device_code = str(payload.get("device_code") or "")
+    s.user_code = str(payload.get("user_code") or "")
+    s.verification_url = str(payload.get("verification_url") or "")
+    s.verification_uri_complete = str(payload.get("verification_uri_complete")
+                                      or payload.get("short_uri_complete")
+                                      or payload.get("verification_url") or "")
+    s.interval = max(2, int(payload.get("interval", 2) or 2))
+    s.expires_at = utcnow() + timedelta(seconds=expires_in)
+    s.last_message = ""
+    s.updated_at = utcnow()
+    db.commit()
+    # 二维码载荷是 App 内授权地址，不能当网页链接直接用浏览器打开。
+    return {
+        "user_code": s.user_code,
+        "verification_url": s.verification_url,
+        "verification_uri_complete": s.verification_uri_complete,
+        "interval": s.interval,
+        "expires_in": expires_in,
+        "flow": "webqr",
+    }
+
+
+async def poll_webqr(db: Session) -> dict:
+    """轮询扫码授权结果；pending 保持会话，成功落 AuthToken(flow=webqr)。"""
+    s = _session(db)
+    if s.purpose != "webqr" or not s.device_code:
+        raise AuthError("没有进行中的扫码授权，请先发起扫码登录", "no_pending")
+    if s.expires_at and as_utc(s.expires_at) <= utcnow():
+        s.purpose = ""
+        db.commit()
+        raise AuthError("二维码已过期，请重新发起扫码登录", "expired")
+    body = {
+        "client_id": _webqr_cid(),
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": s.device_code,
+    }
+    async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
+        r = await client.post(f"{_webqr_base()}/v1/auth/token", json=body)
+    text = (r.text or "").strip()
+    if "authorization_pending" in text:
+        s.last_message = "等待用户在光鸭 App 中扫码并确认授权"
+        db.commit()
+        return {"status": "pending"}
+    if "expired" in text.lower() or "invalid" in text.lower():
+        s.purpose = ""
+        db.commit()
+        raise AuthError(f"扫码授权失败：{text[:200]}", "expired")
+    payload = _json(r)
+    if not payload.get("access_token"):
+        s.last_message = text[:200]
+        db.commit()
+        return {"status": "pending", "message": s.last_message}
+    _save_token(db, payload, "webqr")
+    s.purpose = ""
+    s.device_code = ""
+    s.last_message = "扫码授权成功"
+    db.commit()
+    return {"status": "authorized", "sub": str(payload.get("sub", "") or "")}
+
+
 def start_pkce(db: Session) -> dict:
     """§5.1/5.2：state 与 code_verifier 暂存后端会话，不下发 sign_secret。"""
     if not settings.guangya_client_id or not settings.guangya_oauth_redirect_uri:
@@ -283,7 +375,10 @@ async def get_access_token(db: Session) -> str:
 
 def _save_token(db: Session, payload: dict, flow: str) -> None:
     t = _token(db) or AuthToken(id=1)
-    t.client_id = settings.guangya_client_id or t.client_id
+    # v0.9.2：扫码登录没有 OpenAPI client_id 时，落到网页端公开 client_id，
+    # 保证后续 refresh_token 能带上正确的 client_id。
+    cid = settings.guangya_client_id or (settings.guangya_webqr_client_id if flow == "webqr" else "")
+    t.client_id = cid or t.client_id
     t.access_token_enc = encrypt_secret(payload["access_token"])
     if payload.get("refresh_token"):
         t.refresh_token_enc = encrypt_secret(payload["refresh_token"])
