@@ -86,6 +86,67 @@ def push_whitelist(db: Session) -> tuple[list[str], list[str]]:
             [str(x).strip() for x in _json_list("bot_push_groups_json", db) if str(x).strip()])
 
 
+def push_routes(db: Session) -> list[dict]:
+    """v0.9.5：推送白名单改为「目录路由表」。
+
+    每条 {dir_id, kind(channel|group), chat_id}：把 B 库某目录（或其子目录）下的影视
+    经同一个全局单 Bot 推到指定频道或群。默认 1 条、最多 10 条由前端约束，后端也兜底。
+    """
+    import json
+    try:
+        raw = json.loads(runtime_config.get(db, "push_routes_json") or "[]")
+    except Exception:
+        raw = []
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:10]:
+        if not isinstance(item, dict):
+            continue
+        chat = str(item.get("chat_id") or "").strip()
+        if not chat:
+            continue  # 频道 ID、群 ID 任填其一即可，空路由跳过
+        kind = "group" if str(item.get("kind") or "").lower() == "group" else "channel"
+        out.append({"dir_id": str(item.get("dir_id") or "").strip(),
+                    "kind": kind, "chat_id": chat})
+    return out
+
+
+def match_push_routes(db: Session, resource) -> list[dict]:
+    """返回与资源目录匹配的路由（可多条）。
+
+    匹配规则：dir_id 为空 = 根目录通配（匹配所有资源，即整库推送）；
+    否则精确匹配 resource.parent_id，或出现在 resource.dir_chain_json 目录链中。
+    """
+    routes = push_routes(db)
+    if not routes:
+        return []
+    parent = str(getattr(resource, "parent_id", "") or "").strip()
+    try:
+        chain = set(str(x) for x in json.loads(getattr(resource, "dir_chain_json", "[]") or "[]"))
+    except Exception:
+        chain = set()
+    matched = []
+    for r in routes:
+        dir_id = r["dir_id"]
+        if not dir_id or dir_id == parent or dir_id in chain:
+            matched.append(r)
+    return matched
+
+
+def route_target_channel(db: Session, route: dict):
+    """把路由项的 chat_id 解析为可用的启用 Channel（频道/群聊统一记录）。
+
+    路由表是配置真相源；Channel 记录由保存路由时同步维护。若记录缺失（老数据/手工改库），
+    这里按 chat_id 现场匹配一条启用 Channel，避免路由配了却推不出去。
+    """
+    rows = db.scalars(select(Channel).where(Channel.enabled.is_(True))).all()
+    for c in rows:
+        if str(c.chat_id or "").strip() == route["chat_id"]:
+            return c
+    return None
+
+
 def effective_token(db: Session) -> str:
     """v0.9.4：交互 Bot token 与 Bot 管理去重。
 
@@ -149,6 +210,29 @@ async def _api(db: Session, token: str, method: str, payload: dict) -> dict:
     return data if isinstance(data, dict) else {"ok": False}
 
 
+def _normalize_tme_link(raw: str) -> str:
+    """把 @用户名 / t.me/用户名 / 完整 URL 归一成可点的 https://t.me/... 链接。"""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    s = s.lstrip("@")
+    return f"https://t.me/{s}" if s else ""
+
+
+def restriction_keyboard(db: Session) -> dict | None:
+    """v0.9.5：未满足使用限制时，附上官方频道 / 交流群跳转按钮（t.me/@ 链接）。"""
+    buttons = []
+    ch_link = _normalize_tme_link(runtime_config.get(db, "bot_required_channel_link"))
+    grp_link = _normalize_tme_link(runtime_config.get(db, "bot_required_group_link"))
+    if ch_link:
+        buttons.append({"text": "📺 关注官方频道", "url": ch_link})
+    if grp_link:
+        buttons.append({"text": "👥 加入交流群", "url": grp_link})
+    return {"inline_keyboard": [buttons]} if buttons else None
+
+
 async def _reply(db: Session, token: str, chat_id: str, text: str,
                  reply_markup: dict | None = None) -> None:
     """只回复指令来源的 chat（频道 / 群聊 / 私聊由 poll_once 决定），不主动私推用户。"""
@@ -163,12 +247,14 @@ async def _reply(db: Session, token: str, chat_id: str, text: str,
 
 
 async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[bool, str]:
-    """使用限制：仅 membership 模式生效，用户需关注指定频道 / 加入指定群聊。
+    """使用限制（v0.9.5 独立功能）：用户须关注指定频道 / 加入指定群聊之一。
 
-    v0.9.2：只校验管理员实际填写的项目（频道、群聊不必两类都配）；
-    与「推送白名单」二选一——由 gate_mode 决定本机制是否生效。结果按秒数缓存。
+    由 bot_restrict_enabled 独立开关控制，与「推送白名单」相互独立、不再二选一。
+    兼容旧配置 gate_mode=membership 作为兜底。结果按秒数缓存。
     """
-    if gate_mode(db) != "membership":
+    restrict_on = (runtime_config.get(db, "bot_restrict_enabled") or "").lower() == "true" \
+        or gate_mode(db) == "membership"
+    if not restrict_on:
         return True, ""
     req_channels = [str(x).strip() for x in _json_list("bot_required_channels_json", db) if str(x).strip()]
     req_groups = [str(x).strip() for x in _json_list("bot_required_groups_json", db) if str(x).strip()]
@@ -186,6 +272,9 @@ async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[b
         return cached[1], cached[2]
     if not token:
         return False, "机器人尚未配置 Token，无法校验关注状态"
+    # v0.9.5：「关注的频道 ID / 加入的群 ID 任填其一即可」= OR 语义——
+    # 管理员可填多个候选，用户只需满足其中任意一个即可使用 Bot（不再要求全部满足）。
+    reason = "请先关注官方频道或加入交流群，再使用机器人功能。"
     for chat in required:
         try:
             data = await _api(db, token, "getChatMember",
@@ -194,13 +283,11 @@ async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[b
             data = {}
         status = str(((data.get("result") or {}) if data.get("ok") else {}).get("status") or "")
         # kicked / left / restricted 均视为未满足；restricted 仅在可发消息时通过
-        if status not in ("creator", "administrator", "member"):
-            reason = (f"请关注频道 / 加入群聊后再使用指令：{chat}"
-                      "（管理员可把频道 @用户名 或 ID 填到使用限制里）")
-            _restrict_cache[uid] = (now, False, reason)
-            return False, reason
-    _restrict_cache[uid] = (now, True, "")
-    return True, ""
+        if status in ("creator", "administrator", "member"):
+            _restrict_cache[uid] = (now, True, "")
+            return True, ""  # 任一满足即通过
+    _restrict_cache[uid] = (now, False, reason)
+    return False, reason
 
 
 # ---------- v0.9.2：Bot 真交互菜单（inline keyboard + callback 路由） ----------
@@ -326,8 +413,11 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
         await _api(db, token, "answerCallbackQuery", {"callback_query_id": cb_id})
     ok, reason = await check_restriction(db, token, user_id)
     if not ok:
-        await _api(db, token, "sendMessage",
-                   {"chat_id": chat_id, "text": reason[:4000]})
+        payload = {"chat_id": chat_id, "text": reason[:4000]}
+        kb = restriction_keyboard(db)
+        if kb:
+            payload["reply_markup"] = kb
+        await _api(db, token, "sendMessage", payload)
         return "blocked"
     text, keyboard = _menu_text(db, data)
     payload = {"chat_id": chat_id, "message_id": message_id,
@@ -524,7 +614,8 @@ async def poll_once(db: Session) -> dict:
             if not ok:
                 stats["blocked"] = stats.get("blocked", 0) + 1
                 if chat_id and text.strip().startswith("/"):
-                    await _reply(db, token, chat_id, reason)
+                    await _reply(db, token, chat_id, reason,
+                                 reply_markup=restriction_keyboard(db))
                 continue
             action, reply = await handle_text(
                 db, text, tg_user_id=user_id,

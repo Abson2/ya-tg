@@ -222,6 +222,9 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "episode_progress": esc(episode_progress),
         "episode_status": esc(episode_status),
         "reward_code": esc(runtime_config.get(db, "reward_code") or ""),  # v0.7.0：赞赏码
+        # v0.9.5：频道/群跳转链接（与打赏配置一起维护，模板可用 {{channel_link}}/{{group_link}}）
+        "channel_link": esc(runtime_config.get(db, "tg_channel_link") or ""),
+        "group_link": esc(runtime_config.get(db, "tg_group_link") or ""),
         "version": esc(version),
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
@@ -248,19 +251,33 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
     if poster:
         payload["photo"] = poster
     # v0.7.0：分享链接按钮化 + 福袋 bot 跳转入口（inline keyboard）
+    # v0.9.5：频道/群跳转按钮（与打赏配置一起维护），独立一行，plain/button 模式都可显示。
+    from . import bot_listener
+    keyboard_rows: list[list[dict]] = []
     link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
     if link_style == "button" and res.share_url:
         buttons = [{"text": "📥 获取资源", "url": res.share_url}]
         fubao = (runtime_config.get(db, "tg_fubao_bot") or "").strip().lstrip("@")
         if fubao:
             buttons.append({"text": "🎁 福袋/入库", "url": f"https://t.me/{fubao}?start=library"})
-        payload["reply_markup"] = {"inline_keyboard": [buttons]}
+        keyboard_rows.append(buttons)
         # 按钮模式下去掉正文末行的纯文本链接，避免重复
         caption = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
         if poster:
             payload["caption"] = caption
         else:
             payload["text"] = caption
+    jump_buttons = []
+    ch_link = bot_listener._normalize_tme_link(runtime_config.get(db, "tg_channel_link"))
+    grp_link = bot_listener._normalize_tme_link(runtime_config.get(db, "tg_group_link"))
+    if ch_link:
+        jump_buttons.append({"text": "📢 官方频道", "url": ch_link})
+    if grp_link:
+        jump_buttons.append({"text": "👥 交流群", "url": grp_link})
+    if jump_buttons:
+        keyboard_rows.append(jump_buttons)
+    if keyboard_rows:
+        payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
     retry_after = None
     try:
         async with httpx.AsyncClient(timeout=20) as client:

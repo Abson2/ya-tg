@@ -193,7 +193,8 @@ def status(db: Session) -> dict:
     has_refresh = bool(t and t.refresh_token_enc)
     logged_in = bool(t and t.access_token_enc)
     # 自动刷新：每 60 秒巡检一次，到期前 10 分钟触发；有 refresh_token 才具备能力。
-    auto_refresh = bool(logged_in and has_refresh and flow in ("sms", "tgto"))
+    # v0.9.5：扫码登录（webqr）也在到期前自动刷新（走 guangya_auth.refresh 网页端设备码通道）
+    auto_refresh = bool(logged_in and has_refresh and flow in ("sms", "tgto", "webqr"))
     needs_refresh = bool(expires and seconds_left is not None and seconds_left <= 600)
     if not logged_in:
         message = "尚未登录"
@@ -205,12 +206,15 @@ def status(db: Session) -> dict:
         message = "已登录（短信）· 自动刷新已开启"
     elif flow == "tgto":
         message = "已登录 · 自动刷新已开启"
+    elif flow == "webqr":
+        message = "已登录（扫码）· 自动刷新已开启"
     else:
         message = f"已授权（{flow}）"
     return {
         "logged_in": logged_in,
         "flow": flow,
-        "sms_mode": flow in ("sms", "tgto"),  # 兼容旧 tgto 通道已有 token
+        # v0.9.5：扫码登录也具备自动刷新，前端凭证卡据此显示「已开启」
+        "sms_mode": flow in ("sms", "tgto", "webqr"),  # 兼容旧 tgto 通道已有 token
         "account": mask_account(t.sub) if t else "",  # v0.7.0：账号脱敏，避免手机号明文泄露
         # 带 Z 的 UTC 时间，前端 Date 解析无歧义（naive 会被当成本地时间）
         "expires_at": expires.isoformat().replace("+00:00", "Z") if expires else None,

@@ -1,6 +1,4 @@
-import time
 from datetime import timedelta
-from urllib.parse import urlencode
 
 import httpx
 from sqlalchemy.orm import Session
@@ -9,7 +7,7 @@ from .config import settings
 from .db import json_dumps
 from .models import AuthSession, AuthToken
 from .security import decrypt_secret, encrypt_secret, secret_configured
-from .utils import as_utc, device_sign, generate_pkce, traceparent, utcnow
+from .utils import as_utc, traceparent, utcnow
 
 
 class AuthError(RuntimeError):
@@ -41,10 +39,12 @@ def status(db: Session) -> dict:
     flow = t.flow if t else ""
     client_id = runtime_config.get(db, "guangya_client_id")
     share_configured = bool(runtime_config.get(db, "guangya_share_authorization"))
+    # v0.9.5：扫码登录（webqr）写入 AuthToken(id=1) 且补 did，与短信二选一都能跑业务，
+    # 因此与 sms/tgto 同等视为「已配置、可自动刷新」。
     return {
-        "configured": bool(client_id) or flow in ("sms", "tgto"),
+        "configured": bool(client_id) or flow in ("sms", "tgto", "webqr"),
         "authenticated": bool(t and t.access_token_enc),
-        "has_refresh_token": bool(t and t.refresh_token_enc) or flow in ("sms", "tgto"),
+        "has_refresh_token": bool(t and t.refresh_token_enc) or flow in ("sms", "tgto", "webqr"),
         "client_id": client_id,
         "flow": flow,
         "share_configured": share_configured,
@@ -55,8 +55,6 @@ def status(db: Session) -> dict:
         "needs_refresh": bool(expires and expires <= now + timedelta(minutes=5)),
         "pending_flow": s.purpose or None,
         "pending_message": s.last_message if s.purpose else "",
-        "device_supported": bool(settings.guangya_client_id and settings.guangya_project_id and settings.guangya_sign_secret),
-        "pkce_supported": bool(settings.guangya_client_id and settings.guangya_oauth_redirect_uri),
         # v0.9.2：网页端扫码登录无需开放平台应用凭证，默认即可用
         "webqr_supported": bool(settings.guangya_webqr_account_base and settings.guangya_webqr_client_id),
     }
@@ -82,106 +80,13 @@ def seed_from_config(db: Session) -> None:
     db.commit()
 
 
-async def start_device(db: Session) -> dict:
-    """OpenAPI v1.3 §4.1/4.2：设备码由后端用 sign_secret 签名申请。"""
-    cid = settings.guangya_client_id
-    if not cid or not settings.guangya_project_id or not settings.guangya_sign_secret:
-        raise AuthError("Device 授权需要 GUANGYA_CLIENT_ID / GUANGYA_PROJECT_ID / GUANGYA_SIGN_SECRET", "missing_config")
-    timestamp = str(int(time.time()))
-    sign = device_sign(cid, timestamp, settings.guangya_sign_secret)
-    headers = {
-        "Content-Type": "application/json",
-        "x-client-id": cid,
-        "x-project-id": settings.guangya_project_id,
-        "x-device-id": settings.guangya_device_id,
-        "timestamp": timestamp,
-        "sign": sign,
-        "traceparent": traceparent(),
-    }
-    body = {"scope": "", "client_id": cid, "project_id": settings.guangya_project_id}
-    async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-        r = await client.post(f"{settings.guangya_api_base.rstrip('/')}/v1/auth/device/code",
-                              headers=headers, json=body)
-    payload = _json(r)
-    code = int(payload.get("code", 0) or 0)
-    if r.status_code != 200 or code not in (0, None):
-        msg = str(payload.get("msg") or payload.get("message") or r.text[:300])
-        if code == 111:
-            msg += "；请在光鸭开放平台报备本机/容器出口 IP 白名单（Device 申请设备码按出口 IP 校验）"
-        raise AuthError(msg, str(code))
-    expires_in = int(payload.get("expires_in", 120) or 120)
-    s = _session(db)
-    s.purpose = "device"
-    s.device_code = payload.get("device_code", "")
-    s.user_code = payload.get("user_code", "")
-    s.verification_url = payload.get("verification_url", "")
-    s.verification_uri_complete = payload.get("verification_uri_complete", "")
-    s.interval = max(2, int(payload.get("interval", 3) or 3))
-    s.expires_at = utcnow() + timedelta(seconds=expires_in)
-    s.last_message = ""
-    s.updated_at = utcnow()
-    db.commit()
-    return {
-        "user_code": s.user_code,
-        "verification_url": s.verification_url,
-        "verification_uri_complete": s.verification_uri_complete,
-        "interval": s.interval,
-        "expires_in": expires_in,
-        "schema_url": f"gyp://auth?url={s.verification_uri_complete}",
-    }
-
-
-async def poll_device(db: Session) -> dict:
-    """§4.4：authorization_pending 为纯文本，成功为 JSON；无 sign。"""
-    s = _session(db)
-    if s.purpose != "device" or not s.device_code:
-        raise AuthError("没有进行中的 Device 授权，请先发起设备码授权", "no_pending")
-    if s.expires_at and as_utc(s.expires_at) <= utcnow():
-        s.purpose = ""
-        db.commit()
-        raise AuthError("设备码已过期，请重新发起授权", "expired")
-    body = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "device_code": s.device_code,
-        "client_id": settings.guangya_client_id,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "x-client-id": settings.guangya_client_id,
-        "x-device-id": settings.guangya_device_id,
-        "x-project-id": settings.guangya_project_id,
-        "traceparent": traceparent(),
-    }
-    async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-        r = await client.post(f"{settings.guangya_account_base.rstrip('/')}/v1/auth/token",
-                              headers=headers, json=body)
-    text = (r.text or "").strip()
-    if "authorization_pending" in text:
-        s.last_message = "等待用户在光鸭 App 中确认授权"
-        db.commit()
-        return {"status": "pending"}
-    if "expired" in text.lower() or "invalid" in text.lower():
-        s.purpose = ""
-        db.commit()
-        raise AuthError(f"设备授权失败：{text[:200]}", "expired")
-    payload = _json(r)
-    if not payload.get("access_token"):
-        s.last_message = text[:200]
-        db.commit()
-        return {"status": "pending", "message": s.last_message}
-    _save_token(db, payload, "device")
-    s.purpose = ""
-    s.device_code = ""
-    s.last_message = "授权成功"
-    db.commit()
-    return {"status": "authorized", "sub": payload.get("sub", "")}
-
-
 # ---------- v0.9.2：网页端扫码登录（官方 Skill 同款设备码协议，零配置） ----------
 # 与官方 OpenAPI Device 的区别：无需 project_id / sign_secret / IP 白名单，
 # 使用网页应用公开 client_id（非隐私），端点是 account.guangyapan.com 而非 openapi。
 # 协议经只读实测确认：code 申请无签名；token 换取 grant_type=device_code，
 # pending 时 HTTP 400 + "authorization_pending"文本，成功为 JSON。
+# v0.9.5：扫码 token 独立存 runtime_config，绝不覆盖 AuthToken(id=1) 短信业务凭证
+# （镜像/扫描/分享只认带 did 的 sms 凭证；扫码 token 无 did，写入 id=1 会让业务 401）。
 
 def _webqr_base() -> str:
     return settings.guangya_webqr_account_base.rstrip("/")
@@ -267,74 +172,8 @@ async def poll_webqr(db: Session) -> dict:
     return {"status": "authorized", "sub": str(payload.get("sub", "") or "")}
 
 
-def start_pkce(db: Session) -> dict:
-    """§5.1/5.2：state 与 code_verifier 暂存后端会话，不下发 sign_secret。"""
-    if not settings.guangya_client_id or not settings.guangya_oauth_redirect_uri:
-        raise AuthError("Web PKCE 需要 GUANGYA_CLIENT_ID 与 GUANGYA_OAUTH_REDIRECT_URI", "missing_config")
-    import secrets
-
-    verifier, challenge = generate_pkce()
-    state = secrets.token_urlsafe(24)
-    s = _session(db)
-    s.purpose = "pkce"
-    s.state = state
-    s.code_verifier = verifier
-    s.redirect_uri = settings.guangya_oauth_redirect_uri
-    s.expires_at = utcnow() + timedelta(minutes=10)
-    s.last_message = ""
-    s.updated_at = utcnow()
-    db.commit()
-    params = {
-        "client_id": settings.guangya_client_id,
-        "response_type": "code",
-        "scope": "user offline",
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "redirect_uri": settings.guangya_oauth_redirect_uri,
-        "state": state,
-    }
-    return {"auth_url": f"{settings.guangya_www_base.rstrip('/')}/oauth/?{urlencode(params)}", "state": state}
-
-
-async def exchange_pkce(db: Session, code: str, state: str, error: str = "", error_description: str = "") -> dict:
-    s = _session(db)
-    if s.purpose != "pkce" or not s.state:
-        raise AuthError("没有进行中的 Web 授权", "no_pending")
-    if state != s.state:
-        raise AuthError("state 校验失败，疑似 CSRF 或会话已失效，请重新发起授权", "bad_state")
-    if error:
-        s.purpose = ""
-        db.commit()
-        raise AuthError(f"用户拒绝授权：{error_description or error}", "denied")
-    if s.expires_at and as_utc(s.expires_at) <= utcnow():
-        s.purpose = ""
-        db.commit()
-        raise AuthError("授权会话已过期，请重新发起", "expired")
-    body = {
-        "client_id": settings.guangya_client_id,
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": s.code_verifier,
-        "redirect_uri": s.redirect_uri,
-    }
-    headers = {"Content-Type": "application/json", "x-client-id": settings.guangya_client_id,
-               "traceparent": traceparent()}
-    async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-        r = await client.post(f"{settings.guangya_account_base.rstrip('/')}/v1/auth/token",
-                              headers=headers, json=body)
-    payload = _json(r)
-    if not payload.get("access_token"):
-        raise AuthError(str(payload.get("msg") or r.text[:300]))
-    _save_token(db, payload, "pkce")
-    s.purpose = ""
-    s.code_verifier = ""
-    s.state = ""
-    db.commit()
-    return {"status": "authorized", "sub": payload.get("sub", "")}
-
-
 async def refresh(db: Session, force: bool = False) -> str:
-    """刷新 Token。短信登录通道走光鸭账号服务；官方 Device/PKCE 通道走 refresh_token。"""
+    """刷新 Token。短信登录走光鸭账号服务；扫码登录走网页端设备码 refresh_token。"""
     t = _token(db)
     if t and t.flow in ("sms", "tgto"):
         from . import guangya_sms
@@ -346,16 +185,20 @@ async def refresh(db: Session, force: bool = False) -> str:
         raise AuthError("没有可用 Refresh Token，请重新授权", "no_refresh_token")
     if not force and t.expires_at and as_utc(t.expires_at) > utcnow() + timedelta(minutes=5):
         return decrypt_secret(t.access_token_enc)
+    # v0.9.5：扫码登录（webqr）是网页端设备码协议，access/refresh token 都在
+    # account.guangyapan.com 域名、用 webqr 公开 client_id；不能用官方 OpenAPI 账号服务刷新。
+    is_webqr = t.flow == "webqr"
+    cid = _webqr_cid() if is_webqr else (settings.guangya_client_id or t.client_id)
+    base = _webqr_base() if is_webqr else settings.guangya_account_base
     body = {
-        "client_id": settings.guangya_client_id or t.client_id,
+        "client_id": cid,
         "grant_type": "refresh_token",
         "refresh_token": decrypt_secret(t.refresh_token_enc),
     }
-    headers = {"Content-Type": "application/json", "x-client-id": body["client_id"],
+    headers = {"Content-Type": "application/json", "x-client-id": cid,
                "traceparent": traceparent()}
     async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-        r = await client.post(f"{settings.guangya_account_base.rstrip('/')}/v1/auth/token",
-                              headers=headers, json=body)
+        r = await client.post(f"{base.rstrip('/')}/v1/auth/token", headers=headers, json=body)
     payload = _json(r)
     if not payload.get("access_token"):
         raise AuthError(f"刷新失败：{payload.get('msg') or r.text[:200]}，请重新授权", "refresh_failed")
@@ -385,6 +228,13 @@ def _save_token(db: Session, payload: dict, flow: str) -> None:
     t.expires_at = utcnow() + timedelta(seconds=int(payload.get("expires_in", 3600) or 3600))
     t.sub = str(payload.get("sub", "") or t.sub)
     t.flow = flow
+    # v0.9.5：扫码登录也要能跑镜像/扫描/分享业务，这些接口要求 Bearer+did+dt。
+    # did 是本地生成的设备标识（与短信登录一致），网页端业务接口只校验非空、不绑定 client_id。
+    # 缺失 did 会让 GuangYaWebFiles 直接抛 401——这正是「扫码后业务凭证失效」的根因。
+    if flow == "webqr":
+        from .guangya_sms import generate_did
+        existing_did = getattr(t, "device_id", "") or ""
+        t.device_id = existing_did or generate_did()
     t.granted_at = t.granted_at or utcnow()
     t.updated_at = utcnow()
     if t not in db:

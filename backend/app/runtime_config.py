@@ -82,6 +82,15 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # membership = 只校验用户关注/加群，不按白名单过滤；
     # off = 两者都不启用。空值时兼容旧 bot_restrict_enabled=true → membership。
     "bot_gate_mode": ("bot_gate_mode", ""),
+    # v0.9.5：推送白名单改为「目录路由表」——不同 B 库目录经同一 Bot 推到不同频道/群。
+    # 每条 {dir_id, kind(channel|group), chat_id}；默认 1 条、最多 10 条。
+    "push_routes_json": ("push_routes_json", "[]"),
+    # v0.9.5：使用限制跳转链接（用户未关注频道/未加群时推给他的 t.me/@ 链接）。
+    "bot_required_channel_link": ("bot_required_channel_link", ""),
+    "bot_required_group_link": ("bot_required_group_link", ""),
+    # v0.9.5：推送消息里的频道/群跳转按钮（与打赏配置放一起，模板变量 channel_link/group_link）。
+    "tg_channel_link": ("tg_channel_link", ""),
+    "tg_group_link": ("tg_group_link", ""),
 }
 
 

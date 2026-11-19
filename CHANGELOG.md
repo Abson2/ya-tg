@@ -8,6 +8,36 @@
 
 ---
 
+## v0.9.5 (2026-11-19)
+
+按用户反馈修复「扫码登录后凭证调用未生效、镜像同步报错」，并完成分发与互动中心最后一轮语义重构。不改 A→B 镜像主链路、不改推送口径（仍由全局单 Bot 推到频道/群聊）。
+
+### 一、登录：二选一都能跑通完整业务（关键修复）
+- 根因：扫码登录（webqr）写入 `AuthToken(id=1)` 时未补 `did`，且 flow=webqr 不被业务客户端认可，`GuangYaWebFiles` 直接抛 401「尚未用短信登录」，导致扫码登录后镜像/扫描/分享全部失效。
+- 修复：`guangya_auth._save_token()` 对 webqr 补本地 did（与短信登录一致，业务接口只校验非空、不绑定 client_id）；`GuangYaWebFiles` / `GuangYaShareClient` / `scanner` / 连接验证的业务 flow 白名单纳入 webqr；`guangya_auth.refresh()` 对 webqr 走网页端设备码专属 base + 公开 client_id。现在短信与扫码二选一，登录后都能扫描、镜像、建分享、推送。
+- 刷新显示：`auth/status` 与 `sms/status` 把 webqr 计入 configured / has_refresh_token / auto_refresh；扫码成功前端同时刷新 auth 与 sms 凭证卡。
+- 删除 Device Code 授权与 Web OAuth 2.0 + PKCE 两套登录方式的前后端端点、函数、状态与入口，管理页只保留短信登录 + 扫码登录。
+
+### 二、推送白名单改为「目录路由表」
+- 新配置 `push_routes_json`（默认 1 条、最多 10 条）：每条 = 影视库 B 的下属目录 ID（空=根目录通配）+ 频道 ID 或群 ID（任填其一）。不同目录经同一 Bot 推到不同频道/群。
+- 入队链路 `_enqueue_after_identify()` 优先按目录路由匹配资源（精确 parent_id 或命中目录链），路由表为空时回退旧分发规则，保持升级兼容；同一作品同一目标仍只入一条。
+- 新增 `GET/POST /api/push/routes`：保存路由表时自动同步维护启用 Channel（按 chat_id 复用，标记 `route:` 前缀仅清理路由自创目标，不碰老数据），并在一次请求里更新全局单 Bot token。
+
+### 三、使用限制独立 + 跳转
+- 使用限制改为独立开关 `bot_restrict_enabled`，与推送白名单不再二选一；「关注的频道 ID / 加入的群 ID」任填其一即可（OR 语义，满足任一候选即放行，不再要求全部满足）。
+- 未满足限制的用户使用 Bot 时，回复带「关注官方频道 / 交流群」跳转按钮的消息；链接填 @用户名 或 t.me 地址（`bot_required_channel_link` / `bot_required_group_link`）。
+
+### 四、推送消息频道/群跳转（与打赏配置合并）
+- 打赏配置卡扩展为「打赏与消息跳转配置」：新增 `tg_channel_link` / `tg_group_link`，推送消息加「📢 官方频道」「👥 交流群」inline 按钮。
+- 消息模板新增 `{{channel_link}}` / `{{group_link}}` 变量，与按钮共用同一份配置；按钮模式/纯文本模式都可显示跳转。
+
+### 五、前端「分发与互动中心」收敛
+- 删除重复的 Bot 管理、推送目标、分发规则三个表格与统一弹窗；保留并增强「交互 Bot 与推送配置」（token 填写 / 验证 / 测试推送 / 管理）。
+- a 板块重排为：交互 Bot 与推送配置 → 推送白名单（目录路由）→ 内置指令速查 → 使用限制 → 打赏与消息跳转；b 板块投稿求片、c 板块 TgtoDrive 保持。
+
+### 六、回归
+- 新增 `test_v095_push_routes.py`（目录路由匹配/归一/上限、OR 限制、t.me 链接归一、模板变量、路由保存端点同步 Channel 与 Bot），并为扫码补 did 与 WebFiles 可用性断言。全套 306 passed，前端 vite build 通过。
+
 ## v0.9.4 (2026-11-19)
 
 按用户反馈把「分发与互动中心」里功能重复的六个模块融合成一张配置卡，并做数据去重：同一份 Bot Token、同一份推送目标不再重复填写。不改 A→B 镜像主链路、不改推送口径（仍由 Bot 推到频道/群聊）、不改白名单/限制二选一语义。

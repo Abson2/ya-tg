@@ -3,7 +3,6 @@ import json
 import logging
 import re
 import threading
-import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -13,7 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
@@ -24,7 +23,7 @@ from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, log_retention
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
-from .models import (AuditLog, AuthSession, AuthToken, Bot, Channel, DistributionEvent,
+from .models import (AuditLog, AuthToken, Bot, Channel, DistributionEvent,
                      MediaRequest, MessageTemplate, MirrorDir, MirrorFile, MirrorMedia, MirrorRule,
                      MirrorTask, QueueItem, Resource, ResourceScanBatch, ResourceVersion, Rule,
                      ScanCursor, ScanTask, UserContribution)
@@ -42,7 +41,6 @@ scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 # 用 threading.Lock 而非 asyncio.Lock：定时 job 与手动端点可能来自不同执行上下文，
 # 且测试里 asyncio.run() 会换事件循环，threading 锁不受影响。
 _mirror_lock = threading.Lock()
-_last_device_poll = 0.0
 
 
 def add_audit(db: Session, action: str, target_type: str = "", target_id: str = "", detail: str = "") -> None:
@@ -54,24 +52,6 @@ def check_admin(x_admin_password: str | None = Header(default=None)):
         raise HTTPException(503, "请先在 .env 设置 ADMIN_PASSWORD")
     if x_admin_password != settings.admin_password:
         raise HTTPException(401, "管理密码错误")
-
-
-async def _job_device_poll():
-    global _last_device_poll
-    db = SessionLocal()
-    try:
-        s = db.get(AuthSession, 1)
-        if not s or s.purpose != "device" or not s.device_code:
-            return
-        now = time.monotonic()
-        if now - _last_device_poll < max(2, s.interval or 3):
-            return
-        _last_device_poll = now
-        await guangya_auth.poll_device(db)
-    except Exception:
-        pass  # 后台轮询失败不打断调度，管理端可见 pending_message
-    finally:
-        db.close()
 
 
 async def _job_token_refresh():
@@ -87,7 +67,7 @@ async def _job_token_refresh():
                 add_audit(db, "token_refreshed", target_type="auth", detail="短信登录通道定时刷新成功")
                 db.commit()
             return
-        # 官方 Device/PKCE 通道：refresh_token 刷新
+        # 扫码（webqr）通道：走网页端设备码 refresh_token 刷新（含专属 client_id/base）
         if not t.refresh_token_enc or not t.expires_at:
             return
         if as_utc(t.expires_at) <= utcnow() + timedelta(minutes=10):
@@ -246,8 +226,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     _schedule_queue_worker(queue_trigger)
-    scheduler.add_job(_job_device_poll, "interval", seconds=3, id="device_poll",
-                      max_instances=1, coalesce=True)
     scheduler.add_job(_job_token_refresh, "interval", seconds=60, id="token_refresh",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
@@ -263,13 +241,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.4", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.5", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.4", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.5", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -286,25 +264,6 @@ def overview(db: Session = Depends(get_db)):
 @app.get("/api/auth/status", dependencies=ADMIN)
 def auth_status(db: Session = Depends(get_db)):
     return guangya_auth.status(db)
-
-
-@app.post("/api/auth/device/start", dependencies=ADMIN)
-async def auth_device_start(db: Session = Depends(get_db)):
-    try:
-        data = await guangya_auth.start_device(db)
-        add_audit(db, "auth_device_started", target_type="auth", detail=json_dumps({"user_code": data["user_code"]}))
-        db.commit()
-        return data
-    except guangya_auth.AuthError as exc:
-        raise HTTPException(400, str(exc))
-
-
-@app.post("/api/auth/device/poll", dependencies=ADMIN)
-async def auth_device_poll_now(db: Session = Depends(get_db)):
-    try:
-        return await guangya_auth.poll_device(db)
-    except guangya_auth.AuthError as exc:
-        raise HTTPException(400, str(exc))
 
 
 @app.post("/api/auth/webqr/start", dependencies=ADMIN)
@@ -338,35 +297,6 @@ async def auth_refresh(db: Session = Depends(get_db)):
         return {"ok": True, "status": guangya_auth.status(db)}
     except guangya_auth.AuthError as exc:
         raise HTTPException(400, str(exc))
-
-
-@app.get("/api/auth/pkce/start", dependencies=ADMIN)
-def auth_pkce_start(db: Session = Depends(get_db)):
-    try:
-        data = guangya_auth.start_pkce(db)
-        add_audit(db, "auth_pkce_started", target_type="auth")
-        db.commit()
-        return data
-    except guangya_auth.AuthError as exc:
-        raise HTTPException(400, str(exc))
-
-
-@app.get("/api/auth/pkce/callback", response_class=HTMLResponse)
-async def auth_pkce_callback(code: str = "", state: str = "", error: str = "",
-                             error_description: str = ""):
-    db = SessionLocal()
-    try:
-        result = await guangya_auth.exchange_pkce(db, code, state, error, error_description)
-        add_audit(db, "auth_pkce_success", target_type="auth", detail=result.get("sub", ""))
-        db.commit()
-        message = "授权成功，可关闭本窗口"
-    except Exception as exc:
-        message = f"授权失败：{str(exc)[:300]}"
-    finally:
-        db.close()
-    safe = message.replace("\\", "\\\\").replace("'", "\\'")
-    return HTMLResponse(f"<!doctype html><meta charset='utf-8'><body style='font-family:sans-serif;padding:40px'>"
-                        f"<h3>{safe}</h3><script>window.close()</script></body>")
 
 
 @app.get("/api/share/status", dependencies=ADMIN)
@@ -431,14 +361,15 @@ async def verify_openapi(db: Session = Depends(get_db)):
     Device/PKCE 高级授权才走 get_user_info。
     """
     t = db.get(AuthToken, 1)
-    if t and t.flow in ("sms", "tgto"):
+    if t and t.flow in ("sms", "tgto", "webqr"):
         try:
             data = await GuangYaWebFiles(db).list_files(page_size=1)
             items = data.get("list") or []
-            return {"ok": True, "channel": "web", "flow": "sms",
+            is_webqr = t.flow == "webqr"
+            return {"ok": True, "channel": "web", "flow": t.flow,
                     "user_id": guangya_sms.status(db).get("account") or "",
                     "root_items": len(items),
-                    "message": "光鸭网页端连接正常（短信登录），可扫描与建分享"}
+                    "message": f"光鸭网页端连接正常（{'扫码' if is_webqr else '短信'}登录），可扫描与建分享"}
         except Exception as exc:
             raise HTTPException(502, f"网页端连接失败：{exc}")
     try:
@@ -1897,6 +1828,19 @@ def _enqueue_after_identify(db: Session, x: Resource) -> int:
     if x.identify_status != "identified" or not (x.poster_path or "").strip():
         return 0
     added = 0
+    # v0.9.5：推送白名单改为目录路由表——同一 Bot 按资源所在 B 库目录推到不同频道/群。
+    # 路由表非空时以它为准（不同目录→不同目标）；为空时回退旧分发规则，保持升级兼容。
+    from types import SimpleNamespace
+    routes = bot_listener.push_routes(db)
+    if routes:
+        for route in bot_listener.match_push_routes(db, x):
+            ch = bot_listener.route_target_channel(db, route)
+            if not ch:
+                continue  # 路由目标未落成启用 Channel，跳过（保存路由时会同步维护）
+            pseudo_rule = SimpleNamespace(channel_id=ch.id, auto_publish=True)
+            if _enqueue_ready(db, x, pseudo_rule):
+                added += 1
+        return added
     for rule in db.scalars(select(Rule).where(Rule.enabled.is_(True))).all():
         if rule.directory_id and rule.directory_id != x.parent_id:
             continue
@@ -2975,12 +2919,18 @@ class InteractionConfigInput(BaseModel):
     bot_commands: list[dict] | None = None           # 自定义指令 [{command,description,reply}]
     # v0.9.2：使用限制与推送白名单二选一 whitelist/membership/off
     bot_gate_mode: str | None = None
+    # v0.9.5：使用限制跳转链接 + 推送消息频道/群跳转（与打赏一起维护，模板变量）
+    bot_required_channel_link: str | None = None
+    bot_required_group_link: str | None = None
+    tg_channel_link: str | None = None
+    tg_group_link: str | None = None
 
 
 @app.get("/api/interaction/config", dependencies=ADMIN)
 def interaction_config_get(db: Session = Depends(get_db)):
     plain = ["tgto_base_url", "tgto_scene", "donation_image_url", "donation_text",
-             "donation_button_text"]
+             "donation_button_text", "bot_required_channel_link", "bot_required_group_link",
+             "tg_channel_link", "tg_group_link"]
     out = {k: runtime_config.get(db, k) for k in plain}
     out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
@@ -3012,7 +2962,9 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
     values = {"contribution_enabled": "true" if p.contribution_enabled else "false",
               "donation_enabled": "true" if p.donation_enabled else "false"}
     for k in ("tgto_base_url", "tgto_scene", "tgto_api_key", "contribution_bot_token",
-              "donation_image_url", "donation_text", "donation_button_text"):
+              "donation_image_url", "donation_text", "donation_button_text",
+              "bot_required_channel_link", "bot_required_group_link",
+              "tg_channel_link", "tg_group_link"):
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
@@ -3056,6 +3008,111 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
               detail=json_dumps({"keys": sorted(values)}))
     db.commit()
     return {"ok": True, "saved": sorted(values)}
+
+
+# ---------- v0.9.5：推送白名单 = 目录路由表（全局单 Bot） ----------
+class PushRouteInput(BaseModel):
+    dir_id: str = ""       # 影视库 B 的下属目录 ID；空=根目录通配
+    kind: str = "channel"  # channel=频道 / group=群聊，任填其一即可
+    chat_id: str = ""      # 频道 ID 或群 ID
+
+
+class PushRoutesInput(BaseModel):
+    routes: list[PushRouteInput] = []
+    bot_token: str | None = None   # None/空/掩码=不改；新值=更新全局单 Bot token
+    bot_name: str = "Ya-TG Bot"
+
+
+_ROUTE_CHANNEL_PREFIX = "route:"  # 由路由表自动维护的 Channel 标记，清理时不碰用户旧数据
+
+
+def _global_bot(db: Session) -> Bot | None:
+    """全局单 Bot：优先 interaction_bot_id 指向的，否则第一个启用的，否则第一个。"""
+    raw = (runtime_config.get(db, "interaction_bot_id") or "").strip()
+    if raw.isdigit():
+        b = db.get(Bot, int(raw))
+        if b:
+            return b
+    return (db.scalar(select(Bot).where(Bot.enabled.is_(True)).order_by(Bot.id).limit(1))
+            or db.scalar(select(Bot).order_by(Bot.id).limit(1)))
+
+
+@app.get("/api/push/routes", dependencies=ADMIN)
+def push_routes_get(db: Session = Depends(get_db)):
+    bot = _global_bot(db)
+    return {
+        "routes": bot_listener.push_routes(db),
+        "bot": ({"id": bot.id, "name": bot.name, "enabled": bot.enabled,
+                 "token_masked": _mask_stored_token(bot.token)} if bot else None),
+        "max_routes": 10,
+    }
+
+
+@app.post("/api/push/routes", dependencies=ADMIN)
+def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
+    """保存目录路由表 + 全局单 Bot token，并同步维护推送目标 Channel。
+
+    路由表是配置真相源（runtime_config JSON）；Channel 是队列/发送层依赖的记录，
+    这里为每条路由确保一条启用的 Channel（按 chat_id 复用），删除不再使用的路由 Channel。
+    """
+    routes = []
+    for item in p.routes[:10]:
+        chat = str(item.chat_id or "").strip()
+        if not chat:
+            continue  # 频道/群任填其一，空路由跳过
+        kind = "group" if str(item.kind or "").lower() == "group" else "channel"
+        routes.append({"dir_id": str(item.dir_id or "").strip(), "kind": kind, "chat_id": chat})
+    if len(routes) > 10:
+        raise HTTPException(400, "推送白名单最多 10 条")
+
+    bot = _global_bot(db)
+    # token 有实质新值（非掩码/非占位）时更新或创建全局单 Bot
+    token = (p.bot_token or "").strip()
+    current_masked = _mask_stored_token(bot.token) if bot else ""
+    is_new_token = bool(token) and "•" not in token and "*" not in token and token != current_masked
+    if is_new_token:
+        try:
+            token_enc = encrypt_secret(token)
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc))
+        if bot:
+            bot.token = token_enc
+            bot.name = str(p.bot_name or bot.name).strip() or bot.name
+            bot.enabled = True
+        else:
+            bot = Bot(name=str(p.bot_name or "Ya-TG Bot").strip(), token=token_enc, enabled=True)
+            db.add(bot)
+            db.flush()
+        runtime_config.set_many(db, {"interaction_bot_id": str(bot.id)})
+
+    # 同步路由 Channel：按 chat_id 复用已有启用 Channel；没有则用全局 Bot 新建
+    keep_ids: set[int] = set()
+    for r in routes:
+        ch = db.scalar(select(Channel).where(Channel.chat_id == r["chat_id"]).limit(1))
+        if not ch:
+            if not bot:
+                raise HTTPException(400, "请先在「交互 Bot 与推送配置」填写 Bot Token")
+            ch = Channel(bot_id=bot.id, name=f"{_ROUTE_CHANNEL_PREFIX}{r['kind']}:{r['chat_id']}",
+                         chat_id=r["chat_id"], kind=r["kind"], enabled=True)
+            db.add(ch)
+            db.flush()
+        else:
+            ch.enabled = True
+            ch.kind = r["kind"]
+            if bot and not ch.name.startswith(_ROUTE_CHANNEL_PREFIX):
+                ch.bot_id = bot.id
+        keep_ids.add(ch.id)
+    # 清理路由自动创建、但已不再引用的 Channel（连带其规则/队列交由数据库外键与 worker 处理）
+    for ch in db.scalars(select(Channel).where(Channel.name.startswith(_ROUTE_CHANNEL_PREFIX))).all():
+        if ch.id not in keep_ids:
+            nr, nq = _cascade_channel(db, ch.id)
+            db.delete(ch)
+
+    runtime_config.set_many(db, {"push_routes_json": json_dumps(routes)})
+    add_audit(db, "push_routes_saved", target_type="config",
+              detail=json_dumps({"count": len(routes)}))
+    db.commit()
+    return {"ok": True, "routes": routes, "count": len(routes)}
 
 
 @app.post("/api/tgto/test", dependencies=ADMIN)

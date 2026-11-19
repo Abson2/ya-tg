@@ -164,7 +164,7 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
     # 短信登录用户走网页端文件接口（无需开放平台 client_id，真正零配置）；
     # 仅当使用官方 Device/PKCE 授权时才走官方 OpenAPI 业务接口。
     t = db.get(AuthToken, 1)
-    if t and t.flow in ("sms", "tgto"):
+    if t and t.flow in ("sms", "tgto", "webqr"):
         api = GuangYaWebFiles(db)
     else:
         api = GuangYaOpenAPI(db)

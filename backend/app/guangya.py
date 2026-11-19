@@ -47,7 +47,7 @@ class GuangYaOpenAPI:
         client_id = runtime_config.get(self.db, "guangya_client_id")
         # 前置防护：网页端短信登录凭证不属于官方 OpenAPI 体系，硬调必然 code=120 缺少clientId。
         # v0.5.3 已把扫描切到网页端；这里拦住其余残留调用（如 get_user_info 验证）。
-        if t and t.flow in ("sms", "tgto") and not client_id:
+        if t and t.flow in ("sms", "tgto", "webqr") and not client_id:
             raise GuangYaError(
                 "当前使用网页端短信登录凭证，不能调用官方 OpenAPI 业务接口："
                 "官方要求开放平台分配的 x-client-id（应用 ID），错误码 120 缺少clientId。"
@@ -145,8 +145,8 @@ class GuangYaWebFiles:
         from .security import decrypt_secret
 
         t = db.get(AuthToken, 1)
-        if not t or not t.access_token_enc or t.flow not in ("sms", "tgto"):
-            raise WebFileError("尚未用短信登录光鸭，请在管理页完成手机号+验证码登录", 401)
+        if not t or not t.access_token_enc or t.flow not in ("sms", "tgto", "webqr"):
+            raise WebFileError("尚未登录光鸭，请在管理页用短信验证码或 App 扫码登录", 401)
         self.db = db
         self.base = settings.guangya_share_base.rstrip("/")
         did = getattr(t, "device_id", "") or ""
@@ -310,7 +310,7 @@ class GuangYaShareClient:
             t = db.get(AuthToken, 1)
             # 短信登录用户的 token 就是网页会话凭证，优先使用（手工 .env 凭证可能已过期）
             sms_authorization = ""
-            if t and t.access_token_enc and t.flow in ("sms", "tgto"):
+            if t and t.access_token_enc and t.flow in ("sms", "tgto", "webqr"):
                 sms_authorization = "Bearer " + decrypt_secret(t.access_token_enc)
             authorization = sms_authorization or runtime_config.get(db, "guangya_share_authorization")
             did = runtime_config.get(db, "guangya_share_did")
@@ -349,8 +349,8 @@ class GuangYaShareClient:
             sources = runtime_config.source_map(db)
             source = sources.get("guangya_share_authorization", "empty")
             t = db.get(AuthToken, 1)
-            if t and t.access_token_enc and t.flow in ("sms", "tgto"):
-                source = "sms"  # 短信登录凭证优先
+            if t and t.access_token_enc and t.flow in ("sms", "tgto", "webqr"):
+                source = "sms" if t.flow != "webqr" else "webqr"  # 登录凭证优先
                 authorization = "Bearer ***"
                 did = did or getattr(t, "device_id", "")
         else:
@@ -358,7 +358,8 @@ class GuangYaShareClient:
             did = settings.guangya_share_did
             smid = settings.guangya_share_smid
             source = "env" if authorization else "empty"
-        source_label = {"db": "页面配置", "env": ".env 手工配置", "sms": "短信登录（自动）", "empty": "未配置"}.get(source, source)
+        source_label = {"db": "页面配置", "env": ".env 手工配置", "sms": "短信登录（自动）",
+                        "webqr": "扫码登录（自动）", "empty": "未配置"}.get(source, source)
         return {
             "configured": bool(authorization),
             "base": settings.guangya_share_base,

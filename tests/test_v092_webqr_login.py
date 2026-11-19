@@ -122,6 +122,21 @@ def test_poll_webqr_success_stores_webqr_flow(db):
     # _save_token 优先 OpenAPI client_id（测试环境配了 test-client），否则落网页端公开 ID。
     assert t.client_id in (settings.guangya_client_id, settings.guangya_webqr_client_id)
     assert t.client_id  # refresh 能带上非空 client_id
+    # v0.9.5：扫码登录必须补 did，否则镜像/扫描的 WebFileClient 直接 401
+    assert (t.device_id or "").strip(), "扫码登录必须补 did 才能跑业务接口"
+
+
+def test_webqr_token_usable_by_web_files_client(db):
+    """v0.9.5 红线：扫码登录后业务客户端 GuangYaWebFiles 能构造成功（不再 401）。"""
+    from app.guangya import GuangYaWebFiles
+    t = AuthToken(id=1, access_token_enc=__import__("app.security", fromlist=["encrypt_secret"]).encrypt_secret("tok"),
+                  flow="webqr", device_id="local-did-webqr")
+    db.add(t)
+    db.commit()
+    client = GuangYaWebFiles(db)  # 不抛 WebFileError 即通过
+    assert client.headers["Authorization"] == "Bearer tok"
+    assert client.headers["did"] == "local-did-webqr"
+    assert client.headers["dt"] == "4"
 
 
 def test_poll_webqr_expired_clears_session(db):
