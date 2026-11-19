@@ -280,8 +280,9 @@ def test_mirror_guard_rejects_concurrent_call():
 
 def test_all_long_entrypoints_are_guarded():
     src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    # run / rename / tasks poll / mappings prune：任何分钟级长任务都必须共用同一把锁
-    assert src.count("with _mirror_guard():") == 4
+    # run / rename / tasks poll / mappings prune / media clear-invalid(v0.9.8)：
+    # 任何分钟级长任务或批量删映射都必须共用同一把锁
+    assert src.count("with _mirror_guard():") == 5
     assert "_mirror_lock.acquire(blocking=False)" in src  # 定时同步跳过而非排队
     assert "_mirror_lock.release()" in src
 

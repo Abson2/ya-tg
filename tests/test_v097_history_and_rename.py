@@ -234,10 +234,12 @@ def test_frontend_reward_moved_into_builtin_commands():
 
 
 def test_frontend_jump_links_moved_to_template_module():
-    assert "推送消息 · 官方频道跳转" in APP
-    assert "推送消息 · 交流群跳转" in APP
+    # v0.9.8：两张跳转卡并入同一张「推送消息 · 跳转按钮」panel，标题改为子标题
+    assert "推送消息 · 跳转按钮" in APP
+    assert "官方频道跳转" in APP
+    assert "交流群跳转" in APP
     assert "async function saveJumpLinks" in APP
-    assert "留空则不显示按钮" in APP
+    assert "留空则不启用对应的按钮与模板变量" in APP
     assert "&#123;&#123;channel_link&#125;&#125;" in APP
     assert "&#123;&#123;group_link&#125;&#125;" in APP
 
@@ -249,7 +251,10 @@ def test_private_chat_reply_keyboard_on_start():
     assert kb["resize_keyboard"] is True and kb["one_time_keyboard"] is False
     src = (ROOT / "backend/app/bot_listener.py").read_text(encoding="utf-8")
     assert "reply_markup=main_reply_keyboard()" in src
-    assert "/setMyCommands" not in src  # 红线：不调用 Telegram 底部指令栏注册接口
+    # v0.9.8：用户改口径——需要把其它项目残留的底部指令栏同步/清空为当前项目。
+    # 这里只校验同步函数用 setMyCommands 且只用当前项目的英文指令，不再断言"绝不调用"。
+    assert "def sync_bot_command_menu" in src
+    assert '"setMyCommands"' in src
 
 
 def test_broadcast_notify_sends_only_to_push_routes(session):

@@ -396,6 +396,10 @@ class UserContribution(Base):
     share_url: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/approved/rejected/transferred
     note: Mapped[str] = mapped_column(Text, default="")
+    # v0.9.8：TMDB 候选选定后记录用户最终提交的影号/中文名/年份/类型
+    tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    year: Mapped[str] = mapped_column(String(16), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -408,10 +412,17 @@ class MediaRequest(Base):
     tg_username: Mapped[str] = mapped_column(String(128), default="")
     title: Mapped[str] = mapped_column(String(512), default="")
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # v0.9.8：TMDB 候选中文名/年份/类型落库，供后台展示用户最终选定的作品
+    year: Mapped[str] = mapped_column(String(16), default="")
     media_type: Mapped[str] = mapped_column(String(16), default="")
     season: Mapped[int | None] = mapped_column(Integer, nullable=True)
     keyword_id: Mapped[str] = mapped_column(String(128), default="")
-    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/synced/failed
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/synced/failed（TgtoDrive 同步状态，管理员内部可见）
+    # v0.9.8：管理员审核状态，与 TgtoDrive 同步状态解耦。用户提交后一律 pending，
+    # 不再把「failed」当业务状态展示给用户/后台审核列表。pending/adopted/rejected
+    review_status: Mapped[str] = mapped_column(String(24), default="pending")
+    review_note: Mapped[str] = mapped_column(Text, default="")
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

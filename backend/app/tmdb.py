@@ -12,6 +12,9 @@ AI 回退识别」的思路，见其 README 与 /api/organize-history/recognize-
 import html
 import json
 import re
+import threading
+import time
+from collections import deque
 from difflib import SequenceMatcher
 
 import httpx
@@ -65,6 +68,60 @@ def _prefer_chinese(*values) -> str:
 
 class TmdbAuthError(RuntimeError):
     """TMDB 凭证缺失或无效，携带可直接展示给用户的中文提示。"""
+
+
+class TmdbRateLimited(RuntimeError):
+    """场景限流触发：调用过于频繁，本次请求未发出。"""
+
+
+# ---------- v0.9.8：按场景独立限流（scan 资源库识别 / bot 私聊交互） ----------
+# 每个场景各自维护「上次调用时间 + 滑动窗口内的调用时间戳」。
+# bot 默认间隔久、频次低，防止 Bot 被恶意刷导致 TMDB 账号风控。
+_RATE_LOCK = threading.Lock()
+_RATE_STATE: dict[str, dict] = {}
+SCAN = "scan"
+BOT = "bot"
+
+
+def reset_rate_limiters() -> None:
+    """清空限流状态（测试 / 配置热更新后调用）。"""
+    with _RATE_LOCK:
+        _RATE_STATE.clear()
+
+
+def _rate_cfg(db: Session, scenario: str) -> tuple[float, int, int]:
+    def num(key: str, cast):
+        raw = runtime_config.get(db, key)
+        return cast(raw) if raw not in (None, "") else cast(runtime_config.DEFAULTS[key][1])
+    try:
+        if scenario == BOT:
+            interval = num("tmdb_bot_min_interval", float)
+            max_calls = num("tmdb_bot_max_calls", int)
+        else:
+            interval = num("tmdb_scan_min_interval", float)
+            max_calls = num("tmdb_scan_max_calls", int)
+        window = num("tmdb_rate_window_seconds", int)
+    except (ValueError, TypeError):
+        interval, max_calls, window = 0.0, 60, 60
+    return max(0.0, interval), max(1, max_calls), max(1, window)
+
+
+def check_rate_limit(db: Session, scenario: str = SCAN) -> bool:
+    """检查并消费一次调用配额。返回 True 放行、False 表示被限流（本次不调用 TMDB）。"""
+    interval, max_calls, window = _rate_cfg(db, scenario)
+    now = time.monotonic()
+    with _RATE_LOCK:
+        st = _RATE_STATE.setdefault(scenario, {"last": 0.0, "calls": deque()})
+        calls: deque = st["calls"]
+        while calls and now - calls[0] > window:
+            calls.popleft()
+        if len(calls) >= max_calls:
+            return False
+        if interval > 0 and st["last"] and (now - st["last"]) < interval:
+            return False
+        calls.append(now)
+        st["last"] = now
+        return True
 
 
 def _looks_v4(value: str) -> bool:
@@ -134,10 +191,15 @@ def _mask(value: str) -> str:
     return value[:4] + "…" + value[-4:]
 
 
-async def _get(path: str, params: dict, db: Session | None = None) -> dict:
+async def _get(path: str, params: dict, db: Session | None = None,
+               scenario: str = SCAN) -> dict:
     c = credentials(db)
     if not (c["bearer"] or c["key"]):
         raise TmdbAuthError("尚未配置 TMDB 密钥。请到「TMDB 设置」页填入 v3 API Key 或 v4 Read Access Token。")
+    # v0.9.8：按场景限流。bot 场景（私聊求片/投稿候选搜索）默认更保守，
+    # 被限流时本次不发出 TMDB 请求，调用方按空结果降级。
+    if db is not None and not check_rate_limit(db, scenario):
+        raise TmdbRateLimited(f"TMDB {scenario} 场景调用过于频繁，已被限流，请稍后再试。")
     # 剧名优先中文：所有端点统一带 language，避免漏传时 TMDB 返回英文原名
     params = {**params, "language": params.get("language") or c["language"] or "zh-CN"}
     headers = {"accept": "application/json"}
@@ -250,14 +312,15 @@ def _normalize(item: dict, media_type: str) -> dict:
     }
 
 
-async def search(title: str, media_type: str | None = None, db: Session | None = None) -> list[dict]:
+async def search(title: str, media_type: str | None = None, db: Session | None = None,
+                 scenario: str = SCAN) -> list[dict]:
     title = (title or "").strip()
     if not title:
         return []
     language = credentials(db)["language"]
     params = {"query": title, "language": language, "page": 1}
     path = "/search/multi" if media_type not in ("movie", "tv") else f"/search/{media_type}"
-    data = await _get(path, params, db)
+    data = await _get(path, params, db, scenario)
     out = []
     for x in data.get("results", []):
         mt = media_type or (x.get("media_type") or ("tv" if "first_air_date" in x else "movie"))
@@ -267,12 +330,13 @@ async def search(title: str, media_type: str | None = None, db: Session | None =
     return out[:10]
 
 
-async def search_both(title: str, db: Session | None = None) -> list[dict]:
+async def search_both(title: str, db: Session | None = None,
+                      scenario: str = SCAN) -> list[dict]:
     """类型未知时同时查剧集和电影，供评分决策。"""
     out: list[dict] = []
     for mt in ("tv", "movie"):
         try:
-            out.extend(await search(title, mt, db))
+            out.extend(await search(title, mt, db, scenario))
         except TmdbAuthError:
             raise
         except Exception:

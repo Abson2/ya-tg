@@ -300,13 +300,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.7", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.8", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.7", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.8", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -317,6 +317,83 @@ def overview(db: Session = Depends(get_db)):
         counts[status] = db.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == status)) or 0
     counts["auth"] = "ok" if (db.get(AuthToken, 1) and db.get(AuthToken, 1).access_token_enc) else "unauthorized"
     return counts
+
+
+# ---------- v0.9.8：推送效果统计（只做后端真实可得指标） ----------
+def _stat_bucket(dt, period: str) -> str:
+    """把 UTC 时间按本地日/周/月归桶，返回桶标签。"""
+    local = as_utc(dt).astimezone()  # 转本地时区
+    if period == "month":
+        return f"{local.year:04d}-{local.month:02d}"
+    if period == "week":
+        monday = local - timedelta(days=local.weekday())
+        return f"{monday.year:04d}-{monday.month:02d}-{monday.day:02d}"
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d}"
+
+
+@app.get("/api/push-stats", dependencies=ADMIN)
+def push_stats(period: str = "day", days: int = 30,
+               db: Session = Depends(get_db)):
+    """推送统计与图文报表数据源。
+
+    真实可得：发送成功数、失败数、成功率、重试次数、分发事件数（均来自本地库）。
+    不可得：阅读数 / 点击数 / 转存数——Telegram Bot API 不回传已读/点击，
+    光鸭分享接口也没有转存回调；不造假数，明确在 unavailable 里说明。
+    """
+    if period not in ("day", "week", "month"):
+        raise HTTPException(400, "period 仅支持 day/week/month")
+    days = max(1, min(days, 365))
+    cutoff = utcnow() - timedelta(days=days)
+
+    sent_rows = db.scalars(select(QueueItem).where(
+        QueueItem.sent_at.isnot(None), QueueItem.sent_at >= cutoff)).all()
+    failed_rows = db.scalars(select(QueueItem).where(
+        QueueItem.status == "failed", QueueItem.created_at >= cutoff)).all()
+    dist_rows = db.scalars(select(DistributionEvent).where(
+        DistributionEvent.created_at >= cutoff)).all()
+
+    buckets: dict[str, dict] = {}
+
+    def slot(label: str) -> dict:
+        return buckets.setdefault(label, {"label": label, "sent": 0, "failed": 0,
+                                          "retries": 0, "events": 0})
+
+    for q in sent_rows:
+        slot(_stat_bucket(q.sent_at, period))["sent"] += 1
+        if q.attempts and q.attempts > 1:
+            slot(_stat_bucket(q.sent_at, period))["retries"] += q.attempts - 1
+    for q in failed_rows:
+        slot(_stat_bucket(q.created_at, period))["failed"] += 1
+    for e in dist_rows:
+        slot(_stat_bucket(e.created_at, period))["events"] += 1
+
+    series = sorted(buckets.values(), key=lambda x: x["label"])
+    for row in series:
+        total = row["sent"] + row["failed"]
+        row["success_rate"] = round(row["sent"] / total * 100, 1) if total else 0.0
+
+    totals = {
+        "sent": sum(r["sent"] for r in series),
+        "failed": sum(r["failed"] for r in series),
+        "retries": sum(r["retries"] for r in series),
+        "events": sum(r["events"] for r in series),
+    }
+    tt = totals["sent"] + totals["failed"]
+    totals["success_rate"] = round(totals["sent"] / tt * 100, 1) if tt else 0.0
+
+    return {
+        "period": period, "days": days, "series": series, "totals": totals,
+        "available": ["发送成功数", "发送失败数", "成功率", "重试次数", "分发更新次数"],
+        "unavailable": [
+            {"key": "reads", "label": "阅读数",
+             "reason": "Telegram Bot API 不回传消息已读状态，无法统计"},
+            {"key": "clicks", "label": "点击数",
+             "reason": "Telegram inline 按钮点击不回流到本系统，无法统计"},
+            {"key": "transfers", "label": "转存数",
+             "reason": "光鸭分享接口未提供转存回调，无法统计"},
+        ],
+        "generated_at": utcnow().isoformat(),
+    }
 
 
 # ---------- 光鸭授权 ----------
@@ -980,9 +1057,50 @@ def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
     return {"ok": True, "removed": removed}
 
 
+@app.post("/api/mirror/media/clear-invalid", dependencies=ADMIN)
+def mirror_media_clear_invalid(db: Session = Depends(get_db)):
+    """v0.9.8：清理历史无效影视映射（failed/blocked 且无任何 synced 文件）。
+
+    只删 A→B 映射登记（连同子 MirrorFile），不删资源 / 分享 / 队列 / B 库文件。
+    A 库仍有源文件时，下轮「立即同步」会按 A 库重新识别并重建映射；这是安全的。
+    """
+    targets = _invalid_media_rows(db)
+    removed_media = len(targets)
+    removed_files = 0
+    with _mirror_guard():
+        for m in targets:
+            removed_files += db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
+            db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
+                synchronize_session=False)
+            db.delete(m)
+        if removed_media:
+            add_audit(db, "mirror_media_clear_invalid", target_type="mirror",
+                      detail=json_dumps({"media": removed_media, "files": removed_files}))
+        db.commit()
+    return {"ok": True, "removed_media": removed_media, "removed_files": removed_files}
+
+
+def _invalid_media_rows(db: Session) -> list:
+    """v0.9.8：判定「历史无效影视映射」——状态 failed/blocked 且没有任何 synced 文件。
+
+    这类行不会自动恢复（同步只会重试 pending / RETRYABLE 文件），是历史遗留僵尸映射。
+    删除只清 A→B 映射登记，不删资源 / 分享 / 队列；A 库仍有文件时下轮同步会自动重建。
+    """
+    out = []
+    for m in db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc())).all():
+        if str(getattr(m, "status", "")) not in ("failed", "blocked"):
+            continue
+        synced = db.query(MirrorFile).filter(
+            MirrorFile.media_id == m.id, MirrorFile.status == "synced").count()
+        if synced == 0:
+            out.append(m)
+    return out
+
+
 @app.get("/api/mirror/status", dependencies=ADMIN)
 def mirror_status(db: Session = Depends(get_db)):
     r = _mirror_rule(db)
+    invalid_media = _invalid_media_rows(db)
     media = list(db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc()).limit(200)).all())
     tasks = list(db.scalars(select(MirrorTask).order_by(MirrorTask.id.desc()).limit(30)).all())
     dirs = list(db.scalars(select(MirrorDir).order_by(MirrorDir.id.desc()).limit(200)).all())
@@ -1047,6 +1165,40 @@ def mirror_status(db: Session = Depends(get_db)):
             pending_items.append({"kind": "复制任务待确认", "work": titles.get(t.media_id, ""),
                                   "target": t.task_id, "status": t.status,
                                   "detail": (t.error or "")[:300]})
+
+    # v0.9.8 #195：入库→识别→分享→推送 全流程节点（实时从库里算，用户能看出卡在哪一步）
+    total_files = db.query(MirrorFile).count()
+    synced_files = db.query(MirrorFile).filter(MirrorFile.status == "synced").count()
+    identified_res = db.query(Resource).filter(
+        Resource.identify_status == "identified").count()
+    shared_res = db.query(Resource).filter(
+        Resource.share_url.isnot(None), Resource.share_url != "").count()
+    queued_items = db.query(QueueItem).count()
+    sent_items = db.query(QueueItem).filter(QueueItem.status == "sent").count()
+    pipeline = [
+        {"key": "copy", "label": "① 复制到 B 库", "value": synced_files, "total": total_files,
+         "status": "done" if total_files and synced_files >= total_files else ("active" if synced_files else "idle"),
+         "detail": f"{synced_files}/{total_files} 文件已同步"},
+        {"key": "rename", "label": "② 英文改名", "value": db.query(MirrorFile).filter(
+            MirrorFile.rename_status == "done").count(), "total": total_files,
+         "status": "done" if total_files and db.query(MirrorFile).filter(
+             MirrorFile.rename_status == "done").count() >= total_files else "active",
+         "detail": f"{db.query(MirrorFile).filter(MirrorFile.rename_status == 'done').count()}/{total_files} 已改名（可选步骤）"},
+        {"key": "identify", "label": "③ 入库识别", "value": identified_res,
+         "total": db.query(Resource).count(),
+         "status": "done" if identified_res else "active",
+         "detail": f"{identified_res} 部已识别 / 共 {db.query(Resource).count()} 资源"},
+        {"key": "share", "label": "④ 生成分享", "value": shared_res, "total": identified_res,
+         "status": "done" if identified_res and shared_res >= identified_res else "active",
+         "detail": f"{shared_res}/{identified_res} 已建分享（推送时按需创建）"},
+        {"key": "push", "label": "⑤ 推送入队", "value": queued_items, "total": 0,
+         "status": "done" if sent_items else ("active" if queued_items else "idle"),
+         "detail": f"队列 {queued_items} 项 / 已推送 {sent_items}（由定时调度消费）"},
+    ]
+    # 同步进度百分比：按文件 synced/total；无文件时看锁状态
+    progress = round(synced_files / total_files * 100, 1) if total_files else 0.0
+    lock_info = _mirror_lock.info()
+
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -1085,6 +1237,8 @@ def mirror_status(db: Session = Depends(get_db)):
             "dirs_pruned_zombie": len(pruned_dirs),  # v0.9.6：已清理待重建的僵尸行数
             "dirs_fallback": db.query(MirrorDir).filter(
                 MirrorDir.status == "created_fallback").count(),
+            # v0.9.8：历史无效影视映射（failed/blocked 且无 synced 文件）
+            "media_invalid": len(invalid_media),
         },
         "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
                    "media_type": m.media_type, "status": m.status,
@@ -1092,8 +1246,13 @@ def mirror_status(db: Session = Depends(get_db)):
                    "english_source": getattr(m, "english_source", "") or "",
                    "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
                    "category_path": getattr(m, "category_path", "") or "",
+                   "invalid": any(x.id == m.id for x in invalid_media),  # v0.9.8
                    "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
                   for m in media],
+        # v0.9.8：历史无效影视映射清单，供管理页「清理无效影视映射」按钮展示/确认
+        "invalid_media": [{"id": m.id, "title": m.title_standard,
+                           "status": m.status, "category_path": getattr(m, "category_path", "") or ""}
+                          for m in invalid_media],
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
                   "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id,
@@ -1121,6 +1280,11 @@ def mirror_status(db: Session = Depends(get_db)):
         # v0.9.6：镜像互斥锁状态（谁在跑、跑了多久），前端据此提示「后台任务运行中」，
         # 避免用户点「立即同步」撞上静默的后台改名复查后只看到一句 409。
         "lock": _mirror_lock.info(),
+        # v0.9.8 #195：全流程节点 + 同步进度，首页/镜像页据此展示流程条与进度
+        "pipeline": pipeline,
+        "progress": {"percent": progress, "synced": synced_files, "total": total_files,
+                     "running": bool(lock_info.get("busy")),
+                     "owner": lock_info.get("owner", "")},
         # v0.8.2：回显实际生效配置，一眼看出「自动创建是不是被关掉了」
         "config": {
             "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
@@ -2012,23 +2176,53 @@ class TmdbConfigInput(BaseModel):
     api_key: str = ""
     bearer_token: str = ""
     language: str = ""
+    # v0.9.8：按场景独立限流（bot 默认更保守，防 Bot 被刷导致 TMDB 账号异常）
+    scan_min_interval: str = ""
+    scan_max_calls: str = ""
+    bot_min_interval: str = ""
+    bot_max_calls: str = ""
+    rate_window_seconds: str = ""
 
 
 @app.get("/api/tmdb/status", dependencies=ADMIN)
 def tmdb_status(db: Session = Depends(get_db)):
-    return tmdb.auth_status(db)
+    out = tmdb.auth_status(db)
+    out["rate_limit"] = {
+        "scan_min_interval": runtime_config.get(db, "tmdb_scan_min_interval"),
+        "scan_max_calls": runtime_config.get(db, "tmdb_scan_max_calls"),
+        "bot_min_interval": runtime_config.get(db, "tmdb_bot_min_interval"),
+        "bot_max_calls": runtime_config.get(db, "tmdb_bot_max_calls"),
+        "rate_window_seconds": runtime_config.get(db, "tmdb_rate_window_seconds"),
+    }
+    return out
 
 
 @app.post("/api/tmdb/config", dependencies=ADMIN)
 def tmdb_config_save(p: TmdbConfigInput, db: Session = Depends(get_db)):
-    runtime_config.set_many(db, {
+    values = {
         "tmdb_api_key": p.api_key.strip(),
         "tmdb_bearer_token": p.bearer_token.strip(),
         "tmdb_language": (p.language.strip() or "zh-CN"),
-    })
-    add_audit(db, "tmdb_config_saved", target_type="config", detail="TMDB 密钥已更新（密文存储）")
+    }
+    # 仅当用户填了值才覆盖限流配置（留空保持原值/默认）
+    for field, key in (("scan_min_interval", "tmdb_scan_min_interval"),
+                       ("scan_max_calls", "tmdb_scan_max_calls"),
+                       ("bot_min_interval", "tmdb_bot_min_interval"),
+                       ("bot_max_calls", "tmdb_bot_max_calls"),
+                       ("rate_window_seconds", "tmdb_rate_window_seconds")):
+        raw = getattr(p, field, "").strip()
+        if raw:
+            try:
+                num = float(raw) if "interval" in field or "window" in field else int(raw)
+                if num >= 0:
+                    values[key] = str(int(num) if num == int(num) else num)
+            except ValueError:
+                pass  # 非法输入忽略，保持原值
+    runtime_config.set_many(db, values)
+    tmdb.reset_rate_limiters()  # 配置变更后清空滑动窗口，立即生效
+    add_audit(db, "tmdb_config_saved", target_type="config", detail="TMDB 密钥/限流已更新（密文存储）")
     db.commit()
-    return {"ok": True, "status": tmdb.auth_status(db)}
+    return {"ok": True, "status": tmdb_status(db)}
 
 
 @app.post("/api/tmdb/test", dependencies=ADMIN)
@@ -2582,7 +2776,8 @@ def add_template(p: TemplateInput, db: Session = Depends(get_db)):
 @app.post("/api/templates/default", dependencies=ADMIN)
 def reset_default_template(db: Session = Depends(get_db)):
     """一键恢复 v0.6.4 整剧风格的默认模板（emoji + 海报，不含单集文件名）。"""
-    x = db.scalar(select(MessageTemplate).where(MessageTemplate.name == "默认图文模板"))
+    # v0.9.8：first() 防止历史库多条同名时 scalar() 抛 MultipleResultsFound（500）
+    x = db.scalars(select(MessageTemplate).where(MessageTemplate.name == "默认图文模板")).first()
     if not x:
         x = MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
                             enabled=True, is_default=True)
@@ -2614,16 +2809,39 @@ def edit_template(tid: int, p: TemplateInput, db: Session = Depends(get_db)):
 
 @app.delete("/api/templates/{tid}", dependencies=ADMIN)
 def delete_template(tid: int, db: Session = Depends(get_db)):
-    """v0.9.6：删除模板；默认模板禁删（避免 publisher 无模板可用）。"""
-    x = db.get(MessageTemplate, tid)
-    if not x:
-        raise HTTPException(404, "模板不存在")
-    if x.is_default:
-        raise HTTPException(400, "默认模板不能删除，请先把别的模板设为默认")
-    db.delete(x)
-    add_audit(db, "template_deleted", target_type="template", target_id=str(tid))
-    db.commit()
-    return {"ok": True}
+    """v0.9.8：删除任意模板；删掉默认模板后自动补位，保证 publisher 始终有模板可用。
+
+    旧版直接禁删默认模板（400），真机上历史库存在多条默认/同名模板时，点删除偶发
+    Internal Server Error。这里统一在事务内完成「删除→补默认」，任何异常转成明确
+    中文 HTTPException，绝不让底层异常裸抛成 500。
+    """
+    try:
+        x = db.get(MessageTemplate, tid)
+        if not x:
+            raise HTTPException(404, "模板不存在")
+        was_default = bool(x.is_default)
+        db.delete(x)
+        db.flush()
+        # 删除后必须还有一条启用模板，且恰好有一条默认模板
+        remain = db.scalars(select(MessageTemplate).where(MessageTemplate.enabled.is_(True))).all()
+        defaults = [r for r in remain if r.is_default]
+        if was_default or not defaults:
+            if remain:
+                keeper = defaults[0] if defaults else remain[0]
+                for r in remain:
+                    r.is_default = (r.id == keeper.id)
+            else:
+                # 最后一条模板也被删：重建内置默认，避免 publisher 无模板可用
+                db.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
+                                       enabled=True, is_default=True))
+        add_audit(db, "template_deleted", target_type="template", target_id=str(tid))
+        db.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(400, f"删除模板失败：{str(exc)[:120]}")
 
 
 @app.get("/api/audit", dependencies=ADMIN)
@@ -3229,8 +3447,11 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
 # ---------- v0.9.5：推送白名单 = 目录路由表（全局单 Bot） ----------
 class PushRouteInput(BaseModel):
     dir_id: str = ""       # 影视库 B 的下属目录 ID；空=根目录通配
-    kind: str = "channel"  # channel=频道 / group=群聊，任填其一即可
-    chat_id: str = ""      # 频道 ID 或群 ID
+    kind: str = "channel"  # 老字段：channel/group；v0.9.8 起前端改用双字段，保留兼容
+    chat_id: str = ""      # 老字段：单一目标；v0.9.8 起前端改用双字段，保留兼容
+    # v0.9.8：频道 ID 与群 ID 两个独立可填字段，可只填其一或两个都填
+    channel_id: str = ""
+    group_id: str = ""
     note: str = ""         # v0.9.6：备注，便于肉眼区分不同目录（纯展示，不参与匹配）
 
 
@@ -3258,7 +3479,8 @@ def _global_bot(db: Session) -> Bot | None:
 def push_routes_get(db: Session = Depends(get_db)):
     bot = _global_bot(db)
     return {
-        "routes": bot_listener.push_routes(db),
+        # v0.9.8：管理页回填用原始路由（频道 / 群两个独立字段），不要用展开后的目标列表
+        "routes": bot_listener.push_routes_raw(db),
         "bot": ({"id": bot.id, "name": bot.name, "enabled": bot.enabled,
                  "token_masked": _mask_stored_token(bot.token)} if bot else None),
         "max_routes": 10,
@@ -3274,14 +3496,30 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
     """
     routes = []
     for item in p.routes[:10]:
-        chat = str(item.chat_id or "").strip()
-        if not chat:
-            continue  # 频道/群任填其一，空路由跳过
-        kind = "group" if str(item.kind or "").lower() == "group" else "channel"
-        routes.append({"dir_id": str(item.dir_id or "").strip(), "kind": kind, "chat_id": chat,
+        channel_id = str(getattr(item, "channel_id", "") or "").strip()
+        group_id = str(getattr(item, "group_id", "") or "").strip()
+        # 兼容老前端：只传 kind/chat_id 时归入对应字段
+        if not channel_id and not group_id:
+            legacy = str(item.chat_id or "").strip()
+            if legacy:
+                if str(item.kind or "").lower() == "group":
+                    group_id = legacy
+                else:
+                    channel_id = legacy
+        if not channel_id and not group_id:
+            continue  # 频道/群都为空的路由跳过
+        routes.append({"dir_id": str(item.dir_id or "").strip(),
+                       "channel_id": channel_id, "group_id": group_id,
                        "note": str(item.note or "").strip()[:120]})
     if len(routes) > 10:
         raise HTTPException(400, "推送白名单最多 10 条")
+    # 展开成目标列表供 Channel 同步：一条路由的频道与群各算一个目标
+    channel_targets = []
+    for r in routes:
+        if r["channel_id"]:
+            channel_targets.append({"kind": "channel", "chat_id": r["channel_id"]})
+        if r["group_id"]:
+            channel_targets.append({"kind": "group", "chat_id": r["group_id"]})
 
     bot = _global_bot(db)
     # token 有实质新值（非掩码/非占位）时更新或创建全局单 Bot
@@ -3305,7 +3543,7 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
 
     # 同步路由 Channel：按 chat_id 复用已有启用 Channel；没有则用全局 Bot 新建
     keep_ids: set[int] = set()
-    for r in routes:
+    for r in channel_targets:
         ch = db.scalar(select(Channel).where(Channel.chat_id == r["chat_id"]).limit(1))
         if not ch:
             if not bot:
@@ -3353,6 +3591,30 @@ def push_bot_token_clear(db: Session = Depends(get_db)):
                     "token_masked": _mask_stored_token(bot.token)}}
 
 
+class BotCommandsMenuInput(BaseModel):
+    clear: bool = False
+
+
+@app.post("/api/bot/commands/menu", dependencies=ADMIN)
+async def bot_commands_menu(p: BotCommandsMenuInput = BotCommandsMenuInput(),
+                            db: Session = Depends(get_db)):
+    """v0.9.8：把 Telegram 私聊指令栏同步为当前项目指令，或置空（清除其它项目旧残留）。"""
+    bot = _global_bot(db)
+    if not bot or not bot.token:
+        raise HTTPException(400, "尚未配置 Bot Token，请先填写并保存")
+    try:
+        token = decrypt_secret(bot.token)
+    except Exception:
+        token = bot.token
+    out = await bot_listener.sync_bot_command_menu(db, token, clear=bool(p.clear))
+    if not out.get("ok"):
+        raise HTTPException(400, out.get("description") or "同步指令栏失败，请检查 Token 与网络")
+    add_audit(db, "bot_commands_menu_synced", target_type="config", target_id=str(bot.id),
+              detail="clear" if p.clear else "sync")
+    db.commit()
+    return {"ok": True, "cleared": bool(p.clear), "count": out.get("count", 0)}
+
+
 @app.post("/api/tgto/test", dependencies=ADMIN)
 async def tgto_test(db: Session = Depends(get_db)):
     try:
@@ -3372,7 +3634,10 @@ def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_
     if status:
         stmt = stmt.where(UserContribution.status == status)
     return [{"id": c.id, "title": c.title, "content": c.content, "share_url": c.share_url,
-             "tg_username": c.tg_username, "status": c.status, "note": c.note,
+             "tg_user_id": c.tg_user_id, "tg_username": c.tg_username,
+             "tmdb_id": getattr(c, "tmdb_id", None), "media_type": getattr(c, "media_type", "") or "",
+             "year": getattr(c, "year", "") or "",
+             "status": c.status, "note": c.note,
              "created_at": c.created_at, "handled_at": c.handled_at}
             for c in db.scalars(stmt).all()]
 
@@ -3412,8 +3677,14 @@ def media_requests(limit: int = 100, db: Session = Depends(get_db)):
     rows = db.scalars(select(MediaRequest).order_by(
         MediaRequest.id.desc()).limit(min(limit, 500))).all()
     return [{"id": r.id, "title": r.title, "tmdb_id": r.tmdb_id, "media_type": r.media_type,
-             "season": r.season, "keyword_id": r.keyword_id, "status": r.status,
-             "note": r.note, "tg_username": r.tg_username, "created_at": r.created_at}
+             "year": getattr(r, "year", "") or "",
+             "season": r.season, "keyword_id": r.keyword_id,
+             "status": r.status,  # TgtoDrive 同步状态（管理员内部排查用，不当业务态展示）
+             "review_status": getattr(r, "review_status", "pending") or "pending",
+             "review_note": getattr(r, "review_note", "") or "",
+             "sync_note": r.note or "",  # 后台可见的 TgtoDrive 失败原因
+             "tg_user_id": r.tg_user_id, "tg_username": r.tg_username,
+             "created_at": r.created_at, "handled_at": getattr(r, "handled_at", None)}
             for r in rows]
 
 
@@ -3446,6 +3717,52 @@ async def add_media_request(p: MediaRequestInput, db: Session = Depends(get_db))
     db.commit()
     return {"ok": True, "id": row.id, "status": row.status, "keyword_id": kid,
             "note": row.note}
+
+
+class MediaRequestHandleInput(BaseModel):
+    review_status: str = "adopted"   # adopted / rejected / pending
+    note: str = ""                    # 拒绝原因，可选，会反馈给提交用户
+
+
+@app.post("/api/media-requests/{rid}/handle", dependencies=ADMIN)
+async def handle_media_request(rid: int, p: MediaRequestHandleInput,
+                               db: Session = Depends(get_db)):
+    """v0.9.8：求片后台审核——采纳 / 拒绝（可选填原因反馈用户）/ 重置待处理。
+
+    审核态 review_status 与 TgtoDrive 同步态 status 解耦，列表不再把 failed 当业务态。
+    """
+    if p.review_status not in ("adopted", "rejected", "pending"):
+        raise HTTPException(400, "review_status 仅支持 adopted/rejected/pending")
+    r = db.get(MediaRequest, rid)
+    if not r:
+        raise HTTPException(404, "求片记录不存在")
+    r.review_status = p.review_status
+    r.review_note = p.note[:1000]
+    r.handled_at = utcnow()
+    add_audit(db, "media_request_handled", target_type="media_request", target_id=str(rid),
+              detail=json_dumps({"review_status": p.review_status, "note": p.note[:200]}))
+    db.commit()
+    notice = ""
+    if p.review_status == "adopted":
+        notice = f"你求片的「{r.title}」已采纳，我们会尽快安排，感谢支持！"
+    elif p.review_status == "rejected":
+        notice = f"你求片的「{r.title}」暂不满足条件。" + (f"原因：{p.note}" if p.note else "")
+    notified = False
+    if notice and r.tg_user_id:
+        notified = await bot_listener.notify_user(db, r.tg_user_id, notice)
+    return {"ok": True, "notified": notified, "review_status": r.review_status}
+
+
+@app.delete("/api/media-requests/{rid}", dependencies=ADMIN)
+def delete_media_request(rid: int, db: Session = Depends(get_db)):
+    """v0.9.8：删除求片记录（只删登记行，不动 TgtoDrive 关键词规则）。"""
+    r = db.get(MediaRequest, rid)
+    if not r:
+        raise HTTPException(404, "求片记录不存在")
+    db.delete(r)
+    add_audit(db, "media_request_deleted", target_type="media_request", target_id=str(rid))
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/interaction/status", dependencies=ADMIN)

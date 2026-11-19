@@ -448,7 +448,8 @@ def test_bot_listener_want_and_contribute(db):
     with patch("app.bot_listener.tgto.upsert_keyword", fake_keyword):
         act, reply = asyncio.run(bot_listener.handle_text(
             db, "/want 伟大的长征 297253 1", tg_user_id="42", tg_username="u"))
-        assert act == "want" and "已加入监控" in reply
+        # v0.9.8：用户回复只报「已登记」，不暴露 TgtoDrive 同步细节（管理员侧信息）
+        assert act == "want" and "已登记" in reply and "TgtoDrive" not in reply
         act2, reply2 = asyncio.run(bot_listener.handle_text(
             db, "/contribute 某剧 https://share.example/x", tg_user_id="42"))
         assert act2 == "contribute" and "登记" in reply2

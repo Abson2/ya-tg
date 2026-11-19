@@ -120,6 +120,19 @@ _COLUMNS = {
     "channels": {
         "kind": "TEXT DEFAULT 'channel'",
     },
+    # v0.9.8：求片审核状态与 TgtoDrive 同步状态解耦，后台审核不再显示 failed
+    "media_requests": {
+        "review_status": "TEXT DEFAULT 'pending'",
+        "review_note": "TEXT DEFAULT ''",
+        "handled_at": "DATETIME",
+        "year": "TEXT DEFAULT ''",  # v0.9.8：TMDB 候选选定后的年份
+    },
+    # v0.9.8：投稿记录 TMDB 候选选定的影号/中文名/年份/类型
+    "user_contributions": {
+        "tmdb_id": "INTEGER",
+        "media_type": "TEXT DEFAULT ''",
+        "year": "TEXT DEFAULT ''",
+    },
 }
 
 

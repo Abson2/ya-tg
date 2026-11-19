@@ -17,7 +17,7 @@ const resources = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
-const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
+const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN', scan_min_interval: '', scan_max_calls: '', bot_min_interval: '', bot_max_calls: '', rate_window_seconds: '' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
 const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
 const aiParseName = ref(''), aiParseResult = ref(null)
 const typeFilter = ref(''), identifyFilter = ref('')
@@ -37,7 +37,7 @@ const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {} })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 const mirrorDiagOpen = ref([])
 const diagCount = computed(() => {
@@ -56,16 +56,28 @@ const interactionCfg = ref({ contribution_enabled: false, donation_enabled: fals
   bot_required_channel_link: '', bot_required_group_link: '', tg_channel_link: '', tg_group_link: '' })
 // v0.9.5：推送白名单 = 目录路由表 + 全局单 Bot
 const pushCfg = ref({ bot: null, max_routes: 10 })
-const pushRoutes = ref([{ dir_id: '', kind: 'channel', chat_id: '', note: '' }])
+// v0.9.8：一条路由的频道 ID 与群 ID 分别填写，可只填其一或两个都填
+const pushRoutes = ref([{ dir_id: '', channel_id: '', group_id: '', note: '' }])
 const pushSaving = ref(false), pushBotToken = ref('')
 const broadcastText = ref(''), broadcastSending = ref(false)
 function addPushRoute() {
   if (pushRoutes.value.length >= (pushCfg.value.max_routes || 10)) { ElMessage.warning('推送白名单最多 10 条'); return }
-  pushRoutes.value.push({ dir_id: '', kind: 'channel', chat_id: '', note: '' })
+  pushRoutes.value.push({ dir_id: '', channel_id: '', group_id: '', note: '' })
 }
 function removePushRoute(i) { pushRoutes.value.splice(i, 1) }
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
+// v0.9.8 #194：推送效果报表（只展示后端真实可得指标）
+const pushStats = ref({ series: [], totals: {}, unavailable: [], available: [], period: 'day', days: 30 })
+const statsPeriod = ref('day'), statsDays = ref(30), statsLoading = ref(false)
+async function loadPushStats() {
+  statsLoading.value = true
+  try {
+    pushStats.value = await api(`/push-stats?period=${statsPeriod.value}&days=${statsDays.value}`)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { statsLoading.value = false }
+}
+function statBarHeight(v, max) { return max > 0 ? Math.max(2, Math.round(v / max * 100)) : 2 }
 // v0.9.0：多行文本框 ↔ 数组 的双向映射，避免用户直接编辑数组
 const newCmd = ref({ command: '', description: '', reply: '' })
 const _linesToArr = (v) => String(v || '').split('\n').map(s => s.trim()).filter(Boolean)
@@ -92,7 +104,15 @@ const logCfg = ref({ retention_days: 30, max_rows: 5000, auto_prune: true, sched
 const logStats = ref([]), logBusy = ref(false), logOverview = ref({ total_rows: 0, total_pruneable: 0, container_log: '' })
 
 async function loadTmdb() {
-  try { tmdbStatus.value = await api('/tmdb/status') } catch (e) {}
+  try {
+    tmdbStatus.value = await api('/tmdb/status')
+    const r = tmdbStatus.value.rate_limit || {}
+    tmdbForm.value.scan_min_interval = r.scan_min_interval ?? ''
+    tmdbForm.value.scan_max_calls = r.scan_max_calls ?? ''
+    tmdbForm.value.bot_min_interval = r.bot_min_interval ?? ''
+    tmdbForm.value.bot_max_calls = r.bot_max_calls ?? ''
+    tmdbForm.value.rate_window_seconds = r.rate_window_seconds ?? ''
+  } catch (e) {}
 }
 async function loadAi() {
   try {
@@ -222,8 +242,10 @@ function applyTplPreset() {
 }
 function editTpl(t) { tpl.value = { id: t.id, name: t.name, content: t.content, enabled: t.enabled, is_default: t.is_default }; tplPresetPick.value = '' }
 async function deleteTpl(t) {
-  if (t.is_default) { ElMessage.warning('默认模板不能删除，请先把别的模板设为默认'); return }
-  const ok = await confirmBox(`确认删除模板「${t.name}」？此操作不可撤销。`)
+  const tip = t.is_default
+    ? `确认删除默认模板「${t.name}」？删除后系统会自动把另一套模板设为默认；若没有其它模板会自动恢复内置默认模板。`
+    : `确认删除模板「${t.name}」？此操作不可撤销。`
+  const ok = await confirmBox(tip)
   if (!ok) return
   try { await api(`/templates/${t.id}`, { method: 'DELETE' }); ElMessage.success('模板已删除'); await load() }
   catch (e) { ElMessage.error(e.message) }
@@ -419,11 +441,14 @@ async function load() {
   try {
     const pr = await api('/push/routes')
     pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
-    pushRoutes.value = (pr.routes && pr.routes.length) ? pr.routes.map(r => ({ dir_id: r.dir_id || '', kind: r.kind || 'channel', chat_id: r.chat_id || '', note: r.note || '' })) : [{ dir_id: '', kind: 'channel', chat_id: '', note: '' }]
+    pushRoutes.value = (pr.routes && pr.routes.length)
+      ? pr.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '', note: r.note || '' }))
+      : [{ dir_id: '', channel_id: '', group_id: '', note: '' }]
   } catch (e) {}
   try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
   try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
   try { mediaRequests.value = await api('/media-requests?limit=50') } catch (e) {}
+  try { await loadPushStats() } catch (e) {}
   // v0.8.3：日志概览独立加载，任一接口异常不影响主界面
   try { await loadLogs() } catch (e) {}
   await loadAuth()
@@ -637,6 +662,23 @@ async function clearPrunedMappings() {
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
+// v0.9.8：清理历史无效影视映射（failed/blocked 且无 synced 文件的僵尸行）。
+async function clearInvalidMedia() {
+  const n = mirrorStatus.value.counts?.media_invalid || 0
+  if (!n) { ElMessage.info('当前没有可清理的无效影视映射'); return }
+  const ok = await confirmBox(
+    `将物理删除 ${n} 条历史无效影视映射（状态失败/阻断且没有任何已同步文件，属历史遗留僵尸行）。\n\n` +
+    '只删 A→B 映射登记及其文件映射，不删资源 / 分享 / 推送队列 / B 库文件。' +
+    'A 库仍有源文件时，下一轮「立即同步」会自动重建映射。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/media/clear-invalid', { method: 'POST' })
+    ElMessage.success(`已清理 ${d.removed_media || 0} 条无效影视映射（${d.removed_files || 0} 个文件映射）`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
 // v0.8.9：清理 B 库已不存在的文件 / 目录映射。只重置映射，不删资源与分享。
 async function pruneMirrorMappings() {
   const ok = await confirmBox(
@@ -662,7 +704,12 @@ async function pruneMirrorMappings() {
 // ---------- 用户互动 ----------
 async function savePushRoutes() {
   // v0.9.6.1：交互 Bot / 目录路由 / 使用限制 / 打赏统一保存，避免填了使用限制却没保存。
-  const routes = (pushRoutes.value || []).map(r => ({ dir_id: String(r.dir_id || '').trim(), kind: r.kind || 'channel', chat_id: String(r.chat_id || '').trim(), note: String(r.note || '').trim() })).filter(r => r.chat_id)
+  const routes = (pushRoutes.value || []).map(r => ({
+    dir_id: String(r.dir_id || '').trim(),
+    channel_id: String(r.channel_id || '').trim(),
+    group_id: String(r.group_id || '').trim(),
+    note: String(r.note || '').trim()
+  })).filter(r => r.channel_id || r.group_id)
   const body = { routes }
   const token = String(pushBotToken.value || '').trim()
   if (token) body.bot_token = token
@@ -697,12 +744,27 @@ async function clearPushBotToken() {
   } catch (e) { ElMessage.error(e.message) }
   finally { pushSaving.value = false }
 }
-async function testPushRoute(r) {
-  // 用路由目标的 chat_id 直接发一条测试消息，验证 Bot+目标联通
+async function syncBotCommands(clear = false) {
+  const tip = clear
+    ? '确认清空 Telegram 私聊指令栏？清空后输入框「/」不再弹出任何指令下拉；Reply 键盘菜单不受影响。'
+    : '确认把 Telegram 私聊指令栏同步为当前 Ya-TG 指令？会覆盖其它项目残留的旧指令。'
+  const ok = await confirmBox(tip)
+  if (!ok) return
+  pushSaving.value = true
+  try {
+    const d = await api('/bot/commands/menu', { method: 'POST', body: JSON.stringify({ clear }) })
+    ElMessage.success(clear ? '指令栏已清空' : `指令栏已同步（${d.count} 条指令，重启 Telegram 后生效）`)
+  } catch (e) { ElMessage.error(e.message) }
+  finally { pushSaving.value = false }
+}
+async function testPushRoute(r, explicitChatId = '') {
+  // v0.9.8：一条路由的频道 / 群各有独立测试按钮，传明确 chat_id；兼容旧调用（取 chat_id）
+  const chatId = String(explicitChatId || r.chat_id || '').trim()
   const bot = pushCfg.value.bot
   if (!bot) { ElMessage.warning('请先在上方填写 Bot Token 并保存'); return }
+  if (!chatId) { ElMessage.warning('请先填写该目标的 ID 并保存'); return }
   try {
-    const d = await api(`/bots/${bot.id}/test-message`, { method: 'POST', body: JSON.stringify({ chat_id: r.chat_id }) })
+    const d = await api(`/bots/${bot.id}/test-message`, { method: 'POST', body: JSON.stringify({ chat_id: chatId }) })
     ElMessage[d.ok ? 'success' : 'error'](d.message || (d.ok ? '测试消息已发送' : '测试失败'))
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -762,9 +824,41 @@ async function testTgto() {
   finally { tgtoTesting.value = false }
 }
 async function handleContribution(id, status) {
-  try { await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note: '' }) }); await load() }
+  let note = ''
+  if (status === 'rejected') {
+    try {
+      const r = await ElMessageBox.prompt('可填写拒绝原因（会反馈给投稿用户），留空则只通知未通过', '拒绝投稿', {
+        confirmButtonText: '确认拒绝', cancelButtonText: '取消', inputPlaceholder: '例如：资源已在库中'
+      })
+      note = String(r.value || '').trim()
+    } catch (e) { return }
+  }
+  try { await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note }) }); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
+async function handleMediaRequest(row, review) {
+  let note = ''
+  if (review === 'rejected') {
+    try {
+      const r = await ElMessageBox.prompt('可填写拒绝原因（会反馈给求片用户），留空则只通知未采纳', '拒绝求片', {
+        confirmButtonText: '确认拒绝', cancelButtonText: '取消', inputPlaceholder: '例如：版权原因暂不加'
+      })
+      note = String(r.value || '').trim()
+    } catch (e) { return }
+  }
+  try {
+    await api(`/media-requests/${row.id}/handle`, { method: 'POST', body: JSON.stringify({ review_status: review, note }) })
+    ElMessage.success(review === 'adopted' ? '已采纳，已通知用户' : review === 'rejected' ? '已拒绝，已通知用户' : '已重置为待处理')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function deleteMediaRequest(row) {
+  const ok = await confirmBox(`确认删除求片「${row.title}」？只删登记记录，不影响 TgtoDrive 关键词规则。`)
+  if (!ok) return
+  try { await api(`/media-requests/${row.id}`, { method: 'DELETE' }); ElMessage.success('已删除'); await load() }
+  catch (e) { ElMessage.error(e.message) }
+}
+function wantReviewLabel(s) { return ({ pending: '待处理', adopted: '已采纳', rejected: '已拒绝' })[s] || '待处理' }
 async function addWant() {
   const t = String(wantTitle.value || '').trim()
   if (!t) { ElMessage.warning('请填写影视名称'); return }
@@ -1195,7 +1289,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.7 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.8 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1257,6 +1351,63 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
                   <div class="dist-track"><i :style="{ width: Math.min(100, (overview[p.k]||0) * 12) + '%', background: p.c }"></i></div>
                   <b>{{ overview[p.k] || 0 }}</b>
                 </div>
+              </div>
+            </div>
+          </div>
+          <!-- v0.9.8 #194：推送效果报表（首页概览，只展示真实可得指标） -->
+          <div class="panel">
+            <div class="panel-head">
+              <h3>推送效果报表</h3>
+              <div class="head-tools">
+                <el-select v-model="statsPeriod" size="small" style="width:96px" @change="loadPushStats">
+                  <el-option label="按日" value="day"/><el-option label="按周" value="week"/><el-option label="按月" value="month"/>
+                </el-select>
+                <el-select v-model="statsDays" :value="30" size="small" style="width:110px" @change="loadPushStats">
+                  <el-option :value="7" label="近 7 天"/><el-option :value="30" label="近 30 天"/><el-option :value="90" label="近 90 天"/>
+                </el-select>
+                <el-button size="small" :loading="statsLoading" @click="loadPushStats">刷新</el-button>
+              </div>
+            </div>
+            <div class="stats-cards">
+              <div class="stat-card"><div class="stat-num">{{ pushStats.totals.sent || 0 }}</div><div class="stat-label">发送成功</div></div>
+              <div class="stat-card"><div class="stat-num">{{ pushStats.totals.failed || 0 }}</div><div class="stat-label">发送失败</div></div>
+              <div class="stat-card"><div class="stat-num">{{ pushStats.totals.success_rate || 0 }}%</div><div class="stat-label">成功率</div></div>
+              <div class="stat-card"><div class="stat-num">{{ pushStats.totals.retries || 0 }}</div><div class="stat-label">重试次数</div></div>
+              <div class="stat-card"><div class="stat-num">{{ pushStats.totals.events || 0 }}</div><div class="stat-label">分发更新</div></div>
+            </div>
+            <div v-if="pushStats.series && pushStats.series.length" class="chart-wrap">
+              <div class="chart-bars">
+                <div v-for="row in pushStats.series" :key="row.label" class="chart-col" :title="`${row.label}：成功 ${row.sent} / 失败 ${row.failed} / 成功率 ${row.success_rate}%`">
+                  <div class="chart-stack">
+                    <i class="bar-fail" :style="{ height: statBarHeight(row.failed, Math.max(1, ...pushStats.series.map(x => x.sent + x.failed))) + '%' }"></i>
+                    <i class="bar-sent" :style="{ height: statBarHeight(row.sent, Math.max(1, ...pushStats.series.map(x => x.sent + x.failed))) + '%' }"></i>
+                  </div>
+                  <small>{{ row.label.slice(5) }}</small>
+                </div>
+              </div>
+              <div class="chart-legend"><span><i class="lg-sent"></i>成功</span><span><i class="lg-fail"></i>失败</span></div>
+            </div>
+            <div v-else class="empty-hint">所选时间范围内暂无推送记录</div>
+            <el-table v-if="pushStats.series && pushStats.series.length" :data="pushStats.series" size="small" style="margin-top:14px">
+              <el-table-column prop="label" label="时间"/>
+              <el-table-column prop="sent" label="发送成功" width="100"/>
+              <el-table-column prop="failed" label="发送失败" width="100"/>
+              <el-table-column prop="retries" label="重试次数" width="100"/>
+              <el-table-column prop="events" label="分发更新" width="100"/>
+              <el-table-column prop="success_rate" label="成功率" width="100"><template #default="s">{{ s.row.success_rate }}%</template></el-table-column>
+            </el-table>
+            <div v-if="pushStats.unavailable && pushStats.unavailable.length" class="unavailable-box">
+              <b>暂不可得的指标（不造假数）：阅读数 / 点击数 / 转存数</b>
+              <div v-for="x in pushStats.unavailable" :key="x.key" class="unavailable-row"><span>{{ x.label }}</span><small>{{ x.reason }}</small></div>
+            </div>
+          </div>
+          <!-- v0.9.8 #195：首页概览可见的镜像处理流程节点 -->
+          <div class="panel" v-if="mirrorStatus.pipeline && mirrorStatus.pipeline.length">
+            <div class="panel-head"><h3>镜像 → 入库 → 推送 进度</h3><button class="link-btn" @click="tab='镜像同步'">查看详情 →</button></div>
+            <div class="pipeline-flow home-flow">
+              <div v-for="node in mirrorStatus.pipeline" :key="node.key" class="pipe-node" :class="'is-' + (node.status || 'idle')">
+                <div class="pipe-label">{{ node.label }}</div>
+                <div class="pipe-value">{{ node.value }}<span v-if="node.total">/{{ node.total }}</span></div>
               </div>
             </div>
           </div>
@@ -1363,6 +1514,22 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
 
         <section v-else-if="tab === '镜像同步'" class="fade">
           <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；单集/电影文件按英文剧名改名 → 自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
+          <!-- v0.9.8 #195：流程节点 + 同步进度，用户能看出卡在哪一步 -->
+          <div class="panel">
+            <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中' : '实时状态' }}</span></div>
+            <div class="sync-progress">
+              <div class="sync-progress-track"><i :style="{ width: (mirrorStatus.progress?.percent || 0) + '%' }"></i></div>
+              <span>{{ mirrorStatus.progress?.percent || 0 }}%（{{ mirrorStatus.progress?.synced || 0 }}/{{ mirrorStatus.progress?.total || 0 }} 文件已同步）</span>
+            </div>
+            <div class="pipeline-flow">
+              <div v-for="node in (mirrorStatus.pipeline || [])" :key="node.key" class="pipe-node" :class="'is-' + (node.status || 'idle')">
+                <div class="pipe-label">{{ node.label }}</div>
+                <div class="pipe-value">{{ node.value }}<span v-if="node.total">/{{ node.total }}</span></div>
+                <div class="pipe-detail">{{ node.detail }}</div>
+              </div>
+            </div>
+            <p class="hint" style="margin-top:12px">推送由定时调度消费队列：识别成功且有海报的影视入队后，等待队列检查（默认 30 秒）创建目录分享并推送；此处「推送入队」显示的是累积队列数，不代表本轮已全部发出。</p>
+          </div>
           <div class="panel narrow">
             <div class="panel-head"><h3>A / B 库设置</h3></div>
             <div class="form-grid">
@@ -1514,16 +1681,16 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint">分类目录保持 A 库原名、不加标记；只有影视主目录按 · 规则命名，括号里的年份与 TMDB 标记保持原样。</p>
           </div>
           <div class="panel">
-            <div class="panel-head"><h3>影视映射清单</h3></div>
+            <div class="panel-head"><h3>影视映射清单</h3><el-tag v-if="mirrorStatus.counts?.media_invalid" size="small" type="warning">{{ mirrorStatus.counts.media_invalid }} 条无效</el-tag><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.counts?.media_invalid" @click="clearInvalidMedia">清理无效影视映射</el-button></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.media || []" size="small">
               <el-table-column prop="category_path" label="分类目录" min-width="140"/>
               <el-table-column prop="title" label="标准影视名" min-width="180"/>
               <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
               <el-table-column prop="media_type" label="类型" width="90"/>
               <el-table-column prop="files" label="文件" width="80"/>
-              <el-table-column prop="status" label="状态" width="110"/>
+              <el-table-column label="状态" width="120"><template #default="s"><el-tag v-if="s.row.invalid" type="warning" size="small">无效待清理</el-tag><span v-else>{{ s.row.status }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。文件数为 0 但状态显示已同步时，优先看上面的「文件复制失败 / 待重试」清单。</p>
+            <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。<b>状态为失败/阻断且没有任何已同步文件的历史遗留映射</b>可点「清理无效影视映射」移除；只删 A→B 映射登记，不删资源 / 分享 / 队列，A 库仍有文件时下轮同步会自动重建。</p>
           </div>
             </el-collapse-item>
           </el-collapse>
@@ -1551,9 +1718,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
                 <label>验证 / 测试推送</label>
                 <div class="inline-form">
                   <el-button size="small" :disabled="!pushCfg.bot" @click="verifyPushBot">验证 Token</el-button>
-                  <el-button size="small" type="primary" :disabled="!pushCfg.bot" @click="testPushRoute({ chat_id: pushRoutes[0]?.chat_id || '' })">测试推送（第一条目标）</el-button>
+                  <el-button size="small" type="primary" :disabled="!pushCfg.bot" @click="testPushRoute({}, (pushRoutes[0]?.channel_id || pushRoutes[0]?.group_id || ''))">测试推送（第一条目标）</el-button>
                 </div>
-                <small>验证只检查 Token 有效性；测试推送会向目标频道 / 群真实发一条消息。</small>
+                <div class="inline-form" style="margin-top:6px">
+                  <el-button size="small" plain :disabled="!pushCfg.bot?.token_masked" :loading="pushSaving" @click="syncBotCommands(false)">同步指令栏（覆盖旧项目残留）</el-button>
+                  <el-button size="small" plain type="danger" :disabled="!pushCfg.bot?.token_masked" :loading="pushSaving" @click="syncBotCommands(true)">清空指令栏</el-button>
+                </div>
+                <small>验证只检查 Token；同步/清空指令栏处理 Telegram「/」下拉里的旧指令，输入框上方的 Reply 键盘菜单不受影响。</small>
               </div>
               <div class="field">
                 <label>管理员自定义群发通知（仅频道 / 群，不私聊用户）</label>
@@ -1571,9 +1742,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div v-for="(r, i) in pushRoutes" :key="i" class="route-row">
               <div class="field"><label>目录 ID（影视库 B 的下属目录，留空=根目录全部）</label><el-input v-model="r.dir_id" placeholder="留空表示整个 B 库；填目录 fileId 则只推该目录及其子目录"/></div>
               <div class="field"><label>备注（选填，便于肉眼区分目录）</label><el-input v-model="r.note" maxlength="120" placeholder="如：国产剧 / 动画电影 / 欧美剧集"/></div>
-              <div class="field"><label>目标类型</label><el-radio-group v-model="r.kind" size="small"><el-radio-button value="channel">频道</el-radio-button><el-radio-button value="group">群聊</el-radio-button></el-radio-group></div>
-              <div class="field"><label>{{ r.kind === 'group' ? '群 ID' : '频道 ID' }}（任填其一即可）</label><el-input v-model="r.chat_id" :placeholder="r.kind === 'group' ? '群 chat_id，如 -1001234567890' : '频道 chat_id，如 -1001234567890'"/></div>
-              <div class="route-actions"><el-button size="small" text :disabled="!r.chat_id || !pushCfg.bot" @click="testPushRoute(r)">测试</el-button><el-button size="small" text type="danger" :disabled="pushRoutes.length <= 1" @click="removePushRoute(i)">删除</el-button></div>
+              <div class="field"><label>频道 ID（可留空）</label><el-input v-model="r.channel_id" placeholder="频道 chat_id，如 -1001234567890；频道需 Bot 为管理员"/><el-button size="small" text :disabled="!r.channel_id || !pushCfg.bot" @click="testPushRoute(r, r.channel_id)">测试频道</el-button></div>
+              <div class="field"><label>群 ID（可留空）</label><el-input v-model="r.group_id" placeholder="群 chat_id，如 -1001234567890；群只需 Bot 已加入"/><el-button size="small" text :disabled="!r.group_id || !pushCfg.bot" @click="testPushRoute(r, r.group_id)">测试群</el-button></div>
+              <div class="route-actions"><el-button size="small" text type="danger" :disabled="pushRoutes.length <= 1" @click="removePushRoute(i)">删除</el-button></div>
             </div>
             <div class="panel-foot"><el-button size="small" type="primary" plain :disabled="pushRoutes.length >= (pushCfg.max_routes || 10)" @click="addPushRoute">+ 添加路由</el-button><span class="hint" style="margin-left:10px">频道需 Bot 为管理员；群聊只需 Bot 已加入。保存后新识别的影视按目录路由推送。</span></div>
           </div>
@@ -1652,17 +1823,30 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <div class="panel-head"><h3>用户求片（我想看）</h3></div>
               <div class="inline-form"><el-input v-model="wantTitle" placeholder="影视名称" style="width:220px"/><el-button type="primary" @click="addWant">加入监控</el-button></div>
               <div class="table-scroll"><el-table :data="mediaRequests" size="small">
-                <el-table-column prop="title" label="影视名称" min-width="160"/>
-                <el-table-column prop="status" label="状态" width="100"/>
-                <el-table-column prop="note" label="备注" min-width="140"/>
+                <el-table-column label="影视名称（TMDB 候选）" min-width="180"><template #default="s">
+                  {{ s.row.title }}<span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
+                  <el-tag v-if="s.row.tmdb_id" size="small" type="info" effect="plain">#{{ s.row.tmdb_id }}</el-tag>
+                </template></el-table-column>
+                <el-table-column label="提交用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
+                <el-table-column label="审核状态" width="96"><template #default="s"><el-tag size="small" :type="s.row.review_status === 'adopted' ? 'success' : s.row.review_status === 'rejected' ? 'danger' : 'warning'">{{ wantReviewLabel(s.row.review_status) }}</el-tag></template></el-table-column>
+                <el-table-column prop="review_note" label="审核备注" min-width="120"/>
+                <el-table-column label="操作" min-width="210"><template #default="s">
+                  <el-button size="small" type="primary" plain :disabled="s.row.review_status === 'adopted'" @click="handleMediaRequest(s.row, 'adopted')">采纳</el-button>
+                  <el-button size="small" :disabled="s.row.review_status === 'rejected'" @click="handleMediaRequest(s.row, 'rejected')">拒绝</el-button>
+                  <el-button size="small" type="danger" plain @click="deleteMediaRequest(s.row)">删除</el-button>
+                </template></el-table-column>
               </el-table></div>
+              <p class="hint">TgtoDrive 同步失败原因只在后台备注可见，不会发给用户；审核状态与关键词同步状态互不影响。</p>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>用户投稿</h3></div>
               <div class="table-scroll"><el-table :data="contributions" size="small">
-                <el-table-column prop="title" label="标题" min-width="150"/>
-                <el-table-column prop="tg_username" label="用户" width="110"/>
-                <el-table-column prop="status" label="状态" width="100"/>
+                <el-table-column label="标题（TMDB 候选）" min-width="170"><template #default="s">
+                  {{ s.row.title }}<span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
+                  <el-tag v-if="s.row.tmdb_id" size="small" type="info" effect="plain">#{{ s.row.tmdb_id }}</el-tag>
+                </template></el-table-column>
+                <el-table-column label="用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
+                <el-table-column prop="status" label="状态" width="96"/>
                 <el-table-column label="操作" width="160"><template #default="s">
                   <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
                   <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
@@ -1849,12 +2033,35 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <div><small>语言</small><el-input v-model="tmdbForm.language" placeholder="zh-CN"/></div>
             </div>
             <div class="connect-actions" style="margin-top:16px">
-              <el-button type="primary" :loading="tmdbSaving" @click="saveTmdb">保存密钥</el-button>
+              <el-button type="primary" :loading="tmdbSaving" @click="saveTmdb">保存配置</el-button>
               <el-button plain :loading="tmdbTesting" @click="testTmdb">测试连接</el-button>
             </div>
             <p class="hint" style="margin-top:14px">
               没有密钥？到 <a href="https://www.themoviedb.org/settings/api" target="_blank" class="device-link">TMDB 账号设置 → API</a> 免费申请，
               复制 <b>API Read Access Token</b> 粘贴到上面第一个框。
+            </p>
+          </div>
+
+          <!-- v0.9.8：按场景独立限流，Bot 默认更保守防恶意刷 -->
+          <div class="panel">
+            <div class="panel-head"><h3>调用限流（防止 TMDB 账号被风控）</h3><span class="hint">两个场景独立统计，留空保持默认；保存配置即刻生效</span></div>
+            <p class="hint" style="margin:0 0 14px">
+              <b>Bot 场景</b>用于私聊求片/投稿的候选搜索，对外暴露、默认间隔久频次低，避免被恶意刷导致 TMDB 账号异常；
+              <b>资源库识别</b>用于内部扫描识别，可更宽松。超出间隔或频次时本次不请求 TMDB，自动降级。
+            </p>
+            <div class="form-grid">
+              <div><small>识别 · 最小间隔（秒）</small><el-input v-model="tmdbForm.scan_min_interval" placeholder="默认 0.2"/></div>
+              <div><small>识别 · 每窗口最大次数</small><el-input v-model="tmdbForm.scan_max_calls" placeholder="默认 60"/></div>
+              <div><small>Bot · 最小间隔（秒）</small><el-input v-model="tmdbForm.bot_min_interval" placeholder="默认 3"/></div>
+              <div><small>Bot · 每窗口最大次数</small><el-input v-model="tmdbForm.bot_max_calls" placeholder="默认 20"/></div>
+              <div><small>统计窗口（秒）</small><el-input v-model="tmdbForm.rate_window_seconds" placeholder="默认 60"/></div>
+            </div>
+            <div class="connect-actions" style="margin-top:16px">
+              <el-button type="primary" :loading="tmdbSaving" @click="saveTmdb">保存限流配置</el-button>
+            </div>
+            <p class="hint" style="margin-top:12px">
+              当前生效：识别 {{ tmdbStatus.rate_limit?.scan_min_interval || '0.2' }}s / {{ tmdbStatus.rate_limit?.scan_max_calls || '60' }} 次；
+              Bot {{ tmdbStatus.rate_limit?.bot_min_interval || '3' }}s / {{ tmdbStatus.rate_limit?.bot_max_calls || '20' }} 次（每 {{ tmdbStatus.rate_limit?.rate_window_seconds || '60' }}s）。
             </p>
           </div>
 
@@ -1897,20 +2104,23 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         <section v-else-if="tab === '消息模板'" class="fade">
           <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
 
-          <!-- v0.9.6.1：推送消息频道 / 群跳转从打赏卡迁出，并列卡片；留空=不启用 -->
-          <div class="two-col" style="margin-bottom:10px">
-            <div class="panel narrow">
-              <div class="panel-head"><h3>推送消息 · 官方频道跳转</h3><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
-              <el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/>
-              <p class="hint">填值后推送消息追加「📢 官方频道」按钮，模板可用 <code>&#123;&#123;channel_link&#125;&#125;</code>；<b>留空则不显示按钮、不注入该变量</b>。</p>
+          <!-- v0.9.8：跳转卡片与保存按钮合并为同一张 panel，按钮紧贴卡片，增强整体性 -->
+          <div class="panel" style="margin-bottom:14px">
+            <div class="panel-head"><h3>推送消息 · 跳转按钮</h3><span>留空则不启用对应的按钮与模板变量</span></div>
+            <div class="two-col">
+              <div class="panel narrow">
+                <div class="panel-head"><h4>官方频道跳转</h4><el-tag size="small" :type="interactionCfg.tg_channel_link ? 'success' : 'info'">{{ interactionCfg.tg_channel_link ? '已启用' : '未启用' }}</el-tag></div>
+                <el-input v-model="interactionCfg.tg_channel_link" placeholder="@官方频道 或 https://t.me/官方频道"/>
+                <p class="hint">填值后推送消息追加「📢 官方频道」按钮，模板可用 <code>&#123;&#123;channel_link&#125;&#125;</code>。</p>
+              </div>
+              <div class="panel narrow">
+                <div class="panel-head"><h4>交流群跳转</h4><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
+                <el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/>
+                <p class="hint">填值后推送消息追加「👥 交流群」按钮，模板可用 <code>&#123;&#123;group_link&#125;&#125;</code>。</p>
+              </div>
             </div>
-            <div class="panel narrow">
-              <div class="panel-head"><h3>推送消息 · 交流群跳转</h3><el-tag size="small" :type="interactionCfg.tg_group_link ? 'success' : 'info'">{{ interactionCfg.tg_group_link ? '已启用' : '未启用' }}</el-tag></div>
-              <el-input v-model="interactionCfg.tg_group_link" placeholder="@交流群 或 https://t.me/交流群"/>
-              <p class="hint">填值后推送消息追加「👥 交流群」按钮，模板可用 <code>&#123;&#123;group_link&#125;&#125;</code>；<b>留空则不显示按钮、不注入该变量</b>。</p>
-            </div>
+            <div class="panel-foot"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button><span class="hint" style="margin-left:10px">也可在「分发与互动中心」点顶部统一保存按钮一起保存。</span></div>
           </div>
-          <div class="panel-foot" style="margin-bottom:14px"><el-button type="primary" plain :loading="interactionSaving" @click="saveJumpLinks">保存消息跳转链接</el-button><span class="hint" style="margin-left:10px">也可在「分发与互动中心」点顶部统一保存按钮一起保存。</span></div>
 
           <!-- v0.9.6：推送渲染选项（从已删除的 TG 推送配置卡迁入，后端逻辑不变） -->
           <div class="panel narrow" style="margin-bottom:14px">
@@ -1930,7 +2140,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch v-model="tpl.is_default" active-text="设为默认" class="ml"/></div>
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
               <el-button v-if="tpl.id" class="mt" plain @click="tpl = { name:'', content:'', enabled:true, is_default:false }; tplPresetPick=''">新建空模板</el-button>
-              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="primary" :disabled="t.is_default" @click="setDefaultTpl(t)">设为默认</el-button><el-button size="small" text type="danger" :disabled="t.is_default" @click="deleteTpl(t)">删除</el-button></div></div>
+              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="primary" :disabled="t.is_default" @click="setDefaultTpl(t)">设为默认</el-button><el-button size="small" text type="danger" @click="deleteTpl(t)">删除</el-button></div></div>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>
@@ -2080,6 +2290,39 @@ button{font-family:inherit}
 .stat-icon .ico{width:20px;height:20px}
 .tone-indigo .stat-icon{background:#eeedff;color:#5b5bd6}.tone-teal .stat-icon{background:#e5f8f5;color:#19b3a6}.tone-amber .stat-icon{background:#fff3e2;color:#e29328}.tone-violet .stat-icon{background:#f2edff;color:#8b6cf0}.tone-rose .stat-icon{background:#ffedf0;color:#e5526b}.tone-slate .stat-icon{background:#eef1f7;color:#8a93aa}
 .stat-num{font-size:30px;font-weight:780;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.5px}.stat-label{color:var(--yg-muted);font-size:12px;margin-top:6px}
+/* v0.9.8 #194 推送效果报表 */
+.stats-cards{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+.stats-cards .stat-card{padding:14px}.stats-cards .stat-num{font-size:24px}
+.chart-wrap{padding:6px 2px 0}
+.chart-bars{display:flex;align-items:flex-end;gap:4px;height:150px;padding-bottom:20px;position:relative;border-bottom:1px solid var(--yg-line)}
+.chart-col{flex:1;min-width:14px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+.chart-stack{width:70%;max-width:26px;height:100%;display:flex;flex-direction:column;justify-content:flex-end}
+.chart-stack i{display:block;width:100%;min-height:0}
+.bar-sent{background:var(--yg-accent,#4f7cff);border-radius:3px 3px 0 0}
+.bar-fail{background:#e05a5a;border-radius:3px 3px 0 0}
+.chart-col small{font-size:10px;color:var(--yg-muted);margin-top:6px;white-space:nowrap;transform:rotate(-30deg);transform-origin:center}
+.chart-legend{display:flex;gap:16px;justify-content:center;margin-top:14px;font-size:12px;color:var(--yg-muted)}
+.chart-legend span{display:flex;align-items:center;gap:6px}.chart-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.lg-sent{background:var(--yg-accent,#4f7cff)}.lg-fail{background:#e05a5a}
+.empty-hint{padding:28px;text-align:center;color:var(--yg-muted);font-size:13px}
+.unavailable-box{margin-top:16px;background:var(--yg-surface);border:1px dashed var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px}
+.unavailable-box>b{font-size:12px;color:var(--yg-muted)}
+.unavailable-row{display:flex;gap:12px;padding:6px 0;font-size:12px;border-top:1px solid var(--yg-line);margin-top:6px}
+.unavailable-row span{font-weight:600;min-width:60px}.unavailable-row small{color:var(--yg-muted)}
+/* v0.9.8 #195 镜像流程节点 + 进度 */
+.sync-progress{display:flex;align-items:center;gap:12px;margin-bottom:16px;font-size:12px;color:var(--yg-muted)}
+.sync-progress-track{flex:1;height:8px;background:var(--yg-line);border-radius:6px;overflow:hidden}
+.sync-progress-track i{display:block;height:100%;background:var(--yg-accent,#4f7cff);border-radius:6px;transition:width .3s}
+.pipeline-flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.pipe-node{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px;position:relative;overflow:hidden}
+.pipe-node.is-done{border-color:#19b3a6}.pipe-node.is-active{border-color:#f2a33c}.pipe-node.is-idle{opacity:.6}
+.pipe-node:before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--yg-line)}
+.pipe-node.is-done:before{background:#19b3a6}.pipe-node.is-active:before{background:#f2a33c}
+.pipe-label{font-size:12px;font-weight:600}
+.pipe-value{font-size:22px;font-weight:780;margin-top:4px;font-variant-numeric:tabular-nums}
+.pipe-value span{font-size:13px;color:var(--yg-muted);font-weight:400}
+.pipe-detail{font-size:11px;color:var(--yg-muted);margin-top:6px;line-height:1.4}
+.home-flow .pipe-node{padding:10px}.home-flow .pipe-value{font-size:18px}
 .stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
 .panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}

@@ -463,22 +463,29 @@ async def _list_dir(api: GuangYaWebFiles, parent_id: str) -> tuple[list[dict], b
 
 
 async def _walk_source(api: GuangYaWebFiles, root_id: str,
-                       max_dirs: int = 400) -> tuple[dict[str, dict], bool]:
+                       max_dirs: int = 400,
+                       stats: dict | None = None) -> tuple[dict[str, dict], bool]:
     """只读遍历 A 库目录树，返回 {dirId: 节点} 与批次完整性。
 
     节点含 id / name / parent / path / files(直属文件) / children。
     不写任何数据库表，不触碰 Resource —— 扫描 A 库绝不能污染 B 库资源库。
+
+    v0.9.8 #196：stats 可选，用于回显「本轮列了几个目录、发了几次列目录请求、
+    看到多少 A 库文件」——让用户确认慢在列目录（必要开销）而非全量复制。
     """
     root = str(root_id or "*")
     nodes: dict[str, dict] = {}
     stack = [(root, "", "", "")]
     complete = True
+    a_files = 0
+    list_calls = 0
     while stack and len(nodes) < max_dirs:
         did, name, path, parent = stack.pop()
         if did in nodes:
             continue
         display = (path + "/" + name).strip("/") if name else path
         items, ok = await _list_dir(api, did)
+        list_calls += 1
         complete = complete and ok
         node = {"id": did, "name": name, "parent": parent, "path": display,
                 "files": [], "children": []}
@@ -492,6 +499,11 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                 stack.append((fid, _dir_name(it), display, did))
             else:
                 node["files"].append(it)
+                a_files += 1
+    if stats is not None:
+        stats["walk_dirs"] = len(nodes)
+        stats["walk_list_calls"] = list_calls
+        stats["walk_a_files"] = a_files
     return nodes, complete
 
 
@@ -605,12 +617,14 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              "missing_in_b": 0, "name_mismatch": 0,
              "dirs_created": 0, "dirs_mapped": 0, "dirs_fallback": 0,
              "dir_errors": [], "missing_dirs": [], "file_errors": [],
-             "idle_seconds": idle, "errors": []}
+             "idle_seconds": idle, "errors": [],
+             # v0.9.8 #196：列目录开销诊断（慢在列目录而非全量复制）
+             "walk_dirs": 0, "walk_list_calls": 0, "walk_a_files": 0}
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
         raise WebFileError("请先配置 A 源头库目录 ID 与 B 镜像库目录 ID")
     api = GuangYaWebFiles(db)
     stats["purged_legacy"] = _purge_legacy_failed(db, rule.id)
-    nodes, complete = await _walk_source(api, rule.source_root_id)
+    nodes, complete = await _walk_source(api, rule.source_root_id, stats=stats)
     if not complete:
         raise WebFileError("A 库分页不完整，已中止本次镜像（禁止用不完整批次做变更）")
     root = str(rule.source_root_id or "*")
@@ -994,6 +1008,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         f"跳过 {stats['skipped']} · B库缺失补复制 {stats['missing_in_b']} · "
         f"名称不符 {stats['name_mismatch']} · 建目录 {stats['dirs_created']} · "
         f"待建目录 {len(stats['missing_dirs'])} · 文件间隔 {idle}s")
+    # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
+    rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
+                          f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")
     if max_works > 0:
         _left = max(0, stats.get("total_works", 0) - stats["batch_size"])
         rule.last_message += (f" · 本轮限额 {max_works} 部 / 实处理 {stats['batch_size']} 部"

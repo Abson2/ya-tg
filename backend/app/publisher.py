@@ -79,9 +79,13 @@ async def ensure_share(db: Session, res: Resource) -> str:
 
 
 def _template(db: Session) -> MessageTemplate | None:
-    return (db.scalar(select(MessageTemplate).where(MessageTemplate.is_default.is_(True),
-                                                    MessageTemplate.enabled.is_(True)))
-            or db.scalar(select(MessageTemplate).where(MessageTemplate.enabled.is_(True))))
+    # v0.9.8：用 scalars().first() 而非 scalar()。历史库可能残留多条 is_default=True
+    # 或一条 enabled 模板都有的情况，scalar() 遇多行会抛 MultipleResultsFound（表现为
+    # 推送 Internal Server Error）；first() 取第一条，绝不抛异常。
+    return (db.scalars(select(MessageTemplate).where(
+        MessageTemplate.is_default.is_(True), MessageTemplate.enabled.is_(True))).first()
+            or db.scalars(select(MessageTemplate).where(
+                MessageTemplate.enabled.is_(True))).first())
 
 
 def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str]:

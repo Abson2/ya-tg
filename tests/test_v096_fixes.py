@@ -164,13 +164,14 @@ def test_delete_template_rejects_default(csv_session):
     assert main.delete_template(tpl.id, db=csv_session)["ok"] is True
     assert csv_session.get(MessageTemplate, tpl.id) is None
 
+    # v0.9.8：默认模板可删，删后自动补位（不再抛 400）。详见 test_v098_heal_a.py。
     dflt = MessageTemplate(name="默认图文模板", content="x", enabled=True, is_default=True)
     csv_session.add(dflt)
     csv_session.commit()
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException) as e:
-        main.delete_template(dflt.id, db=csv_session)
-    assert e.value.status_code == 400
+    assert main.delete_template(dflt.id, db=csv_session)["ok"] is True
+    from sqlalchemy import select
+    rest = csv_session.scalars(select(MessageTemplate)).all()
+    assert len(rest) == 1 and rest[0].is_default is True
 
 
 def test_default_template_dedup_in_migrate(csv_session):

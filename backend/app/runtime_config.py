@@ -28,6 +28,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tmdb_api_key": ("tmdb_api_key", ""),
     "tmdb_bearer_token": ("tmdb_bearer_token", ""),
     "tmdb_language": ("tmdb_language", "zh-CN"),
+    # v0.9.8：TMDB 按调用场景独立限流。bot 场景默认更保守（间隔久、频次低），
+    # 防止 Bot 被恶意刷求片/投稿导致 TMDB 账号触发风控；scan 场景供内部识别使用。
+    "tmdb_scan_min_interval": ("tmdb_scan_min_interval", "0.2"),  # 资源库识别：最小间隔秒
+    "tmdb_scan_max_calls": ("tmdb_scan_max_calls", "60"),         # 每窗口最大调用数
+    "tmdb_bot_min_interval": ("tmdb_bot_min_interval", "3"),      # Bot 场景：默认间隔 3 秒
+    "tmdb_bot_max_calls": ("tmdb_bot_max_calls", "20"),           # Bot 场景：每窗口 20 次
+    "tmdb_rate_window_seconds": ("tmdb_rate_window_seconds", "60"),  # 频次统计窗口
     # AI 辅助识别：OpenAI 兼容接口，用户可自定义服务端与模型
     "ai_enabled": ("ai_enabled", "false"),
     "ai_base_url": ("ai_base_url", "https://api.openai.com/v1"),

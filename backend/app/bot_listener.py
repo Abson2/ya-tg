@@ -19,7 +19,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import runtime_config, tgto
+from . import runtime_config, tgto, tmdb
 from .models import Bot, Channel, MediaRequest, Resource, UserContribution, utcnow
 from .security import decrypt_secret
 
@@ -31,11 +31,13 @@ BUILTIN_COMMANDS = [
     {"command": "打赏", "aliases": ["donate"], "description": "查看打赏支持方式"},
 ]
 HELP = ("Ya-TG 指令说明\n\n"
-        "/求片 剧名 [TMDB ID] [季]  — 提交想看，自动加入关键词监控\n"
-        "/投稿 标题 [分享链接]      — 投稿资源，等待管理员审核\n"
-        "/搜索 关键词               — 搜索资源库中的影视\n"
-        "/打赏                     — 查看打赏方式\n"
-        "/help                     — 查看本说明\n\n"
+        "/求片 剧名               — 列出 TMDB 候选，点选提交（推荐）\n"
+        "/求片 剧名 TMDB_ID 季    — 精确提交，跳过候选\n"
+        "/投稿 剧名               — 选 TMDB 候选后补光鸭链接\n"
+        "/投稿 标题 分享链接      — 一步提交投稿\n"
+        "/搜索 关键词             — 搜索资源库中的影视\n"
+        "/打赏                    — 查看打赏方式\n"
+        "/help                    — 查看本说明\n\n"
         "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏。\n"
         "其它指令以管理员在后台配置的为准。")
 
@@ -86,13 +88,12 @@ def push_whitelist(db: Session) -> tuple[list[str], list[str]]:
             [str(x).strip() for x in _json_list("bot_push_groups_json", db) if str(x).strip()])
 
 
-def push_routes(db: Session) -> list[dict]:
-    """v0.9.5：推送白名单改为「目录路由表」。
+def push_routes_raw(db: Session) -> list[dict]:
+    """v0.9.8：目录路由表的原始配置（供管理页回填）。
 
-    每条 {dir_id, kind(channel|group), chat_id}：把 B 库某目录（或其子目录）下的影视
-    经同一个全局单 Bot 推到指定频道或群。默认 1 条、最多 10 条由前端约束，后端也兜底。
+    每条同时可填 channel_id / group_id 两个独立目标（任选其一或两个都填）：
+    {dir_id, channel_id, group_id, note}。老数据只有 {kind, chat_id} 时归一到对应字段。
     """
-    import json
     try:
         raw = json.loads(runtime_config.get(db, "push_routes_json") or "[]")
     except Exception:
@@ -103,14 +104,36 @@ def push_routes(db: Session) -> list[dict]:
     for item in raw[:10]:
         if not isinstance(item, dict):
             continue
-        chat = str(item.get("chat_id") or "").strip()
-        if not chat:
-            continue  # 频道 ID、群 ID 任填其一即可，空路由跳过
-        kind = "group" if str(item.get("kind") or "").lower() == "group" else "channel"
+        channel_id = str(item.get("channel_id") or "").strip()
+        group_id = str(item.get("group_id") or "").strip()
+        # 兼容老数据：只有 kind/chat_id 时归入对应字段
+        if not channel_id and not group_id:
+            legacy_chat = str(item.get("chat_id") or "").strip()
+            if legacy_chat:
+                if str(item.get("kind") or "").lower() == "group":
+                    group_id = legacy_chat
+                else:
+                    channel_id = legacy_chat
+        if not channel_id and not group_id:
+            continue
         out.append({"dir_id": str(item.get("dir_id") or "").strip(),
-                    "kind": kind, "chat_id": chat,
-                    # v0.9.6：备注仅用于管理页肉眼区分目录，不参与匹配/推送逻辑
+                    "channel_id": channel_id, "group_id": group_id,
                     "note": str(item.get("note") or "").strip()[:120]})
+    return out
+
+
+def push_routes(db: Session) -> list[dict]:
+    """把原始路由展开成「一个目标一项」的列表，供匹配 / 推送 / 群发消费。
+
+    v0.9.8：一条路由可同时含频道与群两个目标，展开后返回两条 {dir_id, kind, chat_id, note}；
+    下游 match_push_routes / route_target_channel / 群发逻辑保持不变。
+    """
+    out = []
+    for r in push_routes_raw(db):
+        for kind, chat in (("channel", r["channel_id"]), ("group", r["group_id"])):
+            if chat:
+                out.append({"dir_id": r["dir_id"], "kind": kind, "chat_id": chat,
+                            "note": r["note"]})
     return out
 
 
@@ -212,6 +235,28 @@ async def _api(db: Session, token: str, method: str, payload: dict) -> dict:
     return data if isinstance(data, dict) else {"ok": False}
 
 
+async def sync_bot_command_menu(db: Session, token: str, *, clear: bool = False) -> dict:
+    """v0.9.8：同步 / 清空 Telegram 私聊指令栏（setMyCommands）。
+
+    真机上曾残留其它项目的旧指令栏（用户反馈第 3 项）。Telegram 指令必须是英文，
+    所以用当前项目内置指令的英文 aliases 注册，覆盖旧残留；clear=True 则传空数组
+    彻底置空。与 Reply 键盘（main_reply_keyboard）互不冲突：键盘在输入框上方，
+    指令栏是输入法 "/" 触发的下拉，两者可共存。
+    """
+    commands = [] if clear else [
+        {"command": "start", "description": "开始使用 / 打开菜单"},
+        {"command": "help", "description": "查看指令说明"},
+        {"command": "want", "description": "求片：提交想看的影视"},
+        {"command": "contribute", "description": "投稿：登记影视资源"},
+        {"command": "search", "description": "搜索资源库影视"},
+        {"command": "donate", "description": "打赏支持方式"},
+    ]
+    data = await _api(db, token, "setMyCommands", {"commands": commands})
+    ok = bool(data.get("ok"))
+    return {"ok": ok, "count": len(commands),
+            "description": str(data.get("description") or "")[:200]}
+
+
 def _normalize_tme_link(raw: str) -> str:
     """把 @用户名 / t.me/用户名 / 完整 URL 归一成可点的 https://t.me/... 链接。"""
     s = str(raw or "").strip()
@@ -302,6 +347,72 @@ CB_WANT = "m.want"
 CB_CONTRIB = "m.contrib"
 CB_SEARCH = "m.search"
 CB_DONATE = "m.donate"
+
+# ---------- v0.9.8：求片/投稿 TMDB 候选多轮交互 ----------
+# 会话按 tg_user_id 存内存（进程内，重启即失效，符合「一次性选择」场景）。
+# 结构: {uid: {"flow": "want"|"contribute", "query": str, "candidates": [dict],
+#              "secret": str(可选, 投稿先收链接), "created": float}}
+_pick_sessions: dict[str, dict] = {}
+_PICK_TTL = 600  # 10 分钟未选完则丢弃
+# callback_data 中候选选择的短码（Telegram 限制 64 字节）。格式 pick.<flow>.<idx>
+CB_PICK = "pk"
+FLOW_WANT = "want"
+FLOW_CONTRIB = "contribute"
+
+
+def _pick_gc() -> None:
+    """清理过期候选会话，避免长期运行内存泄漏。"""
+    now = time.time()
+    for uid in [k for k, v in _pick_sessions.items()
+                if now - float(v.get("created") or 0) > _PICK_TTL]:
+        _pick_sessions.pop(uid, None)
+
+
+def _pick_set(uid: str, flow: str, query: str, candidates: list[dict],
+              secret: str = "") -> None:
+    _pick_gc()
+    _pick_sessions[str(uid)] = {"flow": flow, "query": query,
+                                "candidates": candidates[:8], "secret": secret,
+                                "created": time.time()}
+
+
+def _pick_get(uid: str) -> dict | None:
+    _pick_gc()
+    return _pick_sessions.get(str(uid))
+
+
+def _pick_clear(uid: str) -> None:
+    _pick_sessions.pop(str(uid), None)
+
+
+def _candidates_keyboard(flow: str, candidates: list[dict]) -> dict:
+    """候选选择 inline 键盘：每题一行，最多 8 个，附「跳过/取消」。"""
+    rows = []
+    for i, c in enumerate(candidates[:8]):
+        title = str(c.get("title") or "?")
+        year = str(c.get("year") or "")
+        kind = "剧" if c.get("media_type") == "tv" else "影"
+        label = f"{i + 1}. {title}" + (f" ({year})" if year else "") + f" · {kind}"
+        rows.append([{"text": label[:60],
+                      "callback_data": f"{CB_PICK}.{flow}.{i}"}])
+    rows.append([{"text": "跳过 TMDB，手动填写", "callback_data": f"{CB_PICK}.{flow}.skip"},
+                 {"text": "取消", "callback_data": f"{CB_PICK}.{flow}.cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def _candidate_caption(flow: str, query: str, candidates: list[dict]) -> str:
+    verb = "求片" if flow == FLOW_WANT else "投稿"
+    lines = [f"🔍 按「{query}」找到以下 TMDB 候选，请点选{verb}对应作品：", ""]
+    for i, c in enumerate(candidates[:8]):
+        title = str(c.get("title") or "?")
+        year = str(c.get("year") or "")
+        kind = "剧集" if c.get("media_type") == "tv" else "电影"
+        score = c.get("vote_average")
+        rating = f" ⭐{float(score):.1f}" if score else ""
+        lines.append(f"{i + 1}. {title}" + (f"（{year}）" if year else "")
+                     + f" · {kind}{rating} · ID {c.get('tmdb_id')}")
+    return "\n".join(lines) + "\n\n选错可点「跳过 TMDB，手动填写」。"
+
 async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
     """v0.9.2：审核投稿 / 求片后主动回复用户一次（非刷屏，属事务性通知）。
 
@@ -403,16 +514,108 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
             lines.append(f"· {name}" + (f"  {link}" if link else ""))
         return "\n".join(lines), back_keyboard()
     if data == CB_WANT:
-        return ("🎬 求片用法：\n/求片 剧名 [TMDB ID] [季]\n"
-                "例：/求片 伟大的长征 297253 1\n提交后自动加入关键词监控。", back_keyboard())
+        return ("🎬 求片：直接发送剧名，我会列出 TMDB 候选让你点选（推荐）。\n"
+                "也可精确提交：/求片 剧名 TMDB_ID 季\n例：/求片 伟大的长征 297253 1", back_keyboard())
     if data == CB_CONTRIB:
-        return ("📤 投稿用法：\n/投稿 标题 分享链接\n"
+        return ("📤 投稿：先发剧名选 TMDB 候选，再补光鸭分享链接。\n"
+                "也可一步提交：/投稿 标题 分享链接\n"
                 "也可直接把分享链接发给我，我会自动登记，管理员审核后处理。", back_keyboard())
     if data == CB_SEARCH:
         return "🔍 搜索用法：\n/搜索 关键词\n例：/搜索 保镖恋人", back_keyboard()
     if data == CB_DONATE:
         return _donate_text(db), back_keyboard()
     return "未知操作，请重试。", main_keyboard()
+
+
+async def _edit_or_send(db, token, chat_id, message_id, text: str,
+                        keyboard: dict | None) -> str:
+    """编辑原消息；失败则新发一条。供候选交互复用。"""
+    payload = {"chat_id": chat_id, "text": text[:4000],
+               "disable_web_page_preview": True}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    if message_id:
+        r = await _api(db, token, "editMessageText", {**payload, "message_id": message_id})
+        if r.get("ok"):
+            return "pick"
+    await _api(db, token, "sendMessage", payload)
+    return "pick"
+
+
+async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id: str,
+                       message_id, tg_username: str = "") -> str:
+    """处理 TMDB 候选点选：pick.<flow>.<idx|skip|cancel>。"""
+    parts = data.split(".")
+    flow = parts[1] if len(parts) > 1 else ""
+    token_part = parts[2] if len(parts) > 2 else ""
+    sess = _pick_get(uid)
+    if token_part == "cancel":
+        _pick_clear(uid)
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   "已取消，未提交任何内容。", main_keyboard())
+    if not sess or sess.get("flow") != flow:
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   "候选已过期，请重新输入剧名发起求片/投稿。", main_keyboard())
+    if token_part == "skip":
+        _pick_clear(uid)
+        hint = ("请手动发送：/求片 剧名 TMDB_ID 季" if flow == FLOW_WANT else
+                "请手动发送：/投稿 标题 光鸭链接")
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   f"已跳过 TMDB 候选。{hint}", main_keyboard())
+    try:
+        idx = int(token_part)
+    except ValueError:
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   "选择无效，请重试。", main_keyboard())
+    candidates = sess.get("candidates") or []
+    if idx < 0 or idx >= len(candidates):
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   "选择超出范围，请重试。", main_keyboard())
+    chosen = candidates[idx]
+    title = _fmt_title(chosen)
+    tmdb_id = int(chosen["tmdb_id"]) if str(chosen.get("tmdb_id") or "").isdigit() else None
+    media_type = str(chosen.get("media_type") or "") or "tv"
+    year = str(chosen.get("year") or "")
+
+    if flow == FLOW_WANT:
+        kid = tgto.keyword_id(tmdb_id, None, title)
+        req = MediaRequest(tg_user_id=str(uid), tg_username=tg_username,
+                           title=title, tmdb_id=tmdb_id, media_type=media_type,
+                           year=year, season=None, keyword_id=kid, status="pending",
+                           review_status="pending")
+        db.add(req)
+        db.flush()
+        try:
+            r = await tgto.upsert_keyword(db, title=title, tmdb_id=tmdb_id,
+                                          media_type=media_type, season=None)
+            req.status = "synced" if r.get("ok") else "failed"
+            req.note = r.get("message") or r.get("status") or ""
+            if r.get("ok"):
+                req.synced_at = utcnow()
+        except Exception as exc:
+            req.status, req.note = "failed", str(exc)[:300]
+        _pick_clear(uid)
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   f"已登记「{title}」，我们会尽快处理，感谢支持！", main_keyboard())
+
+    # 投稿：若会话里已存链接（先发链接再选片）则直接落库，否则提示补链接
+    secret = str(sess.get("secret") or "").strip()
+    if secret:
+        db.add(UserContribution(tg_user_id=str(uid), tg_username=tg_username,
+                                title=title[:512], content=sess.get("query", "")[:4000],
+                                share_url=secret, status="pending",
+                                tmdb_id=tmdb_id, media_type=media_type, year=year,
+                                note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
+        _pick_clear(uid)
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   f"投稿已登记：{title}\n管理员审核后处理。", main_keyboard())
+    # 记住已选候选，等下一条消息补链接
+    sess["picked"] = {"title": title, "tmdb_id": tmdb_id,
+                      "media_type": media_type, "year": year}
+    _pick_sessions[str(uid)] = sess
+    return await _edit_or_send(db, token, chat_id, message_id,
+                               f"已选「{title}」，请发送该资源的光鸭分享链接（http/https）。",
+                               back_keyboard())
 
 
 async def _handle_callback(db: Session, token: str, cb: dict) -> str:
@@ -434,6 +637,11 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
             payload["reply_markup"] = kb
         await _api(db, token, "sendMessage", payload)
         return "blocked"
+    # v0.9.8：TMDB 候选选择回调 pick.<flow>.<idx|skip|cancel>
+    if data.startswith(f"{CB_PICK}."):
+        return await _handle_pick(db, token, data, uid=user_id,
+                                  chat_id=chat_id, message_id=message_id,
+                                  tg_username=str(user.get("username") or ""))
     text, keyboard = _menu_text(db, data)
     payload = {"chat_id": chat_id, "message_id": message_id,
                "text": text[:4000], "disable_web_page_preview": True}
@@ -486,12 +694,75 @@ async def _do_search(db: Session, keyword: str) -> str:
     return "\n".join(lines)
 
 
+async def search_candidates(db: Session, query: str, media_type: str = "") -> list[dict]:
+    """TMDB 中文候选搜索：默认双路（剧+影）并按查询词相关性排序。
+
+    TMDB 未配置 / 网络异常时返回空列表，调用方据此降级到旧的直接登记流程，
+    保证「TMDB 挂了也能投稿求片」。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        if not tmdb.configured(db):
+            return []
+        if media_type in ("movie", "tv"):
+            rows = await tmdb.search(q, media_type, db, scenario=tmdb.BOT)
+        else:
+            # BOT 场景用 multi 单路：一次配额拿到剧+影，避免 search_both 双路
+            # 各扣一次配额、且被 bot 间隔挡掉第二路导致只返回剧集。
+            rows = await tmdb.search(q, None, db, scenario=tmdb.BOT)
+    except Exception:
+        return []
+    if not rows:
+        return []
+    ranked = tmdb.rank(rows, {"clean_title": q})
+    # 去重（同一 tmdb_id + type 只留一条），保中文名
+    seen: set[tuple] = set()
+    out = []
+    for it in ranked:
+        key = (str(it.get("tmdb_id") or ""), str(it.get("media_type") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"tmdb_id": it.get("tmdb_id"), "title": it.get("title") or "",
+                    "year": str(it.get("year") or ""), "media_type": it.get("media_type") or "",
+                    "vote_average": it.get("vote_average") or 0})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _fmt_title(c: dict) -> str:
+    """候选落库展示名：TMDB 中文名 + 年份。"""
+    title = str(c.get("title") or "").strip()
+    year = str(c.get("year") or "").strip()
+    return f"{title}（{year}）" if title and year else (title or year)
+
+
 async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                       tg_username: str = "") -> tuple[str, str]:
     """处理一条用户文本，返回 (动作, 回复文本)。写库但不在此处 commit。"""
     raw = (text or "").strip()
     if not raw:
         return "ignored", ""
+    # v0.9.8：投稿候选已选、正在等光鸭链接 —— 本次消息作为链接落库
+    pending = _pick_get(tg_user_id)
+    if pending and pending.get("flow") == FLOW_CONTRIB and pending.get("picked"):
+        urls = _SHARE_URL.findall(raw)
+        if urls:
+            picked = pending["picked"]
+            db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
+                                    title=str(picked.get("title") or "")[:512],
+                                    content=raw[:4000], share_url=urls[-1], status="pending",
+                                    tmdb_id=picked.get("tmdb_id"),
+                                    media_type=picked.get("media_type") or "",
+                                    year=str(picked.get("year") or ""),
+                                    note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
+            _pick_clear(tg_user_id)
+            return "contribute", (f"投稿已登记：{picked.get('title')}\n管理员审核后处理。")
+        return "contribute_await_url", "请发送该资源的光鸭分享链接（http/https 开头），或输入 /投稿 重来。"
+
     cmd, *rest = raw.split(None, 1)
     arg = (rest[0] if rest else "").strip()
     low = cmd.lower().split("@")[0]
@@ -518,7 +789,7 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
 
     if builtin == "求片":
         if not arg:
-            return "want_invalid", "用法：/求片 剧名 [TMDB ID] [季]\n例：/求片 伟大的长征 297253 1"
+            return "want_invalid", "用法：/求片 剧名 [TMDB ID] [季]\n例：/求片 伟大的长征 297253 1\n也可直接输入剧名，我会列出 TMDB 候选让你选。"
         bits = arg.split()
         tmdb_id = None
         season = None
@@ -531,12 +802,21 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
             else:
                 tail.append(b)
         title = " ".join(tail).strip() or arg
+        # v0.9.8：只给了剧名、没带 TMDB ID → 走候选选择；用户已给 ID 时直接登记（保持兼容）。
+        if tmdb_id is None:
+            candidates = await search_candidates(db, title)
+            if candidates:
+                _pick_set(tg_user_id, FLOW_WANT, title, candidates)
+                return "want_pick", _candidate_caption(FLOW_WANT, title, candidates)
         kid = tgto.keyword_id(tmdb_id, season, title)
         req = MediaRequest(tg_user_id=str(tg_user_id), tg_username=tg_username,
                            title=title, tmdb_id=tmdb_id, media_type="tv" if season else "",
                            season=season, keyword_id=kid, status="pending")
         db.add(req)
         db.flush()
+        # v0.9.8：TgtoDrive 同步是管理员侧的事，失败原因只写 note 供后台排查，
+        # 绝不能发给用户（用户反馈第 4 项）。用户只看到「已登记，等待审核」。
+        req.review_status = "pending"
         try:
             r = await tgto.upsert_keyword(db, title=title, tmdb_id=tmdb_id,
                                           media_type=req.media_type or "tv", season=season)
@@ -544,17 +824,22 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
             req.note = r.get("message") or r.get("status") or ""
             if r.get("ok"):
                 req.synced_at = utcnow()
-            reply = (f"已加入监控：{title}（规则 {kid}）" if r.get("ok")
-                     else f"登记成功，但关键词同步未生效：{req.note}")
         except Exception as exc:
             req.status, req.note = "failed", str(exc)[:300]
-            reply = f"已登记「{title}」，但 TgtoDrive 未配置或不可达：{req.note}"
+        reply = f"已登记「{title}」，我们会尽快处理，感谢支持！"
         return "want", reply
 
     if builtin == "投稿":
         urls = _SHARE_URL.findall(arg)
         share_url = urls[-1] if urls else ""
         title = _SHARE_URL.sub("", arg).strip() or (share_url or "未命名投稿")
+        # v0.9.8：有标题但没链接 → 先走 TMDB 候选，选完再让用户补光鸭链接。
+        # 若用户已带链接（旧用法）或 TMDB 不可用，则直接登记（保持兼容与可用性）。
+        if not share_url and title and title != "未命名投稿":
+            candidates = await search_candidates(db, title)
+            if candidates:
+                _pick_set(tg_user_id, FLOW_CONTRIB, title, candidates)
+                return "contribute_pick", _candidate_caption(FLOW_CONTRIB, title, candidates)
         db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
                                 title=title[:512], content=raw[:4000],
                                 share_url=share_url, status="pending",
@@ -643,6 +928,11 @@ async def poll_once(db: Session) -> dict:
                 # 不调用 setMyCommands，不改 Telegram 底部指令栏；只回来源 chat。
                 if action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
                     await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+                elif action in ("want_pick", "contribute_pick"):
+                    # v0.9.8：TMDB 候选列表附 inline 选择键盘
+                    sess = _pick_get(user_id)
+                    kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
+                    await _reply(db, token, chat_id, reply, reply_markup=kb)
                 else:
                     await _reply(db, token, chat_id, reply)
         except Exception as exc:
