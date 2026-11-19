@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -236,11 +237,17 @@ async def _api(db: Session, token: str, method: str, payload: dict) -> dict:
 
 
 async def sync_bot_command_menu(db: Session, token: str, *, clear: bool = False) -> dict:
-    """v0.9.8：同步 / 清空 Telegram 私聊指令栏（setMyCommands）。
+    """v0.9.9 #207：同步 / 清空 Telegram 私聊指令栏（setMyCommands）。
 
-    真机上曾残留其它项目的旧指令栏（用户反馈第 3 项）。Telegram 指令必须是英文，
-    所以用当前项目内置指令的英文 aliases 注册，覆盖旧残留；clear=True 则传空数组
-    彻底置空。与 Reply 键盘（main_reply_keyboard）互不冲突：键盘在输入框上方，
+    真机上曾残留其它项目的旧指令栏（/bind /unbind /profile /register /code /renew，
+    用户截图反馈）。这些是 Telegram 服务端的持久状态，只设一次就一直在，除非被
+    覆盖/清空——所以 v0.9.9 起在 poll_once 里按 token 指纹自动清空一次，无需用户手动点。
+
+    两种策略：
+      - clear=True：传空数组彻底置空。用户已转向「点 Reply 键盘 + 直接输入文字」，
+        不需要 "/" 下拉指令栏，置空可永久消除旧项目残留。
+      - clear=False：注册当前项目 6 个英文指令（Telegram 指令只能英文）。
+    与 Reply 键盘（main_reply_keyboard）互不冲突：键盘在输入框上方，
     指令栏是输入法 "/" 触发的下拉，两者可共存。
     """
     commands = [] if clear else [
@@ -255,6 +262,49 @@ async def sync_bot_command_menu(db: Session, token: str, *, clear: bool = False)
     ok = bool(data.get("ok"))
     return {"ok": ok, "count": len(commands),
             "description": str(data.get("description") or "")[:200]}
+
+
+# v0.9.9 #207：指令栏自动清理。setMyCommands 是 Telegram 服务端持久状态，旧项目经
+# BotFather 设过的指令会一直挂在 "/" 下拉里，用户不手动清就永远显示。用 token 指纹
+# 记录「已自动清过」的 bot，进程内 + runtime_config 双保险，每个 token 只清一次，
+# 避免 poll_once 每 10 秒都打一次 setMyCommands 被 TG 限流。
+_AUTO_CLEARED_TOKENS: set[str] = set()
+
+
+async def auto_clear_stale_commands(db: Session, token: str) -> bool:
+    """每个 Bot token 首次进入轮询时自动清空一次 "/" 指令栏，覆盖旧项目残留。
+
+    返回是否本次执行了清空。失败不抛异常（登录/网络问题不阻断消息轮询），
+    下次进程启动会重试；成功则写 runtime_config 持久标记 + 进程内集合。
+    用户仍可用管理页「同步指令栏」按钮注册当前项目指令，或再次「清空」。
+    """
+    if not token:
+        return False
+    fp = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    if fp in _AUTO_CLEARED_TOKENS:
+        return False
+    marked = set()
+    try:
+        marked = set(x for x in (runtime_config.get(db, "bot_commands_cleared_fp") or "").split(",") if x)
+    except Exception:
+        marked = set()
+    if fp in marked:
+        _AUTO_CLEARED_TOKENS.add(fp)
+        return False
+    try:
+        out = await sync_bot_command_menu(db, token, clear=True)
+    except Exception:
+        return False
+    if not out.get("ok"):
+        return False
+    _AUTO_CLEARED_TOKENS.add(fp)
+    marked.add(fp)
+    try:
+        runtime_config.set_many(db, {"bot_commands_cleared_fp": ",".join(sorted(marked))})
+        db.flush()
+    except Exception:
+        pass
+    return True
 
 
 def _normalize_tme_link(raw: str) -> str:
@@ -358,6 +408,48 @@ _PICK_TTL = 600  # 10 分钟未选完则丢弃
 CB_PICK = "pk"
 FLOW_WANT = "want"
 FLOW_CONTRIB = "contribute"
+
+# ---------- v0.9.9 #209：点 Reply 键盘进入会话态，后续直接输入文字即可 ----------
+# 与候选会话 _pick_sessions 分开：这里只记录「用户当前处于求片/投稿模式」，
+# 让用户点「求片」「投稿」按钮后不必每条都加 /命令，直接发剧名/链接。
+_flow_sessions: dict[str, dict] = {}       # {uid: {"flow": want|contribute, "created": ts}}
+_FLOW_TTL = 600                            # 10 分钟无操作自动退出会话
+CB_END = "m.end"                           # inline「结束交互」按钮短码
+
+
+def _flow_gc() -> None:
+    now = time.time()
+    for uid in [k for k, v in _flow_sessions.items()
+                if now - float(v.get("created") or 0) > _FLOW_TTL]:
+        _flow_sessions.pop(uid, None)
+
+
+def _flow_set(uid: str, flow: str) -> None:
+    _flow_gc()
+    if str(uid):
+        _flow_sessions[str(uid)] = {"flow": flow, "created": time.time()}
+
+
+def _flow_get(uid: str) -> str:
+    _flow_gc()
+    s = _flow_sessions.get(str(uid))
+    return str(s.get("flow") or "") if s else ""
+
+
+def _flow_clear(uid: str) -> None:
+    _flow_sessions.pop(str(uid), None)
+
+
+def low_end(raw: str) -> bool:
+    """识别用户主动结束交互的文字（中英文/斜杠命令都认）。"""
+    s = str(raw or "").strip().lower().lstrip("/")
+    return s in ("结束", "退出", "取消", "返回", "end", "exit", "cancel", "stop", "home")
+
+
+def end_flow_keyboard() -> dict:
+    """会话态的 inline 键盘：一个「结束交互」按钮，让用户随时退出文字模式。"""
+    return {"inline_keyboard": [
+        [{"text": "✅ 结束交互 / 返回主菜单", "callback_data": CB_END}]]}
 
 
 def _pick_gc() -> None:
@@ -494,7 +586,7 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
         return ("请选择功能：\n\n求片/投稿/搜索用下方按钮；"
                 "也可直接发送 /求片 剧名、/投稿 标题 链接、/搜索 关键词。", main_keyboard())
     if data == CB_ACTIONS:
-        return "求片：提交想看的影视，自动加入关键词监控。\n投稿：登记你的资源分享链接，等待管理员审核。", actions_keyboard()
+        return "求片：提交想看的影视，自动加入关键词监控。\n投稿：登记你的资源分享链接，我们会尽快处理。", actions_keyboard()
     if data == CB_CHANNELS:
         channels, _ = push_whitelist(db)
         if not channels:
@@ -519,7 +611,7 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
     if data == CB_CONTRIB:
         return ("📤 投稿：先发剧名选 TMDB 候选，再补光鸭分享链接。\n"
                 "也可一步提交：/投稿 标题 分享链接\n"
-                "也可直接把分享链接发给我，我会自动登记，管理员审核后处理。", back_keyboard())
+                "也可直接把分享链接发给我，我会自动为你登记，感谢支持！", back_keyboard())
     if data == CB_SEARCH:
         return "🔍 搜索用法：\n/搜索 关键词\n例：/搜索 保镖恋人", back_keyboard()
     if data == CB_DONATE:
@@ -545,6 +637,9 @@ async def _edit_or_send(db, token, chat_id, message_id, text: str,
 async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id: str,
                        message_id, tg_username: str = "") -> str:
     """处理 TMDB 候选点选：pick.<flow>.<idx|skip|cancel>。"""
+    # v0.9.9 #209：进入候选点选即退出「文字会话态」，后续由 _pick_sessions 管理，
+    # 避免用户点选后发下一条无关消息仍被当成求片/投稿输入。
+    _flow_clear(uid)
     parts = data.split(".")
     flow = parts[1] if len(parts) > 1 else ""
     token_part = parts[2] if len(parts) > 2 else ""
@@ -608,7 +703,7 @@ async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id:
                                 note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
         _pick_clear(uid)
         return await _edit_or_send(db, token, chat_id, message_id,
-                                   f"投稿已登记：{title}\n管理员审核后处理。", main_keyboard())
+                                   f"投稿已登记：{title}\n感谢支持，我们会尽快处理。", main_keyboard())
     # 记住已选候选，等下一条消息补链接
     sess["picked"] = {"title": title, "tmdb_id": tmdb_id,
                       "media_type": media_type, "year": year}
@@ -637,6 +732,13 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
             payload["reply_markup"] = kb
         await _api(db, token, "sendMessage", payload)
         return "blocked"
+    # v0.9.9 #209：inline「结束交互」按钮——清掉文字会话与候选会话
+    if data == CB_END:
+        _flow_clear(user_id)
+        _pick_clear(user_id)
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   "已结束本次交互，随时可点下方「求片 / 投稿」重新开始。",
+                                   main_keyboard())
     # v0.9.8：TMDB 候选选择回调 pick.<flow>.<idx|skip|cancel>
     if data.startswith(f"{CB_PICK}."):
         return await _handle_pick(db, token, data, uid=user_id,
@@ -742,10 +844,21 @@ def _fmt_title(c: dict) -> str:
 
 async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                       tg_username: str = "") -> tuple[str, str]:
-    """处理一条用户文本，返回 (动作, 回复文本)。写库但不在此处 commit。"""
+    """处理一条用户文本，返回 (动作, 回复文本)。写库但不在此处 commit。
+
+    v0.9.9 #209：点「求片 / 投稿」Reply 键盘后进入会话态，后续直接输入文字即可，
+    不必每条都加 /命令；发「结束」或点 inline「结束交互」按钮退出。
+    """
     raw = (text or "").strip()
     if not raw:
         return "ignored", ""
+
+    # v0.9.9 #209：结束词优先——任何会话（文字模式 / TMDB 候选）都清掉
+    if low_end(raw):
+        _flow_clear(tg_user_id)
+        _pick_clear(tg_user_id)
+        return "flow_end", "已结束本次交互，随时可点下方「求片 / 投稿」重新开始。"
+
     # v0.9.8：投稿候选已选、正在等光鸭链接 —— 本次消息作为链接落库
     pending = _pick_get(tg_user_id)
     if pending and pending.get("flow") == FLOW_CONTRIB and pending.get("picked"):
@@ -760,8 +873,11 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                                     year=str(picked.get("year") or ""),
                                     note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
             _pick_clear(tg_user_id)
-            return "contribute", (f"投稿已登记：{picked.get('title')}\n管理员审核后处理。")
-        return "contribute_await_url", "请发送该资源的光鸭分享链接（http/https 开头），或输入 /投稿 重来。"
+            _flow_clear(tg_user_id)
+            # v0.9.9 #208：用户回复只给友好文案，管理员侧状态只在后台 note 可见
+            return "contribute", (f"投稿已登记：{picked.get('title')}\n"
+                                  "感谢支持，我们会尽快处理。")
+        return "contribute_await_url", "请发送该资源的光鸭分享链接（http/https 开头），或回复「结束」退出。"
 
     cmd, *rest = raw.split(None, 1)
     arg = (rest[0] if rest else "").strip()
@@ -772,8 +888,32 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
 
     builtin = _match_builtin(low)
     custom = None if builtin else _custom_command(db, low)
+
+    # v0.9.9 #209：会话态下，用户直接输入的文字（不含命令）当作当前 flow 的输入。
+    # 这样点「求片」后发「凡人修仙传」= 求片剧名，点「投稿」后发剧名 = 投稿候选。
+    active_flow = _flow_get(tg_user_id)
+    if active_flow and not builtin and not custom and not low.startswith("/"):
+        builtin = "求片" if active_flow == FLOW_WANT else "投稿"
+        arg = raw
+        low = builtin
+
     if not builtin and not custom and not _SHARE_URL.search(raw):
         return "ignored", ""
+
+    # v0.9.9 #209：裸命令（点 Reply 键盘触发，无参数）→ 进入会话态，提示直接输入文字。
+    # 不再回「用法：/求片 …」逼用户加命令，也不再让投稿落「未命名投稿」。
+    if builtin in ("求片", "投稿") and not arg:
+        if builtin == "求片":
+            _flow_set(tg_user_id, FLOW_WANT)
+            return "flow_want", ("已进入求片模式。请直接输入剧名，我会列出 TMDB 候选让你点选。\n"
+                                 "随时回复「结束」或点下方按钮退出。")
+        _flow_set(tg_user_id, FLOW_CONTRIB)
+        return "flow_contribute", ("已进入投稿模式。请直接输入剧名（我会列 TMDB 候选），"
+                                   "或直接粘贴光鸭分享链接。\n随时回复「结束」或点下方按钮退出。")
+
+    # 用户带了内容 → 该轮交互完成，退出文字会话态（后续走正常候选/落库流程）
+    if builtin in ("求片", "投稿") and active_flow:
+        _flow_clear(tg_user_id)
 
     if builtin == "打赏" or (custom and str(custom.get("command") or "").lower() in ("donate", "打赏")):
         if (runtime_config.get(db, "donation_enabled") or "").lower() != "true":
@@ -832,33 +972,63 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     if builtin == "投稿":
         urls = _SHARE_URL.findall(arg)
         share_url = urls[-1] if urls else ""
-        title = _SHARE_URL.sub("", arg).strip() or (share_url or "未命名投稿")
-        # v0.9.8：有标题但没链接 → 先走 TMDB 候选，选完再让用户补光鸭链接。
-        # 若用户已带链接（旧用法）或 TMDB 不可用，则直接登记（保持兼容与可用性）。
-        if not share_url and title and title != "未命名投稿":
+        title = _SHARE_URL.sub("", arg).strip()
+        # v0.9.9 #208：有剧名先走 TMDB 候选，选完补链接，后台拿到中文名/年份/影号。
+        # TMDB 未配置/无候选时仍可用用户剧名登记，但绝不再造「未命名投稿」。
+        if not share_url and title:
             candidates = await search_candidates(db, title)
             if candidates:
                 _pick_set(tg_user_id, FLOW_CONTRIB, title, candidates)
                 return "contribute_pick", _candidate_caption(FLOW_CONTRIB, title, candidates)
+        if not title and not share_url:
+            return "contribute_need_title", "请告诉我影视名称，或直接粘贴光鸭分享链接。"
+        final_title = (title or share_url)[:512]
         db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                                title=title[:512], content=raw[:4000],
+                                title=final_title, content=raw[:4000],
                                 share_url=share_url, status="pending",
                                 note="投稿转存接口待验证，当前仅登记，不自动入库"))
-        return "contribute", (f"投稿已登记：{title}\n管理员审核后处理。"
-                              "（转存接口尚未验证，暂不自动入库）")
+        # v0.9.9 #208：用户侧只给友好确认，「转存接口待验证」等管理员信息只在后台 note
+        return "contribute", (f"投稿已登记：{final_title}\n"
+                              "感谢支持，我们会尽快处理。")
 
     if custom:
         return "custom", str(custom.get("reply") or custom.get("description") or "已收到指令。")
 
-    # 普通消息里带链接也按投稿登记，降低用户使用门槛
+    # 普通消息里带链接也按投稿登记，降低用户使用门槛（如会话态里直接发纯链接）
     if _SHARE_URL.search(raw):
-        share_url = _SHARE_URL.findall(raw)[-1]
-        title = _SHARE_URL.sub("", raw).strip()[:512] or "未命名投稿"
+        return await _register_link_contribution(db, raw, tg_user_id, tg_username)
+    # 会话态下走到这里说明是一段文字但没匹配命令——按投稿剧名处理，先走 TMDB 候选
+    if active_flow == FLOW_CONTRIB and raw:
+        candidates = await search_candidates(db, raw)
+        if candidates:
+            _pick_set(tg_user_id, FLOW_CONTRIB, raw, candidates)
+            return "contribute_pick", _candidate_caption(FLOW_CONTRIB, raw, candidates)
         db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                                title=title, content=raw[:4000], share_url=share_url,
-                                status="pending", note="自动识别为投稿；转存接口待验证"))
-        return "contribute", f"已收到资源链接并登记投稿（{title}），等待管理员处理。"
+                                title=raw[:512], content=raw[:4000], share_url="",
+                                status="pending", note="文字投稿（TMDB 无候选）；转存接口待验证"))
+        _flow_clear(tg_user_id)
+        return "contribute", f"投稿已登记：{raw[:512]}\n感谢支持，我们会尽快处理。"
     return "ignored", ""
+
+
+async def _register_link_contribution(db: Session, raw: str, tg_user_id: str,
+                                      tg_username: str) -> tuple[str, str]:
+    """纯光鸭链接投稿：链接即内容，标题从候选/文本拿，用户回复不含管理员信息。"""
+    share_url = _SHARE_URL.findall(raw)[-1]
+    text_title = _SHARE_URL.sub("", raw).strip()[:512]
+    title = text_title
+    if not title:
+        candidates = await search_candidates(db, share_url)
+        if candidates:
+            # 有候选也走点选，拿到规范中文名；链接先存进会话 secret 供选完落库
+            _pick_set(tg_user_id, FLOW_CONTRIB, "分享链接", candidates, secret=share_url)
+            return "contribute_pick", _candidate_caption(FLOW_CONTRIB, "分享链接", candidates)
+        title = share_url  # 无候选兜底用链接本身，仍不造「未命名投稿」
+    db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
+                            title=title, content=raw[:4000], share_url=share_url,
+                            status="pending", note="自动识别为投稿；转存接口待验证"))
+    _flow_clear(tg_user_id)
+    return "contribute", f"已收到资源并登记投稿（{title}），感谢支持，我们会尽快处理。"
 
 
 async def poll_once(db: Session) -> dict:
@@ -871,6 +1041,9 @@ async def poll_once(db: Session) -> dict:
     token = effective_token(db)
     if not token:
         return {"enabled": False, "messages": 0, "error": "未配置交互 Bot（请在 Bot 管理添加并选用，或配置投稿 Bot Token）"}
+    # v0.9.9 #207：每个 token 首次轮询自动清空一次旧项目残留的 "/" 指令栏。
+    # 指纹去重在 auto_clear_stale_commands 内部，正常轮询不产生额外请求。
+    menu_cleared = await auto_clear_stale_commands(db, token)
     try:
         offset = int(runtime_config.get(db, "contribution_update_offset") or 0)
     except ValueError:
@@ -886,7 +1059,8 @@ async def poll_once(db: Session) -> dict:
         return {"enabled": True, "messages": 0, "error": str(exc)[:200]}
     updates = data.get("result") or [] if isinstance(data, dict) else []
     stats = {"enabled": True, "messages": len(updates), "handled": 0,
-             "blocked": 0, "callbacks": 0, "actions": []}
+             "blocked": 0, "callbacks": 0, "actions": [],
+             "menu_cleared": menu_cleared}
     for upd in updates:
         uid = int(upd.get("update_id") or 0)
         offset = max(offset, uid + 1)
@@ -933,6 +1107,15 @@ async def poll_once(db: Session) -> dict:
                     sess = _pick_get(user_id)
                     kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
                     await _reply(db, token, chat_id, reply, reply_markup=kb)
+                elif action == "flow_end":
+                    # v0.9.9 #209：退出文字会话，回主 Reply 键盘
+                    await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+                elif action in ("flow_want", "flow_contribute", "contribute_await_url"):
+                    # v0.9.9 #209：刚进入会话 / 等光鸭链接，附 inline「结束交互」按钮
+                    await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
+                elif _flow_get(user_id) or _pick_get(user_id):
+                    # v0.9.9 #209：会话态下其它回复也带结束按钮
+                    await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
                 else:
                     await _reply(db, token, chat_id, reply)
         except Exception as exc:

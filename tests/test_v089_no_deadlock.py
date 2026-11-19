@@ -280,9 +280,10 @@ def test_mirror_guard_rejects_concurrent_call():
 
 def test_all_long_entrypoints_are_guarded():
     src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    # run / rename / tasks poll / mappings prune / media clear-invalid(v0.9.8)：
-    # 任何分钟级长任务或批量删映射都必须共用同一把锁
-    assert src.count("with _mirror_guard():") == 5
+    # run / rename / tasks poll / mappings prune(v0.8.9) / mirror run 内的长任务共用一把锁。
+    # v0.9.9 #205：media clear-invalid 只删本地僵尸映射行、不联网不写 B 库，已刻意不持锁
+    # （否则后台改名复查持锁时按钮报「有任务在进行」），故这里为 4。
+    assert src.count("with _mirror_guard():") == 4
     assert "_mirror_lock.acquire(blocking=False)" in src  # 定时同步跳过而非排队
     assert "_mirror_lock.release()" in src
 

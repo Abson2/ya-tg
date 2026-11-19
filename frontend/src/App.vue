@@ -313,7 +313,10 @@ const episodeHint = computed(() => '剧集状态：{{episode_status}}=追更「�
 const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'season_label', 'episode_count', 'reward_code', 'size', 'share_url',
   'tmdb_id', 'tmdb_url', 'type', 'type_label', 'origin_country', 'origin_country_code',
   'genres', 'tags', 'vote_average', 'original_title', 'season', 'episode', 'episode_tag', 'media_type', 'filename',
-  'episode_status', 'episode_progress', 'updated_to_episode', 'total_episodes', 'current_episode']
+  'episode_status', 'episode_progress', 'updated_to_episode', 'total_episodes', 'current_episode',
+  // v0.9.9 #202：用户新样式变量（来源/画质/编码/音频文件名解析，上映时间取 TMDB）
+  'air_date', 'release_date', 'vote_plain', 'source', 'quality', 'video_codec', 'audio_codec',
+  'season_count', 'episode_range', 'buttons_text', 'channel_link', 'group_link']
 const previewDemo = {
   title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
   filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
@@ -325,7 +328,12 @@ const previewDemo = {
   vote_average: '7.0', original_title: 'Marfil', season: '', episode: '',
   episode_tag: '', media_type: 'movie',
   episode_status: '', episode_progress: '', updated_to_episode: '',
-  total_episodes: '', current_episode: ''
+  total_episodes: '', current_episode: '',
+  // v0.9.9 #202：新样式预览值
+  air_date: '2026-11-15', release_date: '2026-11-15', vote_plain: '9',
+  source: 'Web-DL', quality: '2160p | 10bit | 60fps | SDR', video_codec: 'H265', audio_codec: 'AAC',
+  season_count: '1', episode_range: 'S01 E01-E13', buttons_text: '📢 频道　👥 群组　🔍 投稿/搜索',
+  channel_link: '', group_link: ''
 }
 const previewText = computed(() => {
   const raw = tpl.value.content || ''
@@ -1289,7 +1297,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.8 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.9 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1530,7 +1538,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             </div>
             <p class="hint" style="margin-top:12px">推送由定时调度消费队列：识别成功且有海报的影视入队后，等待队列检查（默认 30 秒）创建目录分享并推送；此处「推送入队」显示的是累积队列数，不代表本轮已全部发出。</p>
           </div>
-          <div class="panel narrow">
+          <!-- v0.9.9 #200：A/B 库设置与同步状态并列，减少纵向滚动 -->
+          <div class="two-col mirror-two-col">
+          <div class="panel mirror-col">
             <div class="panel-head"><h3>A / B 库设置</h3></div>
             <div class="form-grid">
               <div class="field"><label>A 源头库目录 ID（只读）</label><el-input v-model="mirrorCfg.source_root_id" placeholder="光鸭网页端目录 fileId"/></div>
@@ -1561,7 +1571,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div v-if="mirrorStatus.lock?.busy && !mirrorBusy" class="mirror-lock-tip"><el-tag type="warning" size="small">后台任务运行中</el-tag> {{ mirrorStatus.lock.owner || '镜像任务' }} 已运行约 {{ mirrorStatus.lock.held_seconds }} 秒；同步 / 改名共用一把锁，等它结束再点「立即同步」即可，无需刷新页面。</div>
             <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
-          <div class="panel narrow">
+          <div class="panel mirror-col">
             <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
             <div class="stat-group">
               <div class="stat-group-title"><span class="grp-ico">⇄</span>文件传输</div>
@@ -1617,6 +1627,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div class="endpoint-list"><code v-for="e in (mirrorStatus.unverified_endpoints || [])" :key="e">{{ e }}</code></div>
               </el-collapse-item>
             </el-collapse>
+          </div>
           </div>
           <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
             <el-collapse-item name="diagnostics">
@@ -2326,7 +2337,7 @@ button{font-family:inherit}
 .stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
 .panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}
-.panel.narrow{max-width:780px}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
+.panel.narrow{max-width:780px}.mirror-two-col{margin-bottom:18px}.mirror-col{max-width:none;min-width:0}.mirror-col .form-grid{grid-template-columns:1fr}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
 .link-btn{border:0;background:transparent;color:var(--yg-primary);cursor:pointer;font-size:12px}
 .check-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--yg-line)}.check-row:last-child{border:0}
 .check-dot{width:24px;height:24px;border-radius:8px;display:grid;place-items:center}.check-dot.ok{background:#e5f8f5;color:#19b3a6}.check-dot.no{background:#fff3e2;color:#e29328}.check-dot .ico{width:14px;height:14px}

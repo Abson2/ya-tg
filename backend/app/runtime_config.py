@@ -78,6 +78,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 其余为管理员后台自定义的指令名→说明。白名单只放行 Bot 自己管理的频道/群聊，
     # 绝不向用户私聊推送，避免刷屏。
     "bot_commands_json": ("bot_commands_json", "[]"),       # 自定义指令 [{command,description}]
+    # v0.9.9 #207：已自动清空过 "/" 指令栏的 bot token 指纹（逗号分隔），每 token 只清一次
+    "bot_commands_cleared_fp": ("bot_commands_cleared_fp", ""),
     "bot_push_channels_json": ("bot_push_channels_json", "[]"),  # 白名单频道 ID（需管理员）
     "bot_push_groups_json": ("bot_push_groups_json", "[]"),      # 白名单群聊 ID（无需管理员）
     "bot_restrict_enabled": ("bot_restrict_enabled", "false"),   # 使用限制开关

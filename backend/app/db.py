@@ -72,6 +72,8 @@ _COLUMNS = {
         "finish_locked": "BOOLEAN DEFAULT 0",
         # v0.8.9：TMDB 官方总集数，供「更新至 N / 共 M 集」模板变量
         "total_episodes": "INTEGER DEFAULT 0",
+        # v0.9.9 #202：TMDB 首播/上映完整日期，供 {{release_date}}
+        "release_date": "TEXT DEFAULT ''",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
         # v0.6.3：目录 fileId 链 + 剧集目录级分享
@@ -140,19 +142,27 @@ _COLUMNS = {
 # v0.8.9 补「剧集状态 / 集数进度」两行；v0.9.0 剧集状态改季集标签：
 # 追更剧「📡 更新至 S01E07 · 连载中」，完结剧「📡 S01E24 · 完结」，
 # 进度由 episode_progress（N/M）单独承载；episode_count 为「已收录」，避免重复。
+# v0.9.9 #202：默认模板改为用户指定样式（纯文字按钮标签，不做 inline 按钮）。
+# 变量全部由 publisher._build_message 的 ctx 提供：分项技术规格从文件名解析，
+# 上映时间取 TMDB release_date（无则回退 year），评分用 vote_plain（整数优先）。
 DEFAULT_TEMPLATE = (
-    "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
-    "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
-    "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
-    "{{#if episode_progress}}🔢 进度：{{episode_progress}}\n{{/if}}"
-    "{{#if episode_count}}📼 本地已收录：共 {{episode_count}} 集\n{{/if}}"
-    "{{#if tmdb_url}}🔗 TMDB：<a href=\"{{tmdb_url}}\">#{{tmdb_id}}</a>\n{{/if}}"
-    "{{#if vote_average}}⭐ 评分：{{vote_average}}/10\n{{/if}}"
-    "{{#if resolution}}📐 画质：{{resolution}}\n{{/if}}"
-    "{{#if version}}🎞 版本：{{version}}\n{{/if}}"
-    "{{#if size}}💾 大小：{{size}}\n{{/if}}"
-    "{{#if overview}}\n📖 {{overview}}\n\n{{/if}}"
-    "{{#if tags}}🏷 {{tags}}\n{{/if}}"
+    "<b>{{title}}{{#if year}} ({{year}}){{/if}} 🖼️</b>\n"
+    "{{#if type_label}}类型：{{type_label}}\n{{/if}}"
+    "{{#if tmdb_id}}🆔 TMDB ID: {{tmdb_id}}\n{{/if}}"
+    "{{#if air_date}}📅 上映时间: {{air_date}}\n{{/if}}"
+    "{{#if vote_plain}}⭐️ 评分: {{vote_plain}}{{/if}}"
+    "{{#if source}} | 💿 来源: {{source}}{{/if}}\n"
+    "{{#if quality}}📺 画质: {{quality}}\n{{/if}}"
+    "{{#if video_codec}}🎞️ 编码: {{video_codec}}{{/if}}"
+    "{{#if audio_codec}} | 🔊 音频: {{audio_codec}}{{/if}}\n"
+    "{{#if season_count}}📋 季集：共{{season_count}}季{{/if}}"
+    "{{#if episode_count}} | 共 {{episode_count}} 集{{/if}}"
+    "{{#if episode_status}}（{{episode_status}}）{{/if}}"
+    "{{#if episode_range}} {{episode_range}}{{/if}}\n"
+    "{{#if size}}📦 大小：{{size}}\n{{/if}}"
+    "{{#if overview}}📝 简介: {{overview}}\n{{/if}}"
+    "{{#if tags}}🏷️ 标签： {{tags}}\n{{/if}}"
+    "{{buttons_text}}\n"
     "{{share_url}}"
 )
 # v0.9.6：内置模板预设（供管理页下拉一键载入，不落库；用户载入后可改可另存）。
@@ -221,6 +231,10 @@ def _is_legacy_default(content: str) -> bool:
     c = content or ""
     if not c:
         return False
+    # v0.9.9 #202：新样式含类型行「类型：{{type_label}}」但已是当前版本，不能误判为 legacy
+    # （否则每次启动 migrate 都把用户新模板重写一遍）。用新样式独占特征优先排除。
+    if "{{buttons_text}}" in c or "🆔 TMDB ID" in c or "🖼️" in c:
+        return False
     if "🎬" in c or "{{version}}" in c:  # 已经是新版
         return False
     legacy_marks = ("资源：{{filename}}", "type={{type}}", "类型：{{type_label}}", "地区：{{origin_country}}")
@@ -230,17 +244,26 @@ def _is_legacy_default(content: str) -> bool:
 def _needs_template_upgrade(content: str) -> bool:
     """判断存量默认模板是否需要升级到当前版本。
 
-    覆盖三类：
+    覆盖四类：
       1) v0.5.x/v0.6.0 老模板（含单集文件名/type= 调试行）；
       2) v0.6.4 整剧模板（含 🎬，但缺 v0.6.5 新增的 {{episode_count}} 行）；
-      3) v0.6.5~v0.8.8 默认模板（含 v0.8.9 之前的集数行原句，缺剧集状态行）。
-    第 3 类用**整句精确匹配**识别，用户自己改过、同样含 {{episode_count}} 的
-    自定义模板一律不动——这正是「升级了但模板没变 / 升级把自定义覆盖」的两头坑。
+      3) v0.6.5~v0.8.8 默认模板（含 v0.8.9 之前的集数行原句，缺剧集状态行）；
+      4) v0.9.9 #202：v0.8.9 旧默认模板（含 {{episode_status}} 但无新样式特征
+         {{buttons_text}} / 🆔 TMDB ID），升级到用户指定的新样式。
+    自定义模板一律不动：第 3/4 类都用「旧默认骨架特征同时命中 + 无新样式特征」
+    判断，用户自己改过内容的模板缺这些组合标记，不会被覆盖。
     """
     c = content or ""
     if not c:
         return False
-    if "{{episode_status}}" in c:  # 已是 v0.8.9 新版
+    if "{{buttons_text}}" in c or "🆔 TMDB ID" in c:  # 已是 v0.9.9 新版样式
+        return False
+    # v0.9.9 #202：v0.8.9 旧默认模板（🎬 标题 + 📡 剧集状态 + 🔗 TMDB 链接骨架）。
+    # 三者同时命中、且无新样式特征，才升级——这是用户反复反馈「改了模板没生效」的根因：
+    # 旧判定见 episode_status 就 return False，存量库永远停在 v0.8.9 样式。
+    if ("{{episode_status}}" in c and "🎬 {{title}}" in c and "🔗 TMDB" in c):
+        return True
+    if "{{episode_status}}" in c:  # 含状态但非旧默认骨架：其它版本/自定义，不动
         return False
     # v0.6.5~v0.8.8 默认模板：集数行原句 + 默认骨架。两者同时命中才升级，
     # 用户自己改过、恰好也用了 {{episode_count}} 的自定义模板一律不动。

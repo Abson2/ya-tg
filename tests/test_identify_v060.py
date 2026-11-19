@@ -121,9 +121,10 @@ def test_default_template_emits_tmdb_classification_tags():
     # v0.6.4：新默认模板改为整剧展示，用标签串替代 type=/origin_country=/genres= 调试行
     assert "#保镖恋人" in text and "#电影" in text and "#爱情" in text
     assert "资源：" not in text and ".mkv" not in text  # 不再暴露单集文件名
-    assert "🎬" in text and "🎞" in text
+    # v0.9.9 #202：默认模板改为用户指定样式（🖼️ 标题 / 🏷️ 标签），不再用 🎬/🎞
+    assert "🖼️" in text and "🏷️" in text
     tpl = db.scalar(select(MessageTemplate).where(MessageTemplate.is_default.is_(True)))
-    assert tpl and "{{tags}}" in tpl.content and "{{version}}" in tpl.content
+    assert tpl and "{{tags}}" in tpl.content and "{{buttons_text}}" in tpl.content
     db.delete(res)
     db.commit()
     db.close()

@@ -130,9 +130,10 @@ def test_cancel_share_clears_url_and_siblings():
 
 # ---------- 4. 模板整剧展示 ----------
 def test_default_template_is_series_oriented():
-    assert "🎬" in DEFAULT_TEMPLATE and "🎞" in DEFAULT_TEMPLATE
+    # v0.9.9 #202：默认模板换为用户指定样式（🖼️ 标题 / 🏷️ 标签 / 分项技术规格）
+    assert "🖼️" in DEFAULT_TEMPLATE and "🏷️" in DEFAULT_TEMPLATE
     assert "资源：" not in DEFAULT_TEMPLATE and "{{filename}}" not in DEFAULT_TEMPLATE
-    assert "{{version}}" in DEFAULT_TEMPLATE and "{{season_label}}" in DEFAULT_TEMPLATE
+    assert "{{quality}}" in DEFAULT_TEMPLATE and "{{episode_range}}" in DEFAULT_TEMPLATE
 
 
 def test_version_spec_extracts_full_spec():
@@ -155,8 +156,8 @@ def test_build_message_hides_single_episode_filename():
     # 完整文件名 / 扩展名进入推送文案。
     assert ".mkv" not in text
     assert "The.Silent.Storm.S01E04" not in text
-    assert "🎬" in text and "第1季" in text and "2026" in text
-    assert "9.0/10" in text and "https://share/x" in text
+    assert "🖼️" in text and "S01" in text and "2026" in text
+    assert "⭐️ 评分: 9" in text and "https://share/x" in text
     db.close()
     _clean()
 

@@ -300,13 +300,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.8", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.9", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.8", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.9", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -679,6 +679,18 @@ async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
     ident = await _post_scan_identify(db, publish_after_identify=True, limit=500)
     out["identify"] = ident
     out["queued"] = int(ident.get("queued", 0) or 0)
+    # v0.9.9 #201/#206：把入队拦截原因显露出来——真机「识别了却一条队列都没有」
+    # 就卡在这里，此前四道拦截全静默 continue，用户与排查都看不到。
+    diag = dict(ident.get("enqueue_diag") or {})
+    out["enqueue_diag"] = diag
+    if diag:
+        label_map = {"skip_unidentified": "未识别", "skip_no_poster": "无海报闸门",
+                     "skip_route_no_match": "目录路由未匹配", "skip_no_channel": "目标无启用频道",
+                     "skip_dedup_or_disabled": "去重/停用", "skip_no_target": "未配置推送目标",
+                     "skip_rule_dir_mismatch": "规则目录不符", "skip_rule_keyword_mismatch": "规则关键词不符",
+                     "enqueued": "已入队"}
+        pretty = "、".join(f"{label_map.get(k, k)} {v}" for k, v in diag.items() if v)
+        r.last_message = ((r.last_message or "") + f" · 入队诊断：{pretty}")[-1000:]
     # 只读统计，绝不在这里处理：内容变化事件仍由常规扫描链路消化
     out["changes_pending"] = int(db.scalar(
         select(func.count()).select_from(DistributionEvent).where(
@@ -1067,28 +1079,37 @@ def mirror_media_clear_invalid(db: Session = Depends(get_db)):
     targets = _invalid_media_rows(db)
     removed_media = len(targets)
     removed_files = 0
-    with _mirror_guard():
-        for m in targets:
-            removed_files += db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
-            db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
-                synchronize_session=False)
-            db.delete(m)
-        if removed_media:
-            add_audit(db, "mirror_media_clear_invalid", target_type="mirror",
-                      detail=json_dumps({"media": removed_media, "files": removed_files}))
-        db.commit()
+    # v0.9.9 #205：这里只删本地僵尸映射行，不联网、不写 B 库、不碰文件，
+    # 因此不再占用 _mirror_lock——否则后台「改名复查」持锁时按钮报「有任务在进行」，
+    # 用户以为清理没生效。与目录映射的 clear-pruned 保持一致（那个也不持锁）。
+    for m in targets:
+        removed_files += db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
+        db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
+            synchronize_session=False)
+        db.delete(m)
+    if removed_media:
+        add_audit(db, "mirror_media_clear_invalid", target_type="mirror",
+                  detail=json_dumps({"media": removed_media, "files": removed_files}))
+    db.commit()
     return {"ok": True, "removed_media": removed_media, "removed_files": removed_files}
 
 
 def _invalid_media_rows(db: Session) -> list:
-    """v0.9.8：判定「历史无效影视映射」——状态 failed/blocked 且没有任何 synced 文件。
+    """v0.9.9 #205：判定「历史无效影视映射」——没有任何 synced 文件、且不在进行中的僵尸行。
 
-    这类行不会自动恢复（同步只会重试 pending / RETRYABLE 文件），是历史遗留僵尸映射。
-    删除只清 A→B 映射登记，不删资源 / 分享 / 队列；A 库仍有文件时下轮同步会自动重建。
+    v0.9.8 口径只认 failed/blocked，真机上大量「status=synced 但 B 库文件已删」或
+    「unknown/空状态」的历史遗留行清不掉，用户反馈「按钮点了没反应」。这里放宽为：
+      - 没有任何 MirrorFile.status == "synced"（无已落地的 B 库文件锚点）；
+      - 且状态不是进行中（copying/syncing/pending），避免误删正在同步的作品；
+      - 且状态不是可信完成态 synced-with-files（已被上一条排除）。
+    这样 failed/blocked/unknown/synced(无文件)/空状态 都归为可清理僵尸行。
+    删除只清 A→B 映射登记，不删资源 / 分享 / 队列；A 库仍有文件时下轮同步自动重建。
     """
+    in_progress = {"copying", "syncing", "pending"}
     out = []
     for m in db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc())).all():
-        if str(getattr(m, "status", "")) not in ("failed", "blocked"):
+        status = str(getattr(m, "status", "") or "").strip().lower()
+        if status in in_progress:
             continue
         synced = db.query(MirrorFile).filter(
             MirrorFile.media_id == m.id, MirrorFile.status == "synced").count()
@@ -1175,6 +1196,12 @@ def mirror_status(db: Session = Depends(get_db)):
         Resource.share_url.isnot(None), Resource.share_url != "").count()
     queued_items = db.query(QueueItem).count()
     sent_items = db.query(QueueItem).filter(QueueItem.status == "sent").count()
+    # v0.9.9 #206：从最近一次同步的 last_message 里取入队诊断，让「⑤推送入队=0」
+    # 的节点直接说明卡在哪（无海报 / 路由未匹配 / 未配置目标），不再是一个孤立的 0。
+    enqueue_diag_text = ""
+    _lm = str(getattr(r, "last_message", "") or "") if r else ""
+    if "入队诊断：" in _lm:
+        enqueue_diag_text = _lm.split("入队诊断：", 1)[-1].split(" ·", 1)[0].strip()
     pipeline = [
         {"key": "copy", "label": "① 复制到 B 库", "value": synced_files, "total": total_files,
          "status": "done" if total_files and synced_files >= total_files else ("active" if synced_files else "idle"),
@@ -1193,7 +1220,8 @@ def mirror_status(db: Session = Depends(get_db)):
          "detail": f"{shared_res}/{identified_res} 已建分享（推送时按需创建）"},
         {"key": "push", "label": "⑤ 推送入队", "value": queued_items, "total": 0,
          "status": "done" if sent_items else ("active" if queued_items else "idle"),
-         "detail": f"队列 {queued_items} 项 / 已推送 {sent_items}（由定时调度消费）"},
+         "detail": (f"队列 {queued_items} 项 / 已推送 {sent_items}（由定时调度消费）"
+                    + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else ""))},
     ]
     # 同步进度百分比：按文件 synced/total；无文件时看锁状态
     progress = round(synced_files / total_files * 100, 1) if total_files else 0.0
@@ -1328,7 +1356,10 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     完结标签：已识别但 finish_status 为空的历史资源（v0.7.0 之前识别的）用已有
     tmdb_id 回查 TMDB detail 补 status，否则角标永远不显示。
     """
-    stats = {"identified": 0, "failed": 0, "queued": 0, "finish_backfilled": 0}
+    stats = {"identified": 0, "failed": 0, "queued": 0, "finish_backfilled": 0,
+             # v0.9.9 #201/#206：入队拦截诊断，逐条累积后供镜像管线与前端进度节点展示
+             "enqueue_diag": {}}
+    diag = stats["enqueue_diag"]
     pending = list(db.scalars(select(Resource).where(
         Resource.identify_status.in_(["unidentified", "ambiguous", "failed", "none", ""])
     ).order_by(Resource.id.desc()).limit(min(limit, 500))).all())
@@ -1342,7 +1373,7 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
                 # autoflush=False：同批次识别后立刻查队列去重，必须 flush
                 db.flush()
                 if publish_after_identify:
-                    stats["queued"] += _enqueue_after_identify(db, x)
+                    stats["queued"] += _enqueue_after_identify(db, x, diag=diag)
             else:
                 x.identify_status = r.get("status") or "none"
                 x.identify_source = r.get("source") or ""
@@ -2039,6 +2070,8 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     x.media_title = d.get("title") or ""
     x.original_title = d.get("original_title") or ""
     x.overview = d.get("overview") or ""
+    # v0.9.9 #202：TMDB 完整首播/上映日期，供消息模板 {{release_date}}
+    x.release_date = d.get("release_date") or ""
     x.poster_path = d.get("poster_path") or ""
     x.genres = json_dumps(d.get("genres") or [])
     x.origin_country = json_dumps(d.get("origin_country") or [])
@@ -2115,13 +2148,44 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     return True
 
 
-def _enqueue_after_identify(db: Session, x: Resource) -> int:
+def _ensure_route_channel(db: Session, route: dict):
+    """v0.9.9 #201：路由目标 Channel 缺失时，用全局 Bot 现场补建并启用。
+
+    真机根因：用户保存路由后 Channel 被清理（旧配置 / 手动改库 / 版本迁移），
+    route_target_channel 找不到启用 Channel 就静默 continue，导致「识别成功却
+    一条队列项都没有」。这里按 chat_id 现场补建，保证「配了路由就能推」。
+    仍以路由表为配置真相源，不臆造未配置的 chat_id。
+    """
+    ch = bot_listener.route_target_channel(db, route)
+    if ch:
+        return ch
+    bot = _global_bot(db)
+    if not bot:
+        return None
+    kind = str(route.get("kind") or "channel")
+    ch = Channel(bot_id=bot.id, name=f"{_ROUTE_CHANNEL_PREFIX}{kind}:{route['chat_id']}",
+                 chat_id=route["chat_id"], kind=kind, enabled=True)
+    db.add(ch)
+    db.flush()
+    return ch
+
+
+def _enqueue_after_identify(db: Session, x: Resource, diag: dict | None = None) -> int:
     """v0.6.5：识别成功且拿到 TMDB 海报后才入队推送。
 
-    扫描只负责入库，不再触发推送；未识别/无海报的单集永不入队，
-    保证用户看到的每条消息都有完整海报与元数据，且同一作品只推一条。
+    v0.9.9 #201/#206：新增 diag 收集每道拦截原因，解决「识别了却没入队、
+    用户完全看不到卡在哪」。不改海报闸门红线（无海报仍不入队），但把拦截
+    量化到镜像管线输出，前端进度节点可直接显示。
     """
-    if x.identify_status != "identified" or not (x.poster_path or "").strip():
+    d = diag if diag is not None else {}
+    def bump(key: str, n: int = 1) -> None:
+        d[key] = int(d.get(key, 0)) + n
+
+    if x.identify_status != "identified":
+        bump("skip_unidentified")
+        return 0
+    if not (x.poster_path or "").strip():
+        bump("skip_no_poster")
         return 0
     added = 0
     # v0.9.5：推送白名单改为目录路由表——同一 Bot 按资源所在 B 库目录推到不同频道/群。
@@ -2129,21 +2193,41 @@ def _enqueue_after_identify(db: Session, x: Resource) -> int:
     from types import SimpleNamespace
     routes = bot_listener.push_routes(db)
     if routes:
-        for route in bot_listener.match_push_routes(db, x):
-            ch = bot_listener.route_target_channel(db, route)
+        matched = bot_listener.match_push_routes(db, x)
+        if not matched:
+            bump("skip_route_no_match")
+            return 0
+        for route in matched:
+            ch = _ensure_route_channel(db, route)
             if not ch:
-                continue  # 路由目标未落成启用 Channel，跳过（保存路由时会同步维护）
+                bump("skip_no_channel")
+                continue
             pseudo_rule = SimpleNamespace(channel_id=ch.id, auto_publish=True)
             if _enqueue_ready(db, x, pseudo_rule):
                 added += 1
+            else:
+                bump("skip_dedup_or_disabled")
+        if added:
+            bump("enqueued", added)
         return added
-    for rule in db.scalars(select(Rule).where(Rule.enabled.is_(True))).all():
+    # 没有任何启用规则 / 路由：明确记为「未配置推送目标」，不再静默
+    rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))).all())
+    if not rules:
+        bump("skip_no_target")
+        return 0
+    for rule in rules:
         if rule.directory_id and rule.directory_id != x.parent_id:
+            bump("skip_rule_dir_mismatch")
             continue
         if rule.keyword and rule.keyword.lower() not in (x.name or "").lower():
+            bump("skip_rule_keyword_mismatch")
             continue
         if _enqueue_ready(db, x, rule):
             added += 1
+        else:
+            bump("skip_dedup_or_disabled")
+    if added:
+        bump("enqueued", added)
     return added
 
 

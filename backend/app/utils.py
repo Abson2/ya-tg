@@ -473,6 +473,55 @@ def version_spec(name: str) -> str:
     return " · ".join(parts)
 
 
+def parse_tech_spec(name: str) -> dict:
+    """v0.9.9 #202：从文件名拆出「来源 / 画质细项 / 编码 / 音频」，供消息模板分项变量用。
+
+    version_spec 返回的是合并串，用户新样式要求分项展示（💿 来源 / 📺 画质 / 🎞 编码 / 🔊 音频），
+    这里按同一批正则逐个抽取，取不到返回空串，绝不臆造。仅解析文件名，不请求任何网络。
+    """
+    out = {"source": "", "quality": "", "codec": "", "audio": ""}
+    if not name:
+        return out
+    # 来源：WEB-DL / BluRay / REMUX 等
+    m = re.search(r"\b(WEB-?DL|WEBRip|BluRay|BLURAY|BDRip|REMUX|HDTV|DVDRip)\b", name, re.I)
+    if m:
+        v = m.group(0).upper().replace("WEB-DL", "Web-DL").replace("WEBDL", "Web-DL")
+        out["source"] = v
+    # 画质细项：分辨率 + 10bit + 帧率 + 动态范围，用 | 连接（用户示例 2160p | 10bit | 60fps | SDR）
+    q = []
+    m = re.search(r"\b(2160p|1080p|720p|480p|4K)\b", name, re.I)
+    if m:
+        _res = m.group(0)
+        q.append("4K" if _res.upper() == "4K" else _res.lower())
+    if re.search(r"\b10bit\b", name, re.I):
+        q.append("10bit")
+    elif re.search(r"\b8bit\b", name, re.I):
+        q.append("8bit")
+    m = re.search(r"\b(23\.976|24|25|30|50|60)fps\b", name, re.I)
+    if m:
+        q.append(f"{m.group(1)}fps")
+    for pat, label in ((r"\bDoVi\b|\bDV\b", "DoVi"), (r"\bHDR10\+?\b", "HDR10+"),
+                       (r"\bHDR\b", "HDR"), (r"\bSDR\b", "SDR")):
+        if re.search(pat, name, re.I):
+            q.append(label)
+            break
+    out["quality"] = " | ".join(q)
+    # 视频编码
+    m = re.search(r"\b(H\.?265|HEVC|x265|H\.?264|AVC|x264|AV1|VP9)\b", name, re.I)
+    if m:
+        vu = m.group(0).upper().replace(".", "").replace(" ", "")
+        out["codec"] = {"HEVC": "H265", "X265": "H265", "H265": "H265",
+                        "AVC": "H264", "X264": "H264", "H264": "H264"}.get(vu, m.group(0))
+    # 音频编码（含声道）
+    m = re.search(r"\b(DDP|EAC3|AC3|AAC|TrueHD|DTS-?HD|FLAC|Opus)\b(?:\s*(5\.1|7\.1|2\.0))?", name, re.I)
+    if m:
+        aud = m.group(1).upper().replace("EAC3", "E-AC-3") if m.group(1) else m.group(0).upper()
+        if m.group(2):
+            aud += f" {m.group(2)}"
+        out["audio"] = aud
+    return out
+
+
 def series_dir_info(path_hint: str, dir_chain: list[str] | str | None = None,
                     parent_id: str = "", media_type: str = "tv") -> dict:
     """v0.6.3：判定单集文件对应的「剧集目录」层级与 fileId。

@@ -52,6 +52,9 @@ class Resource(Base):
     # v0.8.9：TMDB 官方总集数（tv.number_of_episodes），供推送模板「更新至 N/总 M 集」使用。
     # 与本地实际收录集数（模板 episode_count）刻意分开：追更剧两者不等才有意义。
     total_episodes: Mapped[int] = mapped_column(Integer, default=0)
+    # v0.9.9 #202：TMDB 首播/上映完整日期（如 2026-11-15），供消息模板 {{release_date}}。
+    # 与 year（仅年份，文件名解析）分开：有 TMDB 详情时写全日期，否则留空由 year 兜底。
+    release_date: Mapped[str] = mapped_column(String(32), default="")
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")

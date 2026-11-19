@@ -71,8 +71,9 @@ def _render(db, fid="v089-e01"):
 
 # ---------- 1. 默认模板与升级 ----------
 def test_default_template_exposes_episode_status_vars():
-    # 默认模板只需展示状态与进度两行；其余细粒度变量供用户自行插入模板
-    for var in ("{{episode_status}}", "{{episode_progress}}", "{{episode_count}}"):
+    # v0.9.9 #202：默认模板改用户样式，展示季集范围而非进度 N/M；
+    # episode_progress 等细粒度变量仍保留在变量面板供用户自行插入。
+    for var in ("{{episode_status}}", "{{episode_count}}", "{{episode_range}}"):
         assert var in DEFAULT_TEMPLATE, var
     assert _needs_template_upgrade(DEFAULT_TEMPLATE) is False
     # 变量面板必须把 5 个新变量都列出来，否则用户根本不知道能插入
@@ -118,9 +119,10 @@ def test_returning_series_shows_updated_to_and_progress(db):
     text = _render(db)
     # v0.9.0：剧集状态改为季集标签「更新至 S01E12 · 连载中」
     assert "更新至 S01E12 · 连载中" in text, text
-    assert "进度：12/24" in text, text
+    # v0.9.9 #202：新模板用季集范围「S01 E01-E12」替代旧「进度：12/24」
+    assert "S01 E01-E12" in text, text
     assert "共 12 集" in text, text          # 兼容既有「本地已收录集数」口径
-    assert "📡" in text and "🔢" in text, text
+    assert "📋" in text and "🖼️" in text, text
 
 
 def test_ended_series_shows_full_episode_count(db):
@@ -131,7 +133,7 @@ def test_ended_series_shows_full_episode_count(db):
     text = _render(db, "v089-f01")
     # v0.9.0：收齐显示「S01E24 · 完结」
     assert "S01E24 · 完结" in text, text
-    assert "进度：24/24" in text, text
+    assert "S01 E01-E24" in text, text  # v0.9.9 #202：季集范围替代旧进度行
 
 
 def test_no_tmdb_total_falls_back_to_local_count(db):

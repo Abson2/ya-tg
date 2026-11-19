@@ -301,6 +301,8 @@ def _normalize(item: dict, media_type: str) -> dict:
         "title": title,
         "original_title": original,
         "year": date[:4],
+        # v0.9.9 #202：完整首播/上映日期，供消息模板 {{release_date}}
+        "release_date": date,
         "poster_path": item.get("poster_path") or "",
         "backdrop_path": item.get("backdrop_path") or "",
         "overview": item.get("overview") or "",

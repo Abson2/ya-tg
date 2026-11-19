@@ -14,9 +14,9 @@ from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import AuditLog, Bot, Channel, MessageTemplate, QueueItem, Resource, utcnow
 from .security import decrypt_secret
-from .utils import (backoff_seconds, is_video_file, parse_media_name, plus_seconds,
-                    render_template, retry_after_seconds, version_spec, work_episode_numbers,
-                    work_group_key)
+from .utils import (backoff_seconds, is_video_file, parse_media_name, parse_tech_spec,
+                    plus_seconds, render_template, retry_after_seconds, version_spec,
+                    work_episode_numbers, work_group_key)
 
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
@@ -102,6 +102,12 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     esc = lambda v: html.escape(str(v if v is not None else ""), quote=False)
     title = res.media_title or res.name
     hint = parse_media_name(res.name)
+    # v0.9.9 #202：技术规格分项（来源/画质/编码/音频），纯文件名解析、不联网
+    spec = parse_tech_spec(res.name)
+    # 季集范围变量默认值（tv 分支内会覆盖）
+    episode_range = ""
+    season_count = ""
+    _parsed_eps: list = []
     tpl = _template(db)
     # v0.7.0：精简详情——compact 模式把简介压到 110 字，缩短消息篇幅
     detail_level = (runtime_config.get(db, "tg_detail_level") or "compact").strip()
@@ -161,6 +167,17 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
             else:
                 updated_ep = n
             cur_ep = int(episode) if episode else (updated_ep or 0)
+            # v0.9.9 #202：季集范围串——「S01 E01-E13」「共 N 季」供新模板分项展示
+            _parsed_eps = parsed
+            if seasons:
+                season_count = str(len(seasons))
+            if eps:
+                rng_season = max(se for se, _ in eps)
+                rng_eps = sorted(ep for se, ep in eps if se == rng_season)
+                if rng_eps:
+                    ep_part = (f"E{rng_eps[0]:02d}" if len(rng_eps) == 1
+                               else f"E{rng_eps[0]:02d}-E{rng_eps[-1]:02d}")
+                    episode_range = f"S{rng_season:02d} {ep_part}"
             if total_episodes > 0 and updated_ep > 0:
                 episode_progress = f"{updated_ep}/{total_episodes}"
             elif updated_ep > 0:
@@ -230,6 +247,23 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "channel_link": esc(runtime_config.get(db, "tg_channel_link") or ""),
         "group_link": esc(runtime_config.get(db, "tg_group_link") or ""),
         "version": esc(version),
+        # v0.9.9 #202：用户新样式分项变量（来源/画质/编码/音频从文件名解析，上映时间取 TMDB）
+        "source": esc(spec.get("source")),
+        "quality": esc(spec.get("quality")),
+        "video_codec": esc(spec.get("codec")),
+        "audio_codec": esc(spec.get("audio")),
+        "release_date": esc(getattr(res, "release_date", "") or ""),
+        # 上映时间优先 TMDB 完整日期，回退文件名年份；渲染器不支持 {{else}}，故在 ctx 算好
+        "air_date": esc(getattr(res, "release_date", "") or hint.get("year") or ""),
+        # 评分整数态：TMDB 9.0 → 9，与用户样式「⭐️ 评分: 9」一致
+        "vote_plain": (str(int(float(res.vote_average))) if res.vote_average
+                       and float(res.vote_average) == int(float(res.vote_average))
+                       else (f"{float(res.vote_average):.1f}" if res.vote_average else "")),
+        # 季集范围：共 N 季 / S01 E01-E13（按本地已收录最后一季算）
+        "season_count": esc(season_count),
+        "episode_range": esc(episode_range),
+        # 纯文字按钮标签（用户选「仅文字标签」，保持消息为纯文本卡片）
+        "buttons_text": "📢 频道　👥 群组　🔍 投稿/搜索",
     }
     text = render_template(tpl.content if tpl else _FALLBACK_TEMPLATE, ctx).strip()
     return text[:1000], text[:1000]
