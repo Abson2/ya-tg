@@ -37,7 +37,7 @@ const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [] })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 const mirrorDiagOpen = ref([])
 const diagCount = computed(() => {
@@ -56,11 +56,11 @@ const interactionCfg = ref({ contribution_enabled: false, donation_enabled: fals
   bot_required_channel_link: '', bot_required_group_link: '', tg_channel_link: '', tg_group_link: '' })
 // v0.9.5：推送白名单 = 目录路由表 + 全局单 Bot
 const pushCfg = ref({ bot: null, max_routes: 10 })
-const pushRoutes = ref([{ dir_id: '', kind: 'channel', chat_id: '' }])
+const pushRoutes = ref([{ dir_id: '', kind: 'channel', chat_id: '', note: '' }])
 const pushSaving = ref(false), pushBotToken = ref('')
 function addPushRoute() {
   if (pushRoutes.value.length >= (pushCfg.value.max_routes || 10)) { ElMessage.warning('推送白名单最多 10 条'); return }
-  pushRoutes.value.push({ dir_id: '', kind: 'channel', chat_id: '' })
+  pushRoutes.value.push({ dir_id: '', kind: 'channel', chat_id: '', note: '' })
 }
 function removePushRoute(i) { pushRoutes.value.splice(i, 1) }
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
@@ -200,9 +200,33 @@ async function refreshSms() {
   try { await api('/sms/refresh', { method: 'POST' }); ElMessage.success('光鸭凭证已刷新'); await loadSms() }
   catch (e) { ElMessage.error(e.message) }
 }
+// v0.9.6：「立即刷新凭证」按实际登录方式分流。扫码(webqr)的 refresh_token 是用
+// webqr 公开 client_id 签发的，走短信通道(硬编码 aMe 客户端)会 invalid_grant。
+// sms/tgto 才走短信刷新；webqr 走 /auth/refresh 的网页端设备码刷新分支。
+async function refreshCredential() {
+  const flow = (smsStatus.value?.flow || auth.value?.flow || '').toString()
+  if (flow === 'sms' || flow === 'tgto') return refreshSms()
+  return refreshToken()
+}
 function resetSms() { smsStep.value = 1; smsCode.value = '' }
 // v0.9.5：Bot / 频道 / 规则 独立管理已并入「交互 Bot 与推送配置」（pushCfg/pushRoutes）
 const tpl = ref({ name: '', content: '', enabled: true, is_default: false })
+// v0.9.6：内置模板预设（下拉一键载入）+ 选中项
+const tplPresets = ref([]), tplPresetPick = ref('')
+function applyTplPreset() {
+  const p = tplPresets.value.find(x => x.name === tplPresetPick.value)
+  if (!p) return
+  tpl.value = { id: 0, name: p.name, content: p.content, enabled: true, is_default: false }
+  ElMessage.success('已载入内置模板，可修改后点「保存模板」另存')
+}
+function editTpl(t) { tpl.value = { id: t.id, name: t.name, content: t.content, enabled: t.enabled, is_default: t.is_default }; tplPresetPick.value = '' }
+async function deleteTpl(t) {
+  if (t.is_default) { ElMessage.warning('默认模板不能删除，请先把别的模板设为默认'); return }
+  const ok = await confirmBox(`确认删除模板「${t.name}」？此操作不可撤销。`)
+  if (!ok) return
+  try { await api(`/templates/${t.id}`, { method: 'DELETE' }); ElMessage.success('模板已删除'); await load() }
+  catch (e) { ElMessage.error(e.message) }
+}
 
 let clockTimer = null, webqrTimer = null
 
@@ -370,6 +394,7 @@ async function load() {
   reviews.value = await api('/review')
   queue.value = await api('/queue')
   templates.value = await api('/templates')
+  try { tplPresets.value = await api('/templates/presets') } catch (e) { tplPresets.value = [] }
   audit.value = await api('/audit')
   try { diagnostics.value = await api('/diagnostics') } catch (e) { diagnostics.value = { blockers: [] } }
   try { await loadTgExtra() } catch (e) {}
@@ -384,7 +409,7 @@ async function load() {
   try {
     const pr = await api('/push/routes')
     pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
-    pushRoutes.value = (pr.routes && pr.routes.length) ? pr.routes.map(r => ({ dir_id: r.dir_id || '', kind: r.kind || 'channel', chat_id: r.chat_id || '' })) : [{ dir_id: '', kind: 'channel', chat_id: '' }]
+    pushRoutes.value = (pr.routes && pr.routes.length) ? pr.routes.map(r => ({ dir_id: r.dir_id || '', kind: r.kind || 'channel', chat_id: r.chat_id || '', note: r.note || '' })) : [{ dir_id: '', kind: 'channel', chat_id: '', note: '' }]
   } catch (e) {}
   try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
   try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
@@ -567,6 +592,41 @@ async function pollMirrorTasks() {
   catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
+// v0.9.6：清空「英文改名待处理」清单——把英文名为空的作品标记 ignored，
+// 从待处理清单消失；不改文件、不删映射，点「重新解析英文名并改名」可恢复。
+async function clearUntranslated() {
+  const n = mirrorStatus.value.untranslated_works?.length || 0
+  if (!n) { ElMessage.info('当前没有待处理项'); return }
+  const ok = await confirmBox(
+    `将把 ${n} 部「英文名为空」的作品标记为已忽略，从待处理清单移除。\n\n` +
+    '不删映射、不动文件、不影响入库与分享。若这些作品仍在 A 库且需要改名，' +
+    '日后点「重新解析英文名并改名」会清掉标记重新解析。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/rename/untranslated/clear', { method: 'POST' })
+    ElMessage.success(`已清空 ${d.cleared || 0} 条待处理项`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v0.9.6：彻底删除「已清理待重建」的僵尸目录映射（带 [pruned] 标记的 missing 行）。
+async function clearPrunedMappings() {
+  const n = mirrorStatus.value.counts?.dirs_pruned_zombie || 0
+  if (!n) { ElMessage.info('当前没有可清空的已清理映射'); return }
+  const ok = await confirmBox(
+    `将物理删除 ${n} 条「已清理待重建」的目录映射记录（B 库已不存在的僵尸行）。\n\n` +
+    '只删这类 [pruned] 记录，不碰真正建目录失败的映射，也不删资源 / 分享 / 推送队列。' +
+    'A 库仍是权威源：若目录还在，下一轮「立即同步」会自动重建映射。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/mappings/clear-pruned', { method: 'POST' })
+    ElMessage.success(`已清空 ${d.removed || 0} 条无效映射记录`)
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
 // v0.8.9：清理 B 库已不存在的文件 / 目录映射。只重置映射，不删资源与分享。
 async function pruneMirrorMappings() {
   const ok = await confirmBox(
@@ -592,7 +652,7 @@ async function pruneMirrorMappings() {
 // ---------- 用户互动 ----------
 async function savePushRoutes() {
   // v0.9.5：保存目录路由表 + 全局单 Bot token（token 留空表示不改）
-  const routes = (pushRoutes.value || []).map(r => ({ dir_id: String(r.dir_id || '').trim(), kind: r.kind || 'channel', chat_id: String(r.chat_id || '').trim() })).filter(r => r.chat_id)
+  const routes = (pushRoutes.value || []).map(r => ({ dir_id: String(r.dir_id || '').trim(), kind: r.kind || 'channel', chat_id: String(r.chat_id || '').trim(), note: String(r.note || '').trim() })).filter(r => r.chat_id)
   if (!routes.length) { ElMessage.warning('请至少配置一条推送目标（频道 ID 或群 ID）'); return }
   const body = { routes }
   const token = String(pushBotToken.value || '').trim()
@@ -954,6 +1014,7 @@ async function saveTpl() {
     if (tpl.value.id) await api(`/templates/${tpl.value.id}`, { method: 'PUT', body: JSON.stringify(tpl.value) })
     else await api('/templates', { method: 'POST', body: JSON.stringify(tpl.value) })
     tpl.value = { name: '', content: '', enabled: true, is_default: false }
+    tplPresetPick.value = ''
     ElMessage.success('模板已保存'); await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -1080,7 +1141,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
       </div>
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
-        <div class="foot-version">v0.9.5 · Asia/Shanghai</div>
+        <div class="foot-version">v0.9.6 · Asia/Shanghai</div>
       </div>
     </aside>
 
@@ -1182,7 +1243,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             </div>
             <div v-else class="connect-done">
               <el-result icon="success" title="光鸭已连接" sub-title="凭证已加密保存，系统会自动定期刷新；扫描与建分享无需再配置。">
-                <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshSms">立即刷新凭证</el-button></template>
+                <template #extra><el-button type="primary" @click="resetSms">重新登录</el-button><el-button plain @click="refreshCredential">立即刷新凭证</el-button></template>
               </el-result>
             </div>
             <div class="connect-foot">
@@ -1241,7 +1302,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
           </div>
           <div class="panel">
             <div class="panel-head"><h3>网页分享会话</h3><el-tag :type="shareStatus.configured ? 'success' : 'warning'" size="small">{{ shareStatus.configured ? '已配置' : '未配置' }}</el-tag></div>
-            <div class="kv-grid"><div><small>来源</small><b>{{ shareStatus.source || '—' }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="auth.flow==='sms' ? refreshSms() : refreshToken()">立即刷新</el-button></div></div>
+            <div class="kv-grid"><div><small>来源</small><b>{{ shareStatus.source || '—' }}</b></div><div><small>DID</small><b>{{ shareStatus.did_set ? '已设置' : '未设置' }}</b></div><div><small>SMID</small><b>{{ shareStatus.smid_set ? '已设置' : '未设置' }}</b></div><div><small>刷新</small><el-button size="small" :disabled="!auth.has_refresh_token" @click="refreshCredential">立即刷新</el-button></div></div>
             <p class="hint">{{ shareStatus.note }}</p>
           </div>
         </section>
@@ -1276,6 +1337,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint">{{ mirrorCfg.note }}</p>
               </el-collapse-item>
             </el-collapse>
+            <div v-if="mirrorStatus.lock?.busy && !mirrorBusy" class="mirror-lock-tip"><el-tag type="warning" size="small">后台任务运行中</el-tag> {{ mirrorStatus.lock.owner || '镜像任务' }} 已运行约 {{ mirrorStatus.lock.held_seconds }} 秒；同步 / 改名共用一把锁，等它结束再点「立即同步」即可，无需刷新页面。</div>
             <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel narrow">
@@ -1374,20 +1436,20 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
               <el-table-column prop="target" label="目标英文名" min-width="200"/>
               <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button></div>
+            <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button><el-button v-if="mirrorStatus.untranslated_works?.length" :loading="mirrorBusy" :disabled="mirrorBusy" plain @click="clearUntranslated">清空待处理清单</el-button></div>
             <p class="hint">英文剧名按 TMDB en-US 官方片名优先、<b>查不到就直接直译</b>（AI 直译 → 本地拼音兜底），<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。v0.8.9 起 TMDB 单次 6 秒、AI 单次 10 秒硬超时，查不到立即走下一层，绝不会卡住整轮同步。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库，也不影响入库与分享</b>。</p>
           </div>
             </el-collapse-item>
             <el-collapse-item name="mappings">
               <template #title><span class="fold-title">目录映射 / 影视映射清单</span></template>
           <div class="panel">
-            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag><el-button size="small" :loading="mirrorBusy" :disabled="mirrorBusy" @click="pruneMirrorMappings">清理无效映射</el-button></div>
-            <p class="hint">「清理无效映射」会只读核对 B 库，把其中已不存在的文件 / 目录映射重置为待同步（保留 A 库文件名与指纹），下一轮「立即同步」自动补复制并改名；不删资源、分享链接与推送队列。列目录不可信或整部作品为空时跳过，不会误清。</p>
+            <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag><el-tag v-if="mirrorStatus.counts?.dirs_pruned_zombie" size="small" type="warning">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条已清理待重建</el-tag><el-button size="small" :loading="mirrorBusy" :disabled="mirrorBusy" @click="pruneMirrorMappings">清理无效映射</el-button><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.counts?.dirs_pruned_zombie" @click="clearPrunedMappings">清空已清理映射</el-button></div>
+            <p class="hint">「清理无效映射」只读核对 B 库，把已不存在的文件 / 目录映射重置为待同步（保留 A 库文件名与指纹），下一轮「立即同步」自动补复制；不删资源、分享与队列。被清理的目录标记「待重建」后不再占用上方「待创建目录」清单——确认后点「清空已清理映射」可彻底删除这些僵尸行（A 库仍在时下轮同步会自动重建）。</p>
             <div class="table-scroll"><el-table :data="mirrorStatus.dirs || []" size="small">
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="category_path" label="所属分类" min-width="160"/>
-              <el-table-column prop="status" label="状态" width="110"/>
+              <el-table-column label="状态" width="120"><template #default="s"><el-tag v-if="s.row.pruned" type="warning" size="small">待重建</el-tag><span v-else>{{ s.row.status }}</span></template></el-table-column>
               <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
               <el-table-column prop="error" label="备注 / 失败原因" min-width="200"/>
             </el-table></div>
@@ -1444,6 +1506,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <div class="bot-card-head"><span class="bot-ico">📺</span><h3>推送白名单（目录路由）</h3><span class="restrict-sub">不同 B 库目录 → 同一 Bot → 不同频道 / 群聊；默认 1 条，最多 10 条</span><el-tag size="small" style="margin-left:auto">{{ pushRoutes.length }} / {{ pushCfg.max_routes || 10 }}</el-tag></div>
             <div v-for="(r, i) in pushRoutes" :key="i" class="route-row">
               <div class="field"><label>目录 ID（影视库 B 的下属目录，留空=根目录全部）</label><el-input v-model="r.dir_id" placeholder="留空表示整个 B 库；填目录 fileId 则只推该目录及其子目录"/></div>
+              <div class="field"><label>备注（选填，便于肉眼区分目录）</label><el-input v-model="r.note" maxlength="120" placeholder="如：国产剧 / 动画电影 / 欧美剧集"/></div>
               <div class="field"><label>目标类型</label><el-radio-group v-model="r.kind" size="small"><el-radio-button value="channel">频道</el-radio-button><el-radio-button value="group">群聊</el-radio-button></el-radio-group></div>
               <div class="field"><label>{{ r.kind === 'group' ? '群 ID' : '频道 ID' }}（任填其一即可）</label><el-input v-model="r.chat_id" :placeholder="r.kind === 'group' ? '群 chat_id，如 -1001234567890' : '频道 chat_id，如 -1001234567890'"/></div>
               <div class="route-actions"><el-button size="small" text :disabled="!r.chat_id || !pushCfg.bot" @click="testPushRoute(r)">测试</el-button><el-button size="small" text type="danger" :disabled="pushRoutes.length <= 1" @click="removePushRoute(i)">删除</el-button></div>
@@ -1494,17 +1557,6 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
             <p class="hint warn">未满足限制的用户使用 Bot 时，会收到带上方跳转按钮的提示。此功能与推送白名单相互独立，互不影响。</p>
           </div>
 
-          <!-- TG 推送配置 -->
-          <div class="panel">
-            <div class="panel-head"><h3>TG 推送配置</h3><span>推送样式 · 福袋入口</span></div>
-            <div class="tg-extra-grid">
-              <div class="field"><label>推送方式</label><el-input value="由 Bot 推送（频道 / 群聊统一）" readonly/><small>所有影视分享都由 Bot 发送：频道、群聊各作为一条「频道」记录添加，Bot 用自己的 Token 推到对应 chat_id，并受推送白名单控制。</small></div>
-              <div class="field"><label>福袋 Bot 用户名</label><el-input v-model="tgExtra.fubao_bot" placeholder="如 fubao_bot（不带@），推送消息加跳转按钮"/><small>留空则不显示福袋/入库跳转按钮</small></div>
-              <div class="field"><label>分享链接样式</label><el-select v-model="tgExtra.link_style" style="width:100%"><el-option label="按钮（推荐）" value="button"/><el-option label="纯文本" value="plain"/></el-select></div>
-              <div class="field"><label>详情篇幅</label><el-select v-model="tgExtra.detail_level" style="width:100%"><el-option label="精简" value="compact"/><el-option label="完整" value="full"/></el-select></div>
-            </div>
-            <div class="panel-foot"><el-button type="primary" :loading="tgExtraSaving" @click="saveTgExtra">保存 TG 配置</el-button></div>
-          </div>
 
           <!-- 推送调度 + 链路自检 -->
           <div class="bot-card" style="margin-bottom:14px">
@@ -1781,14 +1833,27 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer) })
         </section>
 
         <section v-else-if="tab === '消息模板'" class="fade">
-          <div class="page-head"><div><h2>消息模板</h2><p>支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
+          <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
+
+          <!-- v0.9.6：推送渲染选项（从已删除的 TG 推送配置卡迁入，后端逻辑不变） -->
+          <div class="panel narrow" style="margin-bottom:14px">
+            <div class="panel-head"><h3>推送渲染选项</h3><span>分享链接样式 · 详情篇幅（影响所有模板的推送消息）</span></div>
+            <div class="form-grid">
+              <div class="field"><label>分享链接样式</label><el-select v-model="tgExtra.link_style" style="width:100%"><el-option label="按钮（推荐）" value="button"/><el-option label="纯文本" value="plain"/></el-select><small>按钮模式把分享链接渲染成「📥 获取资源」inline 按钮，并去掉正文末尾的纯文本链接。</small></div>
+              <div class="field"><label>详情篇幅</label><el-select v-model="tgExtra.detail_level" style="width:100%"><el-option label="精简" value="compact"/><el-option label="完整" value="full"/></el-select><small>精简把简介压到 110 字；完整保留整段简介。</small></div>
+            </div>
+            <div class="panel-foot"><el-button type="primary" :loading="tgExtraSaving" @click="saveTgExtra">保存渲染选项</el-button></div>
+          </div>
+
           <div class="two-col tpl-layout">
             <div class="panel">
-              <div class="field"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
+              <div class="field"><label>内置模板（一键载入，可改后另存）</label><el-select v-model="tplPresetPick" placeholder="选择一套内置模板" style="width:100%" @change="applyTplPreset"><el-option v-for="p in tplPresets" :key="p.name" :label="p.name" :value="p.name"/></el-select></div>
+              <div class="field mt"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
               <div class="field mt"><label>消息内容</label><el-input v-model="tpl.content" type="textarea" :rows="10" placeholder="在这里编写 Telegram 消息内容"/></div>
               <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch v-model="tpl.is_default" active-text="设为默认" class="ml"/></div>
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
-              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></div></div>
+              <el-button v-if="tpl.id" class="mt" plain @click="tpl = { name:'', content:'', enabled:true, is_default:false }; tplPresetPick=''">新建空模板</el-button>
+              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="danger" :disabled="t.is_default" @click="deleteTpl(t)">删除</el-button></div></div>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>
@@ -1987,6 +2052,8 @@ button{font-family:inherit}
 .hint{color:#929bb5;font-size:11px;line-height:1.8;margin:12px 0 0}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
+/* v0.9.6：镜像锁占用提示——后台改名复查静默持锁时，让用户知道为何「立即同步」会 409 */
+.mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:#fff8e6;border:1px solid #f5d98a;border-radius:10px;color:#8a6d1f;font-size:12px;line-height:1.7}
 /* v0.9.0：镜像同步页分区治理——状态数字按语义分组，配置/接口改成结构化 chip */
 .mirror-fold{margin-top:16px;border-top:1px solid var(--yg-line);border-bottom:0}
 .mirror-fold .el-collapse-item__header{font-size:13px;font-weight:650;color:#3b4361;min-height:42px;height:auto;padding:10px 4px}
@@ -2066,6 +2133,8 @@ button{font-family:inherit}
 .row-btn:hover{background:#eeedff}.row-btn.danger{color:var(--yg-rose)}.row-btn.danger:hover{background:#ffedf0}.row-btn:disabled{opacity:.5;cursor:wait}
 .status-tag{padding:3px 9px;border-radius:14px;font-size:11px;font-weight:600;background:#eef1f7;color:#7e88a8}.st-sent{background:#e5f8f5;color:#129688}.st-pending{background:#fff3e2;color:#cf7f1c}.st-review{background:#f2edff;color:#7a55dd}.st-retry{background:#ffedf0;color:#d63f59}.st-failed{background:#f1f2f6;color:#7e88a8}
 .tpl-layout{align-items:start}.var-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}.var-grid button{border:1px solid var(--yg-line);background:#fafbff;border-radius:8px;padding:8px 4px;font-size:11px;color:var(--yg-primary);cursor:pointer}.var-grid button:hover{background:#eeedff}
+/* v0.9.6：模板列表项可点编辑 + 删除；名称区域可点 */
+.tpl-mini{display:flex;align-items:center;justify-content:space-between;gap:8px}.tpl-mini-name{display:inline-flex;align-items:center;gap:8px;cursor:pointer;flex:1;min-width:0}.tpl-mini-name:hover b{color:var(--yg-primary)}
 .preview-box{border:1px dashed var(--yg-line);border-radius:12px;padding:14px;background:#fafbff}.preview-title{font-size:11px;color:var(--yg-muted);margin-bottom:8px}.preview-body{font-size:13px;white-space:pre-wrap;line-height:1.7;min-height:60px}
 .mt{margin-top:12px}.ml{margin-left:18px}
 .login-screen{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#eef0fb 0%,#f7f9fd 60%,#eaf7f6 100%);position:relative;overflow:hidden}

@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -21,7 +22,7 @@ from sqlalchemy.orm import Session
 from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, log_retention,
                mirror, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
-from .db import DEFAULT_TEMPLATE, Base, SessionLocal, get_db, json_dumps, migrate, engine
+from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
 from .models import (AuditLog, AuthToken, Bot, Channel, DistributionEvent,
                      MediaRequest, MessageTemplate, MirrorDir, MirrorFile, MirrorMedia, MirrorRule,
@@ -37,10 +38,66 @@ from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name
                     work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-# v0.8.9：镜像同步 / 改名是分钟级长任务，同一进程内只允许一个在跑。
-# 用 threading.Lock 而非 asyncio.Lock：定时 job 与手动端点可能来自不同执行上下文，
-# 且测试里 asyncio.run() 会换事件循环，threading 锁不受影响。
-_mirror_lock = threading.Lock()
+
+
+class _TimedMirrorLock:
+    """v0.9.6：带持有者/时间戳的镜像互斥锁，防止「假持锁」误报 409。
+
+    v0.8.9 起用 threading.Lock 互斥；正常路径 try/finally 都会释放，但有两种情况
+    会让锁看起来「一直被占用」而界面上又看不到任务：
+      1) 后台 `_job_rename_pending` 每 120 秒拿锁做长改名，用户点「立即同步」被 409，
+         但后台任务不在界面显示，用户以为「没有任务在跑」；
+      2) 进程异常 / 任务被强制中断时 finally 未执行，锁残留到下次请求。
+    这里在 acquire 时记录 owner + 起始时间，超过 STALE_SECONDS 视为失效自动放行，
+    并把占用信息暴露给 /api/mirror/status，前端可提示「后台改名任务运行中」。
+    仍用 threading.Lock 做真正的互斥（定时 job 与手动端点上下文不同、测试会换事件循环）。
+    """
+    STALE_SECONDS = 30 * 60  # 镜像长剧 + 改名最多几分钟；30 分钟仍持锁必属异常残留
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owner = ""
+        self._since = 0.0
+
+    def acquire(self, blocking: bool = False, owner: str = "") -> bool:
+        if self._lock.acquire(blocking=blocking):
+            self._owner = owner or "镜像任务"
+            self._since = time.monotonic()
+            return True
+        # 拿不到锁：若当前持有已超时，判定为残留，强制解绑（不 release 原锁，避免
+        # 真持有者稍后 release 时误放别人的锁；用代数版本号隔离，见 release）。
+        if self._held_seconds() > self.STALE_SECONDS:
+            logger.warning("[mirror] 镜像锁持有超过 %ss（owner=%s），判定残留并强制放行",
+                           self.STALE_SECONDS, self._owner)
+            self._owner, self._since = "", 0.0
+            self._lock.release()  # 残留场景：原持有者已不存在，安全释放
+            self._owner = "镜像任务(残留回收)"
+            self._since = time.monotonic()
+            return True
+        return False
+
+    def release(self) -> None:
+        self._owner, self._since = "", 0.0
+        try:
+            self._lock.release()
+        except RuntimeError:
+            pass  # 未被持有时重复 release，忽略
+
+    def set_owner(self, owner: str) -> None:
+        """拿锁后补充持有者名称（保留 acquire(blocking=False) 原字面调用，兼容旧契约测试）。"""
+        if self._since:
+            self._owner = owner
+
+    def _held_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._since) if self._since else 0.0
+
+    def info(self) -> dict:
+        held = self._lock.locked()
+        return {"busy": held, "owner": self._owner if held else "",
+                "held_seconds": int(self._held_seconds()) if held else 0}
+
+
+_mirror_lock = _TimedMirrorLock()
 
 
 def add_audit(db: Session, action: str, target_type: str = "", target_id: str = "", detail: str = "") -> None:
@@ -117,6 +174,7 @@ async def _job_rename_pending():
     """
     if not _mirror_lock.acquire(blocking=False):
         return
+    _mirror_lock.set_owner("后台改名复查")
     try:
         with SessionLocal() as db:
             r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
@@ -241,13 +299,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.5", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.6", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.5", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.6", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -560,6 +618,7 @@ async def _scheduled_mirror() -> None:
     if not _mirror_lock.acquire(blocking=False):
         logger.info("[mirror] 已有同步 / 改名任务运行，跳过本轮定时镜像")
         return
+    _mirror_lock.set_owner("定时镜像")
     try:
         with SessionLocal() as db:
             try:
@@ -691,8 +750,17 @@ def _mirror_guard():
     表现就是「整理剧集改名时后台页面卡死打不开」。宁可明确拒绝，也不排队。
     """
     if not _mirror_lock.acquire(blocking=False):
+        info = _mirror_lock.info()
+        owner = info.get("owner") or "未知任务"
+        held = info.get("held_seconds", 0)
+        # v0.9.6：把占用者说清楚——多数「假 409」是后台改名复查（每 120 秒静默跑）
+        # 正持锁，界面看不到它，用户误以为「没有任务在跑」。给出占用者与时长，
+        # 超过阈值的残留由 _TimedMirrorLock.acquire 自动回收，这里只报真实在跑的。
         raise HTTPException(
-            409, "已有镜像同步 / 改名任务正在运行，请等当前任务结束后再操作")
+            409, f"已有镜像同步 / 改名任务「{owner}」正在运行（已持续约 {held} 秒）；"
+                 "多为后台改名复查或本轮同步尚未结束，请稍候重试。"
+                 f"若长时间（>30 分钟）仍报此错，重启容器即可清除残留锁。")
+    _mirror_lock.set_owner("手动同步 / 改名")
     try:
         yield
     finally:
@@ -823,6 +891,28 @@ async def mirror_rename_files(force: bool = False, db: Session = Depends(get_db)
         return await _do_mirror_rename_files(force, db)
 
 
+@app.post("/api/mirror/rename/untranslated/clear", dependencies=ADMIN)
+def mirror_clear_untranslated(db: Session = Depends(get_db)):
+    """v0.9.6：清空「英文改名待处理」清单——把当前英文名为空的作品标记 ignored。
+
+    这些行多是已不在 A 库 / 已停止追更的历史映射，英文名为空却每次同步都进待处理清单，
+    看着像「过期没清」。本端点不删映射、不动文件，只置 english_source=ignored 让其从
+    清单消失；日后点「重新解析英文名并改名」(force=True) 会清掉标记重新解析，可随时恢复。
+    """
+    rows = list(db.scalars(select(MirrorMedia).where(
+        or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == ""),
+        or_(MirrorMedia.english_source.is_(None), MirrorMedia.english_source != "ignored")
+    )).all())
+    cleared = len(rows)
+    for m in rows:
+        m.english_source = "ignored"
+    if cleared:
+        add_audit(db, "mirror_untranslated_cleared", target_type="mirror",
+                  detail=json_dumps({"cleared": cleared}))
+    db.commit()
+    return {"ok": True, "cleared": cleared}
+
+
 async def _do_mirror_poll_tasks(db: Session) -> dict:
     r = _mirror_rule(db)
     if not r:
@@ -867,13 +957,43 @@ async def mirror_mappings_prune(dry_run: bool = False, db: Session = Depends(get
         return stats
 
 
+@app.post("/api/mirror/mappings/clear-pruned", dependencies=ADMIN)
+def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
+    """v0.9.6：彻底删除「已清理待重建」的僵尸目录映射行。
+
+    这些行是之前「清理无效映射」(prune) 把 B 库已不存在的目录置 missing 留下的，
+    error 带 [pruned] 标记。它们在「待创建目录」里已被排除，本端点供用户在确认后
+    物理删除，让「目录映射清单」恢复干净。安全前提：A 库是权威源，若目录仍在，
+    下轮「立即同步」会经 _record_dir 按 source_dir_id 原样重建；不会删资源 / 分享 / 队列。
+    只删带 [pruned] 标记的 missing 行，不碰真正建目录失败的 missing 与任何正常映射。
+    """
+    rows = list(db.scalars(select(MirrorDir).where(MirrorDir.status == "missing")).all())
+    targets = [d for d in rows
+               if str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
+    removed = len(targets)
+    for d in targets:
+        db.delete(d)
+    if removed:
+        add_audit(db, "mirror_mappings_clear_pruned", target_type="mirror",
+                  detail=json_dumps({"removed": removed}))
+    db.commit()
+    return {"ok": True, "removed": removed}
+
+
 @app.get("/api/mirror/status", dependencies=ADMIN)
 def mirror_status(db: Session = Depends(get_db)):
     r = _mirror_rule(db)
     media = list(db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc()).limit(200)).all())
     tasks = list(db.scalars(select(MirrorTask).order_by(MirrorTask.id.desc()).limit(30)).all())
     dirs = list(db.scalars(select(MirrorDir).order_by(MirrorDir.id.desc()).limit(200)).all())
-    missing = [d for d in dirs if d.status == "missing"]
+    # v0.9.6：missing 分两类。带 [pruned] 的是「已清理待重建」僵尸行（下轮同步从 A 库
+    # 自动重建，不需要用户手工建目录），从「待创建目录 / 待办清单」里排除，避免刷屏；
+    # 真正建目录失败的 missing 才作为待办展示。用户可在映射清单里点「清空已清理映射」
+    # 彻底删除僵尸行（需二次确认）。
+    missing = [d for d in dirs if d.status == "missing"
+               and not str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
+    pruned_dirs = [d for d in dirs if d.status == "missing"
+                   and str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK)]
     # v0.8.4：文件复制失败的诊断不再只存在于「立即同步」那一次响应里。
     # MirrorFile.error / MirrorTask.error 落库持久化，刷新页面依然可查。
     failed_files = list(db.scalars(select(MirrorFile).where(
@@ -889,8 +1009,12 @@ def mirror_status(db: Session = Depends(get_db)):
     rename_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
                       "file": f.file_name, "target": f.target_name or "",
                       "error": f.rename_error or ""} for f in rename_failed]
+    # v0.9.6：排除用户已「清空 / 忽略」的待翻译项（english_source=ignored）。
+    # 这些作品英文名为空但已被用户确认跳过，不再占用待处理清单；点「重新解析英文名并改名」
+    # (force) 会清掉 ignored 标记重新走 TMDB→AI→拼音链路，可随时恢复。
     no_english = list(db.scalars(select(MirrorMedia).where(
-        or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == "")
+        or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == ""),
+        or_(MirrorMedia.english_source.is_(None), MirrorMedia.english_source != "ignored")
     ).order_by(MirrorMedia.id.desc()).limit(50)).all())
     untranslated_works = [{"work": m.title_standard,
                            "reason": "尚未解析到英文剧名；补齐 TMDB 密钥或 AI 配置后点「按英文规范改名」重跑"}
@@ -955,6 +1079,7 @@ def mirror_status(db: Session = Depends(get_db)):
             "dirs_created": db.query(MirrorDir).filter(MirrorDir.status == "created").count(),
             "dirs_missing": len(missing),
             "dirs_failed": len(missing),
+            "dirs_pruned_zombie": len(pruned_dirs),  # v0.9.6：已清理待重建的僵尸行数
             "dirs_fallback": db.query(MirrorDir).filter(
                 MirrorDir.status == "created_fallback").count(),
         },
@@ -969,6 +1094,7 @@ def mirror_status(db: Session = Depends(get_db)):
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
                   "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id,
+                  "pruned": str(getattr(d, "error", "") or "").startswith(mirror.PRUNED_DIR_MARK),
                   "error": getattr(d, "error", "") or ""}
                  for d in dirs],
         # v0.8.2：tip 不再硬编码成「请手工建立」，直接回显 create_dir 的真实报错
@@ -989,6 +1115,9 @@ def mirror_status(db: Session = Depends(get_db)):
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "min_idle_seconds": mirror.MIN_FILE_IDLE_SECONDS,
+        # v0.9.6：镜像互斥锁状态（谁在跑、跑了多久），前端据此提示「后台任务运行中」，
+        # 避免用户点「立即同步」撞上静默的后台改名复查后只看到一句 409。
+        "lock": _mirror_lock.info(),
         # v0.8.2：回显实际生效配置，一眼看出「自动创建是不是被关掉了」
         "config": {
             "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
@@ -2423,6 +2552,12 @@ class TemplateInput(BaseModel):
     is_default: bool = False
 
 
+@app.get("/api/templates/presets", dependencies=ADMIN)
+def template_presets():
+    """v0.9.6：内置模板预设列表（不落库），供管理页下拉一键载入后再改 / 另存。"""
+    return [{"name": p["name"], "content": p["content"]} for p in TEMPLATE_PRESETS]
+
+
 @app.get("/api/templates", dependencies=ADMIN)
 def templates(db: Session = Depends(get_db)):
     return [{"id": x.id, "name": x.name, "content": x.content, "enabled": x.enabled,
@@ -2470,6 +2605,20 @@ def edit_template(tid: int, p: TemplateInput, db: Session = Depends(get_db)):
     for k, v in p.model_dump().items():
         setattr(x, k, v)
     add_audit(db, "template_updated", target_type="template", target_id=str(tid))
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/templates/{tid}", dependencies=ADMIN)
+def delete_template(tid: int, db: Session = Depends(get_db)):
+    """v0.9.6：删除模板；默认模板禁删（避免 publisher 无模板可用）。"""
+    x = db.get(MessageTemplate, tid)
+    if not x:
+        raise HTTPException(404, "模板不存在")
+    if x.is_default:
+        raise HTTPException(400, "默认模板不能删除，请先把别的模板设为默认")
+    db.delete(x)
+    add_audit(db, "template_deleted", target_type="template", target_id=str(tid))
     db.commit()
     return {"ok": True}
 
@@ -3015,6 +3164,7 @@ class PushRouteInput(BaseModel):
     dir_id: str = ""       # 影视库 B 的下属目录 ID；空=根目录通配
     kind: str = "channel"  # channel=频道 / group=群聊，任填其一即可
     chat_id: str = ""      # 频道 ID 或群 ID
+    note: str = ""         # v0.9.6：备注，便于肉眼区分不同目录（纯展示，不参与匹配）
 
 
 class PushRoutesInput(BaseModel):
@@ -3061,7 +3211,8 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
         if not chat:
             continue  # 频道/群任填其一，空路由跳过
         kind = "group" if str(item.kind or "").lower() == "group" else "channel"
-        routes.append({"dir_id": str(item.dir_id or "").strip(), "kind": kind, "chat_id": chat})
+        routes.append({"dir_id": str(item.dir_id or "").strip(), "kind": kind, "chat_id": chat,
+                       "note": str(item.note or "").strip()[:120]})
     if len(routes) > 10:
         raise HTTPException(400, "推送白名单最多 10 条")
 

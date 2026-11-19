@@ -142,6 +142,40 @@ DEFAULT_TEMPLATE = (
     "{{#if tags}}🏷 {{tags}}\n{{/if}}"
     "{{share_url}}"
 )
+# v0.9.6：内置模板预设（供管理页下拉一键载入，不落库；用户载入后可改可另存）。
+# 全部只用现有 {{变量}} 与 {{#if}} 语法，不引入新变量，兼容 publisher 渲染器。
+# 默认图文沿用 DEFAULT_TEMPLATE，另给精简 / 追更 / 纯文本三套，解决「默认图文模板重复、
+# 只有一种样式」的问题。键 name 用于下拉展示，content 用于填充编辑框。
+TEMPLATE_PRESETS = [
+    {"name": "默认图文（整剧 · 推荐）", "content": DEFAULT_TEMPLATE},
+    {"name": "精简卡片", "content": (
+        "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
+        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
+        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
+        "{{#if vote_average}}⭐ {{vote_average}}/10\n{{/if}}"
+        "{{#if resolution}}📐 {{resolution}}\n{{/if}}"
+        "{{#if size}}💾 {{size}}\n{{/if}}"
+        "{{share_url}}"
+    )},
+    {"name": "追更剧集（带进度）", "content": (
+        "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
+        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
+        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
+        "{{#if episode_progress}}🔢 进度 {{episode_progress}}\n{{/if}}"
+        "{{#if episode_count}}📼 已收录 {{episode_count}} 集\n{{/if}}"
+        "{{#if overview}}\n📖 {{overview}}\n\n{{/if}}"
+        "{{share_url}}"
+    )},
+    {"name": "纯文本分享", "content": (
+        "🎬 {{title}}{{#if year}}（{{year}}）{{/if}}\n"
+        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
+        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
+        "{{#if vote_average}}⭐ {{vote_average}}/10 · {{/if}}{{#if resolution}}{{resolution}} · {{/if}}{{#if size}}{{size}}\n{{/if}}"
+        "{{#if overview}}📖 {{overview}}\n{{/if}}"
+        "资源：{{share_url}}"
+    )},
+]
+
 # v0.6.0 旧版默认模板：仍在使用它（用户没改过）时自动升级到 v0.6.4 新版
 PREV_DEFAULT_TEMPLATE = (
     "<b>{{title}}</b>{{#if year}}（{{year}}）{{/if}}\n"
@@ -264,6 +298,17 @@ def migrate() -> None:
 
     with SessionLocal() as db:
         tpl = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").first()
+        # v0.9.6：去重——历史上「一键恢复默认模板」在并发 / 空表时可能写入多条同名
+        # 「默认图文模板」（用户截图出现 5 条）。这里保留第一条（优先 is_default），
+        # 删除其余同名重复行；用户真正自定义的其它名字模板一律不动。
+        dupes = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").all()
+        if len(dupes) > 1:
+            keeper = next((x for x in dupes if x.is_default), dupes[0])
+            for x in dupes:
+                if x.id != keeper.id:
+                    db.delete(x)
+            db.commit()
+            tpl = keeper
         if not tpl:
             db.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
                                    enabled=True, is_default=True))

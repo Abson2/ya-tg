@@ -108,7 +108,9 @@ def push_routes(db: Session) -> list[dict]:
             continue  # 频道 ID、群 ID 任填其一即可，空路由跳过
         kind = "group" if str(item.get("kind") or "").lower() == "group" else "channel"
         out.append({"dir_id": str(item.get("dir_id") or "").strip(),
-                    "kind": kind, "chat_id": chat})
+                    "kind": kind, "chat_id": chat,
+                    # v0.9.6：备注仅用于管理页肉眼区分目录，不参与匹配/推送逻辑
+                    "note": str(item.get("note") or "").strip()[:120]})
     return out
 
 

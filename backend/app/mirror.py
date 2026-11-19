@@ -93,6 +93,10 @@ LIST_PAGE_SIZE = 50
 # v0.8.4：只有 synced 才表示「文件确实到了 B 库」。这些状态必须重试，
 # 绝不能和 synced 一起塞进 existing 判 unchanged（否则永久卡死）。
 RETRYABLE_FILE_STATUS = {"pending", "copying", "failed", "unknown"}
+# v0.9.6：prune 已清理的目录映射标记。带此标记的 missing 行是「B 库不存在、映射已清、
+# 下轮同步从 A 库重建」的僵尸行，不需用户手工建目录；展示层据此从「待创建目录」排除，
+# 并在用户确认后由 /api/mirror/mappings/clear-pruned 真正删除（不违反自动 prune 不删行的红线）。
+PRUNED_DIR_MARK = "[pruned]"
 
 _TMDB_TAG = re.compile(r"\{?\s*tmdb[-_:：]?(\d+)\s*\}?", re.I)
 # 影视主目录强特征：{tmdb-xxx} / (2021) 这类标记
@@ -1123,8 +1127,14 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     复制 / 入库 / 分享 / 推送主链路。
     """
     cached = str(getattr(media, "english_title", "") or "").strip()
+    src_existing = str(getattr(media, "english_source", "") or "").strip()
+    # v0.9.6：用户点「清空待处理清单」后会置 english_source=ignored。非强制解析时
+    # 尊重该标记、直接跳过（否则每轮同步又把历史垃圾解析一遍，清单永远清不干净）；
+    # 只有 force=True（点「重新解析英文名并改名」）才清掉标记、重新走解析链路。
+    if src_existing == "ignored" and not force:
+        return "", "ignored"
     if cached and not force:
-        return cached, str(getattr(media, "english_source", "") or "cached")
+        return cached, src_existing or "cached"
     core, year = work_core_title(media.title_standard)
     eng, source = "", ""
     if not core:
@@ -1508,7 +1518,10 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
                 continue
             d.target_dir_id = ""
             d.status = "missing"
-            d.error = "B 库该目录已不存在，映射已清理，下轮同步自动重建"
+            # v0.9.6：加 [pruned] 标记区分「已清理待重建的僵尸行」与「真正建目录失败」。
+            # 前者不需要用户手工介入（下轮同步会从 A 库重建），从「待创建目录」清单里
+            # 排除；管理页另给「清空已清理映射」按钮让用户在确认后彻底删除这些行。
+            d.error = PRUNED_DIR_MARK + "B 库该目录已不存在，映射已清理，下轮同步自动重建"
             d.updated_at = utcnow()
             db.commit()
     return stats
