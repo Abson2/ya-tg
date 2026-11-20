@@ -306,3 +306,17 @@
 ---
 
 *报告生成基线：`d91c4c10e967f5cab9fa6b4748e334f8a088ff52`。阶段一结束，未修改任何业务代码。*
+
+---
+
+## 8. 整改状态更新（阶段二起，原始审计结论不改写）
+
+> 原始第 1~7 节为基线 `d91c4c10` 的审计快照，保持不动。本节记录后续验证/修复的真实结果。
+
+### C-01｜SPA 路径穿越：已确认存在并修复（原定级 C → 升级为已确认）
+
+- **动态验证（用户批准"允许"）**：首次本地 TestClient 因无 `/app/static`、SPA 路由未注册，结果不充分（全部 404），不作为结论。改用隔离环境：临时静态目录 + 同级 `db/ya-tg.db` 敏感哨兵文件 + 真实 uvicorn + `curl --path-as-is` 打未规范化原始路径。
+- **验证结果**：`/../db/ya-tg.db`、`/..%2fdb%2fya-tg.db`、`/%2e%2e/db/ya-tg.db`、`/%2e%2e%2fdb%2fya-tg.db`、`/./../db/ya-tg.db` 全部 **HTTP 200 且返回哨兵内容 `<<<SECRET_DB_LEAKED>>>`**；`/assets/../...` 因 StaticFiles 挂载返回 404。证明 `f = static / path` + `f.is_file()` 未做 realpath 归属校验时可穿越读取静态目录外文件——**漏洞成立**（生产容器内 `/app/db/ya-tg.db` 含凭证/数据，风险真实）。
+- **修复**：`main.py` 新增模块级 `safe_static_file(path, root)`，对 `(root/path).resolve()` 与 `root.resolve()` 做归属校验（`candidate == root 或 root ∈ candidate.parents`），越界/不存在/符号链接逃逸一律返回 None，SPA 路由改为 `safe_static_file(path, static) or static/index.html`。既保留正常 SPA 路由与 `index.html` 回退，又阻断 `..`、URL 编码、符号链接三类穿越。
+- **验证证据**：`tests/test_c01_spa_path_traversal.py` 4 项通过——穿越 payload 全拒、正常静态文件仍可服务、符号链接逃逸拦截、真实 uvicorn + `--path-as-is` 端到端不复现泄露。
+- **状态**：C-01 由"待验证" → "已确认 + 已修复 + 已测试"。

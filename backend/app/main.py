@@ -5275,6 +5275,26 @@ def interaction_status(db: Session = Depends(get_db)):
     }
 
 
+def safe_static_file(path: str, root: Path) -> Path | None:
+    """C-01 修复：返回 root 目录内且真实存在的文件；越界/不存在返回 None。
+
+    SPA catch-all 必须把请求路径 realpath 规范化后校验仍落在静态目录内，
+    否则 /../db/ya-tg.db、/%2e%2e/... 等未规范化原始路径可读取静态目录外的文件。
+    抽成模块级纯函数以便单元测试直接覆盖（无需 /app/static 存在）。
+    """
+    if not path:
+        return None
+    try:
+        resolved_root = root.resolve()
+        candidate = (root / path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    # realpath 后必须仍在静态根内（含根本身），阻断 .. / 符号链接穿越
+    if candidate != resolved_root and resolved_root not in candidate.parents:
+        return None
+    return candidate if candidate.is_file() else None
+
+
 static = Path("/app/static")
 if static.exists():
     assets = static / "assets"
@@ -5283,5 +5303,4 @@ if static.exists():
 
     @app.get("/{path:path}")
     def spa(path: str):
-        f = static / path
-        return FileResponse(f if path and f.is_file() else static / "index.html")
+        return FileResponse(safe_static_file(path, static) or static / "index.html")
