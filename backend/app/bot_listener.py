@@ -944,36 +944,9 @@ async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
         return False
 
 
-async def forward_contribution_to_tgto(db: Session, share_url: str, title: str = "") -> tuple[bool, str]:
-    """[已弃用 v0.9.18] 旧的「交互 Bot → TGtoDrive Bot 私聊」转发，仅保留兼容历史测试。
-
-    该函数是 USER_BOT_TO_BOT_DISABLED 报错根因——Bot 向 Bot 私聊被 Telegram 禁止。
-    审核通过流程已改走 contribution_dispatch（中转群 relay / OpenAPI 双通道），
-    不再调用本函数。勿在新代码里使用；配置 tgto_contribute_bot_chat_id 也已弃用。
-    返回 (是否发送, 说明)。
-    """
-    chat_id = (runtime_config.get(db, "tgto_contribute_bot_chat_id") or "").strip()
-    if not chat_id:
-        return False, "未配置 TgtoDrive 投稿监控 chat_id"
-    share_url = (share_url or "").strip()
-    if not share_url:
-        return False, "投稿无分享链接，跳过转发"
-    token = effective_token(db)
-    if not token:
-        return False, "未配置交互 Bot Token，无法转发"
-    text = f"📥 投稿转存\n{title}\n{share_url}" if title else f"📥 投稿转存\n{share_url}"
-    try:
-        data = await _api(db, token, "sendMessage",
-                          {"chat_id": chat_id, "text": text[:4000],
-                           "disable_web_page_preview": False})
-    except Exception as exc:
-        return False, f"转发请求失败：{str(exc)[:160]}"
-    # v0.9.17 热修：_api 返回 {"ok":false,...} 不抛异常，必须判 ok，
-    # 否则 Telegram 拒绝（chat not found / bot 被禁）会被误报为"已转发"。
-    if isinstance(data, dict) and not data.get("ok"):
-        desc = str(data.get("description") or "")[:160]
-        return False, f"转发被 Telegram 拒绝：{desc or '未知原因'}（请确认 Bot 已在该 chat 且有发送权限）"
-    return True, "已转发至 TgtoDrive 监控 Bot"
+# v0.9.19：旧的 forward_contribution_to_tgto（交互 Bot → TGtoDrive Bot 私聊）已彻底删除。
+# 该链路是 USER_BOT_TO_BOT_DISABLED 根因；投稿转存现统一走光鸭原生 API
+# （见 contribution_restore.py），与 Telegram Bot 转发无关。
 
 
 def main_keyboard() -> dict:

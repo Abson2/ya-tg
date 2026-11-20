@@ -66,15 +66,11 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tgto_rule_resolution": ("tgto_rule_resolution", "4k"),       # 4k/1080p/720p
     "tgto_rule_effect": ("tgto_rule_effect", "all"),              # all/dolby/hdr/sdr
     "tgto_rule_required_keyword": ("tgto_rule_required_keyword", "265"),  # 必含关键词
-    # 投稿审核通过后把分享链接转发到该 TgtoDrive 绑定 Bot（chat_id），由其监控转存
-    "tgto_contribute_bot_chat_id": ("tgto_contribute_bot_chat_id", ""),
-    # v0.9.18：投稿分发（审核态/分发态解耦）。mode: relay(中转群)/openapi/off。
-    # relay 用交互 Bot 发消息到中转群（群里有 TGtoDrive 个人账号 + 万能转发），
-    # 绝不 Bot→Bot 私聊（Telegram USER_BOT_TO_BOT_DISABLED 根因）。
-    "contribution_dispatch_mode": ("contribution_dispatch_mode", "relay"),
-    "contribution_relay_chat_id": ("contribution_relay_chat_id", ""),  # 专用中转群 chat_id
-    # 中转消息模板：仅必要链接信息，不含投稿人隐私。占位符 {ref}/{title}/{share_url}/{code}
-    "contribution_relay_template": ("contribution_relay_template", ""),
+    # v0.9.19：投稿转存——审核通过后直接调光鸭原生 API 转存到指定目录，不经 TgtoDrive。
+    # 去掉 v0.9.18 的中转群/OpenAPI 分发与旧「投稿转存监控 Bot chat_id」（Bot→Bot 私聊被
+    # Telegram USER_BOT_TO_BOT_DISABLED 拒绝，是绕路链路）。
+    "contribution_restore_enabled": ("contribution_restore_enabled", "false"),
+    "contribution_restore_target_dir_id": ("contribution_restore_target_dir_id", ""),
     # v0.8.0：用户互动 / 打赏
     "contribution_enabled": ("contribution_enabled", "false"),
     "contribution_bot_token": ("contribution_bot_token", ""),  # v0.9.4 起仅作旧配置回退

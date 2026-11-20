@@ -8,6 +8,31 @@
 
 ---
 
+## v0.9.19 (2026-11-20)
+
+投稿转存路线纠偏：**去掉 v0.9.18 的 TGtoDrive 分发通道（中转群 / OpenAPI），改为审核通过后直接调用光鸭自身转存 API，把用户投稿保存到配置的目标目录 ID**。不再经过 TgtoDrive、不再依赖 Telegram Bot 转发。审核态与转存态仍然分离。
+
+### 路线纠偏（用户拍板）
+- 用户判定 v0.9.18「绕路了」：投稿本来就是光鸭分享链接，光鸭自己就有转存接口，没必要绕 TGtoDrive 中转群或个人账号万能转发。
+- 彻底删除：`contribution_dispatch.py`、`ContributionDispatch` 表、`contribution_dispatch_mode`/`contribution_relay_chat_id`/`contribution_relay_template` 配置、旧 `tgto_contribute_bot_chat_id`（投稿转存监控 Bot chat_id）与 `forward_contribution_to_tgto()` Bot 私聊函数——这是 `USER_BOT_TO_BOT_DISABLED` 的根因链路。
+- 新增 `ContributionRestore` 表 + `contribution_restore.py`：一条投稿至多一条转存任务（contribution_id 唯一），重复点通过不新建、success 不重跑、失败可重试、后台 job 30s 续跑（重启恢复）、删除投稿连带清理。
+
+### 光鸭原生转存（接口契约全部来自取证，不猜测）
+- 链路：`parse_share_reference()` 解析 `/s/<shareId>[_后缀]` → `POST /userres/v1/get_share_access_token {shareId,code}` → `POST /userres/v1/get_share_page_files_list {accessToken,cursor,...}` 列分享根文件 → `POST /userres/v1/restore_share {accessToken,fileIds,parentId,shareCode}` 转存到目标目录。
+- 错误码按光鸭技能真实契约处理：200/201/202=分享失效、203/209=提取码错误、**204=SHARE_SELF_RESTORE（当前账号自建分享不可自转存，retryable=false）**；均给管理员可读提示，不静默吞、不盲目重试。
+- **提交成功 ≠ 落库成功**：转存后分页列目标目录，按「文件名 + 大小」核对分享根文件全部到位才标 success；核对不到标 failed 并写明缺哪几项。重试前先核对，避免响应丢失导致重复转存。
+- 修正 `contribution_links.py` 正则：真实分享链接 `/s/1970558251383148604_aey8...` 的 shareId 含下划线，旧正则会误判为非法链接。
+
+### 配置 / 前端
+- 在「分发与互动中心」TgtoDrive 联动模块旁新增独立「投稿转存」模块：`contribution_restore_enabled`（开关）+ `contribution_restore_target_dir_id`（目标目录 fileId）。
+- 投稿表格「分发状态/分发方式」改为「转存状态/转存时间/尝试」，记录/重试按钮走 `/api/contributions/{cid}/restore[/retry]`；审核回执字段改为 `restore_ok/restore_result/restore_status`。
+- TgtoDrive 板块只保留求片白名单联动，移除所有投稿分发/中转群/监控 chat_id UI 与文案。
+
+### 验证
+- 新增 `tests/test_v0919_contribution_restore.py` 15 项（含**真实 API 请求体契约测试**，验证非猜测参数）；删除 `tests/test_v0918_contribution_dispatch.py`；适配 v0913/v0916 两条旧转发断言。
+- 全量 pytest **594 passed，1 warning**；前端 build 成功。
+- 仍待真机：跨账号他人分享转存成功路径（手上无可信他人分享样本，取证文档已标注未验证）；当前账号自建分享按 `SHARE_SELF_RESTORE` 明确拒绝。
+
 ## v0.9.18.1 (2026-11-20)
 
 发现列表「删除」语义修正（真机反馈：删除对群有效、对频道无效，且批量删除按钮缺失）。**纯交互修正，不动推送闸门/认证/白名单逻辑**。

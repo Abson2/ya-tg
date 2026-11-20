@@ -60,10 +60,10 @@ const missingDirSelected = ref([]), fileErrSelected = ref([])
 const showScanPanel = ref(false)
 // v0.9.4：Bot 交互配置——交互 Bot 复用 bots 表 token、白名单复用推送目标；内置四指令固定
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', interaction_bot_username: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
-  // v0.9.13 #254：TgtoDrive 频道监控白名单规则 a/b/c + 投稿转存监控 chat
-  tgto_rule_resolution: '4k', tgto_rule_effect: 'all', tgto_rule_required_keyword: '265', tgto_contribute_bot_chat_id: '',
-  // v0.9.18：投稿分发（审核态/分发态分离）——中转群 / OpenAPI / off
-  contribution_dispatch_mode: 'relay', contribution_relay_chat_id: '', contribution_relay_template: '',
+  // v0.9.13 #254：TgtoDrive 频道监控白名单规则 a/b/c（求片联动，与投稿转存无关）
+  tgto_rule_resolution: '4k', tgto_rule_effect: 'all', tgto_rule_required_keyword: '265',
+  // v0.9.19：投稿转存——审核通过后直接调光鸭 API 转存到指定目录（不经 TgtoDrive）
+  contribution_restore_enabled: false, contribution_restore_target_dir_id: '',
   bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [],
   // v0.9.5：使用限制跳转链接 + 推送消息频道/群跳转（模板变量 channel_link/group_link）
   // v0.9.10：新增机器人跳转链接（推送 Bot 本身），渲染层统一追加三行文字链接
@@ -1079,15 +1079,13 @@ async function postInteractionConfig() {
   const c = interactionCfg.value
   const body = { contribution_enabled: !!c.contribution_enabled, donation_enabled: !!c.donation_enabled,
     tgto_base_url: c.tgto_base_url || '', tgto_scene: c.tgto_scene || 'ENV_FILTER_GUANGYA',
-    // v0.9.13 #254：白名单规则 a/b/c + 投稿转存监控 chat
+    // v0.9.13 #254：TgtoDrive 白名单规则 a/b/c（求片联动）
     tgto_rule_resolution: c.tgto_rule_resolution || '4k',
     tgto_rule_effect: c.tgto_rule_effect || 'all',
     tgto_rule_required_keyword: c.tgto_rule_required_keyword || '',
-    tgto_contribute_bot_chat_id: c.tgto_contribute_bot_chat_id || '',
-    // v0.9.18：投稿分发通道配置
-    contribution_dispatch_mode: c.contribution_dispatch_mode || 'relay',
-    contribution_relay_chat_id: c.contribution_relay_chat_id || '',
-    contribution_relay_template: c.contribution_relay_template || '',
+    // v0.9.19：投稿转存配置（光鸭原生 API → 指定目录 ID）
+    contribution_restore_enabled: !!c.contribution_restore_enabled,
+    contribution_restore_target_dir_id: c.contribution_restore_target_dir_id || '',
     donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
     donation_button_text: c.donation_button_text || '打赏支持',
     // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
@@ -1151,6 +1149,16 @@ async function saveTgto() {
   } catch (e) { ElMessage.error(e.message) }
   finally { interactionSaving.value = false }
 }
+async function saveContributionRestore() {
+  // v0.9.19：投稿转存模块独立保存按钮（复用互动配置接口，只改转存两项）
+  interactionSaving.value = true
+  try {
+    await postInteractionConfig()
+    ElMessage.success('投稿转存配置已保存')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { interactionSaving.value = false }
+}
 async function handleContribution(id, status) {
   let note = ''
   if (status === 'rejected') {
@@ -1163,35 +1171,35 @@ async function handleContribution(id, status) {
   }
   try {
     const d = await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note }) })
-    // v0.9.18：审核状态与分发状态分离——通过即审核成功，分发结果单独如实回显
-    if (status === 'approved' && d && 'forwarded' in d) {
-      const ok = !!d.forwarded
+    // v0.9.19：审核状态与转存状态分离——通过即审核成功，光鸭转存结果单独如实回显
+    if (status === 'approved' && d && 'restore_ok' in d) {
+      const ok = !!d.restore_ok
       const msg = ok
-        ? `投稿已通过，链接已分发（${d.dispatch_status || 'submitted'}）`
-        : `投稿已通过（审核不受影响）；分发未完成：${d.dispatch_result || d.forward_info || '未知原因'}，可在分发列手动重试`
+        ? `投稿已通过，光鸭转存完成（${d.restore_status || 'success'}）`
+        : `投稿已通过（审核不受影响）；转存未完成：${d.restore_result || d.forward_info || '未知原因'}，可在转存状态列手动重试`
       ElMessage[ok ? 'success' : 'warning']({ message: msg, duration: 6500, showClose: true })
     } else ElMessage.success('已处理')
     await load()
   }
   catch (e) { ElMessage.error(e.message) }
 }
-// v0.9.18：投稿分发状态映射 + 手动重试 + 分发记录查看
-function dispatchStatusTag(s) { return ({ submitted: 'success', sending: 'warning', pending: 'info', retry_wait: 'warning', failed: 'danger' })[s] || 'info' }
-async function retryContributionDispatch(row) {
+// v0.9.19：投稿转存状态映射 + 手动重试 + 转存记录查看（光鸭原生 API）
+function restoreStatusTag(s) { return ({ success: 'success', restoring: 'warning', pending: 'info', retry_wait: 'warning', failed: 'danger' })[s] || 'info' }
+async function retryContributionRestore(row) {
   try {
-    const d = await api(`/contributions/${row.id}/dispatch/retry`, { method: 'POST' })
-    ElMessage[d.ok ? 'success' : 'warning']({ message: d.ok ? `已重新分发：${d.info || ''}` : `重试未完成：${d.info || ''}`, duration: 6000, showClose: true })
+    const d = await api(`/contributions/${row.id}/restore/retry`, { method: 'POST' })
+    ElMessage[d.ok ? 'success' : 'warning']({ message: d.ok ? `已重试转存：${d.info || ''}` : `重试未完成：${d.info || ''}`, duration: 6000, showClose: true })
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
-async function showContributionDispatch(row) {
+async function showContributionRestore(row) {
   try {
-    const d = await api(`/contributions/${row.id}/dispatch`)
-    if (!d.exists) { ElMessage.info('该投稿尚无分发任务'); return }
+    const d = await api(`/contributions/${row.id}/restore`)
+    if (!d.exists) { ElMessage.info('该投稿尚无转存记录'); return }
     const hist = (d.history || []).map(h => `· ${h.action} ${h.ts || ''} ${h.detail || ''}`).join('\n') || '（无）'
     await ElMessageBox.alert(
-      `状态：${d.status_label}（${d.status}）\n方式：${d.mode_label}（${d.mode}）\n尝试次数：${d.attempts}\n编号：${d.ref || '—'}\n分发时间：${d.dispatched_at || '—'}\n错误：${d.error || '—'}\n\n分发记录：\n${hist}`,
-      '分发记录', { confirmButtonText: '关闭', customClass: 'dispatch-detail-box' })
+      `状态：${d.status_label}（${d.status}）\n尝试次数：${d.attempts}\n转存时间：${d.restored_at || '—'}\n错误：${d.error || '—'}\n核对结果：${d.verify_note || '—'}\n原始响应：${d.last_response || '—'}\n\n转存记录：\n${hist}`,
+      '转存记录', { confirmButtonText: '关闭', customClass: 'restore-detail-box' })
   } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e)) }
 }
 async function handleMediaRequest(row, review) {
@@ -2340,30 +2348,30 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-table-column label="审核状态" width="92"><template #default="s">
                   <el-tag size="small" :type="contributionStatusTag(s.row.status)">{{ contributionStatusLabel(s.row.status) }}</el-tag>
                 </template></el-table-column>
-                <!-- v0.9.18：分发态与审核态分离，独立展示 -->
-                <el-table-column label="分发状态" width="110"><template #default="s">
-                  <el-tooltip v-if="s.row.dispatch_error" :content="s.row.dispatch_error" placement="top">
-                    <el-tag size="small" :type="dispatchStatusTag(s.row.dispatch_status)">{{ s.row.dispatch_status_label || '未分发' }}</el-tag>
+                <!-- v0.9.19：转存态与审核态分离，独立展示（光鸭原生 API） -->
+                <el-table-column label="转存状态" width="110"><template #default="s">
+                  <el-tooltip v-if="s.row.restore_error || s.row.restore_verify_note" :content="s.row.restore_error || s.row.restore_verify_note" placement="top">
+                    <el-tag size="small" :type="restoreStatusTag(s.row.restore_status)">{{ s.row.restore_status_label || '未转存' }}</el-tag>
                   </el-tooltip>
-                  <el-tag v-else size="small" :type="dispatchStatusTag(s.row.dispatch_status)">{{ s.row.dispatch_status_label || '未分发' }}</el-tag>
+                  <el-tag v-else size="small" :type="restoreStatusTag(s.row.restore_status)">{{ s.row.restore_status_label || '未转存' }}</el-tag>
                 </template></el-table-column>
-                <el-table-column label="分发方式/时间" width="140"><template #default="s">
-                  <div class="muted" style="line-height:1.4">{{ s.row.dispatch_mode_label || '—' }}</div>
-                  <div class="muted" style="line-height:1.4; font-size:11px">{{ s.row.dispatched_at ? new Date(s.row.dispatched_at).toLocaleString('zh-CN') : (s.row.dispatch_attempts ? `尝试 ${s.row.dispatch_attempts} 次` : '—') }}</div>
+                <el-table-column label="转存时间/尝试" width="140"><template #default="s">
+                  <div class="muted" style="line-height:1.4">{{ s.row.restore_status === 'success' ? '光鸭目录已核对' : '—' }}</div>
+                  <div class="muted" style="line-height:1.4; font-size:11px">{{ s.row.restored_at ? new Date(s.row.restored_at).toLocaleString('zh-CN') : (s.row.restore_attempts ? `尝试 ${s.row.restore_attempts} 次` : '—') }}</div>
                 </template></el-table-column>
                 <el-table-column label="操作" width="290"><template #default="s">
                   <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
                   <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
-                  <el-button v-if="s.row.dispatch_status" size="small" type="warning" plain @click="showContributionDispatch(s.row)">记录</el-button>
-                  <el-button v-if="['failed','retry_wait'].includes(s.row.dispatch_status)" size="small" type="success" plain @click="retryContributionDispatch(s.row)">重试</el-button>
+                  <el-button v-if="s.row.restore_status" size="small" type="warning" plain @click="showContributionRestore(s.row)">记录</el-button>
+                  <el-button v-if="['failed','retry_wait'].includes(s.row.restore_status)" size="small" type="success" plain @click="retryContributionRestore(s.row)">重试</el-button>
                   <el-button size="small" type="danger" plain @click="deleteContribution(s.row)">删除</el-button>
                 </template></el-table-column>
               </el-table></div>
             </div>
           </div>
 
-          <!-- ===== c 板块：TgtoDrive 项目联动调用配置 ===== -->
-          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片审核通过后写入频道监控白名单、删单联动移除；投稿审核通过后转发链接给绑定 Bot 监控转存</p></div><span class="sec-line"></span></div>
+          <!-- ===== c 板块：TgtoDrive 项目联动调用配置（仅求片白名单联动） ===== -->
+          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片审核通过后写入频道监控白名单、删单联动移除；投稿转存已改走下方「投稿转存」模块的光鸭原生 API，不再依赖 TgtoDrive</p></div><span class="sec-line"></span></div>
           <div class="panel narrow">
             <div class="panel-head"><h3>TgtoDrive 联动配置</h3>
               <div class="head-tools">
@@ -2378,21 +2386,24 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="field"><label>a. 分辨率</label><el-select v-model="interactionCfg.tgto_rule_resolution" style="width:100%"><el-option label="4K" value="4k"/><el-option label="1080p" value="1080p"/><el-option label="720p" value="720p"/><el-option label="不限" value="all"/></el-select></div>
               <div class="field"><label>b. 画面效果</label><el-select v-model="interactionCfg.tgto_rule_effect" style="width:100%"><el-option label="全部效果" value="all"/><el-option label="杜比视界" value="dolby"/><el-option label="HDR" value="hdr"/><el-option label="SDR" value="sdr"/></el-select></div>
               <div class="field"><label>c. 自定义必含关键词</label><el-input v-model="interactionCfg.tgto_rule_required_keyword" placeholder="默认 265；留空则不启用必含条件"/></div>
-              <div class="field"><label>投稿转存监控 Bot chat_id（旧，已弃用）</label><el-input v-model="interactionCfg.tgto_contribute_bot_chat_id" placeholder="旧 Bot 私聊转发，已弃用；请改用下方中转群"/></div>
             </div>
             <p class="hint">白名单采用「读取全量 → 合并 → 回写 → 回读校验」，只增量新增/删除本项目 kw_ 幂等规则，不覆盖、不清空 TgtoDrive 原有关键词；管理员在求片列表删除或拒绝时联动移除本项目规则。</p>
-            <div class="sec-band" style="margin-top:10px"><span class="sec-key">d</span><div><h3>投稿分发通道（v0.9.18）</h3><p>审核通过只改审核态；分发独立执行、失败不回退审核、可手动重试</p></div><span class="sec-line"></span></div>
-            <div class="form-grid">
-              <div class="field"><label>分发方式</label><el-select v-model="interactionCfg.contribution_dispatch_mode" style="width:100%">
-                <el-option label="中转群（推荐）" value="relay"/><el-option label="OpenAPI（需真机验证 transfer 接口）" value="openapi"/><el-option label="关闭分发（仅审核）" value="off"/>
-              </el-select></div>
-              <div class="field"><label>中转群 Chat ID</label><el-input v-model="interactionCfg.contribution_relay_chat_id" placeholder="如 -1001234567890；群内需有 TGtoDrive 个人账号并开启万能转发"/></div>
-              <div class="field" style="grid-column:1/-1"><label>中转消息模板（留空用默认；占位符 {ref} {title} {share_url} {code}）</label><el-input v-model="interactionCfg.contribution_relay_template" type="textarea" :rows="5" placeholder="【Ya-TG 审核通过】&#10;投稿编号：{ref}&#10;资源名称：{title}&#10;光鸭分享链接：{share_url}&#10;提取码：{code}&#10;来源：用户投稿&#10;审核状态：已通过"/></div>
-            </div>
-            <p class="hint">中转群方案：交互 Bot 发消息到群（不 Bot→Bot 私聊，规避 USER_BOT_TO_BOT_DISABLED），由群内 TGtoDrive 个人账号的万能转发把链接交给其 Bot 处理。消息只含投稿编号/资源名/链接/提取码，不含投稿人隐私。OpenAPI 通道调用 /api/media/resources/transfer，字段以实际接口为准；该接口在导出的规范中为 inferred（未真机验证），请先手工验证后再启用。两项均「保存 TgtoDrive 配置」即可生效。</p>
           </div>
 
-          <p class="hint" style="text-align:right;margin:0">a/b/c 与 chat_id 也可随页面顶部「保存分发与互动配置」一起保存。</p>
+          <!-- ===== d 板块：投稿转存（v0.9.19，光鸭原生 API，不经 TgtoDrive） ===== -->
+          <div class="sec-band" style="margin-top:14px"><span class="sec-key">d</span><div><h3>投稿转存</h3><p>审核通过后直接调用光鸭转存 API，把用户投稿保存到下方目录 ID；不经 TgtoDrive，不依赖 Bot 转发</p></div><span class="sec-line"></span></div>
+          <div class="panel narrow">
+            <div class="panel-head"><h3>投稿转存配置</h3>
+              <div class="head-tools"><el-button type="primary" :loading="interactionSaving" size="small" @click="saveContributionRestore">保存投稿转存配置</el-button></div>
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>启用投稿转存</label><el-switch v-model="interactionCfg.contribution_restore_enabled"/></div>
+              <div class="field"><label>目标目录 ID（光鸭 fileId）</label><el-input v-model="interactionCfg.contribution_restore_target_dir_id" placeholder="填目标目录 fileId，如 1943905243358466080"/></div>
+            </div>
+            <p class="hint">关闭开关时审核通过只改审核状态、不转存。转存链路：解析光鸭分享链接 → 取 accessToken → 列分享根文件 → restore_share 到目标目录 → 列目标目录按「文件名+大小」核对，接口提交成功但核对不到不会标记完成。若分享由当前光鸭账号自己创建（SHARE_SELF_RESTORE），光鸭会拒绝自转存，需用户换账号分享。</p>
+          </div>
+
+          <p class="hint" style="text-align:right;margin:0">a/b/c 与投稿转存配置也可随页面顶部「保存分发与互动配置」一起保存。</p>
 
         </section>
 

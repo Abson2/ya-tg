@@ -139,6 +139,11 @@ class GuangYaWebFiles:
     CREATE_DIR_PATH = "/userres/v1/file/create_dir"
     RENAME_PATH = "/userres/v1/file/rename"
     DELETE_FILE_PATH = "/userres/v1/file/delete_file"
+    # v0.9.19：投稿转存（光鸭网页端真实接口，契约取自光鸭技能 api-client.mjs /
+    # protocol.mjs 与 docs/光鸭接口取证.md，均非猜测）。普通短信登录凭证即可调用。
+    SHARE_TOKEN_PATH = "/userres/v1/get_share_access_token"
+    SHARE_PAGE_FILES_PATH = "/userres/v1/get_share_page_files_list"
+    RESTORE_SHARE_PATH = "/userres/v1/restore_share"
 
     def __init__(self, db: Session):
         from .models import AuthToken
@@ -255,10 +260,13 @@ class GuangYaWebFiles:
             break
         raise WebFileError(last_error)
 
-    async def _post_web(self, path: str, body: dict) -> dict:
+    async def _post_web(self, path: str, body: dict, *,
+                        allow_codes: tuple = (), return_envelope: bool = False) -> dict:
         """网页端写接口统一 POST，返回 data 段；沿用 list_files 的鉴权与重试约定。
 
         v0.9.15 #267：header 每请求重建，117 强制刷新凭证重试一次（仅一次，避免循环）。
+        v0.9.19：allow_codes 允许特定业务码（如转存 204 自转存拒绝）据此判定，不误当
+        网络失败；return_envelope=True 返回整个响应体（含 code/msg/data）供调用方分辨业务码。
         """
         last_error = ""
         refreshed = False
@@ -268,8 +276,9 @@ class GuangYaWebFiles:
                 r = await client.post(f"{self.base}{path}", json=body, headers=headers)
             data = self._json(r)
             code = data.get("code")
-            if r.status_code == 200 and (code == 0 or data.get("msg") == "success"):
-                return data.get("data") or {}
+            if r.status_code == 200 and (code == 0 or data.get("msg") == "success"
+                                          or code in allow_codes):
+                return data if return_envelope else (data.get("data") or {})
             msg = str(data.get("msg") or data.get("message") or r.text[:200])
             last_error = f"网页端 {path} 失败 code={code} msg={msg}"
             if code == 117 and not refreshed:
@@ -364,6 +373,113 @@ class GuangYaWebFiles:
         return {"status": data.get("status"),
                 "detail": data.get("detail") or {},
                 "raw": data}
+
+    # ---------------- v0.9.19：用户投稿 → 光鸭原生转存到指定目录 ----------------
+    async def share_access_token(self, share_id: str, code: str = "") -> str:
+        """POST /userres/v1/get_share_access_token {shareId,code} → data.accessToken。
+
+        业务码（光鸭技能 sharePost 契约，非猜测）：
+          200/201/202 = 分享失效；203/209 = 提取码错误；其余非 0 = 失败。
+        访问 token 只对本次转存有效，绝不写库/入日志。
+        """
+        sid = str(share_id or "").strip()
+        if not sid:
+            raise WebFileError("分享链接解析失败，缺少 shareId")
+        body = {"shareId": sid}
+        if code:
+            body["code"] = str(code)
+        resp = await self._post_web(
+            self.SHARE_TOKEN_PATH, body,
+            allow_codes=(200, 201, 202, 203, 209), return_envelope=True)
+        biz = int(resp.get("code") or 0)
+        if biz in (200, 201, 202):
+            raise WebFileError(f"分享已失效（code={biz}）：{resp.get('msg') or ''}", biz)
+        if biz in (203, 209):
+            raise WebFileError(f"提取码错误（code={biz}）：{resp.get('msg') or ''}", biz)
+        token = str((resp.get("data") or {}).get("accessToken") or "")
+        if not token:
+            raise WebFileError("get_share_access_token 未返回 accessToken，无法转存")
+        return token
+
+    async def share_root_files(self, access_token: str, max_items: int = 100) -> list[dict]:
+        """POST /userres/v1/get_share_page_files_list 列分享根目录文件。
+
+        游标契约（光鸭技能 shareRootIds）：首次 cursor=0，翻页用响应 data.cursor，
+        data.hasMore=false 结束；根目录超过 max_items 直接拒绝（与技能上限一致，
+        避免一次性转存整棵大树）。返回 [{file_id,name,size,is_dir}]。
+        """
+        token = str(access_token or "").strip()
+        if not token:
+            raise WebFileError("缺少分享 accessToken")
+        out: list[dict] = []
+        seen: set = set()
+        cursor = 0
+        while len(out) < max_items:
+            if cursor in seen:
+                raise WebFileError("分享文件分页游标未推进，停止以避免死循环")
+            seen.add(cursor)
+            data = await self._post_web(self.SHARE_PAGE_FILES_PATH, {
+                "accessToken": token, "cursor": cursor,
+                "pageSize": 100, "orderBy": 0, "sortType": 0})
+            for it in (data.get("list") or []):
+                out.append({
+                    "file_id": str(it.get("fileId") or ""),
+                    "name": str(it.get("fileName") or ""),
+                    "size": int(it.get("fileSize") or 0),
+                    "is_dir": it.get("isDir") in (True, 1, "1"),
+                })
+            if len(out) > max_items:
+                raise WebFileError(f"分享根目录超过 {max_items} 项，请在分享端整理后再转存")
+            if not data.get("hasMore"):
+                break
+            nxt = data.get("cursor")
+            if nxt in (None, "", cursor):
+                break
+            cursor = nxt
+        if not out:
+            raise WebFileError("分享当前没有可见文件（可能尚未完成分享审核），请稍后重试")
+        return out
+
+    async def restore_share_to_dir(self, share_url: str, target_dir_id: str,
+                                   code: str = "") -> dict:
+        """用户投稿的光鸭分享 → 转存到指定目录（审核通过后调用）。
+
+        真实链路（docs/光鸭接口取证.md + 光鸭技能源码，非猜测）：
+          1) parse_share_reference(share_url) → shareId / code（?code=）
+          2) get_share_access_token {shareId,code} → accessToken
+          3) get_share_page_files_list {accessToken,cursor,...} → 根目录 fileIds
+          4) restore_share {accessToken,fileIds,parentId,shareCode}
+        业务码 204 = SHARE_SELF_RESTORE（当前账号自建分享不可自转存，retryable=false）。
+        返回 shared_files 供上层「列目标目录按名称+大小核对」，绝不只凭提交成功标记完成。
+        """
+        from .contribution_links import parse_share_reference
+
+        share_id, qcode = parse_share_reference(share_url)
+        eff_code = str(code or "").strip() or qcode
+        target = str(target_dir_id or "").strip()
+        if not share_id:
+            raise WebFileError("投稿链接不是可解析的光鸭 /s/ 分享链接")
+        if not target:
+            raise WebFileError("未配置投稿转存目标目录 ID")
+
+        token = await self.share_access_token(share_id, eff_code)
+        files = await self.share_root_files(token)
+        file_ids = [f["file_id"] for f in files if f["file_id"]]
+        if not file_ids:
+            raise WebFileError("分享根目录文件缺少 fileId，无法提交转存")
+        resp = await self._post_web(self.RESTORE_SHARE_PATH, {
+            "accessToken": token, "fileIds": file_ids,
+            "parentId": target, "shareCode": eff_code,
+        }, allow_codes=(204,), return_envelope=True)
+        if int(resp.get("code") or 0) == 204:
+            raise WebFileError(
+                f"SHARE_SELF_RESTORE：该分享由当前账号创建，不能自转存（{resp.get('msg') or ''}）", 204)
+        return {
+            "share_id": share_id,
+            "shared_files": files,
+            "target_dir_id": target,
+            "raw": resp,
+        }
 
     @staticmethod
     def _json(r: httpx.Response) -> dict:

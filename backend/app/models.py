@@ -472,26 +472,24 @@ class UserContribution(Base):
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class ContributionDispatch(Base):
-    """v0.9.18：投稿审核通过后的 TGtoDrive 分发任务（审核态与分发态彻底解耦）。
+class ContributionRestore(Base):
+    """v0.9.19：投稿审核通过后的「光鸭原生转存」任务（审核态与转存态分离）。
 
-    一条投稿 = 至多一条分发任务（contribution_id 唯一），重复点审核通过不会新建。
-    status 独立管理，分发失败绝不回写投稿审核状态：
-      pending / sending / submitted / failed / retry_wait
-    mode: relay（中转群，默认）/ openapi（TGtoDrive OpenAPI）
+    替代 v0.9.18 的 ContributionDispatch（TGtoDrive 中转群 / OpenAPI 分发通道）。
+    一条投稿 = 至多一条转存任务（contribution_id 唯一），重复点审核通过不新建。
+    审核通过只改投稿 status=approved；转存成败只写本表，绝不回退审核态。
+    status: pending / restoring / success / failed / retry_wait
     """
-    __tablename__ = "contribution_dispatches"
+    __tablename__ = "contribution_restores"
     id: Mapped[int] = mapped_column(primary_key=True)
     contribution_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/sending/submitted/failed/retry_wait
-    mode: Mapped[str] = mapped_column(String(16), default="relay")       # relay/openapi
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/restoring/success/failed/retry_wait
     attempts: Mapped[int] = mapped_column(Integer, default=0)           # 累计执行次数
-    # 中转群消息携带的唯一投稿编号（追踪用），OpenAPI 则为返回的任务 id
-    ref: Mapped[str] = mapped_column(String(128), default="")
-    error: Mapped[str] = mapped_column(Text, default="")                # 最近一次失败原因
+    error: Mapped[str] = mapped_column(Text, default="")                # 最近一次失败原因（可读）
     last_response: Mapped[str] = mapped_column(Text, default="")        # 最近一次原始响应（脱敏后截断）
+    verify_note: Mapped[str] = mapped_column(Text, default="")          # 目标目录按「名称+大小」核对结果
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

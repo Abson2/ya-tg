@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import re
 
-# https://www.guangyapan.com/s/<code>（允许 www./m./裸域，允许尾部查询串）
+# https://www.guangyapan.com/s/<shareId>[_后缀]（允许 www./m./裸域，允许尾部查询串）
+# v0.9.19：真实分享链接形如 /s/1970558251383148604_aey8CVbCzY9joZbY，
+# shareId 含下划线后缀；旧正则只认纯字母数字会把真实链接误判为非法。
 _GY_SHARE_RE = re.compile(
-    r"https?://(?:www\.|m\.)?guangyapan\.com/s/[A-Za-z0-9]+(?:/?\?[^\s]*)?",
+    r"https?://(?:www\.|m\.)?guangyapan\.com/s/[A-Za-z0-9_]+(?:/?\?[^\s]*)?",
     re.I,
 )
 _ANY_URL_RE = re.compile(r"https?://[^\s]+", re.I)
@@ -39,5 +41,25 @@ def extract_guangya_share_url(text: str) -> tuple[str, str]:
 
 
 def share_code(url: str) -> str:
-    m = re.search(r"/s/([A-Za-z0-9]+)", str(url or ""), re.I)
-    return m.group(1) if m else ""
+    """提取真实提取码（?code=xxx）。/s/ 后的串是 shareId，不是提取码。"""
+    try:
+        from urllib.parse import parse_qs, urlsplit
+        return (parse_qs(urlsplit(str(url or "").strip()).query).get("code") or [""])[0]
+    except Exception:
+        return ""
+
+
+def parse_share_reference(url: str) -> tuple[str, str]:
+    """把光鸭分享链接解析为 (shareId, code)。
+
+    契约来自光鸭技能 protocol.mjs::parseShareReference：
+      /userres/v1/get_share_access_token 需要 {shareId, code}
+      shareId = URL path 中 /s/ 后的整段（含下划线后缀，如 1970558251383148604_aey8...）
+      code    = ?code= 查询参数（无则留空，公开分享可能不需要提取码）
+    返回 ("", "") 表示不是可解析的光鸭 /s/ 链接。
+    """
+    raw = str(url or "").strip()
+    m = re.search(r"/s/([A-Za-z0-9_]+)", raw, re.I)
+    if not m:
+        return "", ""
+    return m.group(1), share_code(raw)

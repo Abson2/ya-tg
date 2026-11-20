@@ -289,36 +289,28 @@ def test_whitelist_toggle_rejects_when_no_wildcard_and_full(db):
     assert ei.value.status_code == 400 and "上限" in ei.value.detail
 
 
-# ---------------- v0.9.17 投稿转发诊断（不再静默吞） ----------------
-def test_forward_rejects_ok_false_from_telegram(db):
-    """Telegram 返回 ok=false 不误报为已转发，带出 description。"""
-    from app import bot_listener as bl
-    runtime_config.set_many(db, {"tgto_contribute_bot_chat_id": "-100监控群"})
-    async def fake_api(d, t, method, payload):
-        return {"ok": False, "description": "Bad Request: chat not found"}
-    with patch.object(bl, "effective_token", return_value="tok"), \
-         patch.object(bl, "_api", new=fake_api):
-        ok, msg = asyncio.run(bl.forward_contribution_to_tgto(db, "https://s/x", "标题"))
-    assert ok is False and "chat not found" in msg
-
-
-def test_handle_contribution_records_forward_failure(db):
-    """v0.9.18：分发异常也不影响审核通过，原因如实回显（不再写投稿 note）。"""
+# ---------------- v0.9.19 投稿转存失败诊断（不再静默吞） ----------------
+def test_handle_contribution_records_restore_failure(db):
+    """v0.9.19：光鸭转存异常也不影响审核通过，原因如实回显（不写投稿 note）。"""
     from app import main
-    from app import contribution_dispatch as cd_mod
+    from app import contribution_restore as cr_mod
+
+    runtime_config.set_many(db, {"contribution_restore_enabled": "true",
+                                 "contribution_restore_target_dir_id": "1943905243358466080"})
+    db.commit()
     c = UserContribution(tg_user_id="u1", title="剧",
                          share_url="https://www.guangyapan.com/s/x",
                          status="pending", note="")
     db.add(c); db.commit()
     async def boom(*a, **kw):
-        raise RuntimeError("模拟分发异常")
-    with patch.object(cd_mod, "run_dispatch_for_contribution", new=boom), \
+        raise RuntimeError("模拟转存异常")
+    with patch.object(cr_mod, "run_restore_for_contribution", new=boom), \
          patch.object(bot_listener, "notify_user", new=AsyncMock(return_value=False)):
         out = asyncio.run(main.handle_contribution(
             c.id, main.ContributionHandleInput(status="approved", note=""), db))
-    assert out["ok"] is True and out["forwarded"] is False
-    assert "分发执行异常" in out["forward_info"]
-    assert db.get(UserContribution, c.id).status == "approved"  # 分发失败不改审核态
+    assert out["ok"] is True and out["restore_ok"] is False
+    assert "转存执行异常" in out["restore_result"]
+    assert db.get(UserContribution, c.id).status == "approved"  # 转存失败不改审核态
 
 
 # ---------------- v0.9.17 #280 求片审核参数传入 TgtoDrive ----------------

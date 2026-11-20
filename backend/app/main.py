@@ -20,12 +20,12 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import (ai_assist, bot_listener, contribution_dispatch, guangya_auth,
+from . import (ai_assist, bot_listener, contribution_restore, guangya_auth,
                guangya_sms, log_retention, mirror, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
-from .models import (AuditLog, AuthToken, Bot, Channel, ContributionDispatch, DiscoveredChat,
+from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, DiscoveredChat,
                      DistributionEvent, MediaRequest, MessageTemplate, MirrorDir, MirrorFile,
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
                      ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution)
@@ -160,33 +160,33 @@ async def _job_bot_poll():
                 db.rollback()
 
 
-_dispatch_lock = asyncio.Lock()
+_restore_lock = asyncio.Lock()
 
 
-async def _job_contribution_dispatch():
-    """v0.9.18：后台续跑未完成的投稿分发任务（重启后可恢复）。
+async def _job_contribution_restore():
+    """v0.9.19：后台续跑未完成的投稿转存任务（重启后可恢复）。
 
     审核通过时已即时执行一次；本 job 兜底处理 pending / retry_wait（如进程
     重启、当次网络失败留待重试）。带进程内非阻塞锁，不与手动重试抢写。
     """
-    if _dispatch_lock.locked():
+    if _restore_lock.locked():
         return
-    async with _dispatch_lock:
+    async with _restore_lock:
         with SessionLocal() as db:
             try:
-                rows = contribution_dispatch.pick_pending(db, limit=20)
+                if not contribution_restore.enabled(db):
+                    return
+                rows = contribution_restore.pick_pending(db, limit=20)
                 for row in rows:
-                    if contribution_dispatch.dispatch_mode(db) == "off":
-                        break
-                    ok, info = await contribution_dispatch.execute_dispatch(db, row)
-                    add_audit(db, "contribution_dispatch", target_type="contribution",
+                    ok, info = await contribution_restore.execute_restore(db, row)
+                    add_audit(db, "contribution_restore", target_type="contribution",
                               target_id=str(row.contribution_id),
-                              detail=json_dumps({"ok": ok, "mode": row.mode,
-                                                 "attempts": row.attempts, "info": info[:160]}))
+                              detail=json_dumps({"ok": ok, "attempts": row.attempts,
+                                                 "info": info[:160]}))
                     db.commit()
             except Exception:
                 db.rollback()
-                logger.warning("[contribution-dispatch] 后台分发异常", exc_info=True)
+                logger.warning("[contribution-restore] 后台转存异常", exc_info=True)
 
 
 async def _job_log_prune():
@@ -331,8 +331,8 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
                       max_instances=1, coalesce=True)
-    # v0.9.18：投稿分发续跑（重启后恢复 pending / retry_wait 任务）
-    scheduler.add_job(_job_contribution_dispatch, "interval", seconds=30, id="contribution_dispatch",
+    # v0.9.19：投稿转存续跑（重启后恢复 pending / retry_wait 任务）
+    scheduler.add_job(_job_contribution_restore, "interval", seconds=30, id="contribution_restore",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_rename_pending, "interval", seconds=120, id="rename_pending",
                       max_instances=1, coalesce=True)
@@ -3898,15 +3898,13 @@ class InteractionConfigInput(BaseModel):
     tgto_base_url: str | None = None
     tgto_scene: str | None = None
     tgto_api_key: str | None = None
-    # v0.9.13 #254：白名单规则 a/b/c + 投稿转存监控 chat
+    # v0.9.13 #254：TgtoDrive 白名单规则 a/b/c（求片联动，与投稿转存无关）
     tgto_rule_resolution: str | None = None
     tgto_rule_effect: str | None = None
     tgto_rule_required_keyword: str | None = None
-    tgto_contribute_bot_chat_id: str | None = None
-    # v0.9.18：投稿分发（审核态/分发态分离）
-    contribution_dispatch_mode: str | None = None          # relay / openapi / off
-    contribution_relay_chat_id: str | None = None          # 专用中转群 chat_id
-    contribution_relay_template: str | None = None         # 中转消息模板
+    # v0.9.19：投稿转存——直接调光鸭 API 转存到指定目录（不经 TgtoDrive）
+    contribution_restore_enabled: bool | None = None
+    contribution_restore_target_dir_id: str | None = None
     contribution_bot_token: str | None = None
     interaction_bot_id: str | None = None       # v0.9.4：交互 Bot 引用 bots 表 id（token 去重）；"" = 不选用
     interaction_bot_username: str | None = None  # v0.9.15 #276：Bot @用户名（startgroup 链接兜底；getMe 会自动缓存）
@@ -3937,12 +3935,12 @@ def interaction_config_get(db: Session = Depends(get_db)):
              "donation_button_text", "bot_required_channel_link", "bot_required_group_link",
              "tg_channel_link", "tg_group_link", "tg_bot_link",
              "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
-             "tgto_contribute_bot_chat_id", "contribution_dispatch_mode",
-             "contribution_relay_chat_id", "contribution_relay_template"]
+             "contribution_restore_target_dir_id"]
     out = {k: runtime_config.get(db, k) for k in plain}
     out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
     out["donation_enabled"] = (runtime_config.get(db, "donation_enabled") or "").lower() == "true"
+    out["contribution_restore_enabled"] = contribution_restore.enabled(db)
     # v0.9.0：推送白名单 / 使用限制 / 指令清单回显
     out["bot_push_channels"] = bot_listener.push_whitelist(db)[0]
     out["bot_push_groups"] = bot_listener.push_whitelist(db)[1]
@@ -3962,7 +3960,7 @@ def interaction_config_get(db: Session = Depends(get_db)):
                            "token_masked": _mask_stored_token(b.token)}
                           for b in db.scalars(select(Bot).order_by(Bot.id)).all()]
     out["scene_default"] = "ENV_FILTER_GUANGYA"
-    out["unverified_endpoints"] = ["投稿分享转存（光鸭接口，8.6 待验证）"]
+    out["unverified_endpoints"] = ["跨账号他人分享转存成功路径（无可信他人分享样本，未验证）"]
     return out
 
 
@@ -3975,11 +3973,13 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
               "bot_required_channel_link", "bot_required_group_link",
               "tg_channel_link", "tg_group_link", "tg_bot_link",
               "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
-              "tgto_contribute_bot_chat_id", "contribution_dispatch_mode",
-              "contribution_relay_chat_id", "contribution_relay_template"):
+              "contribution_restore_target_dir_id"):
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
+    # v0.9.19：投稿转存开关（bool → runtime_config 字符串）
+    if p.contribution_restore_enabled is not None:
+        values["contribution_restore_enabled"] = "true" if p.contribution_restore_enabled else "false"
     # v0.9.4：交互 Bot 引用（token 去重）。传 "" 表示清空引用、回退 contribution_bot_token。
     if p.interaction_bot_id is not None:
         bid = str(p.interaction_bot_id).strip()
@@ -4018,10 +4018,6 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
             cmds.append({"command": cmd[:64], "description": str(c.get("description") or "")[:200],
                          "reply": str(c.get("reply") or "")[:2000]})
         values["bot_commands_json"] = json_dumps(cmds)
-    # v0.9.18：投稿分发模式白名单校验
-    if "contribution_dispatch_mode" in values and values["contribution_dispatch_mode"]:
-        if values["contribution_dispatch_mode"] not in contribution_dispatch.DISPATCH_MODES:
-            raise HTTPException(400, "contribution_dispatch_mode 仅支持 relay/openapi/off")
     runtime_config.set_many(db, values)
     add_audit(db, "interaction_config_saved", target_type="interaction",
               detail=json_dumps({"keys": sorted(values)}))
@@ -4834,17 +4830,15 @@ def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_
              "last_submitted_at": c.last_submitted_at.isoformat() if getattr(c, "last_submitted_at", None) else None,
              "status": c.status, "note": c.note,
              "created_at": c.created_at, "handled_at": c.handled_at,
-             # v0.9.18：分发态与审核态分离——列表带出分发快照供后台展示
-             "dispatch_status": d.status if d else None,
-             "dispatch_status_label": contribution_dispatch.status_label(d.status) if d else "未分发",
-             "dispatch_mode": d.mode if d else None,
-             "dispatch_mode_label": contribution_dispatch.mode_label(d.mode) if d else None,
-             "dispatch_attempts": int(d.attempts or 0) if d else 0,
-             "dispatch_ref": d.ref if d else "",
-             "dispatch_error": d.error if d else "",
-             "dispatched_at": d.dispatched_at.isoformat() if d and d.dispatched_at else None}
-            for c, d in (
-                (c, contribution_dispatch.dispatch_for(db, c.id))
+             # v0.9.19：转存态与审核态分离——列表带出光鸭转存快照供后台展示
+             "restore_status": r.status if r else None,
+             "restore_status_label": contribution_restore.status_label(r.status) if r else "未转存",
+             "restore_attempts": int(r.attempts or 0) if r else 0,
+             "restore_error": r.error if r else "",
+             "restore_verify_note": r.verify_note if r else "",
+             "restored_at": r.restored_at.isoformat() if r and r.restored_at else None}
+            for c, r in (
+                (c, contribution_restore.restore_for(db, c.id))
                 for c in db.scalars(stmt).all()
             )]
 
@@ -4856,11 +4850,11 @@ class ContributionHandleInput(BaseModel):
 
 @app.post("/api/contributions/{cid}/handle", dependencies=ADMIN)
 async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session = Depends(get_db)):
-    """v0.9.18：审核态与分发态分离。
+    """v0.9.19：审核态与转存态分离（光鸭原生 API，不经 TgtoDrive）。
 
-    审核通过：先落审核状态并 commit（分发失败绝不回退审核态），再幂等建一条
-    分发任务并即时执行一次；分发结果只更新分发任务，不改投稿 status。
-    重复点「通过」不会新建任务、已提交不自动重跑；失败可手动重试。
+    审核通过：先落审核状态并 commit（转存失败绝不回退审核态），再幂等建一条
+    转存任务并即时执行一次；转存结果只更新转存任务，不改投稿 status。
+    重复点「通过」不会新建任务、已成功不自动重跑；失败可手动重试。
     """
     if p.status not in ("approved", "rejected", "transferred", "pending"):
         raise HTTPException(400, "status 仅支持 approved/rejected/transferred/pending")
@@ -4870,32 +4864,29 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     c.status, c.note, c.handled_at = p.status, p.note[:1000], utcnow()
     add_audit(db, "contribution_handled", target_type="contribution", target_id=str(cid),
               detail=json_dumps({"status": p.status, "note": p.note[:200]}))
-    db.commit()  # 审核结论先独立落盘，后续分发成败与此无关
+    db.commit()  # 审核结论先独立落盘，后续转存成败与此无关
     notice = ""
-    dispatch_result = ""        # 分发结果只回显给管理员，不写审核备注、不发给投稿用户
-    dispatch_ok = False
-    dispatch_status = None
+    restore_result = ""         # 转存结果只回显给管理员，不写审核备注、不发给投稿用户
+    restore_ok = False
+    restore_status = None
     if p.status == "approved":
         notice = f"你的投稿「{c.title}」已通过审核，感谢支持！"
-        # 幂等建任务 + 即时执行一次；网络失败留 failed/retry_wait 供后台或手动重试
+        # 幂等建任务 + 即时执行一次；失败留任务供后台或手动重试
         try:
-            if contribution_dispatch.dispatch_mode(db) == "off":
-                dispatch_result = "分发通道未启用（off），任务未创建；请在配置里选 relay / openapi"
-                dispatch_ok, dispatch_status = False, "off"
+            cfg_err = contribution_restore.config_error(db)
+            if cfg_err:
+                restore_result = cfg_err
+                restore_ok, restore_status = False, "unconfigured"
             else:
-                if not contribution_dispatch.is_guangya_share_url(c.share_url or ""):
-                    dispatch_result = "投稿链接非光鸭分享链接，跳过分发"
-                    dispatch_ok, dispatch_status = False, "skipped"
-                else:
-                    dispatch_ok, dispatch_result, drow = await contribution_dispatch.run_dispatch_for_contribution(db, cid)
-                    dispatch_status = drow.status if drow else None
-                    db.commit()
+                restore_ok, restore_result, rrow = await contribution_restore.run_restore_for_contribution(db, cid)
+                restore_status = rrow.status if rrow else None
+                db.commit()
         except Exception as exc:
             db.rollback()
-            dispatch_result = f"分发执行异常：{type(exc).__name__}: {str(exc)[:160]}"
-            dispatch_ok, dispatch_status = False, "failed"
-        add_audit(db, "contribution_dispatch_approved", target_type="contribution",
-                  target_id=str(cid), detail=json_dumps({"ok": dispatch_ok, "info": dispatch_result[:200]}))
+            restore_result = f"转存执行异常：{type(exc).__name__}: {str(exc)[:160]}"
+            restore_ok, restore_status = False, "failed"
+        add_audit(db, "contribution_restore_approved", target_type="contribution",
+                  target_id=str(cid), detail=json_dumps({"ok": restore_ok, "info": restore_result[:200]}))
         db.commit()
     elif p.status == "rejected":
         notice = f"你的投稿「{c.title}」未通过审核。" + (f"原因：{p.note}" if p.note else "")
@@ -4904,57 +4895,57 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     notified = False
     if notice and c.tg_user_id:
         notified = await bot_listener.notify_user(db, c.tg_user_id, notice)
-    # 兼容旧字段 forwarded/forward_info（前端历史文案），语义改为「分发」
+    # 兼容旧字段 forwarded/forward_info，语义改为「光鸭转存」
     return {"ok": True, "notified": notified,
-            "forwarded": dispatch_ok, "forward_info": dispatch_result,
-            "dispatch_ok": dispatch_ok, "dispatch_result": dispatch_result,
-            "dispatch_status": dispatch_status}
+            "forwarded": restore_ok, "forward_info": restore_result,
+            "restore_ok": restore_ok, "restore_result": restore_result,
+            "restore_status": restore_status}
 
 
-@app.get("/api/contributions/{cid}/dispatch", dependencies=ADMIN)
-def contribution_dispatch_detail(cid: int, db: Session = Depends(get_db)):
-    """查看某投稿的分发任务与历史记录（当前一条任务 + 审计留痕）。"""
+@app.get("/api/contributions/{cid}/restore", dependencies=ADMIN)
+def contribution_restore_detail(cid: int, db: Session = Depends(get_db)):
+    """查看某投稿的光鸭转存任务与历史记录（当前一条任务 + 审计留痕）。"""
     if not db.get(UserContribution, cid):
         raise HTTPException(404, "投稿不存在")
-    row = contribution_dispatch.dispatch_for(db, cid)
+    row = contribution_restore.restore_for(db, cid)
     if not row:
         return {"exists": False}
     history = db.scalars(select(AuditLog).where(
         AuditLog.target_type == "contribution", AuditLog.target_id == str(cid),
-        AuditLog.action.like("contribution_dispatch%")).order_by(AuditLog.id.desc()).limit(50)).all()
+        AuditLog.action.like("contribution_restore%")).order_by(AuditLog.id.desc()).limit(50)).all()
     return {"exists": True,
-            "status": row.status, "status_label": contribution_dispatch.status_label(row.status),
-            "mode": row.mode, "mode_label": contribution_dispatch.mode_label(row.mode),
-            "attempts": int(row.attempts or 0), "ref": row.ref, "error": row.error,
-            "last_response": row.last_response,
-            "created_at": row.created_at, "dispatched_at": row.dispatched_at,
+            "status": row.status, "status_label": contribution_restore.status_label(row.status),
+            "attempts": int(row.attempts or 0), "error": row.error,
+            "verify_note": row.verify_note, "last_response": row.last_response,
+            "created_at": row.created_at, "restored_at": row.restored_at,
             "updated_at": row.updated_at,
             "history": [{"action": a.action, "detail": a.detail,
                          "ts": a.ts.isoformat() if getattr(a, "ts", None) else None} for a in history]}
 
 
-@app.post("/api/contributions/{cid}/dispatch/retry", dependencies=ADMIN)
-async def contribution_dispatch_retry(cid: int, db: Session = Depends(get_db)):
-    """管理员手动重试失败的分发任务；已提交的不自动重复执行。"""
+@app.post("/api/contributions/{cid}/restore/retry", dependencies=ADMIN)
+async def contribution_restore_retry(cid: int, db: Session = Depends(get_db)):
+    """管理员手动重试失败的转存任务；已成功的不自动重复转存。"""
     c = db.get(UserContribution, cid)
     if not c:
         raise HTTPException(404, "投稿不存在")
-    if contribution_dispatch.dispatch_mode(db) == "off":
-        raise HTTPException(400, "分发通道未启用（off），请先在配置里选 relay / openapi")
-    if not contribution_dispatch.is_guangya_share_url(c.share_url or ""):
-        raise HTTPException(400, "投稿链接非光鸭分享链接，无法重试分发")
+    cfg_err = contribution_restore.config_error(db)
+    if cfg_err:
+        raise HTTPException(400, cfg_err)
+    if not contribution_restore.is_guangya_share_url(c.share_url or ""):
+        raise HTTPException(400, "投稿链接非光鸭分享链接，无法重试转存")
     try:
-        ok, info, row = await contribution_dispatch.retry_dispatch(db, cid)
+        ok, info, row = await contribution_restore.retry_restore(db, cid)
         db.commit()
     except Exception as exc:
         db.rollback()
-        raise HTTPException(502, f"重试分发异常：{type(exc).__name__}: {str(exc)[:160]}")
-    add_audit(db, "contribution_dispatch_retry", target_type="contribution",
+        raise HTTPException(502, f"重试转存异常：{type(exc).__name__}: {str(exc)[:160]}")
+    add_audit(db, "contribution_restore_retry", target_type="contribution",
               target_id=str(cid), detail=json_dumps({"ok": ok, "info": info[:200]}))
     db.commit()
     return {"ok": ok, "info": info,
-            "dispatch_status": row.status if row else None,
-            "dispatch_status_label": contribution_dispatch.status_label(row.status) if row else None}
+            "restore_status": row.status if row else None,
+            "restore_status_label": contribution_restore.status_label(row.status) if row else None}
 
 
 @app.delete("/api/contributions/{cid}", dependencies=ADMIN)
@@ -4963,10 +4954,10 @@ def delete_contribution(cid: int, db: Session = Depends(get_db)):
     c = db.get(UserContribution, cid)
     if not c:
         raise HTTPException(404, "投稿不存在")
-    # v0.9.18：连带清理分发任务（审核/分发都属这条投稿）
-    drow = contribution_dispatch.dispatch_for(db, cid)
-    if drow:
-        db.delete(drow)
+    # v0.9.19：连带清理转存任务（审核/转存都属这条投稿）
+    rrow = contribution_restore.restore_for(db, cid)
+    if rrow:
+        db.delete(rrow)
     db.delete(c)
     add_audit(db, "contribution_deleted", target_type="contribution", target_id=str(cid))
     db.commit()

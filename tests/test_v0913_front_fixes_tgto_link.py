@@ -28,7 +28,8 @@ INDEX_HTML = ROOT / "frontend" / "index.html"
 
 CFG_KEYS = (
     "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
-    "tgto_contribute_bot_chat_id", "tgto_base_url", "tgto_api_key", "tgto_scene",
+    "contribution_restore_enabled", "contribution_restore_target_dir_id",
+    "tgto_base_url", "tgto_api_key", "tgto_scene",
 )
 
 
@@ -243,8 +244,11 @@ def test_delete_media_request_removes_whitelist(db):
     assert db.get(MediaRequest, req.id) is None
 
 
-def test_contribution_approve_forwards_share_url(db):
-    """v0.9.18：审核通过触发分发（分发逻辑已迁到 contribution_dispatch）。"""
+def test_contribution_approve_triggers_guangya_restore(db):
+    """v0.9.19：审核通过触发光鸭转存（逻辑在 contribution_restore）。"""
+    runtime_config.set_many(db, {"contribution_restore_enabled": "true",
+                                 "contribution_restore_target_dir_id": "1943905243358466080"})
+    db.commit()
     c = UserContribution(title="投稿剧", share_url="https://www.guangyapan.com/s/x",
                          status="pending", tg_user_id="42")
     db.add(c)
@@ -253,16 +257,12 @@ def test_contribution_approve_forwards_share_url(db):
 
     async def fake_run(db_, cid, **kw):
         calls.append(cid)
-        return True, "已提交", None
+        return True, "已转存", None
 
     body = main_mod.ContributionHandleInput(status="approved", note="")
-    with patch.object(main_mod.contribution_dispatch, "run_dispatch_for_contribution", new=fake_run), \
+    with patch.object(main_mod.contribution_restore, "run_restore_for_contribution", new=fake_run), \
          patch.object(bl, "notify_user", AsyncMock(return_value=False)):
         out = asyncio.run(main_mod.handle_contribution(c.id, body, db))
     assert out["ok"] and calls and calls[0] == c.id
+    assert out["restore_ok"] is True
     assert db.get(UserContribution, c.id).status == "approved"
-
-
-def test_forward_contribution_requires_chat_id(db):
-    ok, msg = asyncio.run(bl.forward_contribution_to_tgto(db, "https://s/x", "标题"))
-    assert ok is False and "chat_id" in msg
