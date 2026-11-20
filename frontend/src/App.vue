@@ -2449,8 +2449,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </div>
           </div>
 
-          <!-- ===== c 板块：TgtoDrive 项目联动调用配置（仅求片白名单联动） ===== -->
-          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片审核通过后写入频道监控白名单、删单联动移除；投稿转存已改走下方「投稿转存」模块的光鸭原生 API，不再依赖 TgtoDrive</p></div><span class="sec-line"></span></div>
+          <!-- ===== c / d 板块并排：TgtoDrive 联动 + 投稿转存（窄屏自动堆叠） ===== -->
+          <div class="link-modules">
+          <div class="link-module">
+          <!-- c 板块：TgtoDrive 项目联动调用配置（仅求片白名单联动） -->
+          <div class="sec-band"><span class="sec-key">c</span><div><h3>TgtoDrive 项目联动</h3><p>求片审核通过后写入频道监控白名单、删单联动移除；投稿转存已改走右侧「投稿转存」模块的光鸭原生 API，不再依赖 TgtoDrive</p></div><span class="sec-line"></span></div>
           <div class="panel narrow">
             <div class="panel-head"><h3>TgtoDrive 联动配置</h3>
               <div class="head-tools">
@@ -2469,8 +2472,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">白名单采用「读取全量 → 合并 → 回写 → 回读校验」，只增量新增/删除本项目 kw_ 幂等规则，不覆盖、不清空 TgtoDrive 原有关键词；管理员在求片列表删除或拒绝时联动移除本项目规则。</p>
           </div>
 
-          <!-- ===== d 板块：投稿转存（v0.9.19，光鸭原生 API，不经 TgtoDrive） ===== -->
-          <div class="sec-band" style="margin-top:14px"><span class="sec-key">d</span><div><h3>投稿转存</h3><p>审核通过后直接调用光鸭转存 API，把用户投稿保存到下方目录 ID；不经 TgtoDrive，不依赖 Bot 转发</p></div><span class="sec-line"></span></div>
+          </div><!-- /link-module c -->
+          <div class="link-module">
+          <!-- d 板块：投稿转存（光鸭原生 API，不经 TgtoDrive） -->
+          <div class="sec-band" style="margin-top:0"><span class="sec-key">d</span><div><h3>投稿转存</h3><p>审核通过后直接调用光鸭转存 API，把用户投稿保存到下方目录 ID；不经 TgtoDrive，不依赖 Bot 转发</p></div><span class="sec-line"></span></div>
           <div class="panel narrow">
             <div class="panel-head"><h3>投稿转存配置</h3>
               <div class="head-tools"><el-button type="primary" :loading="interactionSaving" size="small" @click="saveContributionRestore">保存投稿转存配置</el-button></div>
@@ -2481,6 +2486,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </div>
             <p class="hint">关闭开关时审核通过只改审核状态、不转存。转存链路：解析光鸭分享链接 → 取 accessToken → 列分享根文件 → restore_share 到目标目录 → 列目标目录按「文件名+大小」核对，接口提交成功但核对不到不会标记完成。若分享由当前光鸭账号自己创建（SHARE_SELF_RESTORE），光鸭会拒绝自转存，需用户换账号分享。</p>
           </div>
+          </div><!-- /link-module d -->
+          </div><!-- /link-modules -->
 
           <p class="hint" style="text-align:right;margin:0">a/b/c 与投稿转存配置也可随页面顶部「保存分发与互动配置」一起保存。</p>
 
@@ -2944,7 +2951,9 @@ button{font-family:inherit}
 .stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
 .panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}
-.panel.narrow{max-width:780px}.mirror-two-col{margin-bottom:18px}.mirror-col{max-width:none;min-width:0}.mirror-col .form-grid{grid-template-columns:1fr}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
+.panel.narrow{max-width:780px}.mirror-two-col{margin-bottom:18px}.mirror-col{max-width:none;min-width:0}.mirror-col .form-grid{grid-template-columns:1fr}
+/* c/d 联动模块并排：每列内部表单单列、panel 不限宽；窄屏(<1100px)自动堆叠 */
+.link-modules{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-top:22px}.link-module{min-width:0;display:flex;flex-direction:column}.link-module .sec-band{margin-top:0}.link-module .panel{max-width:none;flex:1}.link-module .form-grid{grid-template-columns:1fr;gap:14px}.link-module .panel-head{flex-wrap:wrap}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
 .link-btn{border:0;background:transparent;color:var(--yg-primary);cursor:pointer;font-size:12px}
 .check-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--yg-line)}.check-row:last-child{border:0}
 .check-dot{width:24px;height:24px;border-radius:8px;display:grid;place-items:center}.check-dot.ok{background:#e5f8f5;color:#19b3a6}.check-dot.no{background:#fff3e2;color:#e29328}.check-dot .ico{width:14px;height:14px}
@@ -3133,7 +3142,7 @@ button{font-family:inherit}
 .preset-btn.on{background:var(--yg-primary);border-color:var(--yg-primary);color:#fff;font-weight:600}
 .inline-label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:400}
 .inline-form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}.stats-cards,.pipeline-flow{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}.stats-cards,.pipeline-flow{grid-template-columns:repeat(3,1fr)}.link-modules{grid-template-columns:1fr;gap:0}.link-module .sec-band:not(:first-child){margin-top:22px}}
 
 /* ============ v0.6.5 手机 / 触屏适配 ============ */
 /* ≤900px：侧栏从左侧竖排改为顶部横向导航，主区占满宽度 */
