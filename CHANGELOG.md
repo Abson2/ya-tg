@@ -19,7 +19,7 @@
 - **Telegram 客观边界**：官方无「列出 Bot 已加入全部群」接口，只能从更新里的新消息发现；自动发现需 Bot 已入群 + 群内有新消息，开了隐私模式需设 Bot 为管理员或 @Bot 发言。管理页已明确提示。
 
 ### 二、Bot 发送权限检查（#256）
-- `check_chat_permission()` 用 `getChatMember(chat_id, Bot 自身 ID)` 判定：Bot ID 从 token 冒号前解析，异常时回退 `getMe`。频道需 creator/administrator 且 `can_post_messages`；群按 creator/admin 默认可发、member/restricted 看 `can_send_messages`，left/kicked 判为不在群。结果带缓存回写 `discovered_chats`。
+- `check_chat_permission()` 用 `getChatMember(chat_id, Bot 自身 ID)` 判定：Bot ID 从 token 冒号前解析，异常时回退 `getMe`。频道需 creator/administrator 且 `can_post_messages`；群的 creator 必可发、administrator/member 缺省可发（Telegram `ChatMemberMember` 不带 `can_send_messages` 字段，不能因缺字段误判为无权限）、restricted 才严格看 `can_send_messages`，left/kicked 判为不在群。结果带缓存回写 `discovered_chats`。
 - 检查失败一律返回 unknown/no_permission，不误判为有权限；「检查权限」按钮单独触发，`/api/discover/chats/{id}/permission`。
 
 ### 三、统一推送目标管理（#258）
