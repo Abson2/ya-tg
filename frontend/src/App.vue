@@ -697,45 +697,59 @@ async function api(path, opt = {}, timeoutMs = 0) {
   } finally { if (timer) clearTimeout(timer) }
 }
 async function load() {
-  overview.value = await api('/overview')
-  task.value = await api('/scan-task')
-  resources.value = await api('/resources')
-  try { seriesGroups.value = await api('/library/series') } catch (e) { seriesGroups.value = [] }
-  reviews.value = await api('/review')
-  queue.value = await api('/queue')
-  templates.value = await api('/templates')
-  try { tplPresets.value = await api('/templates/presets') } catch (e) { tplPresets.value = [] }
-  audit.value = await api('/audit')
-  try { diagnostics.value = await api('/diagnostics') } catch (e) { diagnostics.value = { blockers: [] } }
-  try { await loadTgExtra() } catch (e) {}
-  try { const t = await api('/telegram/config'); telegramBase.value = t.base_url || t.default || '' } catch (e) {}
-  try { queueSchedule.value = await api('/queue/schedule') } catch (e) {}
+  // 阶段三 D-07：无依赖的纯 GET 并行拉取（Promise.allSettled，单个失败不影响其它）。
+  // 赋值语义与降级口径与改造前逐条 await 完全一致；内部有依赖的 load* 函数保持原顺序。
+  const keys = ['overview', 'scan-task', 'resources', 'library/series', 'review', 'queue',
+    'templates', 'templates/presets', 'audit', 'diagnostics', 'telegram/config',
+    'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
+    'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
+    'contributions?limit=50', 'media-requests?limit=50', 'logs/overview']
+  const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
+  const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
+  overview.value = v(0) || overview.value
+  task.value = v(1) || task.value
+  resources.value = v(2) || resources.value
+  seriesGroups.value = v(3) || []
+  reviews.value = v(4) || reviews.value
+  queue.value = v(5) || queue.value
+  templates.value = v(6) || templates.value
+  tplPresets.value = v(7) || []
+  audit.value = v(8) || audit.value
+  diagnostics.value = v(9) || { blockers: [] }
+  const tg = v(10); if (tg) telegramBase.value = tg.base_url || tg.default || ''
+  queueSchedule.value = v(11) || queueSchedule.value
+  mirrorCfg.value = v(12) || mirrorCfg.value
+  mirrorStatus.value = v(13) || mirrorStatus.value
+  scanBatches.value = v(14) || []
+  interactionCfg.value = v(15) || interactionCfg.value
   // v0.8.0：每个新模块独立加载，任一接口异常不影响主界面（沿用既有约定）
   try { scanInterval.value = task.value.interval_minutes || 0; scanCustom.value = !task.value.interval_minutes } catch (e) {}
-  try { mirrorCfg.value = await api('/mirror/config') } catch (e) {}
-  try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
-  try { scanBatches.value = await api('/scan/batches?limit=5') } catch (e) {}
-  try { interactionCfg.value = await api('/interaction/config') } catch (e) {}
-  // v0.9.16 #278：初次加载即同步 Bot 下拉来源（bot_options 来自配置接口），
-  // 不再需要先手动填「Bot 用户名」才能出现下拉选项。
+  // v0.9.16 #278：初次加载即同步 Bot 下拉来源（bot_options 来自配置接口）
   syncDiscBots()
-  try {
-    const pr = await api('/push/routes')
+  const pr = v(16)
+  if (pr) {
     pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
     pushRoutes.value = (pr.routes && pr.routes.length)
       ? pr.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '',
         targets: (r.targets || []).map(t => ({ kind: t.kind || 'channel', chat_id: t.chat_id || '', name: t.name || '' })),
         note: r.note || '' }))
       : [{ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' }]
-  } catch (e) {}
+  }
   // v0.9.14 #258：自动发现群组 / 统一推送目标
-  try { const dc = await api('/discover/chats'); discoverChats.value = dc.chats || [] } catch (e) {}
-  try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
-  try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
-  try { mediaRequests.value = await api('/media-requests?limit=50') } catch (e) {}
+  const dc = v(17); if (dc) discoverChats.value = dc.chats || []
+  interactionStatus.value = v(18) || interactionStatus.value
+  contributions.value = v(19) || []
+  mediaRequests.value = v(20) || []
+  const lg = v(21)
+  if (lg) {
+    logCfg.value = lg.config || logCfg.value
+    logStats.value = lg.tables || []
+    logOverview.value = { total_rows: lg.total_rows || 0, total_pruneable: lg.total_pruneable || 0,
+      container_log: lg.container_log || '' }
+  }
+  // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
+  try { await loadTgExtra() } catch (e) {}
   try { await loadPushStats() } catch (e) {}
-  // v0.8.3：日志概览独立加载，任一接口异常不影响主界面
-  try { await loadLogs() } catch (e) {}
   await loadAuth()
   await loadTmdb()
   await loadAi()

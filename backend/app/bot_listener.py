@@ -154,6 +154,21 @@ def upsert_media_request(db: Session, *, tg_user_id: str, tg_username: str,
 
 # 使用限制检查结果缓存：{tg_user_id: (checked_ts, ok, reason)}
 _restrict_cache: dict[str, tuple[float, bool, str]] = {}
+# 阶段三 B-05：限制缓存无上界，公开群累计用户数会线性膨胀。
+_RESTRICT_CACHE_MAX = 10000  # 硬上限，超出时清最旧的过期项
+
+
+def _restrict_gc(ttl: int) -> None:
+    """清理过期缓存项；无过期项但超上限时按写入时间淘汰最旧的一批。"""
+    now = time.time()
+    if ttl > 0:
+        stale = [u for u, v in _restrict_cache.items() if now - float(v[0]) > ttl]
+        for u in stale:
+            _restrict_cache.pop(u, None)
+    if len(_restrict_cache) > _RESTRICT_CACHE_MAX:
+        oldest = sorted(_restrict_cache, key=lambda u: float(_restrict_cache[u][0]))
+        for u in oldest[:len(_restrict_cache) - _RESTRICT_CACHE_MAX]:
+            _restrict_cache.pop(u, None)
 
 
 def _json_list(key: str, db: Session) -> list:
@@ -785,6 +800,7 @@ async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[b
     except ValueError:
         ttl = 120
     now = time.time()
+    _restrict_gc(ttl)  # 阶段三 B-05：按 TTL + 硬上限清理，杜绝公开群 uid 线性膨胀
     cached = _restrict_cache.get(uid)
     if cached and ttl > 0 and now - cached[0] < ttl:
         return cached[1], cached[2]

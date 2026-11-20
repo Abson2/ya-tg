@@ -143,7 +143,22 @@ def get(db: Session, key: str) -> str:
 
 
 def get_many(db: Session, keys: list[str]) -> dict[str, str]:
-    return {k: get(db, k) for k in keys}
+    """阶段三 D-03：一次批量取所有 key，{} 来源优先级与 get() 完全一致。"""
+    if not keys:
+        return {}
+    rows = {r.key: r for r in db.scalars(
+        select(AppConfig).where(AppConfig.key.in_(list(set(keys))))).all()}
+    out: dict[str, str] = {}
+    for k in keys:
+        row = rows.get(k)
+        value = ""
+        if row and row.value_enc:
+            try:
+                value = decrypt_secret(row.value_enc) or ""
+            except Exception:
+                value = ""
+        out[k] = value if value else _env_value(k)
+    return out
 
 
 def set_many(db: Session, values: dict[str, str]) -> None:
@@ -166,11 +181,20 @@ def set_many(db: Session, values: dict[str, str]) -> None:
 
 
 def source_map(db: Session) -> dict[str, str]:
-    """每个 key 的来源（db/env/empty），供前端展示，不暴露明文。"""
+    """每个 key 的来源（db/env/empty），供前端展示，不暴露明文。
+
+    阶段三 D-03：批量取 AppConfig，避免逐 key db.get（~80 key → 1 次查询）。
+    """
+    rows = {r.key: r for r in db.scalars(
+        select(AppConfig).where(AppConfig.key.in_(list(DEFAULTS)))).all()}
     result = {}
     for key in DEFAULTS:
-        row = db.get(AppConfig, key)
-        if row and row.value_enc and decrypt_secret(row.value_enc):
+        row = rows.get(key)
+        try:
+            from_db = bool(row and row.value_enc and decrypt_secret(row.value_enc))
+        except Exception:
+            from_db = False
+        if from_db:
             result[key] = "db"
         elif _env_value(key):
             result[key] = "env"
