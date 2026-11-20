@@ -187,3 +187,31 @@ for task in sorted(pending_tasks, key=sequence_id):
 - `batch_id` 生成：用 `f"{rule_id}-{utcnowstamp}"` 还是递增整数？倾向前者（可读、无并发冲突）。
 - 执行器与定时 job 的并发互斥：复用 v0.9.21 `_TimedMirrorLock`（已加心跳），严格顺序执行器全程持锁。
 - 受控并发 >1：首版不实现，接口预留参数但强制钳制为 1，避免范围失控。
+
+---
+
+## 7. 实施进度（阶段二路线B，实际结果）
+
+| Commit | 内容 | 测试 | 状态 |
+| --- | --- | --- | --- |
+| `2828d24` | C-01 SPA 路径穿越修复（realpath 归属校验） | 618 passed | ✅ |
+| `30807f7` | C1 迁移骨架（models+db._COLUMNS+旧库兼容） | 621 passed | ✅ |
+| `b41c9aa` | C2 确定性自然排序（natural_key+三处 DFS 注入） | 627 passed | ✅ |
+| `f281e67` | C3 严格顺序执行核心（序列落库+远端核验+控制边界） | 637 passed | ✅ |
+| `915b600` | C4 批次控制 API + 前端开关/按钮 | 642 passed + build ok | ✅ |
+| （本批） | C5 定时续跑 job + 隔离性能基线 | 待全量回归 | 进行中 |
+
+### 实现与设计的偏差（如实记录）
+- 严格模式通过 `sync_rule(strict=True)` 开关启用，默认 `False` 保留旧批量路径，**功能完全一致**（FEATURE_PRESERVATION 红线全守住）；未删除旧引擎，作为回退对照。
+- 批次 `sequence_id` 为全批次递增（跨作品），`parent_sequence_id` 当前置为作品起点序列（同作品内任务视为同父）；真正的"父目录失败不进子目录"依赖现有 `_ensure_child` 的 `break`（目录阶段已串行阻断），任务级子树依赖首版未做细粒度展开。
+- 受控并发 >1 首版未实现（设计文档 2.4 已声明）。
+- 重启续跑通过每 60s 的 `_job_mirror_task_poll` 复用现有 `poll_pending_tasks` 覆盖 submitted/verifying 遗留任务，而非重新发起复制。
+
+### C5 隔离性能基线（mock，100/1000/10000 文件，不碰生产网盘）
+| 规模 | natural_key 排序 | _media_files DFS | plan_work_batch |
+| --- | --- | --- | --- |
+| 100 | 0.10 ms | 0.08 ms | 0.10 ms |
+| 1000 | 0.75 ms | 0.73 ms | <0.01 ms |
+| 10000 | 7.96 ms | 6.96 ms | <0.01 ms |
+
+结论：确定性排序开销可忽略（10000 文件 <8ms），镜像耗时主因仍是网盘列目录（与审计 A-01 一致），路线B未引入显著 CPU 开销。基线脚本：`tests/perf_strict_baseline.py`。

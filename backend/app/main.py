@@ -295,6 +295,29 @@ async def _job_mirror_task_reap():
             logger.warning("[mirror] 僵尸任务自愈扫描异常", exc_info=True)
 
 
+async def _job_mirror_task_poll():
+    """阶段二路线B C5：定时轮询未确认的复制任务（含严格顺序批次遗留）。
+
+    修复审计缺口：重启后 strict 批次停在 submitted/verifying 的任务此前只能手动
+    /api/mirror/tasks/poll 才续跑。此 job 每 60s 自动确认远端状态；镜像锁被持有
+    时跳过，避免与正在进行的同步/轮询互相干扰。
+    """
+    if _mirror_lock.info().get("busy"):
+        return
+    with SessionLocal() as db:
+        try:
+            r = _mirror_rule(db)
+            if not r or not (r.source_root_id and r.target_root_id):
+                return
+            out = await mirror.poll_pending_tasks(db, r, max_polls=3, interval=1.0)
+            if out.get("done") or out.get("failed"):
+                logger.info("[mirror] 定时续跑：done=%s failed=%s",
+                            out["done"], out["failed"])
+        except Exception:
+            db.rollback()
+            logger.warning("[mirror] 定时轮询未确认任务异常", exc_info=True)
+
+
 async def _job_log_prune():
     """v0.8.3：每日按保留策略自动清理日志与历史留痕。失败只记日志，不影响其它任务。"""
     with SessionLocal() as db:
@@ -447,6 +470,9 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     # v0.9.21：僵尸镜像任务自愈（每 5 分钟扫描一次超时未终结的 running/pending）
     scheduler.add_job(_job_mirror_task_reap, "interval", seconds=300, id="mirror_task_reap",
+                      max_instances=1, coalesce=True)
+    # 阶段二路线B C5：定时轮询未确认复制任务（strict 批次重启续跑，每 60s）
+    scheduler.add_job(_job_mirror_task_poll, "interval", seconds=60, id="mirror_task_poll",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_log_prune,
                       CronTrigger.from_crontab("30 3 * * *", timezone="Asia/Shanghai"),
