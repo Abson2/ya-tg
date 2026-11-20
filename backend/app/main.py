@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html
 import json
 import logging
@@ -60,17 +61,37 @@ class _TimedMirrorLock:
     直到 30 分钟才回收。改为持有方在推进阶段 heartbeat() 打点，超过 STALE_SECONDS
     无进展才回收——既保护正常长任务、又快速释放真卡死的锁。held_seconds 仍保留总
     持有时长（前端/契约不变），另暴露 idle_seconds 供诊断「多久没进展」。
+
+    阶段四 B-03：v0.9.21 的残留接管只覆盖元数据、未真正取得底层锁所有权，且
+    threading.Lock 无 owner 概念——误判残留（旧持有者其实还活着但无心跳）时，
+    旧持有者 finally release() 会误放掉新持有者的锁。改为：接管分支先强制释放
+    底层锁再阻塞式重新 acquire（新持有者真正持有）；并用 contextvars  fencing
+    token 标记代次——每次 acquire 递增，release()/heartbeat() 只接受与当前代次
+    一致的操作，过期持有者迟到的 release/heartbeat 自动失效（fencing token 语
+    义）。ContextVar 按 asyncio Task 隔离，恰好区分不同任务里的新旧持有者；跨
+    线程调用取不到 token 时退回旧的无条件行为，兼容 threading 场景与旧测试。
     """
     STALE_SECONDS = 30 * 60  # 距最后心跳超过 30 分钟无进展才判残留（长剧持有本身不受限）
+
+    # 当前持锁代次：acquire 成功写入本 Task 上下文，release/heartbeat 校验。
+    _fence_ctx: contextvars.ContextVar = contextvars.ContextVar("mirror_lock_fence", default=None)
 
     def __init__(self):
         self._lock = threading.Lock()
         self._owner = ""
         self._since = 0.0
         self._last_beat = 0.0
+        self._fence = 0  # 代次计数，每次 acquire（含接管）递增
+
+    def _valid_fence(self) -> bool:
+        """调用方是否当前持有者；跨线程无 token 时按旧语义放行。"""
+        token = self._fence_ctx.get()
+        return token is None or token == self._fence
 
     def acquire(self, blocking: bool = False, owner: str = "") -> bool:
         if self._lock.acquire(blocking=blocking):
+            self._fence += 1
+            self._fence_ctx.set(self._fence)
             self._owner = owner or "镜像任务"
             self._since = time.monotonic()
             self._last_beat = self._since
@@ -81,10 +102,16 @@ class _TimedMirrorLock:
             logger.warning("[mirror] 镜像锁距最后心跳超过 %ss 无进展（owner=%s，总持有 %ss），"
                            "判定残留并强制接管", self.STALE_SECONDS, self._owner,
                            int(self._held_seconds()))
-            # v0.9.21 修正：旧实现此处先 release() 再覆盖 owner，导致锁实际 unlocked，
-            # 新持有者以为持锁却不互斥、info() 也显示空 owner，finally release 还抛
-            # RuntimeError。残留场景原持有者已死，直接覆盖状态接管、保持 locked，
-            # 新持有者的 try/finally 才能正常互斥与释放。误判由 STALE 阈值兜底。
+            # B-03：v0.9.21 覆盖元数据但没拿到底层锁，旧持有者仍在 threading.Lock 层面
+            # 拥有它，迟到的 finally release() 会误放新持有者的锁。先强制释放残留锁，
+            # 再阻塞式重新 acquire 拿到真正所有权；blocking 兜住释放瞬间的并发抢锁。
+            try:
+                self._lock.release()
+            except RuntimeError:
+                pass  # 底层锁已释放（元数据残留）时也继续接管
+            self._lock.acquire(blocking=True)
+            self._fence += 1
+            self._fence_ctx.set(self._fence)
             self._owner = "镜像任务(残留回收)"
             self._since = time.monotonic()
             self._last_beat = self._since
@@ -92,7 +119,13 @@ class _TimedMirrorLock:
         return False
 
     def release(self) -> None:
+        # B-03：过期持有者迟到 release 不得清掉新持有者元数据/误放其锁。
+        if not self._valid_fence():
+            logger.warning("[mirror] 忽略过期持有者的 release（fence %s != 当前 %s）",
+                           self._fence_ctx.get(), self._fence)
+            return
         self._owner, self._since, self._last_beat = "", 0.0, 0.0
+        self._fence_ctx.set(None)
         try:
             self._lock.release()
         except RuntimeError:
@@ -100,12 +133,15 @@ class _TimedMirrorLock:
 
     def set_owner(self, owner: str) -> None:
         """拿锁后补充持有者名称（保留 acquire(blocking=False) 原字面调用，兼容旧契约测试）。"""
-        if self._since:
+        if self._since and self._valid_fence():
             self._owner = owner
 
     def heartbeat(self) -> None:
-        """持有方在每个推进阶段打点，证明「还活着且在进展」，重置残留计时。"""
-        if self._since:
+        """持有方在每个推进阶段打点，证明「还活着且在进展」，重置残留计时。
+
+        B-03：过期持有者迟到的 heartbeat 不得重置新持有者的空闲计时。
+        """
+        if self._since and self._valid_fence():
             self._last_beat = time.monotonic()
 
     def _held_seconds(self) -> float:
@@ -121,17 +157,41 @@ class _TimedMirrorLock:
         held = self._lock.locked()
         return {"busy": held, "owner": self._owner if held else "",
                 "held_seconds": int(self._held_seconds()) if held else 0,
-                "idle_seconds": int(self._idle_seconds()) if held else 0}
+                "idle_seconds": int(self._idle_seconds()) if held else 0,
+                "fence": self._fence}
 
 
 _mirror_lock = _TimedMirrorLock()
 
 
+# 阶段四 B-11：审计日志脱敏。异常 str(exc) 可能带 token / 签名 URL 片段，
+# 原样落 audit_logs 会长期留存敏感信息。只替换明确的敏感 kv，不破坏诊断上下文。
+_AUDIT_SECRET_RE = re.compile(
+    r"(?i)(authorization|access[_-]?token|refresh[_-]?token|token|password|secret|api[_-]?key)"
+    r"(\s*[=:]\s*)([^\s,;\"'}&]+)"
+)
+
+
+def _mask_audit_detail(detail: str) -> str:
+    text = str(detail or "")
+    text = _AUDIT_SECRET_RE.sub(r"\1\2***", text)
+    # Bearer <token> 形式
+    text = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", text)
+    return text[:4000]
+
+
 def add_audit(db: Session, action: str, target_type: str = "", target_id: str = "", detail: str = "") -> None:
-    db.add(AuditLog(action=action, target_type=target_type, target_id=str(target_id), detail=detail))
+    db.add(AuditLog(action=action, target_type=target_type,
+                    target_id=str(target_id), detail=_mask_audit_detail(detail)))
 
 
 _SESSION_EXPIRED_MSG = "登录已过期，请重新输入密码"
+# 阶段四 B-12：拒绝示例/占位符口令——照抄 .env.example 部署会留下公开弱口令。
+# 只拦截明显占位符，不强制长度（避免破坏存量短密码与测试环境 testpass）。
+_WEAK_ADMIN_PASSWORDS = {
+    "change_me", "请设置强密码", "your_password", "yourpassword",
+    "admin123", "password", "123456", "admin", "test", "root",
+}
 
 
 def check_admin(
@@ -144,8 +204,8 @@ def check_admin(
       前端据此清 token 回登录页。
     - 无 token 时回退 X-Admin-Password 明文比对（旧行为，向后兼容不破坏脚本/测试）。
     """
-    if settings.admin_password == "CHANGE_ME":
-        raise HTTPException(503, "请先在 .env 设置 ADMIN_PASSWORD")
+    if (settings.admin_password or "").strip().lower() in _WEAK_ADMIN_PASSWORDS:
+        raise HTTPException(503, "请先在 .env 设置强 ADMIN_PASSWORD（当前为占位符/弱口令）")
     if x_admin_session:
         state = admin_session.touch(x_admin_session)
         if state == "ok":
@@ -201,6 +261,9 @@ async def _job_bot_poll():
                 await bot_listener.poll_once(db)
             except Exception:
                 db.rollback()
+                # A-09：此前静默 rollback，网络抖动/Telegram 限流时无任何留痕，
+                # 与「Bot 收不到消息」排查方向脱节。补 exc_info 便于定位。
+                logger.warning("[bot] 消息轮询异常，本轮跳过", exc_info=True)
 
 
 _restore_lock = asyncio.Lock()
@@ -283,16 +346,22 @@ def reap_stale_mirror_tasks(db: Session, *, stale_minutes: int | None = None) ->
     return {"scanned": len(stale), "reaped": reaped}
 
 
-async def _job_mirror_task_reap():
-    """每 5 分钟扫描一次僵尸镜像任务；镜像锁正被持有时跳过，避免误伤真在跑的任务。"""
-    if _mirror_lock.info().get("busy"):
-        return
+def _reap_stale_mirror_tasks_in_thread() -> None:
+    """A-07：纯同步 DB 自愈扫描，放到线程池执行，Session 也在线程内创建（SQLite 安全）。"""
     with SessionLocal() as db:
         try:
             reap_stale_mirror_tasks(db)
         except Exception:
             db.rollback()
             logger.warning("[mirror] 僵尸任务自愈扫描异常", exc_info=True)
+
+
+async def _job_mirror_task_reap():
+    """每 5 分钟扫描一次僵尸镜像任务；镜像锁正被持有时跳过，避免误伤真在跑的任务。"""
+    if _mirror_lock.info().get("busy"):
+        return
+    # A-07：DB 密集扫描不在事件循环线程做；to_thread 让它与 /api/health 等并发
+    await asyncio.to_thread(_reap_stale_mirror_tasks_in_thread)
 
 
 async def _job_mirror_task_poll():
@@ -318,8 +387,8 @@ async def _job_mirror_task_poll():
             logger.warning("[mirror] 定时轮询未确认任务异常", exc_info=True)
 
 
-async def _job_log_prune():
-    """v0.8.3：每日按保留策略自动清理日志与历史留痕。失败只记日志，不影响其它任务。"""
+def _log_prune_in_thread() -> None:
+    """A-07：日志清理是纯同步 DB 批量操作，放线程池执行，避免阻塞事件循环。"""
     with SessionLocal() as db:
         try:
             cfg = log_retention.config(db)
@@ -334,6 +403,13 @@ async def _job_log_prune():
         except Exception as exc:
             db.rollback()
             logger.warning("[logs] 自动清理失败：%s", exc)
+
+
+async def _job_log_prune():
+    """v0.8.3：每日按保留策略自动清理日志与历史留痕。失败只记日志，不影响其它任务。"""
+    # A-07：DB 密集清理不在事件循环线程做；不降低 busy_timeout（v0.8.8 的 30s+WAL 是
+    # 真实锁竞争修复，回退到 5s 会重现 database is locked），仅把阻塞挪出事件循环。
+    await asyncio.to_thread(_log_prune_in_thread)
 
 
 async def _job_rename_pending():
@@ -414,6 +490,9 @@ async def _scheduled_scan(root: str) -> None:
             db.commit()
         except Exception:
             db.rollback()
+            # A-09：run_scan 虽会写 ScanTask.last_status，但此前此处无应用日志，
+            # 定时任务失败在日志侧不可见。补 exc_info，业务状态与应用日志双留痕。
+            logger.warning("[scan] 定时全量扫描异常", exc_info=True)
 
 
 @asynccontextmanager
@@ -480,7 +559,9 @@ async def lifespan(app: FastAPI):
                       max_instances=1, coalesce=True)
     scheduler.start()
     yield
-    scheduler.shutdown(wait=False)
+    # 阶段四 A-11：wait=True 等待正在执行的 job 收尾，避免容器停止时腰斩
+    # 队列推送 / 转存 / 扫描（各 job 网络调用自带超时，不会无限阻塞）
+    scheduler.shutdown(wait=True)
 
 
 app = FastAPI(title="Ya-TG", version="0.9.20", lifespan=lifespan)
@@ -501,8 +582,8 @@ class AdminLoginInput(BaseModel):
 def admin_login(p: AdminLoginInput):
     """用管理员密码换取会话 token。浏览器只存 token，不再永久保存明文密码。"""
     import hmac
-    if settings.admin_password == "CHANGE_ME":
-        raise HTTPException(503, "请先在 .env 设置 ADMIN_PASSWORD")
+    if (settings.admin_password or "").strip().lower() in _WEAK_ADMIN_PASSWORDS:
+        raise HTTPException(503, "请先在 .env 设置强 ADMIN_PASSWORD（当前为占位符/弱口令）")
     if not hmac.compare_digest(str(p.password or ""), settings.admin_password):
         raise HTTPException(401, "管理密码错误")
     token = admin_session.create()
@@ -5113,8 +5194,14 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
             if cfg_err:
                 restore_result = cfg_err
                 restore_ok, restore_status = False, "unconfigured"
+            elif _restore_lock.locked():
+                # 阶段四 B-02：后台 job / 手动重试正占用转存，审核态已落盘不受影响，
+                # 跳过即时执行，留待后台续跑，避免同分享被并发提交两次。
+                restore_result = "另一次转存正在进行，本次跳过即时执行，后台将自动续跑"
+                restore_ok, restore_status = False, "deferred"
             else:
-                restore_ok, restore_result, rrow = await contribution_restore.run_restore_for_contribution(db, cid)
+                async with _restore_lock:
+                    restore_ok, restore_result, rrow = await contribution_restore.run_restore_for_contribution(db, cid)
                 restore_status = rrow.status if rrow else None
                 db.commit()
         except Exception as exc:
@@ -5170,9 +5257,15 @@ async def contribution_restore_retry(cid: int, db: Session = Depends(get_db)):
         raise HTTPException(400, cfg_err)
     if not contribution_restore.is_guangya_share_url(c.share_url or ""):
         raise HTTPException(400, "投稿链接非光鸭分享链接，无法重试转存")
+    # 阶段四 B-02：与后台 job / 审核通过入口共用同一把锁，防同分享被重复提交转存
+    if _restore_lock.locked():
+        raise HTTPException(409, "另一次转存正在进行，请稍后重试")
     try:
-        ok, info, row = await contribution_restore.retry_restore(db, cid)
+        async with _restore_lock:
+            ok, info, row = await contribution_restore.retry_restore(db, cid)
         db.commit()
+    except HTTPException:
+        raise
     except Exception as exc:
         db.rollback()
         raise HTTPException(502, f"重试转存异常：{type(exc).__name__}: {str(exc)[:160]}")

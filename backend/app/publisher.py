@@ -380,7 +380,7 @@ def _work_group_key(res: Resource) -> str:
     return f"file:{res.id}"
 
 
-async def process_queue(limit: int = 20) -> dict:
+async def _process_queue_impl(limit: int = 20) -> dict:
     db: Session = SessionLocal()
     sent = failed = shared = 0
     # v0.6.5：逐条发送节流，避免一次轮询连发多条触发 Telegram 风控
@@ -512,3 +512,17 @@ async def process_queue(limit: int = 20) -> dict:
         return {"sent": sent, "failed": failed, "shares_created": shared}
     finally:
         db.close()
+
+
+# 阶段四 B-01：定时 worker 与 HTTP「立即处理一次」互斥。
+# 原实现无进程内锁，二者可并发操作同一批 pending 项，重复建分享 / 重复发 TG。
+# 非阻塞拿锁：正有一轮在跑时直接返回 skipped，不排队堆积。
+_queue_lock = asyncio.Lock()
+
+
+async def process_queue(limit: int = 20) -> dict:
+    if _queue_lock.locked():
+        return {"sent": 0, "failed": 0, "shares_created": 0,
+                "skipped": True, "reason": "另一次队列处理进行中，本轮跳过"}
+    async with _queue_lock:
+        return await _process_queue_impl(limit=limit)

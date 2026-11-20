@@ -318,6 +318,8 @@ async def run_scan(root_id: str = "", resume: bool = True, db: Session | None = 
             db.commit()
         except Exception:
             db.rollback()
+            # A-09：写失败状态本身再失败此前静默，导致 last_status 未更新却无日志。
+            logger.warning("[scan] 写入失败状态失败（原异常继续上抛）", exc_info=True)
         raise
     finally:
         if own_db:

@@ -14,6 +14,9 @@
 ```bash
 mkdir -p /vol1/1000/docker/ya-tg/db
 mkdir -p /vol1/1000/docker/ya-tg/logs
+# 容器以非 root（UID/GID 10001）运行；普通 rootful Docker 会自动 chown 挂载卷，
+# 若你的飞牛启用了 rootless/用户命名空间映射，需先手动授权：
+chown -R 10001:10001 /vol1/1000/docker/ya-tg/db /vol1/1000/docker/ya-tg/logs
 cd /vol1/1000/docker/ya-tg
 ```
 

@@ -11,13 +11,16 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 
 import httpx
 from sqlalchemy import or_, select
+from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto, tmdb
@@ -25,6 +28,58 @@ from .contribution_links import extract_guangya_share_url
 from .models import (Bot, Channel, DiscoveredChat, MediaRequest, ProcessedUpdate,
                      QueueItem, Resource, UserContribution, utcnow)
 from .security import decrypt_secret
+
+logger = logging.getLogger(__name__)
+
+# 阶段四 A-10：可重试错误分类 + 每 update 重试上限。用进程内计数（key=bot_id:uid），
+# 避免瞬时故障吞掉投稿/求片消息；达上限后仍标记已处理、不无限卡 offset。
+_POLL_RETRY_LIMIT = 5
+_POLL_RETRY_MAX_KEYS = 2000
+_poll_retry_counts: dict[str, int] = {}
+
+
+def is_retryable_poll_error(exc: BaseException) -> bool:
+    """区分「可重试瞬时故障」与「业务拒答」。纯函数便于测试。
+
+    可重试：网络超时/连接错误、429/5xx、TMDB 限流、DB 锁/忙、显式超时。
+    不可重试：投稿件非法、配置缺失、鉴权失败等——重试不会改变结果，仍按旧语义记账，
+    避免坏消息永久卡住 offset（保留 ProcessedUpdate 幂等去重语义）。
+    """
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.TransportError,
+                        asyncio.TimeoutError, TimeoutError, SAOperationalError)):
+        return True
+    if isinstance(exc, tmdb.TmdbRateLimited):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None and getattr(exc, "response", None) is not None:
+        status = getattr(exc.response, "status_code", None)
+    if isinstance(status, int) and (status == 429 or status >= 500):
+        return True
+    msg = str(exc).lower()
+    if any(k in msg for k in ("database is locked", "database is busy", "timed out",
+                              "timeout", "rate limit", "too many requests")):
+        return True
+    return False
+
+
+def _poll_retry_key(bot_id: int, uid: int) -> str:
+    return f"{bot_id}:{uid}"
+
+
+def _poll_retry_bump(bot_id: int, uid: int) -> int:
+    """返回该 update 的重试序号（1 起）。超限清理最旧 key，防止内存泄漏。"""
+    key = _poll_retry_key(bot_id, uid)
+    n = int(_poll_retry_counts.get(key, 0)) + 1
+    _poll_retry_counts[key] = n
+    if len(_poll_retry_counts) > _POLL_RETRY_MAX_KEYS:
+        for k in list(_poll_retry_counts)[:len(_poll_retry_counts) - _POLL_RETRY_MAX_KEYS]:
+            _poll_retry_counts.pop(k, None)
+    return n
+
+
+def _poll_retry_clear(bot_id: int, uid: int) -> None:
+    _poll_retry_counts.pop(_poll_retry_key(bot_id, uid), None)
+
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
 BUILTIN_COMMANDS = [
@@ -1629,6 +1684,7 @@ async def poll_once(db: Session) -> dict:
              "actions": [], "menu_cleared": menu_cleared}
     # 处理成功后才推进的最高 update_id；失败/跳过的事件也记账，避免卡死在同一条
     max_committed = offset
+    deferred_uid = None  # A-10：可重试失败的最低 update_id，offset 不得越过它
     for upd in updates:
         uid = int(upd.get("update_id") or 0)
         if _is_update_processed(db, uid):
@@ -1692,17 +1748,38 @@ async def poll_once(db: Session) -> dict:
                             if reply and chat_id:
                                 await _dispatch_reply(db, token, chat_id, text, action, reply, user_id)
                     except Exception as exc:
+                        # A-10：瞬时故障（TMDB 超时 / DB 锁 / 限流）不能吞掉——抛给外层
+                        # 走「不记账、不推进 offset、下轮重投」；业务拒答仍按旧语义记账。
+                        if is_retryable_poll_error(exc):
+                            raise
                         stats.setdefault("errors", []).append(str(exc)[:120])
+            _poll_retry_clear(bot_id, uid)  # 成功处理，重置该 update 的重试预算
             _mark_update_processed(db, uid, bot_id)
             if uid > max_committed:
                 max_committed = uid
         except Exception as exc:
             stats.setdefault("errors", []).append(str(exc)[:120])
-            # 该 update 处理失败也记账，避免每次重启都卡在同一条；错误已进 stats 可见
+            if is_retryable_poll_error(exc):
+                n = _poll_retry_bump(bot_id, uid)
+                if n <= _POLL_RETRY_LIMIT:
+                    # 不标记已处理、不推进 offset；停止本轮后续 update 避免跳过失败项。
+                    # Telegram 下轮会以同一 offset 重投，靠 ProcessedUpdate 幂等跳过已成功项。
+                    deferred_uid = uid if deferred_uid is None else min(deferred_uid, uid)
+                    logger.warning("[bot] update %s 可重试失败(%s/%s)，保留 offset 待重投：%s",
+                                   uid, n, _POLL_RETRY_LIMIT, str(exc)[:100])
+                    break
+                # 达重试上限仍失败：作为毒消息记账放行，避免永久卡住整条 bot 队列。
+                logger.error("[bot] update %s 重试达上限(%s)，按毒消息放行避免卡死：%s",
+                             uid, n, str(exc)[:120])
+            # 业务拒答 / 重试耗尽：仍记账放行，保留 ProcessedUpdate 幂等去重语义
+            _poll_retry_clear(bot_id, uid)
             _mark_update_processed(db, uid, bot_id)
             if uid > max_committed:
                 max_committed = uid
     new_offset = max(offset, max_committed + 1)
+    if deferred_uid is not None:
+        # A-10：有任何被延迟重试的 update，offset 不得越过它（否则重投捞不回来）
+        new_offset = min(new_offset, deferred_uid)
     runtime_config.set_many(db, {"contribution_update_offset": str(new_offset),
                                  err_key: ""})  # 成功轮询清空上一轮错误状态
     db.commit()

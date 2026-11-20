@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import logging
 import re
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -20,8 +22,14 @@ from . import runtime_config
 from .contribution_links import is_guangya_share_url
 from .guangya import GuangYaWebFiles, WebFileError
 from .models import ContributionRestore, UserContribution, utcnow
+from .utils import as_utc
 
 RESTORE_STATUSES = ("pending", "restoring", "success", "failed", "retry_wait")
+logger = logging.getLogger(__name__)
+# 阶段五 C-02：restoring 是「await 前已 commit」的中间态。进程被 SIGKILL /
+# 容器强停后该行永久悬挂，后台 pick_pending 只扫 pending/retry_wait 永远捞不到。
+# 转存正常几秒完成，30 分钟阈值足够保守（与镜像僵尸自愈同量级），不会误伤在跑任务。
+RESTORING_STALE_MINUTES = 30
 
 
 # ---------------- 配置 ----------------
@@ -82,8 +90,39 @@ def restore_map_for(db: Session, contribution_ids: list[int]) -> dict[int, Contr
     return {r.contribution_id: r for r in rows}
 
 
+def reap_stale_restoring(db: Session, *, stale_minutes: int | None = None) -> dict:
+    """C-02：把崩溃后永久悬挂的 restoring 任务重置为 retry_wait，供后台续跑。
+
+    只在持有 _restore_lock 的后台 job 调用，避免与正在 await 的真实转存并发。
+    时间比较统一走 as_utc()（SQLite 读回 naive datetime，不能直接与 aware 比）。
+    """
+    minutes = RESTORING_STALE_MINUTES if stale_minutes is None else stale_minutes
+    cutoff = utcnow() - timedelta(minutes=max(1, int(minutes)))
+    rows = list(db.scalars(select(ContributionRestore).where(
+        ContributionRestore.status == "restoring")).all())
+    reaped = 0
+    for r in rows:
+        stamp = as_utc(r.updated_at) or as_utc(r.created_at)
+        if stamp is not None and stamp < cutoff:
+            r.status = "retry_wait"
+            r.error = (f"后台自愈：转存任务超过 {minutes} 分钟仍停在 restoring，"
+                       "判定进程中断残留，重置为待重试")[ :300]
+            r.updated_at = utcnow()
+            reaped += 1
+    if reaped:
+        db.commit()
+        logger.warning("[contribution-restore] 僵尸 restoring 自愈：重置为 retry_wait %s 条（阈值 %s 分钟）",
+                       reaped, minutes)
+    return {"scanned": len(rows), "reaped": reaped}
+
+
 def pick_pending(db: Session, limit: int = 20) -> list[ContributionRestore]:
-    """后台 job 扫描未完成任务（pending / retry_wait），重启后可续处理。"""
+    """后台 job 扫描未完成任务（pending / retry_wait），重启后可续处理。
+
+    C-02：扫描前先把超时的 restoring 残留重置为 retry_wait，否则 SIGKILL 后
+    停在 restoring 的任务永远不会被本函数捞到（永久悬挂）。
+    """
+    reap_stale_restoring(db)
     return list(db.scalars(select(ContributionRestore).where(
         ContributionRestore.status.in_(("pending", "retry_wait"))).order_by(
         ContributionRestore.id).limit(limit)).all())
@@ -186,7 +225,9 @@ async def execute_restore(db: Session, row: ContributionRestore) -> tuple[bool, 
     row.status = "restoring"
     row.attempts = int(row.attempts or 0) + 1
     row.updated_at = utcnow()
-    db.flush()
+    # 阶段四 A-06：await 前先 commit 落盘，避免跨网络 await 持 SQLite 写事务
+    # （同仓库 publisher/scanner 已有此范式）。attempts 只在此处累加一次。
+    db.commit()
 
     target = target_dir(db)
     gw = GuangYaWebFiles(db)

@@ -113,7 +113,7 @@ def test_custom_bot_config_is_ignored_even_if_set(db):
 def test_process_queue_has_no_custom_override(db):
     """process_queue 源码级保证：不再读取 tg_custom_* / 不再传 override 参数。"""
     import inspect
-    src = inspect.getsource(publisher.process_queue)
+    src = inspect.getsource(publisher.process_queue) + inspect.getsource(publisher._process_queue_impl)
     assert "tg_custom_bot_token" not in src
     assert "tg_custom_chat_id" not in src
     assert "override_token" not in src

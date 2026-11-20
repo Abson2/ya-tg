@@ -6,8 +6,9 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# 阶段四 B-10：最小权限——构建/推镜像只需读源码；写权限仅 release job 单独授予。
 permissions:
-  contents: write
+  contents: read
 
 env:
   IMAGE_NAME: ya-tg
@@ -48,7 +49,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # 阶段四 B-10：默认不再强制公开仓库（私有部署场景会被意外公开）。
+      # 需要公开仓库时在仓库 Settings → Variables 建 DOCKERHUB_FORCE_PUBLIC=true 显式开启。
       - name: Ensure DockerHub repository is public
+        if: vars.DOCKERHUB_FORCE_PUBLIC == 'true'
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -74,6 +78,9 @@ jobs:
     needs: build-and-push
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # 阶段四 B-10：仅创建 Release 的 job 需要写权限，构建 job 保持只读。
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4

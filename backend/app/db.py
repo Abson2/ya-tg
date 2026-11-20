@@ -1,7 +1,10 @@
 import json
+import logging
 from sqlalchemy import create_engine, event, inspect, or_, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 _IS_SQLITE = settings.database_url.startswith("sqlite")
 args = {"check_same_thread": False} if _IS_SQLITE else {}
@@ -452,8 +455,10 @@ def migrate() -> None:
                 removed = _converge_legacy_queue(db)
                 db.add(AppConfig(key=marker_key, value_enc=str(removed), updated_at=utcnow()))
                 db.commit()
-            except Exception:
+            except Exception as exc:
                 db.rollback()  # 收敛失败不阻断启动，下次启动可重试（标记未写入）
+                # A-09：此前静默吞掉，旧队列残留合并失败在日志侧完全不可见。
+                logger.warning("[db] 旧队列收敛失败（下次启动重试）：%s", exc)
 
 
 def rowdict(row) -> dict:

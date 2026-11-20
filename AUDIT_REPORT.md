@@ -320,3 +320,22 @@
 - **修复**：`main.py` 新增模块级 `safe_static_file(path, root)`，对 `(root/path).resolve()` 与 `root.resolve()` 做归属校验（`candidate == root 或 root ∈ candidate.parents`），越界/不存在/符号链接逃逸一律返回 None，SPA 路由改为 `safe_static_file(path, static) or static/index.html`。既保留正常 SPA 路由与 `index.html` 回退，又阻断 `..`、URL 编码、符号链接三类穿越。
 - **验证证据**：`tests/test_c01_spa_path_traversal.py` 4 项通过——穿越 payload 全拒、正常静态文件仍可服务、符号链接逃逸拦截、真实 uvicorn + `--path-as-is` 端到端不复现泄露。
 - **状态**：C-01 由"待验证" → "已确认 + 已修复 + 已测试"。
+
+### 阶段四｜安全与风控整改（第一批，源码验证中，未发版）
+
+> 原则：功能一致优先。凡与既有真实修复冲突的审计建议（如 busy_timeout 5s）一律不采纳，
+> 如实记录冲突理由；完整 async session 迁移属架构债，本批只做可安全落地的缓解。
+
+- **A-09 后台 job 静默吞异常——已修复**：AST 全量扫描 `backend/app/*.py`，把唯一只 `rollback()` 无日志的 4 处补齐：`main.py` `_job_bot_poll` / `_scheduled_scan`、`db.py` 旧队列收敛、`scanner.py` 写失败状态失败，统一 `logger.warning(..., exc_info=True)`。护栏 `tests/test_v102_silent_exception_logging.py` 9 项：再出现静默 rollback 即失败。原 253/316/339/357/201 等处已有日志，未重复改。
+- **A-11 优雅关闭——已修**：`lifespan` 末尾 `scheduler.shutdown(wait=True)`，容器停止等待在跑 job 完成，避免队列推送/转存被腰斩。
+- **A-06 跨 await 持写事务——已修**：`contribution_restore.execute_restore()` 把 `status=restoring` + attempts 累加在 await 前 `db.commit()` 落盘，不跨网络持 SQLite 写事务。
+- **B-01 队列互斥——已修**：`publisher.process_queue` 原实现改名 `_process_queue_impl`，新增进程内 `asyncio.Lock` wrapper，撞锁直接跳过本轮（不并发建分享）。`test_v092_unified_push.py` 同步更新，源码检查同时覆盖 wrapper + impl 防保护失效。
+- **B-02 转存互斥——已修**：后台续跑 / 审核通过即时转存 / 手动 retry 共用 `_restore_lock`；撞锁时 retry 端点返回 409、审核 approved 分支标 deferred 不阻断审核态落盘。
+- **B-03 镜像锁残留接管——已根治**：v0.9.21 的接管分支只覆盖元数据、未真正取得底层 `threading.Lock` 所有权，误判残留时旧持有者迟到 `release()` 会误放新持有者的锁。改为：接管时先强制释放底层锁再阻塞式重新 `acquire`；并用 `contextvars` fencing token 标记代次，`release()`/`heartbeat()` 只接受当前代次操作，过期持有者迟到操作自动失效。保留 heartbeat 语义（STALE=1800s 不变）。`info()` 增 `fence` 诊断字段。`tests/test_v102_mirror_lock_fencing.py` 5 项 + 历史锁测试 38 项全通过。
+- **B-11 审计日志脱敏——已修**：`add_audit()` 统一经 `_mask_audit_detail()`，正则脱敏敏感 kv（token/password/secret/api_key 等）+ Bearer 串，截断 4000 字。
+- **B-12 弱管理员口令——已修**：`_WEAK_ADMIN_PASSWORDS` 黑名单（CHANGE_ME / 请设置强密码 / admin123 / password / 123456 等），`check_admin()` 与登录端点命中返回 503；`.env.example` 改 `ADMIN_PASSWORD=CHANGE_ME`。不强加长度限制（避免破坏存量短密码与测试环境）。
+- **B-10 CI 最小权限 + Docker 非 root——已修**：workflow 顶层 `permissions: contents: read`，写权限仅 release job 单独授予；强制公开 DockerHub 仓库改为 opt-in（`vars.DOCKERHUB_FORCE_PUBLIC == 'true'`）。Dockerfile 加 `gosu` + 固定 UID/GID 10001 的 `yatg` 用户，`ENTRYPOINT` 以 root 启动仅为 chown 挂载卷（兼容存量 NAS 卷属主）后 `gosu yatg` 降权跑 uvicorn；飞牛 NAS 文档补 rootless 场景手动 `chown` 说明。`tests/test_v102_ci_docker_hardening.py` 5 项。
+- **A-07 事件循环阻塞——部分缓解（架构债保留）**：审计建议的「busy_timeout 降到 5s」**明确不采纳**——v0.8.8 把 5s 提到 30s + WAL 是为修复真实 `database is locked`，回退会重现故障。`/api/health` 本就是同步 `def`（FastAPI 走线程池），不受 async DB 阻塞；真正可安全落地的是把两个纯同步 DB job（僵尸自愈扫描 / 日志清理）用 `asyncio.to_thread` 挪出事件循环，Session 在线程内创建（SQLite 安全）。其余 50 个 async 路由多为网络 await + 短 DB 操作，完整 async session 迁移属架构级重构，本批不做以保证功能一致。`tests/test_v102_eventloop_nonblocking.py` 4 项（含真实并发计时器验证 + 守住 30s 不回退）。
+- **A-10 消息失败仍推进 offset——已修**：新增 `is_retryable_poll_error()` 纯函数区分瞬时故障（网络超时/限流/DB 锁/429/5xx → 可重试）与业务拒答（非法链接/配置缺失 → 不可重试）。`poll_once` 内层 handle_text 捕获到可重试错误时重抛给外层：可重试且未达上限（5 次）→ 不标记 ProcessedUpdate、不推进 offset、`break` 停止本轮后续 update，下轮同 offset 重投靠幂等跳过已成功项；达上限按毒消息记账放行避免永久卡死。`tests/test_v102_bot_retryable.py` 4 项（含审计指定的「首次 Timeout 二次成功，update 被处理两次」场景）。
+- **C-02 转存 restoring 悬挂——已修**：`contribution_restore.reap_stale_restoring()` 把超过 30 分钟仍停在 restoring 的行重置为 retry_wait 并记自愈原因，`pick_pending()` 扫描前先调用（在 `_restore_lock` 内，不与在跑转存并发）；时间比较走 `as_utc()` 规避 SQLite naive/aware 坑。正常在跑任务持续推进 updated_at 不受影响。`tests/test_v102_restore_stale_reap.py` 4 项。
+- **仍未处理（后续批次/架构债，非本批遗漏）**：A-04 逐作品串行 TMDB（属性能非安全，且并发会触发限流，保持串行）；B-04 `_async_scan` 内存态重启丢失（需新表，阶段五考虑）；B-06 单文件 main.py 5287 行（需大拆分，触及全部功能，风险过高本批不动）；B-07 按名+大小回填身份碰撞（用户明确不动的回填设计）；B-08/B-09 镜像边界细节（真机验证后再定）；C-03/C-04 连接释放与 PRAGMA（实测无泄漏，观察项）。
