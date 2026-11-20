@@ -103,6 +103,11 @@ _COLUMNS = {
         "works_cursor": "TEXT DEFAULT ''",
         # v0.9.10：本轮任务各节点处理量快照，进度条只显示当前任务不显示历史累计
         "last_pipeline_json": "TEXT DEFAULT ''",
+        # 阶段二路线B：严格顺序镜像引擎批次控制（旧库 ALTER 补列）
+        "batch_id": "TEXT DEFAULT ''",
+        "batch_status": "TEXT DEFAULT 'idle'",
+        "control_action": "TEXT DEFAULT ''",
+        "cursor_sequence": "INTEGER DEFAULT 0",
     },
     "mirror_media": {
         "category_path": "TEXT DEFAULT ''",
@@ -115,6 +120,14 @@ _COLUMNS = {
         "target_name": "TEXT DEFAULT ''",
         "rename_status": "TEXT DEFAULT ''",
         "rename_error": "TEXT DEFAULT ''",
+    },
+    # 阶段二路线B：严格顺序执行序列持久化（旧库 ALTER 补列，旧数据默认空/0）
+    "mirror_tasks": {
+        "batch_id": "TEXT DEFAULT ''",
+        "sequence_id": "INTEGER DEFAULT 0",
+        "parent_sequence_id": "INTEGER DEFAULT 0",
+        "task_status": "TEXT DEFAULT ''",
+        "retry_count": "INTEGER DEFAULT 0",
     },
     # v0.8.2：建目录失败原因，管理页如实展示，不再用通用文案掩盖接口报错
     "mirror_dirs": {

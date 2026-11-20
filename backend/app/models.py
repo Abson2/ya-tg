@@ -316,6 +316,13 @@ class MirrorRule(Base):
     # v0.9.10：本轮任务各节点处理量快照（JSON），供「处理流程与进度」只显示当前任务，
     # 不再拿全库累计冒充进度。写入方：镜像同步/手动扫描管线完成时。
     last_pipeline_json: Mapped[str] = mapped_column(Text, default="")
+    # 阶段二路线B：严格顺序镜像引擎的批次控制。全部带默认值，旧库 ALTER 兼容。
+    # batch_status: idle/running/paused/cancelling/cancelled
+    # control_action: pause/resume/skip/cancel（执行器在任务边界消费后置空）
+    batch_id: Mapped[str] = mapped_column(String(64), default="")
+    batch_status: Mapped[str] = mapped_column(String(24), default="idle")
+    control_action: Mapped[str] = mapped_column(String(24), default="")
+    cursor_sequence: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -415,6 +422,14 @@ class MirrorTask(Base):
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 阶段二路线B：严格顺序执行的序列持久化。旧数据 task_status='' 视为历史记录，
+    # 不参与新执行器；status 旧值(pending/running/done/failed/unknown)原样保留。
+    batch_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    sequence_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    parent_sequence_id: Mapped[int] = mapped_column(Integer, default=0)
+    # task_status: ''(历史)/pending/submitting/submitted/verifying/completed/failed/skipped/cancelled
+    task_status: Mapped[str] = mapped_column(String(24), default="")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ResourceVersion(Base):
