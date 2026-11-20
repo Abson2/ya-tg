@@ -8,6 +8,29 @@
 
 ---
 
+## v0.9.17.1 (2026-11-20)
+
+v0.9.17 上线后真机反馈三项交互问题：白名单开关状态错乱、已退出目标仍可选推送、求片列表同影视重复。**不改推送闸门、不改认证、不虚构能力**。
+
+### 一、白名单开关无效 / 点删除反而触发开关（#282）
+- 真机反馈：发现列表点白名单开关无反应/弹回；点同行的「删除」反而让开关状态跳变。
+- 根因①（传值相反）：`el-switch` 用 `v-model` 绑定 `row.in_whitelist`，`@change` 触发时 v-model 已翻转成新值，但处理函数内 `const prev = c.in_whitelist`（已是新值）后又发 `!prev`（旧值）给后端——后端收到的永远是相反状态，开关自然弹回。
+- 根因②（DOM 复用错位）：`el-table` 未设 `row-key`，删除/筛选重排后 Vue 按数组索引复用行组件，`el-switch` 内部状态残留到别的行，视觉上像「删除触发了开关」。
+- 修复：开关改受控绑定 `:model-value` + `@change="v => toggleDiscoverWhitelist(row, v)"`，显式用新值发请求、成功以回执为准、失败回滚；表格加 `row-key="id"`；同作品目标键改用真实 id 不按索引。
+
+### 二、已退出 / Bot 不在群的目标仍可选推送（#283）
+- 真机反馈：勾了「显示已退出」后，「光鸭云盘资源分享群」显示 `成员状态=已退出`、`权限=Bot 不在群`，但下方目录路由「额外推送目标」下拉仍能选中它推送。
+- 修复①（前端）：下拉 `el-option` 只列 `isPushableDisc()` 为真的目标——过滤 `active=false`、`member_status in (left,kicked)`、`perm_status=not_member`。
+- 修复②（后端护栏）：新增 `_inactive_discover_reason()`，`discover_set_whitelist` 加入分支与 `discover_test_push` 对**明确**已退出/不在群的目标直接拒绝并给可操作提示（生成授权链接加回 Bot / 频道设管理员）；`unknown`（尚未检查权限/从配置落库）放行，不误伤新目标。
+
+### 三、求片列表同影视重复（#284）
+- 真机反馈：求片列表同一条影视重复显示。
+- 修复：与投稿去重对称——新增 `upsert_media_request()`，dedup_key 复用 `tgto.keyword_id()`（与白名单规则 id 一一对应），重复求片不新增行、`submit_count+1`、刷新最近提交用户与时间；保留 `review_status`/`status`（已采纳/已拒绝/已同步不被冲掉）；后台列表 `×N` 标记、用户侧提示「已合并登记（累计 N 次）」。新增 4 字段（`submit_count/last_tg_user_id/last_tg_username/last_submitted_at`）走 `db.py` 轻量迁移。
+
+### 四、验证
+- 专项 `tests/test_v0916_bot_message_guard_and_discover.py` 增至 **34 项**（新增白名单拦截/测试推送拦截/去重计数/前端源码断言等 7 项）。
+- 全量 pytest **564 passed，1 warning**；前端 build 成功。
+
 ## v0.9.17 (2026-11-20)
 
 v0.9.16 真机热修合集：修复「发现/刷新」白名单目标点操作报「目标不存在」、成员状态与权限自相矛盾、白名单开关弹回、投稿审核通过不转发监控 Bot、求片参数未写入 TgtoDrive、投稿同作品多条待审批。**不重构、不改推送闸门、不改认证、不虚构扫描能力**。

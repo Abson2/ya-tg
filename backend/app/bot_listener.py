@@ -115,6 +115,40 @@ def upsert_contribution(db: Session, *, tg_user_id: str, tg_username: str,
     return existing, False
 
 
+# v0.9.17.1 #284：求片按作品去重合并——dedup_key 复用 tgto.keyword_id（与白名单规则
+# id 一一对应），重复求片累加 submit_count 不新增行，后台只显示一条。
+def upsert_media_request(db: Session, *, tg_user_id: str, tg_username: str,
+                         title: str, tmdb_id: int | None = None,
+                         media_type: str = "", year: str = "",
+                         season: int | None = None) -> tuple[MediaRequest, bool]:
+    """求片入库：同作品去重累加计数（返回 (行, 是否新建)）。
+
+    重复提交保留原 review_status / status（已采纳/已拒绝/已同步不被冲掉），只累加计数
+    并刷新最近提交用户与时间。dedup_key 为空（异常输入）时不合并。
+    """
+    kid = tgto.keyword_id(tmdb_id, season, title)
+    now = utcnow()
+    existing = db.scalar(select(MediaRequest).where(
+        MediaRequest.keyword_id == kid).order_by(MediaRequest.id).limit(1)) if kid else None
+    if existing is None:
+        row = MediaRequest(tg_user_id=str(tg_user_id), tg_username=str(tg_username or ""),
+                           title=title[:512], tmdb_id=tmdb_id,
+                           media_type=media_type or "", year=str(year or ""),
+                           season=season, keyword_id=kid, status="pending",
+                           review_status="pending", note="待管理员审核通过后同步白名单",
+                           submit_count=1, last_tg_user_id=str(tg_user_id),
+                           last_tg_username=str(tg_username or ""), last_submitted_at=now)
+        db.add(row)
+        db.flush()
+        return row, True
+    existing.submit_count = int(existing.submit_count or 1) + 1
+    existing.last_tg_user_id = str(tg_user_id)
+    existing.last_tg_username = str(tg_username or "")
+    existing.last_submitted_at = now
+    db.flush()
+    return existing, False
+
+
 # 使用限制检查结果缓存：{tg_user_id: (checked_ts, ok, reason)}
 _restrict_cache: dict[str, tuple[float, bool, str]] = {}
 
@@ -1085,18 +1119,16 @@ async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id:
     year = str(chosen.get("year") or "")
 
     if flow == FLOW_WANT:
-        kid = tgto.keyword_id(tmdb_id, None, title)
         # v0.9.13 #254：白名单写入后移到「管理员审核通过」时执行（见 main.handle_media_request），
         # 提交阶段只登记，避免未审核的求片占用频道监控。
-        req = MediaRequest(tg_user_id=str(uid), tg_username=tg_username,
-                           title=title, tmdb_id=tmdb_id, media_type=media_type,
-                           year=year, season=None, keyword_id=kid, status="pending",
-                           review_status="pending", note="待管理员审核通过后同步白名单")
-        db.add(req)
-        db.flush()  # autoflush=False：写完即查必须显式 flush
+        # v0.9.17.1 #284：同作品去重合并，重复求片不新增行。
+        req, created = upsert_media_request(
+            db, tg_user_id=str(uid), tg_username=tg_username,
+            title=title, tmdb_id=tmdb_id, media_type=media_type, year=year, season=None)
         _pick_clear(uid)
-        return await _edit_or_send(db, token, chat_id, message_id,
-                                   f"已登记「{title}」，我们会尽快处理，感谢支持！", main_keyboard())
+        thanks = (f"已登记「{title}」，我们会尽快处理，感谢支持！" if created else
+                  f"「{title}」已有其它用户求片，已合并登记（累计 {req.submit_count} 次），感谢支持！")
+        return await _edit_or_send(db, token, chat_id, message_id, thanks, main_keyboard())
 
     # 投稿：若会话里已存链接（先发链接再选片）则直接落库，否则提示补链接
     secret = str(sess.get("secret") or "").strip()
@@ -1399,16 +1431,14 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
             if candidates:
                 _pick_set(tg_user_id, FLOW_WANT, title, candidates)
                 return "want_pick", _candidate_caption(FLOW_WANT, title, candidates)
-        kid = tgto.keyword_id(tmdb_id, season, title)
         # v0.9.13 #254：白名单写入后移到「审核通过」时执行；提交只登记待审核。
         # 同步细节（成功/失败）只写后台 note，绝不发给用户。
-        req = MediaRequest(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                           title=title, tmdb_id=tmdb_id, media_type="tv" if season else "",
-                           season=season, keyword_id=kid, status="pending",
-                           review_status="pending", note="待管理员审核通过后同步白名单")
-        db.add(req)
-        db.flush()  # autoflush=False：写完即查必须显式 flush
-        reply = f"已登记「{title}」，我们会尽快处理，感谢支持！"
+        # v0.9.17.1 #284：同作品去重合并。
+        req, created = upsert_media_request(
+            db, tg_user_id=str(tg_user_id), tg_username=tg_username,
+            title=title, tmdb_id=tmdb_id, media_type="tv" if season else "", season=season)
+        reply = (f"已登记「{title}」，我们会尽快处理，感谢支持！" if created else
+                 f"「{title}」已有其它用户求片，已合并登记（累计 {req.submit_count} 次），感谢支持！")
         return "want", reply
 
     if builtin == "投稿":

@@ -483,6 +483,12 @@ class MediaRequest(Base):
     season: Mapped[int | None] = mapped_column(Integer, nullable=True)
     keyword_id: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/synced/failed（TgtoDrive 同步状态，管理员内部可见）
+    # v0.9.17.1 #284：同作品求片去重合并——dedup_key 复用 keyword_id，重复提交累加
+    # submit_count 不新增行；保留 review_status（已采纳/已拒绝不重开）。
+    submit_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_tg_user_id: Mapped[str] = mapped_column(String(64), default="")
+    last_tg_username: Mapped[str] = mapped_column(String(128), default="")
+    last_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # v0.9.8：管理员审核状态，与 TgtoDrive 同步状态解耦。用户提交后一律 pending，
     # 不再把「failed」当业务状态展示给用户/后台审核列表。pending/adopted/rejected
     review_status: Mapped[str] = mapped_column(String(24), default="pending")

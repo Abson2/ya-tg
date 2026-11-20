@@ -130,6 +130,11 @@ _COLUMNS = {
         "review_note": "TEXT DEFAULT ''",
         "handled_at": "DATETIME",
         "year": "TEXT DEFAULT ''",  # v0.9.8：TMDB 候选选定后的年份
+        # v0.9.17.1 #284：同作品求片去重合并计数
+        "submit_count": "INTEGER DEFAULT 1",
+        "last_tg_user_id": "TEXT DEFAULT ''",
+        "last_tg_username": "TEXT DEFAULT ''",
+        "last_submitted_at": "DATETIME",
     },
     # v0.9.8：投稿记录 TMDB 候选选定的影号/中文名/年份/类型
     "user_contributions": {

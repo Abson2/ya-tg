@@ -108,6 +108,18 @@ function permTagType(c) {
 function memberTagType(c) {
   return (c.member_status === 'left' || c.member_status === 'kicked') ? 'danger' : 'success'
 }
+// v0.9.17.1 #283：只有「Bot 仍在且可发送」的发现目标才允许在目录路由里选为推送目标。
+// 已退出/被移出（left/kicked）或权限判 not_member 的目标不再出现在下拉——否则测试里
+// 勾了「显示已退出」后，一个 Bot 根本不在的群仍能被选中推送，必然发不出去。
+function isPushableDisc(c) {
+  if (!c) return false
+  if (c.active === false) return false
+  const m = String(c.member_status || '')
+  if (m === 'left' || m === 'kicked') return false
+  if (c.perm_status === 'not_member') return false
+  return true
+}
+const pushableDiscoverChats = computed(() => (discoverChats.value || []).filter(isPushableDisc))
 async function loadDiscover() {
   syncDiscBots()
   const params = []
@@ -161,13 +173,17 @@ async function checkDiscoverPerm(c) {
   } catch (e) { ElMessage.error(e.message) }
   finally { discoverChecking.value = -1 }
 }
-async function toggleDiscoverWhitelist(c) {
-  // v0.9.17 热修：v-model 在 change 时已翻转开关，请求失败必须回滚，
-  // 否则接口报 400/404 后开关停在错误状态，看起来"打开了其实没生效"。
+async function toggleDiscoverWhitelist(c, newValue) {
+  // v0.9.17.1 热修：@change 给的 newValue 才是用户想要的目标态。此前用 v-model
+  // 绑定 + 函数内 !prev 取反，而 @change 触发时 v-model 已翻转，导致发给后端的
+  // 永远是旧值 → 开关"点了没反应/弹回"。改为受控 :model-value + @change 显式传值，
+  // 成功后以回执为准，失败回滚到操作前状态。
   const prev = !!c.in_whitelist
+  const target = (typeof newValue === 'boolean') ? newValue : !prev
+  if (target === prev) return
   try {
     const d = await api(`/discover/chats/${c.id}/whitelist`, {
-      method: 'POST', body: JSON.stringify({ in_whitelist: !prev }) })
+      method: 'POST', body: JSON.stringify({ in_whitelist: target }) })
     c.in_whitelist = d.in_whitelist
     ElMessage.success(d.message)
     await load()  // 白名单变动同步到目录路由卡片
@@ -2075,7 +2091,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-button type="danger" plain :disabled="!discSelected.length" @click="batchWhitelist(false)">批量移出白名单</el-button>
             </div>
 
-            <el-table :data="discoverChats" size="small" border v-if="discoverChats.length" style="width:100%" @selection-change="v => discSelected = v.map(x => x.id)">
+            <el-table :data="discoverChats" row-key="id" size="small" border v-if="discoverChats.length" style="width:100%" @selection-change="v => discSelected = v.map(x => x.id)">
               <el-table-column type="selection" width="42" align="center"/>
               <el-table-column label="目标" min-width="170">
                 <template #default="{row}"><div class="disc-name">{{ row.title || row.username || row.chat_id }}</div><div class="disc-sub">{{ row.chat_id }}<span v-if="row.username"> · @{{ row.username }}</span></div></template>
@@ -2084,7 +2100,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column label="Bot" min-width="90"><template #default="{row}"><span class="disc-sub">{{ row.bot_name || '—' }}</span></template></el-table-column>
               <el-table-column label="成员状态" width="100"><template #default="{row}"><el-tag size="small" :type="memberTagType(row)">{{ row.member_label || MEMBER_LABEL[row.member_status] || '未知' }}</el-tag></template></el-table-column>
               <el-table-column label="权限" width="96"><template #default="{row}"><el-tag size="small" :type="permTagType(row)">{{ permLabel(row) }}</el-tag></template></el-table-column>
-              <el-table-column label="白名单" width="76" align="center"><template #default="{row}"><el-switch v-model="row.in_whitelist" @change="toggleDiscoverWhitelist(row)"/></template></el-table-column>
+              <el-table-column label="白名单" width="76" align="center"><template #default="{row}"><el-switch :model-value="!!row.in_whitelist" @change="v => toggleDiscoverWhitelist(row, v)"/></template></el-table-column>
               <el-table-column label="最后活动" min-width="130"><template #default="{row}"><span class="disc-sub">{{ row.last_seen_at || row.updated_at || '—' }}</span></template></el-table-column>
               <el-table-column label="操作" width="230" fixed="right">
                 <template #default="{row}">
@@ -2121,8 +2137,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="field route-targets" v-if="(r.targets || []).length">
                 <label>额外推送目标（一个目录可绑定多个频道/群；上方单目标字段也会一并推送）</label>
                 <div v-for="(t, ti) in r.targets" :key="ti" class="route-target-row">
-                  <el-select v-model="t.chat_id" filterable allow-create placeholder="选已发现目标或手填 chat_id" style="flex:1" @change="onRouteTargetPick(r, ti)">
-                    <el-option v-for="c in discoverChats" :key="c.chat_id" :label="(c.title || c.username || c.chat_id) + ' · ' + (TYPE_TAG[c.chat_type] || c.chat_type)" :value="c.chat_id"/>
+                  <el-select v-model="t.chat_id" filterable allow-create placeholder="选已发现目标或手填 chat_id（已退出/Bot 不在群的目标不可选）" style="flex:1" @change="onRouteTargetPick(r, ti)">
+                    <el-option v-for="c in pushableDiscoverChats" :key="c.chat_id" :label="(c.title || c.username || c.chat_id) + ' · ' + (TYPE_TAG[c.chat_type] || c.chat_type)" :value="c.chat_id"/>
                   </el-select>
                   <el-select v-model="t.kind" style="width:96px"><el-option label="频道" value="channel"/><el-option label="群组" value="group"/></el-select>
                   <el-button size="small" text type="danger" @click="removeRouteTarget(r, ti)">移除</el-button>
@@ -2209,6 +2225,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-table-column label="影视名称（TMDB 候选）" min-width="180"><template #default="s">
                   {{ s.row.title }}<span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
                   <el-tag v-if="s.row.tmdb_id" size="small" type="info" effect="plain">#{{ s.row.tmdb_id }}</el-tag>
+                  <el-tag v-if="s.row.submit_count > 1" size="small" type="warning" effect="plain" :title="'累计 ' + s.row.submit_count + ' 次求片，已合并为一条'">×{{ s.row.submit_count }}</el-tag>
                 </template></el-table-column>
                 <el-table-column label="提交用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
                 <el-table-column label="审核状态" width="96"><template #default="s"><el-tag size="small" :type="s.row.review_status === 'adopted' ? 'success' : s.row.review_status === 'rejected' ? 'danger' : 'warning'">{{ wantReviewLabel(s.row.review_status) }}</el-tag></template></el-table-column>

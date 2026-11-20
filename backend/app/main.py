@@ -4105,6 +4105,24 @@ def _discovered_kind(d: DiscoveredChat) -> str:
     return "channel" if str(d.chat_type or "").lower() == "channel" else "group"
 
 
+def _inactive_discover_reason(d: DiscoveredChat) -> str:
+    """v0.9.17.1 #283：目标已被确认不在群/被移出时的拒绝原因；unknown 不拦截。
+
+    只对明确证据（left/kicked 成员状态、not_member 权限、active=False）拒绝加入
+    推送白名单。member_status=unknown（如从白名单配置落库、尚未检查权限的目标）
+    放行，避免误伤新目标/手工兜底。
+    """
+    member = str(getattr(d, "member_status", "") or "").lower()
+    perm = str(getattr(d, "perm_status", "") or "").lower()
+    if member in ("left", "kicked") or perm == "not_member":
+        label = {"channel": "频道", "group": "群"}.get(_discovered_kind(d), "目标")
+        return (f"Bot 已不在该{label}（成员状态={member or '已退出'}、权限={perm or 'not_member'}），"
+                f"无法加入推送白名单。请先用「生成授权链接」把 Bot 加回{label}"
+                f"{'并设为管理员授予发布权限' if _discovered_kind(d) == 'channel' else ''}，"
+                f"收到成员变化事件后再试。")
+    return ""
+
+
 def _whitelist_configured_chats(db: Session) -> list[tuple[str, str, str]]:
     """v0.9.16 #279：列出管理员已在白名单/目录路由里配置的真实推送目标。
 
@@ -4388,6 +4406,10 @@ def discover_set_whitelist(cid: int, p: DiscoverWhitelistInput,
     routes = bot_listener.push_routes_raw(db)
     chat_id = d.chat_id
     if p.in_whitelist:
+        # v0.9.17.1 #283：明确已退出/不在群的目标禁止加入白名单（unknown 放行）
+        inactive_reason = _inactive_discover_reason(d)
+        if inactive_reason:
+            raise HTTPException(400, inactive_reason)
         bot = _global_bot(db)
         if not bot:
             raise HTTPException(400, "请先在「交互 Bot 与推送配置」填写 Bot Token")
@@ -4454,6 +4476,10 @@ async def discover_test_push(cid: int, db: Session = Depends(get_db)):
     d = db.get(DiscoveredChat, cid)
     if not d:
         raise HTTPException(404, "目标不存在")
+    # v0.9.17.1 #283：明确不在群的目标直接给可操作提示，不发起注定失败的 Telegram 调用
+    inactive_reason = _inactive_discover_reason(d)
+    if inactive_reason:
+        return {"ok": False, "message": inactive_reason}
     bot = _global_bot(db)
     if not bot:
         return {"ok": False, "message": "未配置交互 Bot，无法测试推送"}
@@ -4734,6 +4760,11 @@ def media_requests(limit: int = 100, db: Session = Depends(get_db)):
              "review_note": getattr(r, "review_note", "") or "",
              "sync_note": r.note or "",  # 后台可见的 TgtoDrive 失败原因
              "tg_user_id": r.tg_user_id, "tg_username": r.tg_username,
+             # v0.9.17.1 #284：同作品求片合并计数字段（老库迁移默认 1/空）
+             "submit_count": int(getattr(r, "submit_count", 1) or 1),
+             "last_tg_user_id": getattr(r, "last_tg_user_id", "") or "",
+             "last_tg_username": getattr(r, "last_tg_username", "") or "",
+             "last_submitted_at": r.last_submitted_at.isoformat() if getattr(r, "last_submitted_at", None) else None,
              "created_at": r.created_at, "handled_at": getattr(r, "handled_at", None)}
             for r in rows]
 
@@ -4750,23 +4781,23 @@ async def add_media_request(p: MediaRequestInput, db: Session = Depends(get_db))
     title = (p.title or "").strip()
     if not title:
         raise HTTPException(400, "请填写影视名称")
-    kid = tgto.keyword_id(p.tmdb_id, p.season, title)
-    row = MediaRequest(title=title, tmdb_id=p.tmdb_id, media_type=p.media_type,
-                       season=p.season, keyword_id=kid, status="pending")
-    db.add(row)
-    db.flush()
-    try:
-        r = await tgto.upsert_keyword(db, title=title, tmdb_id=p.tmdb_id,
-                                      media_type=p.media_type, season=p.season)
-        row.status = "synced" if r.get("ok") else "failed"
-        row.note = r.get("message") or r.get("status") or ""
-        if r.get("ok"):
-            row.synced_at = utcnow()
-    except Exception as exc:
-        row.status, row.note = "failed", str(exc)[:300]
+    # v0.9.17.1 #284：同作品去重合并——后台重复加入时不再重复写白名单，只累加计数。
+    row, created = bot_listener.upsert_media_request(
+        db, tg_user_id="", tg_username="", title=title,
+        tmdb_id=p.tmdb_id, media_type=p.media_type, season=p.season)
+    if created:
+        try:
+            r = await tgto.upsert_keyword(db, title=title, tmdb_id=p.tmdb_id,
+                                          media_type=p.media_type, season=p.season)
+            row.status = "synced" if r.get("ok") else "failed"
+            row.note = (r.get("detail") or r.get("message") or r.get("status") or "")[:300]
+            if r.get("ok"):
+                row.synced_at = utcnow()
+        except Exception as exc:
+            row.status, row.note = "failed", str(exc)[:300]
     db.commit()
-    return {"ok": True, "id": row.id, "status": row.status, "keyword_id": kid,
-            "note": row.note}
+    return {"ok": True, "id": row.id, "status": row.status, "keyword_id": row.keyword_id,
+            "note": row.note, "created": created, "submit_count": int(row.submit_count or 1)}
 
 
 class MediaRequestHandleInput(BaseModel):

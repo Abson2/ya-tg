@@ -436,3 +436,98 @@ def test_contributions_api_exposes_merge_count(db):
                            content="", share_url="https://s/y", tmdb_id=902, media_type="tv")
     rows = main.contributions("", 100, db)
     assert len(rows) == 1 and rows[0]["submit_count"] == 2
+
+
+# ---------------- v0.9.17.1 #283 不在群目标禁止加入白名单/推送 ----------------
+def test_inactive_discover_reason_guard(db):
+    """明确 left/kicked/not_member 拦截；unknown 放行，避免误伤新目标。"""
+    from app import main
+    left = DiscoveredChat(bot_id=1, chat_id="-100A", chat_type="supergroup",
+                          member_status="left", perm_status="not_member")
+    unknown = DiscoveredChat(bot_id=1, chat_id="-100B", chat_type="supergroup",
+                             member_status="unknown", perm_status="unknown")
+    assert "不在" in main._inactive_discover_reason(left)
+    assert main._inactive_discover_reason(unknown) == ""
+
+
+def test_whitelist_rejects_inactive_target(db):
+    """后端白名单开关：已退出目标返回 400，不落路由。"""
+    from app import main
+    from fastapi import HTTPException
+    d = DiscoveredChat(bot_id=1, chat_id="-100LEFT", chat_type="supergroup",
+                       member_status="left", perm_status="not_member", in_whitelist=False)
+    db.add(d); db.commit()
+    with pytest.raises(HTTPException) as ei:
+        main.discover_set_whitelist(
+            d.id, main.DiscoverWhitelistInput(in_whitelist=True), db)
+    assert ei.value.status_code == 400 and "不在" in ei.value.detail
+    assert db.get(DiscoveredChat, d.id).in_whitelist is False
+
+
+def test_test_push_rejects_inactive_target(db):
+    """测试推送对已退出目标直接返回 ok=False + 提示，不发起 Telegram 调用。"""
+    from app import main
+    d = DiscoveredChat(bot_id=1, chat_id="-100LEFT2", chat_type="supergroup",
+                       member_status="kicked", perm_status="not_member")
+    db.add(d); db.commit()
+    out = asyncio.run(main.discover_test_push(d.id, db))
+    assert out["ok"] is False and ("不在" in out["message"] or "移出" in out["message"])
+
+
+# ---------------- v0.9.17.1 #284 求片同作品去重合并 ----------------
+def test_upsert_media_request_merges_and_counts(db):
+    """同作品重复求片只留一行、累加计数、保留 pending。"""
+    from app import bot_listener as bl
+    r1, new1 = bl.upsert_media_request(
+        db, tg_user_id="u1", tg_username="a", title="同一部剧",
+        tmdb_id=1234, media_type="tv", season=1)
+    r2, new2 = bl.upsert_media_request(
+        db, tg_user_id="u2", tg_username="b", title="同一部剧",
+        tmdb_id=1234, media_type="tv", season=1)
+    assert new1 is True and new2 is False
+    assert r1.id == r2.id and r2.submit_count == 2
+    assert r2.last_tg_user_id == "u2" and r2.review_status == "pending"
+    assert db.query(MediaRequest).count() == 1
+
+
+def test_upsert_media_request_keeps_adopted_status(db):
+    """已采纳的求片被重复提交时保留 review/status，只计数。"""
+    from app import bot_listener as bl
+    r1, _ = bl.upsert_media_request(
+        db, tg_user_id="u1", tg_username="", title="已采纳剧", tmdb_id=1235, season=1)
+    r1.review_status = "adopted"; r1.status = "synced"
+    db.commit()
+    r2, new2 = bl.upsert_media_request(
+        db, tg_user_id="u3", tg_username="", title="已采纳剧", tmdb_id=1235, season=1)
+    assert new2 is False and r2.review_status == "adopted" and r2.status == "synced"
+    assert r2.submit_count == 2 and db.query(MediaRequest).count() == 1
+
+
+def test_media_requests_api_exposes_merge_count(db):
+    """求片后台列表 API 回显合并计数字段。"""
+    from app import main
+    from app import bot_listener as bl
+    bl.upsert_media_request(db, tg_user_id="u1", tg_username="", title="计数求片", tmdb_id=1236)
+    bl.upsert_media_request(db, tg_user_id="u2", tg_username="", title="计数求片", tmdb_id=1236)
+    rows = main.media_requests(100, db)
+    assert len(rows) == 1 and rows[0]["submit_count"] == 2
+
+
+# ---------------- v0.9.17.1 前端源码断言（开关受控 / row-key / 下拉过滤 / 求片×N） ----------------
+def test_frontend_discover_switch_and_filter_fixes():
+    """锁死三个真机交互修复，防止回归。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
+    # 开关受控绑定：@change 显式传新值，不再 v-model 双翻转
+    assert ':model-value="!!row.in_whitelist"' in src
+    assert '@change="v => toggleDiscoverWhitelist(row, v)"' in src
+    assert 'toggleDiscoverWhitelist(c, newValue)' in src
+    assert 'v-model="row.in_whitelist"' not in src
+    # 表格加 row-key，删除/筛选重排不再按索引复用组件导致开关错位
+    assert ':data="discoverChats" row-key="id"' in src
+    # 推送目标下拉只列可推送目标（已退出/不在群被过滤）
+    assert 'v-for="c in pushableDiscoverChats"' in src
+    assert 'function isPushableDisc' in src
+    # 求片合并计数 ×N 标记
+    assert "累计 ' + s.row.submit_count + ' 次求片" in src
