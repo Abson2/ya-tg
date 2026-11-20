@@ -531,7 +531,8 @@ def overview(db: Session = Depends(get_db)):
               {"resources": Resource, "bots": Bot, "channels": Channel, "rules": Rule}.items()}
     for status in ("pending", "review", "retry", "failed", "sent"):
         counts[status] = db.scalar(select(func.count(QueueItem.id)).where(QueueItem.status == status)) or 0
-    counts["auth"] = "ok" if (db.get(AuthToken, 1) and db.get(AuthToken, 1).access_token_enc) else "unauthorized"
+    _auth = db.get(AuthToken, 1)  # 阶段三 A-05：取一次，避免重复 db.get
+    counts["auth"] = "ok" if (_auth and _auth.access_token_enc) else "unauthorized"
     return counts
 
 
@@ -2336,6 +2337,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     if media_type in ("movie", "tv"):
         stmt = stmt.where(Resource.media_type == media_type)
     rows = list(db.scalars(stmt).all())
+    by_id = {x.id: x for x in rows}  # 阶段三 A-08：复用已取资源，避免筛选时逐条 db.get
     groups: dict[str, dict] = {}
     for x in rows:
         key = _series_group_key(x)
@@ -2418,7 +2420,8 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         # 筛选：标题/文件名关键词
         if q and q.lower() not in (str(g["title"]) + " " + " ".join(str(i) for i in g["ids"])).lower():
             # 关键词也匹配成员文件名
-            member_hit = any(q.lower() in (db.get(Resource, i).name or "").lower() for i in g["ids"])
+            member_hit = any(q.lower() in ((by_id[i].name if i in by_id else "") or "").lower()
+                             for i in g["ids"])
             if not member_hit:
                 continue
         # v0.7.0：一级状态栏筛选（完结/追更、识别状态、分享状态）
@@ -3445,9 +3448,15 @@ def queue(status: str = "", limit: int = 100, db: Session = Depends(get_db)):
     stmt = select(QueueItem).order_by(QueueItem.id.desc()).limit(min(limit, 500))
     if status:
         stmt = stmt.where(QueueItem.status == status)
+    qs = list(db.scalars(stmt).all())
+    # 阶段三 A-02：批量取资源/频道，消除逐条 db.get 的 1+2N 查询
+    res_map = {x.id: x for x in db.scalars(select(Resource).where(
+        Resource.id.in_([q.resource_id for q in qs]))).all()}
+    ch_map = {x.id: x for x in db.scalars(select(Channel).where(
+        Channel.id.in_([q.channel_id for q in qs]))).all()}
     out = []
-    for q in db.scalars(stmt).all():
-        r, c = db.get(Resource, q.resource_id), db.get(Channel, q.channel_id)
+    for q in qs:
+        r, c = res_map.get(q.resource_id), ch_map.get(q.channel_id)
         out.append({"id": q.id, "resource": r.name if r else "", "channel": c.name if c else "",
                     "status": q.status, "attempts": q.attempts, "error": q.error,
                     "next_retry_at": q.next_retry_at.isoformat() if q.next_retry_at else None})
@@ -3456,10 +3465,15 @@ def queue(status: str = "", limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/api/review", dependencies=ADMIN)
 def review(db: Session = Depends(get_db)):
+    qs = list(db.scalars(select(QueueItem).where(QueueItem.status == "review")).all())
+    # 阶段三 A-03：批量取资源/频道，消除逐条 db.get
+    res_map = {x.id: x for x in db.scalars(select(Resource).where(
+        Resource.id.in_([q.resource_id for q in qs]))).all()}
+    ch_map = {x.id: x for x in db.scalars(select(Channel).where(
+        Channel.id.in_([q.channel_id for q in qs]))).all()}
     out = []
-    for q in db.scalars(select(QueueItem).where(QueueItem.status == "review")).all():
-        r = db.get(Resource, q.resource_id)
-        c = db.get(Channel, q.channel_id)
+    for q in qs:
+        r, c = res_map.get(q.resource_id), ch_map.get(q.channel_id)
         out.append({"id": q.id, "resource": r.name if r else "", "channel_id": q.channel_id,
                     "channel": c.name if c else "", "identified": r.identify_status if r else ""})
     return out
@@ -5039,6 +5053,9 @@ def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_
     stmt = select(UserContribution).order_by(UserContribution.id.desc()).limit(min(limit, 500))
     if status:
         stmt = stmt.where(UserContribution.status == status)
+    rows = list(db.scalars(stmt).all())
+    # 阶段三 A-01：一次批量取转存任务，替代逐条 restore_for（1+N → 2 次 SQL）
+    restore_by_cid = contribution_restore.restore_map_for(db, [c.id for c in rows])
     return [{"id": c.id, "title": c.title, "content": c.content, "share_url": c.share_url,
              "tg_user_id": c.tg_user_id, "tg_username": c.tg_username,
              "tmdb_id": getattr(c, "tmdb_id", None), "media_type": getattr(c, "media_type", "") or "",
@@ -5058,10 +5075,8 @@ def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_
              "restore_error": r.error if r else "",
              "restore_verify_note": r.verify_note if r else "",
              "restored_at": r.restored_at.isoformat() if r and r.restored_at else None}
-            for c, r in (
-                (c, contribution_restore.restore_for(db, c.id))
-                for c in db.scalars(stmt).all()
-            )]
+            for c in rows
+            for r in [restore_by_cid.get(c.id)]]
 
 
 class ContributionHandleInput(BaseModel):

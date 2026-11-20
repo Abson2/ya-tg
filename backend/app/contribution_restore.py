@@ -73,6 +73,15 @@ def restore_for(db: Session, contribution_id: int) -> ContributionRestore | None
         ContributionRestore.contribution_id == contribution_id).limit(1))
 
 
+def restore_map_for(db: Session, contribution_ids: list[int]) -> dict[int, ContributionRestore]:
+    """阶段三 A-01：批量取转存任务，消除投稿列表的 N+1 查询。"""
+    if not contribution_ids:
+        return {}
+    rows = db.scalars(select(ContributionRestore).where(
+        ContributionRestore.contribution_id.in_(contribution_ids))).all()
+    return {r.contribution_id: r for r in rows}
+
+
 def pick_pending(db: Session, limit: int = 20) -> list[ContributionRestore]:
     """后台 job 扫描未完成任务（pending / retry_wait），重启后可续处理。"""
     return list(db.scalars(select(ContributionRestore).where(

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select, true
+from sqlalchemy import case, func, select, true
 from sqlalchemy.orm import Session
 
 from . import runtime_config
@@ -114,16 +114,25 @@ def _iso(value) -> str:
 
 
 def stats(db: Session) -> list[dict]:
-    """每类日志的总条数、可清理条数、时间跨度与保护规则。"""
+    """每类日志的总条数、可清理条数、时间跨度与保护规则。
+
+    阶段三 A-12：每条 spec 用一条聚合 SQL 取 rows/min/max/pruneable，
+    由 4×7=28 次查询降到 7 次；返回结构与字段口径完全不变。
+    """
     out = []
     for spec in SPECS:
-        oldest = db.scalar(select(func.min(spec.time_col)))
-        newest = db.scalar(select(func.max(spec.time_col)))
+        row = db.execute(select(
+            func.count(spec.model.id),
+            func.min(spec.time_col),
+            func.max(spec.time_col),
+            func.sum(case((spec.pruneable, 1), else_=0)),
+        )).one()
+        rows, oldest, newest, pruneable = row
         out.append({
             "key": spec.key, "label": spec.label, "note": spec.note,
             "protected": spec.protected,
-            "rows": _count(db, spec),
-            "pruneable": _count(db, spec, pruneable_only=True),
+            "rows": int(rows or 0),
+            "pruneable": int(pruneable or 0),
             "oldest": _iso(oldest), "newest": _iso(newest),
         })
     return out
