@@ -300,15 +300,22 @@ def test_set_whitelist_add_and_remove(db):
     assert ch is None or ch.enabled is False
 
 
-def test_delete_chat_removes_from_routes(db):
+def test_delete_chat_only_hides_and_keeps_routes(db):
+    """v0.9.18.1：删除=仅从列表隐藏，白名单/路由/Channel 原样保留。"""
     _seed_bot(db)
     bl.record_discovered_chat(db, {"id": -1001, "type": "group", "title": "群"})
     row = db.scalar(select(DiscoveredChat))
     main_mod.discover_set_whitelist(row.id, main_mod.DiscoverWhitelistInput(in_whitelist=True), db)
     main_mod.discover_delete_chat(row.id, db)
-    assert db.scalar(select(DiscoveredChat).where(DiscoveredChat.chat_id == "-1001")) is None
+    row = db.scalar(select(DiscoveredChat).where(DiscoveredChat.chat_id == "-1001"))
+    assert row is not None and row.hidden is True  # 行仍在，只是隐藏
     raw = bl.push_routes_raw(db)
-    assert not any(t["chat_id"] == "-1001" for r in raw for t in r["targets"])
+    assert any(t["chat_id"] == "-1001" for r in raw for t in r["targets"])  # 白名单未动
+    ch = db.scalar(select(Channel).where(Channel.chat_id == "-1001"))
+    assert ch is not None and ch.enabled is True  # Channel 未停用
+    # 隐藏后 discover_chats 不再返回该目标
+    out = main_mod.discover_chats(db)
+    assert all(c["chat_id"] != "-1001" for c in out["chats"])
 
 
 # ---------- 前端静态断言 ----------

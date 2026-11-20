@@ -154,6 +154,8 @@ _COLUMNS = {
         "bot_username": "TEXT DEFAULT ''",
         "last_update_id": "BIGINT DEFAULT 0",
         "updated_at": "DATETIME",
+        # v0.9.18.1：仅从发现列表移除的标记（不动白名单/Channel/Telegram）
+        "hidden": "BOOLEAN DEFAULT 0",
     },
 }
 

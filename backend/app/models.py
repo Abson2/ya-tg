@@ -168,6 +168,9 @@ class DiscoveredChat(Base):
     source: Mapped[str] = mapped_column(String(16), default="auto")   # auto / manual
     # 白名单状态：True=已勾选加入推送白名单（Channel 同步启用）
     in_whitelist: Mapped[bool] = mapped_column(Boolean, default=False)
+    # v0.9.18.1：「从发现列表移除」标记。True=仅从本列表隐藏，不动白名单/Channel、
+    # 不动 Bot 已加入的群/频道；有新事件/手动重新加入时自动恢复显示。
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False)
     # Bot 发送权限检查缓存（getChatMember）
     perm_status: Mapped[str] = mapped_column(String(24), default="unknown")  # ok/no_permission/not_member/unknown
     perm_can_send: Mapped[bool] = mapped_column(Boolean, default=False)

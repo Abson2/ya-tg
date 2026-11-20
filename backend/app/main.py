@@ -4302,7 +4302,14 @@ def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
     bot_names = {b.id: b.name for b in db.scalars(select(Bot)).all()}
     out = []
     seen_chat_ids = set()
+    # v0.9.18.1：「从列表移除」的 chat_id 集合——既不再展示，也绝不被白名单兜底
+    # 重新落库（否则用户删除白名单里的频道后又被兜底加回，表现为"删不掉"）。
+    removed_chat_ids = {str(d.chat_id).strip() for d in rows if getattr(d, "hidden", False)}
     for d in rows:
+        # 被移除的目标：不展示、不校正白名单状态（白名单配置原样保留，推送不受影响）
+        if getattr(d, "hidden", False):
+            seen_chat_ids.add(str(d.chat_id).strip())
+            continue
         actual = d.chat_id in whitelisted_ids
         if bool(d.in_whitelist) != actual:
             d.in_whitelist = actual
@@ -4422,6 +4429,8 @@ async def discover_refresh(p: DiscoverRefreshInput = DiscoverRefreshInput(),
                         db.add(row)
                     else:
                         row.source = "manual"
+                        # v0.9.18.1：手动重新加入 → 恢复列表显示
+                        row.hidden = False
                         row.last_seen_at = utcnow()
                         row.updated_at = utcnow()
                         row.chat_type = ctype
@@ -4596,28 +4605,61 @@ async def discover_test_push(cid: int, db: Session = Depends(get_db)):
     return await _send_test_message(token, d.chat_id, bot.name, label, db)
 
 
-@app.delete("/api/discover/chats/{cid}", dependencies=ADMIN)
-def discover_delete_chat(cid: int, db: Session = Depends(get_db)):
-    """从发现池删除目标；若它在白名单里，同时从路由移除并停用 Channel。"""
+def _remove_discovered_chat(db: Session, cid: int) -> tuple[bool, str]:
+    """v0.9.18.1：仅从「发现列表」移除目标——打 hidden 标记，绝不触碰三样东西：
+
+      1) 白名单/目录路由（本项目推送是否加入）——原样保留；
+      2) Channel（发送层落点）——不禁用、不删除；
+      3) Telegram 里 Bot 实际加入的群/频道——本就无任何 Bot API 调用。
+
+    同一 chat_id 可能有多行（不同 Bot，或 auto + whitelist 重复落库），全部一起
+    hidden，避免删一行另一行又在列表里出现。有新事件/手动重新加入时清标记恢复显示。
+    """
     d = db.get(DiscoveredChat, cid)
     if not d:
-        raise HTTPException(404, "目标不存在")
-    chat_id = d.chat_id
-    if d.in_whitelist:
-        routes = bot_listener.push_routes_raw(db)
-        for r in routes:
-            r["targets"] = [t for t in r["targets"] if t["chat_id"] != chat_id]
-            if r["channel_id"] == chat_id:
-                r["channel_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "channel"), "")
-            if r["group_id"] == chat_id:
-                r["group_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "group"), "")
-        runtime_config.set_many(db, {"push_routes_json": json_dumps([r for r in routes if r["targets"]])})
-        for ch in db.scalars(select(Channel).where(Channel.chat_id == chat_id)).all():
-            ch.enabled = False
-    db.delete(d)
-    add_audit(db, "discover_chat_deleted", target_type="chat", target_id=chat_id)
+        return False, "目标不存在"
+    chat_id = str(d.chat_id or "").strip()
+    affected = 0
+    for row in db.scalars(select(DiscoveredChat).where(
+            DiscoveredChat.chat_id == chat_id)).all():
+        if not getattr(row, "hidden", False):
+            row.hidden = True
+            affected += 1
+    db.flush()
+    add_audit(db, "discover_chat_removed_from_list", target_type="chat", target_id=chat_id,
+              detail=json_dumps({"affected_rows": affected, "whitelist_untouched": True}))
+    return True, chat_id
+
+
+@app.delete("/api/discover/chats/{cid}", dependencies=ADMIN)
+def discover_delete_chat(cid: int, db: Session = Depends(get_db)):
+    """从发现列表移除目标（仅隐藏本条台账，不动白名单/Channel/Telegram）。"""
+    ok, info = _remove_discovered_chat(db, cid)
+    if not ok:
+        raise HTTPException(404, info)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "chat_id": info,
+            "message": "已从列表移除；不影响推送白名单与 Bot 已加入的群/频道，可刷新或手动重新加入"}
+
+
+class DiscoverBatchDeleteInput(BaseModel):
+    ids: list[int] = []
+
+
+@app.post("/api/discover/chats/batch-delete", dependencies=ADMIN)
+def discover_batch_delete(p: DiscoverBatchDeleteInput, db: Session = Depends(get_db)):
+    """批量从发现列表移除（仅隐藏台账，不动白名单/Channel/Telegram）。"""
+    removed, missing = 0, 0
+    for cid in p.ids[:500]:
+        ok, _info = _remove_discovered_chat(db, int(cid))
+        if ok:
+            removed += 1
+        else:
+            missing += 1
+    db.commit()
+    add_audit(db, "discover_batch_remove_from_list", target_type="chat",
+              detail=json_dumps({"removed": removed, "missing": missing}))
+    return {"ok": True, "removed": removed, "missing": missing}
 
 
 class DiscoverBatchInput(BaseModel):

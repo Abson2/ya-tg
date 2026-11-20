@@ -210,12 +210,25 @@ async function testDiscoverPush(c) {
   } catch (e) { ElMessage.error(e.message) }
 }
 async function deleteDiscoverChat(c) {
-  const ok = await confirmBox(`确认删除目标「${c.title || c.chat_id}」？若已加入白名单会同时移出。`)
+  // v0.9.18.1：删除 = 仅从本列表移除，不动推送白名单、不动 Bot 已加入的群/频道
+  const ok = await confirmBox(`确认从列表移除目标「${c.title || c.chat_id}」？\n仅从此列表移除，不影响推送白名单与 Bot 已加入的群/频道；之后可手动输入 ID 或刷新重新加入。`)
   if (!ok) return
   try {
     await api(`/discover/chats/${c.id}`, { method: 'DELETE' })
-    ElMessage.success('已删除')
-    await load()
+    ElMessage.success('已从列表移除')
+    await loadDiscover()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function batchDeleteDiscover() {
+  if (!discSelected.value.length) { ElMessage.warning('请先勾选目标'); return }
+  const ok = await confirmBox(`确认从列表移除选中的 ${discSelected.value.length} 个目标？\n仅从此列表移除，不影响推送白名单与 Bot 已加入的群/频道。`)
+  if (!ok) return
+  try {
+    const d = await api('/discover/chats/batch-delete', {
+      method: 'POST', body: JSON.stringify({ ids: discSelected.value.slice() }) })
+    ElMessage.success(`已从列表移除 ${d.removed} 个目标`)
+    discSelected.value = []
+    await loadDiscover()
   } catch (e) { ElMessage.error(e.message) }
 }
 // v0.9.15 #276：Bot 筛选来源（复用交互配置里的 bot_options，不含 token 明文）
@@ -2164,6 +2177,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-button @click="loadDiscover">筛选</el-button>
               <el-button type="success" plain :disabled="!discSelected.length" @click="batchWhitelist(true)">批量加入白名单 ({{ discSelected.length }})</el-button>
               <el-button type="danger" plain :disabled="!discSelected.length" @click="batchWhitelist(false)">批量移出白名单</el-button>
+              <el-button type="danger" :disabled="!discSelected.length" @click="batchDeleteDiscover">批量从列表移除</el-button>
             </div>
 
             <el-table :data="discoverChats" row-key="id" size="small" border v-if="discoverChats.length" style="width:100%" @selection-change="v => discSelected = v.map(x => x.id)">

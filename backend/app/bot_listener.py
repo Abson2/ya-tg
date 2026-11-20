@@ -462,6 +462,9 @@ def record_discovered_chat(db: Session, chat: dict, *, source: str = "auto",
         db.add(row)
     else:
         row.last_seen_at = now
+        # v0.9.18.1：hidden（用户主动从列表移除）保持持久——新消息事件只更新台账数据，
+        # 不自动恢复显示，否则活跃群/频道来一条消息就复活，又变成"删不掉"。
+        # 只有管理员手动重新添加（discover_refresh 的 manual 分支）才清 hidden。
         if count_message:
             row.message_count = int(row.message_count or 0) + 1
         row.updated_at = now
