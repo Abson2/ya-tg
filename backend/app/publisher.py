@@ -502,10 +502,23 @@ async def _process_queue_impl(limit: int = 20) -> dict:
             else:
                 q.attempts += 1
                 q.error = error[:1500]
-                # v0.6.5：用独立变量，勿覆盖逐条发送节流的 delay，否则下一条的间隔会被退避秒数篡改
-                retry_delay = retry_after or backoff_seconds(q.attempts)
-                q.next_retry_at = plus_seconds(utcnow(), retry_delay)
-                q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
+                # 阶段五 #6：429（限流）/网络错误可退避重试；401/403（Token 失效、
+                # Bot 被移出群、无发送权限）是永久错误，重试 MAX_ATTEMPTS 次只会浪费
+                # 配额、让队列看似「在重试」实则永不成功。分级：永久错误直接 failed，
+                # 状态只落在本条 QueueItem（channel_id 独立），不影响其它目标。
+                err_low = str(error or "").lower()
+                permanent = ("http 401" in err_low or "http 403" in err_low or
+                             "bot was blocked" in err_low or "chat not found" in err_low or
+                             "not enough rights" in err_low or "kicked" in err_low)
+                if permanent:
+                    q.status = "failed"
+                    q.next_retry_at = None
+                    q.error = (error + "（永久错误，不重试；请检查 Bot Token / 目标权限）")[:1500]
+                else:
+                    # v0.6.5：用独立变量，勿覆盖逐条发送节流的 delay，否则下一条的间隔会被退避秒数篡改
+                    retry_delay = retry_after or backoff_seconds(q.attempts)
+                    q.next_retry_at = plus_seconds(utcnow(), retry_delay)
+                    q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
             # v0.9.10：本条发送结果立即落盘，绝不把写事务带进下一轮的 sleep / 网络 await。
             db.commit()

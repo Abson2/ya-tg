@@ -26,6 +26,7 @@ def db():
 @pytest.fixture(autouse=True)
 def _fresh():
     migrate()
+    tgto.clear_tmdb_meta_cache()  # 阶段五 B-07：隔离每个用例的元数据缓存
     with SessionLocal() as db:
         db.query(AuthToken).delete()
         db.query(AppConfig).delete()

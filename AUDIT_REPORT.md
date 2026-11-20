@@ -342,3 +342,14 @@
 - **阶段四第 8 项「外部服务统一限流/熔断」——评估后不新增抽象层，如实记录**：源码核查确认 5 个外部服务已有各自成熟限流：`guangya.py` 429 读 Retry-After + 指数退避 + `RateLimiter`、`tmdb.py` 按场景独立限流（`TmdbRateLimited`）、`bot_listener.py` 对 TG 409/429/5xx 分类退避且不推进 offset、`publisher.py` 429 不回退 + 队列 `backoff_seconds`、`tgto.py` 降级安全。审计 A/B/C 类未把此项列为具体缺陷。新增全局熔断层会重复现有逻辑、改变已调优的每服务行为，违反「功能一致」原则且无具体失败案例驱动，故本批不动；若后续真机出现某服务未被现有逻辑覆盖的限流故障，再按该具体服务补点，不做预防性大改。
 
 - **仍未处理（后续批次/架构债，非本批遗漏）**：A-04 逐作品串行 TMDB（属性能非安全，且并发会触发限流，保持串行）；B-04 `_async_scan` 内存态重启丢失（需新表，阶段五考虑）；B-06 单文件 main.py 5287 行（需大拆分，触及全部功能，风险过高本批不动）；B-07 按名+大小回填身份碰撞（用户明确不动的回填设计）；B-08/B-09 镜像边界细节（真机验证后再定）；C-03/C-04 连接释放与 PRAGMA（实测无泄漏，观察项）。
+
+### 阶段五｜业务闭环整改（源码验证中，未发版）
+
+> 原则同阶段四：功能一致优先；无具体失败案例 / 无接口取证支撑的项不猜实现，如实记录评估结论。
+
+- **A-10 完善（投稿/求片失败消息持久化）——已在阶段四 A-10 覆盖**：瞬时故障不推进 offset + 5 次重试上限；达上限按毒消息落 ProcessedUpdate + 日志，消息不再被静默丢弃。本阶段不重复实现。
+- **B-04 `_async_scan` 状态落 DB + 重启恢复——已修**：新增 `async_scan_state.py`，把手动扫描状态以 JSON 落 `app_config`（专用 key，明文无凭证）；`scan_async_reset` 启动即持久化、`_run_async_scan` finally 落终结态；`lifespan` 启动时 `recover_on_startup()` 把遗留 running 标为「已中断（进程重启）」，asyncio.Task 无法跨进程恢复、不谎称在跑。时间比较走 `as_utc()`。`tests/test_v103_async_scan_state.py` 5 项。
+- **C-02 转存 restoring 超时兜底——已在阶段四覆盖**：30 分钟阈值重置 retry_wait。本阶段不重复。
+- **B-07 求片白名单 TMDB 元数据本地缓存——已修**：`tgto._tmdb_meta` 加进程内 TTL（24h）+ 硬上限（500，GC 1/5）缓存，只覆盖 upsert_keyword 这条链路（不动识别/英文名解析的 TMDB 调用）；失败/未配置结果不缓存（不固化暂时故障）；TMDB 配置变更时 `clear_tmdb_meta_cache()` 立即生效。同一 tmdb_id 重复采纳不再重复请求、不消耗 SCAN 限流配额。`tests/test_v103_tmdb_meta_cache.py` 4 项 + 既有 upsert 测试隔离缓存。
+- **分享/作品更新超时先核验远端——评估后不实现，如实记录**：核查 `GuangYaShareClient` 只有 create/update/delete 三个分享接口，无「列已有分享」接口；分享 URL 的 shareId 带随机后缀（如 `1970558251383148604_aey8...`），无法从 fileId 推导。缺少取证支撑的远端核验手段，猜接口会违反「不猜接口」红线。现有防护已覆盖主要重复场景：`ensure_share` 的 share_url 幂等 + 同目录 sibling 复用、`process_queue` 作品级去重（sent_keys_by_channel）、阶段四 B-01 队列进程锁（防手动/定时并发重复建分享）。真机若出现「建分享响应丢失导致重复链接」的具体案例，再按该接口补核验，不做预防性猜测。
+- **Bot 429/403 分级 + 目标独立状态 + 发送历史——部分已具备 + 补永久错误分级**：429 退避（`_send_telegram` 读 retry_after、`process_queue` 用它覆盖 backoff）、目标独立状态（QueueItem 按 channel_id 各自 attempts/error/next_retry_at）、发送历史（AuditLog `push_sent` + QueueItem.telegram_message_id/sent_at）此前已有。本阶段补：401/403（Token 失效 / Bot 被移出群 / 无权限 / bot blocked / chat not found）判为永久错误，直接 failed 不设 next_retry_at，避免重试 MAX_ATTEMPTS 次浪费配额、队列假活；429/网络错误仍退避重试。`tests/test_v103_bot_error_classification.py` 2 项。

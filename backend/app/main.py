@@ -21,9 +21,9 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import (admin_session, ai_assist, bot_listener, contribution_restore,
-               guangya_auth, guangya_sms, log_retention, mirror, mirror_batch,
-               runtime_config, tgto, tmdb)
+from . import (admin_session, ai_assist, async_scan_state, bot_listener,
+               contribution_restore, guangya_auth, guangya_sms, log_retention,
+               mirror, mirror_batch, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
@@ -511,6 +511,16 @@ async def lifespan(app: FastAPI):
                 db.commit()
     except Exception as exc:
         logger.warning("[logs] 启动清理失败（不影响启动）：%s", exc)
+    # 阶段五 B-04：重启恢复遗留的手动扫描状态。asyncio.Task 无法跨进程恢复，
+    # 把上次未终结的 running 标为「已中断」，前端如实展示而非永远卡 running。
+    try:
+        with SessionLocal() as db:
+            recovered = async_scan_state.recover_on_startup(db)
+            if recovered.get("error"):
+                logger.warning("[async-scan] 启动时恢复扫描状态：%s", recovered.get("stage"))
+            _async_scan.update(recovered)
+    except Exception as exc:
+        logger.warning("[async-scan] 扫描状态恢复失败（不影响启动）：%s", exc)
     with SessionLocal() as db:
         guangya_auth.seed_from_config(db)
         task = db.scalar(select(ScanTask).limit(1))
@@ -2272,10 +2282,27 @@ def _async_scan_reset(mode: str) -> None:
     _async_scan.update({"running": True, "started_at": utcnow().isoformat(),
                         "finished_at": None, "mode": mode, "error": "",
                         "result": {}, "stage": "启动"})
+    # 阶段五 B-04：启动即持久化，进程重启后前端能查到「曾在跑」。
+    try:
+        with SessionLocal() as db:
+            async_scan_state.save(db, _async_scan)
+            db.commit()
+    except Exception as exc:
+        logger.warning("[async-scan] 持久化启动状态失败：%s", exc)
+
+
+def _async_scan_persist() -> None:
+    """把当前内存状态写回 DB（离散点调用，绝不跨 await 持写事务）。"""
+    try:
+        with SessionLocal() as db:
+            async_scan_state.save(db, _async_scan)
+            db.commit()
+    except Exception as exc:
+        logger.warning("[async-scan] 持久化进度失败：%s", exc)
 
 
 async def _run_async_scan(mode: str) -> None:
-    """后台执行扫描管线，全程独立 Session；状态写内存，任何异常都落到 error。"""
+    """后台执行扫描管线，全程独立 Session；状态写内存 + DB 快照（B-04）。"""
     global _async_scan_task
     try:
         with SessionLocal() as db:
@@ -2317,6 +2344,8 @@ async def _run_async_scan(mode: str) -> None:
         _async_scan["running"] = False
         _async_scan["finished_at"] = utcnow().isoformat()
         _async_scan_task = None
+        # 阶段五 B-04：终结态（成功/失败/中断）持久化，前端重启后仍可查到本轮结果。
+        _async_scan_persist()
 
 
 @app.post("/api/scan/async", dependencies=ADMIN)
@@ -3061,6 +3090,7 @@ def tmdb_config_save(p: TmdbConfigInput, db: Session = Depends(get_db)):
                 pass  # 非法输入忽略，保持原值
     runtime_config.set_many(db, values)
     tmdb.reset_rate_limiters()  # 配置变更后清空滑动窗口，立即生效
+    tgto.clear_tmdb_meta_cache()  # 阶段五 B-07：清空求片元数据缓存，新语言/密钥立即生效
     add_audit(db, "tmdb_config_saved", target_type="config", detail="TMDB 密钥/限流已更新（密文存储）")
     db.commit()
     return {"ok": True, "status": tmdb_status(db)}

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import httpx
 from sqlalchemy.orm import Session
@@ -25,6 +26,36 @@ from . import runtime_config
 from .config import settings
 
 RULE_SOURCE = "ya-tg"
+
+# 阶段五 B-07：求片白名单采纳时 _tmdb_meta 每次都请求 TMDB（走 SCAN 限流），同一
+# 作品被重复采纳/刷新会重复消耗配额。加进程内 TTL 缓存，只覆盖这一条链路，不动
+# 识别/英文名解析的 TMDB 调用。失败/未配置结果不缓存，避免暂时故障被固化。
+_TMDB_META_TTL = 24 * 3600
+_TMDB_META_MAX = 500
+_tmdb_meta_cache: dict[str, tuple[float, dict]] = {}
+
+
+def clear_tmdb_meta_cache() -> None:
+    """TMDB 配置变更时调用，让新语言/密钥立即生效。"""
+    _tmdb_meta_cache.clear()
+
+
+def _tmdb_meta_cache_get(key: str) -> dict | None:
+    hit = _tmdb_meta_cache.get(key)
+    if hit and time.time() - hit[0] < _TMDB_META_TTL:
+        return dict(hit[1])
+    if hit:
+        _tmdb_meta_cache.pop(key, None)
+    return None
+
+
+def _tmdb_meta_cache_put(key: str, data: dict) -> None:
+    if len(_tmdb_meta_cache) >= _TMDB_META_MAX:
+        # 删最早的 1/5，避免每次到上限都 O(n) 全清理
+        oldest = sorted(_tmdb_meta_cache, key=lambda k: _tmdb_meta_cache[k][0])
+        for k in oldest[:max(1, _TMDB_META_MAX // 5)]:
+            _tmdb_meta_cache.pop(k, None)
+    _tmdb_meta_cache[key] = (time.time(), dict(data))
 
 
 class TgtoError(RuntimeError):
@@ -152,6 +183,12 @@ async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
              "poster_url": "", "backdrop_path": "", "backdrop_url": "", "year": ""}
     if not tmdb_id:
         return empty
+    # B-07：命中缓存直接返回（不消耗 TMDB 限流配额、不发网络）。配置变更时由
+    # clear_tmdb_meta_cache() 清空，语言/密钥变化立即生效。
+    cache_key = f"{int(tmdb_id)}:{(media_type or 'tv').lower()}"
+    cached = _tmdb_meta_cache_get(cache_key)
+    if cached is not None:
+        return dict(cached)
     try:
         from . import tmdb
         if not tmdb.configured(db):  # 未配密钥直接降级，不消耗限流配额也不发网络请求
@@ -161,7 +198,7 @@ async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
         return empty
     poster = str(d.get("poster_path") or "")
     backdrop = str(d.get("backdrop_path") or "")
-    return {
+    result = {
         "original_title": str(d.get("original_title") or ""),
         "overview": str(d.get("overview") or ""),
         "poster_path": poster,
@@ -172,6 +209,11 @@ async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
         # include_year / year；取不到仍为空串，安全降级不阻断写入。
         "year": str(d.get("year") or ""),
     }
+    # B-07：只缓存成功取到数据的结果；全空结果不缓存（可能是 TMDB 临时抖动，
+    # 不应固化 24h），下次采纳还可重试补全海报/简介。
+    if any(result.values()):
+        _tmdb_meta_cache_put(cache_key, result)
+    return result
 
 
 async def fetch_config(db: Session) -> tuple[dict, str]:
