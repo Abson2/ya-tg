@@ -44,6 +44,12 @@ HELP = ("Ya-TG 指令说明\n\n"
         "点后再直接输入文字即可（不必加 /），回复「结束」退出交互。\n"
         "其它指令以管理员在后台配置的为准。")
 
+# v0.9.16 #277：未进入指令/会话态时，对用户随意发送内容的统一纠正提示。
+# 投稿/求片/搜索只走指令或 Reply 菜单进入的会话态，裸链接/裸文字不再自动登记。
+_UNRECOGNIZED_HINT = ("当前内容未识别为指令。请点下方菜单，或发送 "
+                      "/求片 /投稿 /搜索 /打赏 /help；\n"
+                      "如正在交互中，请按提示输入，或回复「结束」退出。")
+
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
 # 使用限制检查结果缓存：{tg_user_id: (checked_ts, ok, reason)}
 _restrict_cache: dict[str, tuple[float, bool, str]] = {}
@@ -944,7 +950,7 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
     if data == CB_CONTRIB:
         return ("📤 投稿：先发剧名选 TMDB 候选，再补光鸭分享链接。\n"
                 "也可一步提交：/投稿 标题 分享链接\n"
-                "也可直接把分享链接发给我，我会自动为你登记，感谢支持！", back_keyboard())
+                "v0.9.16 起裸链接不再自动登记，请先点「投稿」进入流程再按提示操作。", back_keyboard())
     if data == CB_SEARCH:
         return ("🔍 搜索：直接输入剧名 / 关键词，我会把你之前推送过、仍在库的"
                 "资源卡片转发给你。\n也可发 /搜索 关键词。", back_keyboard())
@@ -1255,8 +1261,11 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
         arg = raw
         low = builtin
 
-    if not builtin and not custom and not _SHARE_URL.search(raw):
-        return "ignored", ""
+    # v0.9.16 #277：投稿/求片/搜索只走「指令」或「Reply 键盘进入的会话态」。
+    # 非会话态下任意内容（含裸链接 / 裸文字）一律不落库、不响应业务，回纠正提示。
+    # 仅 /help /start /自定义指令 在上面已返回，裸分享链接不再触发任何投稿。
+    if not builtin and not custom and not active_flow:
+        return "unrecognized", _UNRECOGNIZED_HINT
 
     # v0.9.9 #209：裸命令（点 Reply 键盘触发，无参数）→ 进入会话态，提示直接输入文字。
     # 不再回「用法：/求片 …」逼用户加命令，也不再让投稿落「未命名投稿」。
@@ -1351,41 +1360,13 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     if custom:
         return "custom", str(custom.get("reply") or custom.get("description") or "已收到指令。")
 
-    # 普通消息里带链接也按投稿登记，降低用户使用门槛（如会话态里直接发纯链接）
-    if _SHARE_URL.search(raw):
-        return await _register_link_contribution(db, raw, tg_user_id, tg_username)
-    # 会话态下走到这里说明是一段文字但没匹配命令——按投稿剧名处理，先走 TMDB 候选
-    if active_flow == FLOW_CONTRIB and raw:
-        candidates = await search_candidates(db, raw)
-        if candidates:
-            _pick_set(tg_user_id, FLOW_CONTRIB, raw, candidates)
-            return "contribute_pick", _candidate_caption(FLOW_CONTRIB, raw, candidates)
-        db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                                title=raw[:512], content=raw[:4000], share_url="",
-                                status="pending", note="文字投稿（TMDB 无候选）；转存接口待验证"))
-        _flow_clear(tg_user_id)
-        return "contribute", f"投稿已登记：{raw[:512]}\n感谢支持，我们会尽快处理。"
-    return "ignored", ""
-
-
-async def _register_link_contribution(db: Session, raw: str, tg_user_id: str,
-                                      tg_username: str) -> tuple[str, str]:
-    """纯光鸭链接投稿：链接即内容，标题从候选/文本拿，用户回复不含管理员信息。"""
-    share_url = _SHARE_URL.findall(raw)[-1]
-    text_title = _SHARE_URL.sub("", raw).strip()[:512]
-    title = text_title
-    if not title:
-        candidates = await search_candidates(db, share_url)
-        if candidates:
-            # 有候选也走点选，拿到规范中文名；链接先存进会话 secret 供选完落库
-            _pick_set(tg_user_id, FLOW_CONTRIB, "分享链接", candidates, secret=share_url)
-            return "contribute_pick", _candidate_caption(FLOW_CONTRIB, "分享链接", candidates)
-        title = share_url  # 无候选兜底用链接本身，仍不造「未命名投稿」
-    db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                            title=title, content=raw[:4000], share_url=share_url,
-                            status="pending", note="自动识别为投稿；转存接口待验证"))
-    _flow_clear(tg_user_id)
-    return "contribute", f"已收到资源并登记投稿（{title}），感谢支持，我们会尽快处理。"
+    # v0.9.16 #277：删除「普通消息里带链接也按投稿登记」分支——正是把用户发的
+    # startgroup 授权链接误登记投稿的根因。合法投稿仅三条路径，均已在上面处理：
+    #   ① /投稿 剧名 [链接]      → builtin=投稿 分支
+    #   ② 点「投稿」进会话态后发剧名/链接 → 1259 转为 builtin=投稿 分支
+    #   ③ TMDB 候选点选后补链接  → pending 等链接分支
+    # 走到这里只剩会话态下发了未知 /命令（守卫已拦截非会话态裸内容），回纠正提示。
+    return "unrecognized", _UNRECOGNIZED_HINT
 
 
 ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member", "channel_post"]
@@ -1635,6 +1616,9 @@ async def _dispatch_reply(db: Session, token: str, chat_id: str, text: str,
         kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
         await _reply(db, token, chat_id, reply, reply_markup=kb)
     elif action == "flow_end":
+        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+    elif action == "unrecognized":
+        # v0.9.16 #277：非指令内容纠正提示，附主菜单引导用户走正确入口
         await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
     elif action in ("flow_want", "flow_contribute", "flow_search", "contribute_await_url"):
         await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())

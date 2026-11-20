@@ -8,6 +8,29 @@
 
 ---
 
+## v0.9.16 (2026-11-20)
+
+v0.9.15 真机反馈三项修复：Bot 交互边界收紧（非指令内容不再误登记投稿）、Bot 用户名自动读取与复制兼容、群/频道发现列表兜底与诚实诊断。**不重构、不改推送闸门、不改认证、不虚构扫描能力**。
+
+### 一、非指令内容不得自动登记投稿（#277）
+- 真机反馈：用户发送 startgroup 授权链接或任意分享链接给 Bot，被回复「已收到资源并登记投稿」。根因是 `handle_text()` 末尾无条件 `if _SHARE_URL.search(raw): _register_link_contribution()`，把任意裸链接当投稿落库。
+- 修复：删除「裸链接自动投稿」分支及废弃的 `_register_link_contribution()`。新增统一常量 `_UNRECOGNIZED_HINT`，非指令/非会话态内容一律回 `unrecognized` 纠正提示（点菜单或发 /求片 /投稿 /搜索 /打赏 /help，交互中按提示输入，回复「结束」退出），并附主菜单键盘。投稿仅保留三条合法路径：`/投稿 剧名 [链接]`、Reply 投稿会话态输入、`_pick` TMDB 候选点选后补链接。菜单 CB_CONTRIB 文案同步去掉「直接发链接自动登记」引导。
+
+### 二、Bot 用户名自动读取与复制失败（#278）
+- 真机反馈：①「Bot 用户名」输入框留空不自动读取，自动发现 Bot 下拉需先手填用户名才有选项；②复制用户名/授权链接报「复制失败」。
+- 修复①：`POST /api/discover/invite-link` 的 `getMe` 成功后把权威 username 回写 `interaction_bot_username` 配置（前端生成链接后回填输入框显示）；前端 `load()` 加载交互配置后立即 `syncDiscBots()`，下拉初次进入即有选项，不再依赖手填用户名。
+- 修复②：`copyText()` 增加 `document.execCommand('copy')`（隐藏 textarea）fallback，局域网 HTTP 访问不再因 `navigator.clipboard` 不可用而失败；异步 Clipboard API 作为次选，两者都失败才提示手动选中。
+
+### 三、群/频道已有消息却发现不到（#279）
+- 真机反馈：群内 10:05/10:06/11:26 有消息且 @Bot，点「发现/刷新」仍显示「新增发现 0 个目标」、列表空。
+- 诚实定位：Telegram `getUpdates` 只下发未确认的新事件，后台 `_job_bot_poll` 每 10 秒已消费并推进 offset，历史消息无法重放；隐私模式下普通群消息不下发。**Telegram 无「列出 Bot 已加入全部群」接口，无法真正回溯历史成员**——不虚构扫描发现数。
+- 修复①：`discover_chats()` 增加 `_whitelist_configured_chats()`，把已在 channels 表、目录路由 targets、旧版配置白名单里登记的**真实 chat_id**（管理员确认过、正在推送的目标）合并进统一列表（`source=whitelist`、`in_whitelist=true`），已发现记录优先、按 chat_id 去重，避免对着空列表反复点刷新。
+- 修复②：`discover_refresh()` 在未新增发现且无手动添加时返回 `diagnosis` 字段，按未配置 Token / 409 冲突 / 轮询异常 / 正常无新事件分类说明原因与操作路径（群内 @Bot 发消息、设管理员、私有群发 /id），前端用单一提示链如实展示，不再弹「新增发现 0」误导。
+
+### 四、验证
+- 新增专项 `tests/test_v0916_bot_message_guard_and_discover.py`（12 项）：裸 startgroup 链接/裸分享链接/裸文字不投稿、纠正提示含菜单引导、会话态投稿与候选补链接仍可用、getMe 用户名回写与 @ 剥离、copy fallback 源码、白名单目标合并、诊断字段返回。
+- 专项 12 passed；全量 pytest 542 passed；前端 build 成功。
+
 ## v0.9.15 (2026-11-20)
 
 大批量剧集任务稳定性专项：修复光鸭写接口 `code=117 无效token` 竞态、TgtoDrive 白名单规则缺 TMDB 元数据、推理模型 AI 翻译失败三个根因，剧集未翻译是前两者的连锁后果。**不改 A→B 镜像主链路语义、不改认证协议、不改推送闸门，海报仍优先**。

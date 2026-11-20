@@ -133,17 +133,19 @@ async function refreshDiscover() {
     const d = await api('/discover/refresh', { method: 'POST', body: JSON.stringify(body) })
     discoverChats.value = d.chats || []
     discPollError.value = (d.polled && d.polled.error) || ''
+    // v0.9.16 #279：收敛为单一提示链，避免"发现完成"与诊断两个 toast 叠加
     if (d.added) {
       manualChatId.value = ''; manualChatName.value = ''
       ElMessage.success(`已添加：${d.added.title || d.added.chat_id}`)
     } else if (d.add_error) {
       ElMessage.error(d.add_error)  // 私有邀请链接 / getChat 失败的分类原因
-    } else ElMessage.success('发现完成')
-    if (d.polled && d.polled.error_kind === 'conflict') {
+    } else if (d.polled && d.polled.error_kind === 'conflict') {
       ElMessage.warning('Bot 轮询冲突：可能有另一个实例在使用同一 Token：' + d.polled.error)
+    } else if (d.diagnosis) {
+      ElMessage.info({ message: d.diagnosis, duration: 8000, showClose: true })
     } else if (d.polled && d.polled.messages) {
       ElMessage.info(`本轮处理 ${d.polled.messages} 条更新；新增发现 ${d.polled.discovered || 0} 个目标`)
-    } else if (!manualChatId.value.trim() && !d.add_error) {
+    } else {
       ElMessage.info(d.hint || '暂无新记录；请确保 Bot 已入群并等待成员状态变化或新消息事件')
     }
   } catch (e) { ElMessage.error(e.message) }
@@ -207,14 +209,39 @@ async function genInviteLink(botId) {
       method: 'POST', body: JSON.stringify(botId ? { bot_id: botId } : {}) })
     if (!d.ok) { ElMessage.error(d.error || '生成授权链接失败'); return }
     inviteLink.value = d
+    // v0.9.16 #278：getMe 读取到的用户名回填输入框，管理员可见「自动读取」结果。
+    // 后端 invite-link 端点已把该值持久化到配置，这里只同步本地显示，无需再 POST。
+    if (d.bot_username) interactionCfg.value.interaction_bot_username = d.bot_username
     ElMessage.success('已生成授权链接，复制后在 Telegram 打开选择目标群')
   } catch (e) { ElMessage.error(e.message) }
   finally { inviteLoading.value = false }
 }
-async function copyText(text, label) {
+function copyText(text, label) {
   if (!text) { ElMessage.warning('无可复制内容'); return }
-  try { await navigator.clipboard.writeText(text); ElMessage.success((label || '内容') + '已复制') }
-  catch (e) { ElMessage.warning('复制失败，请手动选中复制：' + text) }
+  // v0.9.16 #278：局域网 HTTP 访问时 navigator.clipboard 不存在/被拒，
+  // fallback 到隐藏 textarea + execCommand('copy')，兼容非 HTTPS 环境。
+  const ok = (function () {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = String(text)
+      ta.setAttribute('readonly', '')
+      ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length)
+      const done = document.execCommand('copy')
+      document.body.removeChild(ta)
+      return !!done
+    } catch (e) { return false }
+  })()
+  if (ok) { ElMessage.success((label || '内容') + '已复制'); return }
+  // 最后再试异步 Clipboard API（HTTPS/localhost 环境）
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(String(text)).then(
+      () => ElMessage.success((label || '内容') + '已复制'),
+      () => ElMessage.warning('浏览器禁止复制，请手动选中：' + text))
+  } else {
+    ElMessage.warning('浏览器禁止复制，请手动选中：' + text)
+  }
 }
 function openStartgroup() {
   if (!inviteLink.value || !inviteLink.value.startgroup_url) { genInviteLink(); return }
@@ -610,6 +637,9 @@ async function load() {
   try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
   try { scanBatches.value = await api('/scan/batches?limit=5') } catch (e) {}
   try { interactionCfg.value = await api('/interaction/config') } catch (e) {}
+  // v0.9.16 #278：初次加载即同步 Bot 下拉来源（bot_options 来自配置接口），
+  // 不再需要先手动填「Bot 用户名」才能出现下拉选项。
+  syncDiscBots()
   try {
     const pr = await api('/push/routes')
     pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
@@ -1508,7 +1538,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v0.9.15 · Asia/Shanghai</span>
+          <span>v0.9.16 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

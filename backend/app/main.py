@@ -313,13 +313,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.15", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.16", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.15", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.16", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -4105,6 +4105,39 @@ def _discovered_kind(d: DiscoveredChat) -> str:
     return "channel" if str(d.chat_type or "").lower() == "channel" else "group"
 
 
+def _whitelist_configured_chats(db: Session) -> list[tuple[str, str, str]]:
+    """v0.9.16 #279：列出管理员已在白名单/目录路由里配置的真实推送目标。
+
+    返回 [(chat_type, chat_id, title), ...]，去重。这些不是"扫描发现"的结果，
+    而是管理员手工确认过、正在使用的 chat_id——用于在发现台账为空时兜底展示，
+    让用户看到实际在推送的群/频道。绝不虚构数量。
+    """
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add(ctype: str, chat_id: str, title: str = ""):
+        cid = str(chat_id or "").strip()
+        if not cid or cid in seen:
+            return
+        seen.add(cid)
+        out.append((ctype, cid, str(title or "").strip()))
+
+    # 1) channels 表（推送目标真相源）
+    for c in db.scalars(select(Channel).where(Channel.enabled.is_(True))).all():
+        ctype = "channel" if (getattr(c, "kind", "channel") or "channel") != "group" else "supergroup"
+        add(ctype, c.chat_id, getattr(c, "name", ""))
+    # 2) 目录路由 targets（一个目录可绑多个目标）
+    for r in bot_listener.push_routes(db):
+        add(r.get("kind", "channel"), r.get("chat_id", ""), r.get("target_name", ""))
+    # 3) 旧版 runtime_config 白名单兼容
+    chans, groups = bot_listener.push_whitelist(db)
+    for cid in chans:
+        add("channel", cid)
+    for cid in groups:
+        add("group", cid)
+    return out
+
+
 def _discovered_row(d: DiscoveredChat, bot_name: str = "") -> dict:
     return {
         "id": d.id, "bot_id": d.bot_id, "bot_name": bot_name,
@@ -4142,6 +4175,7 @@ def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
     whitelisted_ids = {t["chat_id"] for t in bot_listener.push_routes(db)}
     bot_names = {b.id: b.name for b in db.scalars(select(Bot)).all()}
     out = []
+    seen_chat_ids = set()
     for d in rows:
         actual = d.chat_id in whitelisted_ids
         if bool(d.in_whitelist) != actual:
@@ -4149,6 +4183,27 @@ def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
         # 默认隐藏已退出/被移出的目标；include_inactive=True 时全部返回由前端标记
         row = _discovered_row(d, bot_names.get(d.bot_id, ""))
         out.append(row)
+        seen_chat_ids.add(str(d.chat_id).strip())
+    # v0.9.16 #279：把「已在白名单/目录路由里配置、但发现台账里还没有记录」的目标
+    # 补进列表。Telegram 无列群接口、历史消息不可回溯，这些 chat_id 是管理员已确认
+    # 真实存在且在推送的目标——让它们在统一列表可见，而不是对着空列表反复点刷新。
+    # 只补真实配置里的 chat_id，不虚构任何"扫描发现"数量。
+    known_chats = _whitelist_configured_chats(db)
+    main_bot_id = bot_listener.effective_bot_id(db)
+    for ctype, chat_id, title in known_chats:
+        if chat_id in seen_chat_ids:
+            continue
+        seen_chat_ids.add(chat_id)
+        out.append({
+            "id": 0, "bot_id": main_bot_id, "bot_name": bot_names.get(main_bot_id, "主交互 Bot"),
+            "chat_id": chat_id, "title": title or chat_id, "username": "",
+            "chat_type": ctype, "type_label": _TYPE_LABELS.get(ctype, ctype or "未知"),
+            "source": "whitelist", "in_whitelist": True,
+            "perm_status": "unknown", "perm_can_send": True, "perm_detail": "来自白名单配置（未做权限检查）",
+            "perm_checked_at": None, "member_status": "unknown", "member_label": "来自配置",
+            "active": True, "bot_username": "", "last_update_id": 0,
+            "first_seen_at": None, "last_seen_at": None, "updated_at": None, "message_count": 0,
+        })
     if rows:
         db.commit()
     # 筛选
@@ -4251,8 +4306,26 @@ async def discover_refresh(p: DiscoverRefreshInput = DiscoverRefreshInput(),
             add_error = "未配置交互 Bot，无法通过 getChat 校验目标；请先在 Bot 管理配置并选用 Bot。"
     db.commit()
     chats = discover_chats(db)
+    discovered_count = int(polled.get("discovered") or 0) if isinstance(polled, dict) else 0
+    # v0.9.16 #279：诊断为什么"新增发现 0"——不虚构、不误导用户反复点刷新。
+    poll_diagnosis = ""
+    poll_err_kind = (polled.get("error_kind") or "") if isinstance(polled, dict) else ""
+    poll_err = (polled.get("error") or "") if isinstance(polled, dict) else ""
+    if discovered_count == 0 and not add_error:
+        if not token:
+            poll_diagnosis = "未配置交互 Bot，无法接收群消息事件。"
+        elif poll_err_kind == "conflict":
+            poll_diagnosis = "另一个实例正用同一 Token 取更新（409 冲突），本轮未拉取到事件。"
+        elif poll_err:
+            poll_diagnosis = f"轮询异常：{poll_err}"
+        else:
+            poll_diagnosis = ("Telegram 只下发「未确认的新事件」，后台每 10 秒已自动取走并处理；"
+                              "历史群消息无法重放。要让 Bot 发现某群，请在群内 @Bot 发一条消息"
+                              "（或把 Bot 设为管理员），随后等待约 10 秒；私有群请在群内发 /id。"
+                              "已在白名单配置的目标会直接出现在下方列表。")
     return {"ok": True, "added": added, "add_error": add_error, "polled": polled,
             "chats": chats["chats"], "total": chats["total"],
+            "diagnosis": poll_diagnosis,
             "hint": ("自动发现需 Bot 已入群且群内有新消息；若 Bot 开了隐私模式，"
                      "请设为群管理员或在群里 @Bot 发一条消息后再点发现。私有群请在群内发 /id 登记。")}
 
@@ -4445,6 +4518,10 @@ async def discover_invite_link(p: DiscoverInviteInput = DiscoverInviteInput(),
         return {"ok": False, "error": "未配置交互 Bot Token，无法生成授权链接。请先在 Bot 管理中添加并选用 Bot。"}
 
     username, err = await bot_listener.get_bot_username(db, token)
+    if username:
+        # v0.9.16 #278：getMe 成功即回写配置，前端「Bot 用户名」输入框自动回填，
+        # 免管理员手工查抄；这是权威值（BotFather 设置），优先于人工填写兜底。
+        runtime_config.set_many(db, {"interaction_bot_username": username})
     if not username:
         # 人工填写的 username 作为兜底（getMe 网络异常时仍可出链接）
         fallback = (runtime_config.get(db, "interaction_bot_username") or "").strip().lstrip("@")
