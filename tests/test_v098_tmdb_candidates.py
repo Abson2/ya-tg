@@ -29,18 +29,24 @@ def _run(coro):
 @pytest.fixture
 def session():
     migrate()
+    # 阶段七：与同域 bot 测试（v0910/v0912/v0916）对齐全局状态清理，
+    # 消除整包顺序下偶发的 _flow_sessions / 去重计数残留导致的候选字段断言失败。
+    bot_listener._flow_sessions.clear()
+    bot_listener._pick_sessions.clear()
+    bot_listener._AUTO_CLEARED_TOKENS.clear()
     with SessionLocal() as s:
         s.query(MediaRequest).delete()
         s.query(UserContribution).delete()
         s.commit()
-        bot_listener._pick_sessions.clear()
         try:
             yield s
         finally:
             s.query(MediaRequest).delete()
             s.query(UserContribution).delete()
             s.commit()
+            bot_listener._flow_sessions.clear()
             bot_listener._pick_sessions.clear()
+            bot_listener._AUTO_CLEARED_TOKENS.clear()
 
 
 CANDIDATES = [
