@@ -57,6 +57,8 @@ const diagCount = computed(() => {
     (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
+// 阶段二路线B C4：严格顺序引擎开关 + 批次控制状态
+const mirrorStrict = ref(false), batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_sequence: 0 })
 // v0.9.17.2：失败任务定向批量重试的勾选行（目录 / 文件各自独立）
 const missingDirSelected = ref([]), fileErrSelected = ref([])
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
@@ -492,6 +494,20 @@ function stageLabel(s) {
 async function pollMirrorStatus() {
   if (!authed.value) return
   try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
+  try { batchInfo.value = await api('/mirror/batch/status') } catch (e) {}
+}
+// 阶段二路线B C4：批次控制（暂停/恢复/跳过/取消），危险操作二次确认
+async function batchControl(action) {
+  if (action === 'cancel') {
+    try { await ElMessageBox.confirm('取消后未完成的复制任务将停止推进，确定继续？', '取消当前批次', { type: 'warning' }) }
+    catch (e) { return }
+  }
+  try {
+    const d = await api(`/mirror/batch/control?action=${action}`, { method: 'POST' })
+    ElMessage.success(`批次指令已下发：${action}`)
+    await pollMirrorStatus()
+    return d
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
 
 const navGroups = [
@@ -888,7 +904,10 @@ async function saveMirror() {
 async function runMirror(mode = 'auto') {
   mirrorBusy.value = true
   try {
-    const q = mode === 'auto' ? '' : `?post_identify=${mode === 'force' ? 'true' : 'false'}`
+    const parts = []
+    if (mode !== 'auto') parts.push(`post_identify=${mode === 'force' ? 'true' : 'false'}`)
+    if (mirrorStrict.value) parts.push('strict=true')  // 阶段二路线B：严格顺序引擎
+    const q = parts.length ? '?' + parts.join('&') : ''
     const d = await api(`/mirror/run${q}`, { method: 'POST' }, 300000)
     const extra = []
     if (d.dirs_created) extra.push(`新建目录 ${d.dirs_created}`)
@@ -2023,6 +2042,17 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </el-collapse-item>
             </el-collapse>
             <div v-if="mirrorStatus.lock?.busy && !mirrorBusy" class="mirror-lock-tip"><el-tag type="warning" size="small">后台任务运行中</el-tag> {{ mirrorStatus.lock.owner || '镜像任务' }} 已运行约 {{ mirrorStatus.lock.held_seconds }} 秒；同步 / 改名共用一把锁，等它结束再点「立即同步」即可，无需刷新页面。</div>
+            <!-- 阶段二路线B C4：严格顺序引擎与批次控制 -->
+            <div class="batch-control-row">
+              <span class="hint">严格顺序引擎</span>
+              <el-switch v-model="mirrorStrict" size="small"/>
+              <span class="hint">一个文件复制确认完成后才提交下一个，可暂停 / 恢复 / 跳过 / 取消。</span>
+              <el-tag v-if="batchInfo.batch_id" size="small" :type="batchInfo.status === 'paused' ? 'warning' : batchInfo.status === 'running' ? 'success' : 'info'">{{ batchInfo.status || 'idle' }} · {{ batchInfo.done || 0 }}/{{ batchInfo.total || 0 }} · 序列 {{ batchInfo.current_sequence || 0 }}</el-tag>
+              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('pause')">暂停</el-button>
+              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('resume')">恢复</el-button>
+              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('skip')">跳过当前</el-button>
+              <el-button size="small" type="danger" :disabled="!mirrorStrict" @click="batchControl('cancel')">取消批次</el-button>
+            </div>
             <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
           </div>
           <div class="panel mirror-col">
@@ -3001,6 +3031,8 @@ button{font-family:inherit}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
 /* v0.9.6：镜像锁占用提示——后台改名复查静默持锁时，让用户知道为何「立即同步」会 409 */
 .mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:#fff8e6;border:1px solid #f5d98a;border-radius:10px;color:#8a6d1f;font-size:12px;line-height:1.7}
+.batch-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px;padding:10px 14px;background:#f4f7ff;border:1px solid #dbe3ff;border-radius:10px;font-size:12px}
+.batch-control-row .hint{color:#5b6484}
 /* v0.9.0：镜像同步页分区治理——状态数字按语义分组，配置/接口改成结构化 chip */
 .mirror-fold{margin-top:16px;border-top:1px solid var(--yg-line);border-bottom:0}
 .mirror-fold .el-collapse-item__header{font-size:13px;font-weight:650;color:#3b4361;min-height:42px;height:auto;padding:10px 4px}

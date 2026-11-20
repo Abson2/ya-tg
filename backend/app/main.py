@@ -21,7 +21,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import (admin_session, ai_assist, bot_listener, contribution_restore,
-               guangya_auth, guangya_sms, log_retention, mirror, runtime_config, tgto, tmdb)
+               guangya_auth, guangya_sms, log_retention, mirror, mirror_batch,
+               runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
@@ -1135,7 +1136,8 @@ async def _safe_rename(db: Session, r: MirrorRule, **kwargs) -> dict:
                 "untranslated_works": [], "idle_seconds": 0}
 
 
-async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
+async def _do_mirror_run(post_identify: bool | None, db: Session,
+                         strict: bool = False) -> dict:
     """v0.8.5：立即同步；默认按 mirror.auto_identify 决定是否接「入库 → 识别 → 推送」管线。
 
     post_identify 不传（前端「立即同步」）= 遵循配置开关；
@@ -1154,7 +1156,8 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="copy", running=True)
         db.commit()
         _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制开始）
-        stats = await mirror.sync_rule(db, r)
+        # 阶段二路线B C4：strict=True 走严格顺序引擎，默认 False 保持旧批量路径
+        stats = await mirror.sync_rule(db, r, strict=strict)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="rename", running=True,
@@ -1241,10 +1244,13 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
 
 
 @app.post("/api/mirror/run", dependencies=ADMIN)
-async def mirror_run(post_identify: bool | None = None, db: Session = Depends(get_db)):
-    """v0.8.9：立即同步入口加互斥；重复点击直接 409，不让长任务排队堆积。"""
+async def mirror_run(post_identify: bool | None = None, strict: bool = False,
+                     db: Session = Depends(get_db)):
+    """v0.8.9：立即同步入口加互斥；重复点击直接 409，不让长任务排队堆积。
+    strict=True（阶段二路线B）：走严格顺序引擎；默认 False 保持旧批量路径。
+    """
     with _mirror_guard():
-        return await _do_mirror_run(post_identify, db)
+        return await _do_mirror_run(post_identify, db, strict=strict)
 
 
 async def _do_mirror_retry_files(p: MirrorRetryInput, post_identify: bool | None,
@@ -1829,7 +1835,46 @@ def mirror_status(db: Session = Depends(get_db)):
             "max_works_per_run": max(0, int(getattr(r, "max_works_per_run", 0) or 0)) if r else 0,
             "works_cursor": str(getattr(r, "works_cursor", "") or "") if r else "",
         },
+        # 阶段二路线B C4：严格顺序批次状态（前端据此显示暂停/恢复/跳过/取消按钮）
+        "batch": (mirror_batch.batch_status(db, r) if r else
+                  {"batch_id": "", "status": "idle", "control_action": "", "cursor_sequence": 0}),
     }
+
+
+# ---- 阶段二路线B C4：严格顺序批次控制端点 ----
+@app.get("/api/mirror/batch/status", dependencies=ADMIN)
+def mirror_batch_status(db: Session = Depends(get_db)):
+    """当前镜像批次状态 + 任务进度（暂停/恢复/跳过/取消按钮据此渲染）。"""
+    r = _mirror_rule(db)
+    if not r:
+        return {"batch_id": "", "status": "idle", "total": 0, "done": 0,
+                "pending": 0, "percent": 0, "current_sequence": 0, "status_count": {}}
+    info = mirror_batch.batch_status(db, r)
+    if r.batch_id:
+        info.update(mirror_batch.batch_progress(db, r.batch_id))
+    else:
+        info.update({"total": 0, "done": 0, "pending": 0, "percent": 0,
+                     "current_sequence": 0, "status_count": {}})
+    return info
+
+
+@app.post("/api/mirror/batch/control", dependencies=ADMIN)
+def mirror_batch_control(action: str, db: Session = Depends(get_db)):
+    """派发批次控制指令：pause / resume / skip / cancel。
+
+    指令在"任务边界"生效，不打断正在进行的 copy_file/轮询。幂等。
+    """
+    r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "尚无镜像规则")
+    try:
+        out = mirror_batch.request_control(db, r, action)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    add_audit(db, "mirror_batch_control", target_type="mirror",
+              detail=json_dumps({"action": action, "batch_id": r.batch_id}))
+    db.commit()
+    return {"ok": True, **out}
 
 
 @app.get("/api/scan/batches", dependencies=ADMIN)
