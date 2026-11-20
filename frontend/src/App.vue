@@ -796,7 +796,7 @@ async function load() {
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
     'contributions?limit=50', 'media-requests?limit=50', 'logs/overview',
-    'share/tasks?limit=200', 'share/status']
+    'share/tasks?limit=200', 'share/center/status']
   const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
   const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   overview.value = v(0) || overview.value

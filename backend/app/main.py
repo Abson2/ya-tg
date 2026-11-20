@@ -3971,9 +3971,12 @@ async def share_run():
         return await _sc.run_cycle(db, limit=20)
 
 
-@app.get("/api/share/status", dependencies=ADMIN)
-def share_status(db: Session = Depends(get_db)):
-    """分享中心状态：开关 + 各状态计数（前端任务中心聚合用）。"""
+@app.get("/api/share/center/status", dependencies=ADMIN)
+def share_center_status(db: Session = Depends(get_db)):
+    """分享中心状态：开关 + 各状态计数（前端任务中心聚合用）。
+
+    注意：路径不能是 /api/share/status（那是光鸭分享会话状态端点，先注册优先匹配）。
+    """
     from . import share_center as _sc
     from sqlalchemy import func as _fn
     rows = db.execute(select(_sc.ShareTask.status, _fn.count()).group_by(_sc.ShareTask.status)).all()

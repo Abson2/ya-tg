@@ -52,7 +52,7 @@
 - 阶段B 触发点迁移：`_enqueue_ready`/`process_change_events`/`publish_resource` 影子登记 ShareTask（异常吞掉不影响主链）；调度 job `_job_share_center`（开关关闭零开销）；灰度开关 `share_center_enabled`（runtime_config 注册，默认 false）。
 - 阶段C 交接闭环：publisher 开关开启时只消费 accepted 队列项、只读 ShareTask URL 不反建、回执 published/failed；`_reconcile_library` 出库取消 ShareTask（规则2）；`claim_tasks` 原子领取（强制项4）。
 - 阶段D 前端：导航「推送队列」改名「分享中心」并上移到光鸭资源组（key 保留兼容断言）；新增分享任务表格 + 跑一轮/取消操作；任务中心 push 卡片改名。
-- 后端新 API：`GET /api/share/tasks`、`POST /api/share/tasks/{id}/cancel`、`POST /api/share/run`、`GET /api/share/status`。
+- 后端新 API：`GET /api/share/tasks`、`POST /api/share/tasks/{id}/cancel`、`POST /api/share/run`、`GET /api/share/center/status`（**真机验证发现**：原用 `/api/share/status` 与既有光鸭会话状态端点路由冲突，前端拿到错误结构，已改名并通过 ASGI 端到端验证 + 路由契约回归测试锁定）。
 - 新增测试 16 项（test_v106_* 四文件）；全量回归 757 passed（741 基线 +16）；前端 build 通过。
 - **灰度默认关闭**：`share_center_enabled=false` 时新旧链行为与改造前完全一致（零回归），需真机验证后再开启新链。
 
