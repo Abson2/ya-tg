@@ -451,7 +451,7 @@ def test_bot_listener_want_and_contribute(db):
         # v0.9.8：用户回复只报「已登记」，不暴露 TgtoDrive 同步细节（管理员侧信息）
         assert act == "want" and "已登记" in reply and "TgtoDrive" not in reply
         act2, reply2 = asyncio.run(bot_listener.handle_text(
-            db, "/contribute 某剧 https://share.example/x", tg_user_id="42"))
+            db, "/contribute 某剧 https://www.guangyapan.com/s/x", tg_user_id="42"))
         assert act2 == "contribute" and "登记" in reply2
     db.commit()
     req = db.scalar(select(MediaRequest))

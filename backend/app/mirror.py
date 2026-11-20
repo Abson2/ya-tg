@@ -1697,3 +1697,251 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
     db.commit()
     return {"tasks": len(tasks), "done": done, "failed": failed,
             "still_unknown": len(tasks) - done - failed}
+
+
+# ---------------- v0.9.17.2：失败任务定向批量重试（不扫全库） ----------------
+# 用户真机痛点：失败任务一直挂着，唯一入口「立即同步」会 _walk_source 全库扫描，
+# A 源头库很大时任务长时间不结束。这里只针对用户勾选的失败行定向重发：
+#   - 失败目录：MirrorDir 自带 parent_target_id + name_standard，直接 create_dir 重建；
+#   - 失败文件：MirrorFile 没存目标父目录，只 walk **该行所属作品**的 A 目录
+#     （_walk_source(root=media.source_dir_id)，几十个文件），按季目录相对链映射到 B 库，
+#     重发前先用 _b_file_candidates 核对 B 库已存在的直接回填 synced（绝不重复复制）。
+# 全程不调用 sync_rule、不扫 A 库根、不写 push_queue；mark 只改被选中的行。
+
+async def retry_failed_dirs(db: Session, rule: MirrorRule, dir_ids: list[int], *,
+                            idle: float = MIN_FILE_IDLE_SECONDS) -> dict:
+    """定向重建勾选的 missing 目录。复用 _ensure_child 同款 · 规则与标准名降级。"""
+    ids = [int(x) for x in (dir_ids or [])]
+    out = {"selected": len(ids), "recreated": 0, "already_ok": 0,
+           "skipped": 0, "failed": 0, "details": []}
+    if not ids:
+        return out
+    api = GuangYaWebFiles(db)
+    # 只允许本规则、确实 missing 的行；其它状态（mapped/created）不重复建
+    rows = list(db.scalars(select(MirrorDir).where(
+        MirrorDir.rule_id == rule.id, MirrorDir.id.in_(ids))).all())
+    by_id = {r.id: r for r in rows}
+    plain_mode = {"on": False, "tried": False}
+    for did in ids:
+        d = by_id.get(did)
+        if not d:
+            out["skipped"] += 1
+            out["details"].append(f"目录#{did}：不属于本规则或不存在，跳过")
+            continue
+        if d.status != "missing":
+            out["already_ok"] += 1
+            out["details"].append(f"{d.name_standard}：当前状态 {d.status}，无需重建")
+            continue
+        parent = str(d.parent_target_id or "")
+        base = str(d.name_standard or "")
+        if not parent or not base:
+            d.error = "[定向重试] 缺少父目录 ID 或目录名，无法重建"
+            d.status = "missing"
+            out["failed"] += 1
+            out["details"].append(f"{base or '#'+str(did)}：{d.error}")
+            db.commit()
+            continue
+        effective = base.replace("*", NAME_MARK) if d.kind == "work" else base
+        if d.kind == "work" and plain_mode["on"]:
+            effective = standard_media_name(effective)
+        await asyncio.sleep(max(float(idle), MIN_FILE_IDLE_SECONDS))
+        try:
+            made = await api.create_dir(parent, effective)
+        except Exception as exc:
+            first = str(exc)[:200]
+            plain = standard_media_name(effective)
+            made = None
+            if (d.kind == "work" and NAME_MARK in effective and plain != effective
+                    and not plain_mode["tried"]):
+                plain_mode["tried"] = True
+                await asyncio.sleep(max(float(idle), MIN_FILE_IDLE_SECONDS))
+                try:
+                    made = await api.create_dir(parent, plain)
+                    plain_mode["on"] = True
+                    effective = plain
+                except Exception as exc2:
+                    err = f"[定向重试] create_dir 失败：{first}；降级标准名仍失败：{str(exc2)[:160]}"
+            else:
+                err = f"[定向重试] create_dir 失败：{first}"
+            if made is None:
+                d.error = err
+                d.status = "missing"
+                out["failed"] += 1
+                out["details"].append(f"{base}：{err}")
+                db.commit()
+                continue
+        fid = str(made.get("file_id") or "")
+        if not fid:
+            d.error = "[定向重试] create_dir 未返回 fileId，不标记完成"
+            d.status = "missing"
+            out["failed"] += 1
+            out["details"].append(f"{base}：{d.error}")
+            db.commit()
+            continue
+        d.target_dir_id = fid
+        d.status = "created_fallback" if plain_mode["on"] and NAME_MARK not in effective else "created"
+        d.error = ""
+        d.updated_at = utcnow()
+        out["recreated"] += 1
+        out["details"].append(f"{base}：已重建（B 目录 ID {fid}）")
+        # 同父目录下、等待本目录的子目录下次同步会自动 mapped；不在这里递归
+        db.commit()
+    return out
+
+
+async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int], *,
+                             idle: float = MIN_FILE_IDLE_SECONDS,
+                             max_polls: int = 8, poll_interval: float = 2.0) -> dict:
+    """定向重发勾选的失败文件。先核对 B 库已存在则回填，不重复复制。"""
+    ids = [int(x) for x in (file_ids or [])]
+    out = {"selected": len(ids), "reused": 0, "queued": 0, "done": 0,
+           "failed": 0, "skipped": 0, "details": []}
+    if not ids:
+        return out
+    api = GuangYaWebFiles(db)
+    rows = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.rule_id == rule.id, MirrorFile.id.in_(ids))).all())
+    by_id = {r.id: r for r in rows}
+    # 按作品分组：一部作品只 walk 一次 A 目录 + 列一次 B 库候选
+    groups: dict[int, list] = {}
+    for fid in ids:
+        r = by_id.get(fid)
+        if not r:
+            out["skipped"] += 1
+            out["details"].append(f"文件#{fid}：不属于本规则或不存在，跳过")
+            continue
+        groups.setdefault(r.media_id, []).append(r)
+
+    for media_id, group in groups.items():
+        media = db.get(MirrorMedia, media_id)
+        if not media or not str(media.source_dir_id or "").strip() \
+                or not str(media.target_dir_id or "").strip():
+            for r in group:
+                r.status = "failed"
+                r.error = "[定向重试] 作品 A/B 目录映射缺失，无法定位复制目标"
+                out["failed"] += 1
+                out["details"].append(f"{r.file_name}：{r.error}")
+            db.commit()
+            continue
+        # 只 walk 单部作品（非全库），拿到 A 季目录相对链
+        nodes, complete = await _walk_source(api, str(media.source_dir_id), max_dirs=80)
+        if not complete:
+            for r in group:
+                r.status = "failed"
+                r.error = "[定向重试] A 库该作品目录分页不完整，已中止（禁止用不完整数据重发）"
+                out["failed"] += 1
+                out["details"].append(f"{r.file_name}：{r.error}")
+            db.commit()
+            continue
+        root_node = nodes.get(str(media.source_dir_id))
+        # A source_file_id -> 所在目录节点
+        owner: dict[str, dict] = {}
+        for node in nodes.values():
+            for it in node.get("files", []):
+                sid = str(it.get("fileId") or "")
+                if sid:
+                    owner[sid] = node
+        candidates, verified = await _b_file_candidates(api, media)
+        cache: dict[str, dict[str, str]] = {}
+        sub_cache: dict[str, str] = {}
+        pending_tasks: list[tuple[MirrorTask, list]] = []
+
+        for r in group:
+            # 先核对：B 库其实已经有（如轮询超时/已复制成功）→ 回填，不重发
+            hit = _lookup_b_file(candidates, r) if verified else ""
+            if hit:
+                r.target_file_id = hit
+                r.status, r.error = "synced", ""
+                r.updated_at = utcnow()
+                out["reused"] += 1
+                out["details"].append(f"{r.file_name}：B 库已存在，回填为已同步")
+                # 立即提交：一组若全是回填（无 copy task），末尾的 commit 不会执行，
+                # 这里不落库会导致「提示已回填、刷新后仍是 failed」（v0.9.17.2 实测）。
+                db.commit()
+                continue
+            container = owner.get(str(r.source_file_id or ""))
+            if not root_node or container is None:
+                r.status = "failed"
+                r.error = "[定向重试] A 库该作品目录下未找到源文件，可能已被移动/删除"
+                out["failed"] += 1
+                out["details"].append(f"{r.file_name}：{r.error}")
+                db.commit()
+                continue
+            # 计算季目录相对链并映射到 B 库
+            rel = _relative_dir_names(container, root_node, nodes)
+            target_parent = str(media.target_dir_id)
+            sub_ok = True
+            for sub_name in rel:
+                key = f"{target_parent}|{normalize_work_name(sub_name)}"
+                if key in sub_cache:
+                    target_parent = sub_cache[key]
+                    continue
+                try:
+                    children = await _target_children_cached(api, target_parent, cache)
+                    sid = children.get(normalize_work_name(sub_name)) or ""
+                    if not sid:
+                        await asyncio.sleep(max(float(idle), MIN_FILE_IDLE_SECONDS))
+                        made = await api.create_dir(target_parent, standard_media_name(sub_name))
+                        sid = str(made.get("file_id") or "")
+                    if not sid:
+                        raise WebFileError("子目录创建后未返回 fileId")
+                    sub_cache[key] = sid
+                    target_parent = sid
+                except Exception as exc:
+                    r.status = "failed"
+                    r.error = f"[定向重试] B 库子目录「{sub_name}」未就绪：{str(exc)[:160]}"
+                    out["failed"] += 1
+                    out["details"].append(f"{r.file_name}：{r.error}")
+                    sub_ok = False
+                    break
+            if not sub_ok:
+                db.commit()
+                continue
+            # 重发复制：清目标 ID / 改名状态，复用同一行（禁止先删旧再复制）
+            r.status = "copying"
+            r.error = ""
+            r.target_file_id = ""
+            r.target_name = ""
+            r.rename_status = ""
+            r.rename_error = ""
+            try:
+                await asyncio.sleep(max(float(idle), MIN_FILE_IDLE_SECONDS))
+                task_id = await api.copy_file([str(r.source_file_id)], target_parent)
+            except Exception as exc:
+                r.status = "failed"
+                r.error = f"[定向重试] copy_file 失败：{str(exc)[:200]}"
+                out["failed"] += 1
+                out["details"].append(f"{r.file_name}：{r.error}")
+                db.commit()
+                continue
+            task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
+                              status="running")
+            db.add(task)
+            db.commit()
+            r.task_id = task_id
+            pending_tasks.append((task, [r]))
+            out["queued"] += 1
+
+        if pending_tasks:
+            await _poll_tasks_batch(api, pending_tasks, max_polls=max_polls,
+                                    interval=poll_interval)
+            for task, task_rows in pending_tasks:
+                for rr in task_rows:
+                    rr.updated_at = utcnow()
+                    if task.status == "done":
+                        rr.status, rr.error = "synced", ""
+                        out["done"] += 1
+                    elif task.status == "failed":
+                        rr.status, rr.error = "failed", f"[定向重试] 复制任务失败：{task.error[:160]}"
+                        out["failed"] += 1
+                    else:
+                        rr.status = "unknown"
+                        rr.error = f"[定向重试] 任务 {task.task_id} 未确认（{task.raw_status or '未知'}），保留轮询"
+                        out["failed"] += 1
+                    out["details"].append(f"{rr.file_name}：{rr.status}" +
+                                          (f"（{rr.error}）" if rr.error else ""))
+            media_row = db.get(MirrorMedia, media_id)
+            if media_row:
+                media_row.last_synced_at = utcnow()
+            db.commit()
+    return out

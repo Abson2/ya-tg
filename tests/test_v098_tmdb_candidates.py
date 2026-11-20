@@ -84,22 +84,22 @@ def test_contribute_pick_then_link(session):
             session, "tok", "pk.contribute.0", uid="u3", chat_id="c3", message_id=1))
     assert session.query(UserContribution).count() == 0  # 等链接
     action, reply = _run(bot_listener.handle_text(
-        session, "https://pan.example/s/xyz", tg_user_id="u3"))
+        session, "https://www.guangyapan.com/s/xyz", tg_user_id="u3"))
     assert action == "contribute"
     session.flush()
     c = session.query(UserContribution).first()
     assert c.tmdb_id == 261315 and c.year == "2026" and c.media_type == "tv"
-    assert c.share_url == "https://pan.example/s/xyz"
+    assert c.share_url == "https://www.guangyapan.com/s/xyz"
     assert "十万狂花入梦来" in c.title
 
 
 def test_contribute_with_link_keeps_direct_legacy(session):
     action, reply = _run(bot_listener.handle_text(
-        session, "/投稿 我的片子 https://pan.example/s/a", tg_user_id="u4"))
+        session, "/投稿 我的片子 https://www.guangyapan.com/s/a", tg_user_id="u4"))
     assert action == "contribute"
     session.flush()
     c = session.query(UserContribution).first()
-    assert c.share_url == "https://pan.example/s/a" and c.tmdb_id is None
+    assert c.share_url == "https://www.guangyapan.com/s/a" and c.tmdb_id is None
 
 
 def test_want_tmdb_unavailable_degrades_to_direct(session):

@@ -53,6 +53,8 @@ const diagCount = computed(() => {
     (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
+// v0.9.17.2：失败任务定向批量重试的勾选行（目录 / 文件各自独立）
+const missingDirSelected = ref([]), fileErrSelected = ref([])
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const showScanPanel = ref(false)
@@ -60,6 +62,8 @@ const showScanPanel = ref(false)
 const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', interaction_bot_username: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
   // v0.9.13 #254：TgtoDrive 频道监控白名单规则 a/b/c + 投稿转存监控 chat
   tgto_rule_resolution: '4k', tgto_rule_effect: 'all', tgto_rule_required_keyword: '265', tgto_contribute_bot_chat_id: '',
+  // v0.9.18：投稿分发（审核态/分发态分离）——中转群 / OpenAPI / off
+  contribution_dispatch_mode: 'relay', contribution_relay_chat_id: '', contribution_relay_template: '',
   bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [],
   // v0.9.5：使用限制跳转链接 + 推送消息频道/群跳转（模板变量 channel_link/group_link）
   // v0.9.10：新增机器人跳转链接（推送 Bot 本身），渲染层统一追加三行文字链接
@@ -865,6 +869,49 @@ async function pollMirrorTasks() {
   catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
+// v0.9.17.2：勾选失败目录定向重建（只 create_dir 选中行，不扫 A 库）
+async function retryFailedDirs() {
+  const ids = (missingDirSelected.value || []).slice()
+  if (!ids.length) { ElMessage.info('请先勾选要重建的失败目录'); return }
+  const ok = await confirmBox(
+    `将对勾选的 ${ids.length} 个失败目录重新发起 create_dir。\n\n` +
+    '只处理选中行、不扫描 A 源头库；已存在的目录不会重复创建。重建成功后下轮同步会自动映射其下文件。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/retry/dirs', { method: 'POST', body: JSON.stringify({ ids }) })
+    ElMessage.success(`目录重建完成：成功 ${d.recreated || 0} · 无需重建 ${d.already_ok || 0} · 失败 ${d.failed || 0}`)
+    if (d.failed) {
+      const bad = (d.details || []).filter(x => /失败|无法|跳过/.test(x))
+      if (bad.length) ElMessage.warning('部分目录未成功：' + bad.slice(0, 3).join('；'))
+    }
+    missingDirSelected.value = []
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v0.9.17.2：勾选失败文件定向重发复制（只 walk 所属作品，不扫全库）
+async function retryFailedFiles() {
+  const ids = (fileErrSelected.value || []).slice()
+  if (!ids.length) { ElMessage.info('请先勾选要重试的失败文件'); return }
+  const ok = await confirmBox(
+    `将对勾选的 ${ids.length} 个失败文件定向重发复制。\n\n` +
+    '只扫描这些文件所属作品的 A 库目录（不扫整个源头库）；' +
+    'B 库已存在的会直接回填、不重复复制。复制成功后自动走入库→识别→推送入队。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/retry/files', { method: 'POST', body: JSON.stringify({ ids }) })
+    ElMessage.success(`文件重试完成：成功 ${d.done || 0} · B库已存在回填 ${d.reused || 0} · 失败 ${d.failed || 0}`)
+    if (d.failed) {
+      const bad = (d.details || []).filter(x => /失败|无法|未确认|未就绪/.test(x))
+      if (bad.length) ElMessage.warning('部分文件未成功：' + bad.slice(0, 3).join('；'))
+    }
+    fileErrSelected.value = []
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
 // v0.9.6：清空「英文改名待处理」清单——把英文名为空的作品标记 ignored，
 // 从待处理清单消失；不改文件、不删映射，点「重新解析英文名并改名」可恢复。
 async function clearUntranslated() {
@@ -1024,6 +1071,10 @@ async function postInteractionConfig() {
     tgto_rule_effect: c.tgto_rule_effect || 'all',
     tgto_rule_required_keyword: c.tgto_rule_required_keyword || '',
     tgto_contribute_bot_chat_id: c.tgto_contribute_bot_chat_id || '',
+    // v0.9.18：投稿分发通道配置
+    contribution_dispatch_mode: c.contribution_dispatch_mode || 'relay',
+    contribution_relay_chat_id: c.contribution_relay_chat_id || '',
+    contribution_relay_template: c.contribution_relay_template || '',
     donation_image_url: c.donation_image_url || '', donation_text: c.donation_text || '',
     donation_button_text: c.donation_button_text || '打赏支持',
     // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
@@ -1099,14 +1150,36 @@ async function handleContribution(id, status) {
   }
   try {
     const d = await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note }) })
-    // v0.9.17：审核通过时把 TgtoDrive 转发结果如实回显，管理员当场可见
+    // v0.9.18：审核状态与分发状态分离——通过即审核成功，分发结果单独如实回显
     if (status === 'approved' && d && 'forwarded' in d) {
-      const msg = d.forwarded ? `投稿已通过，链接已转发监控 Bot` : `投稿已通过，但转发未完成：${d.forward_info || '未知原因'}`
-      ElMessage[d.forwarded ? 'success' : 'warning']({ message: msg, duration: 6000, showClose: true })
+      const ok = !!d.forwarded
+      const msg = ok
+        ? `投稿已通过，链接已分发（${d.dispatch_status || 'submitted'}）`
+        : `投稿已通过（审核不受影响）；分发未完成：${d.dispatch_result || d.forward_info || '未知原因'}，可在分发列手动重试`
+      ElMessage[ok ? 'success' : 'warning']({ message: msg, duration: 6500, showClose: true })
     } else ElMessage.success('已处理')
     await load()
   }
   catch (e) { ElMessage.error(e.message) }
+}
+// v0.9.18：投稿分发状态映射 + 手动重试 + 分发记录查看
+function dispatchStatusTag(s) { return ({ submitted: 'success', sending: 'warning', pending: 'info', retry_wait: 'warning', failed: 'danger' })[s] || 'info' }
+async function retryContributionDispatch(row) {
+  try {
+    const d = await api(`/contributions/${row.id}/dispatch/retry`, { method: 'POST' })
+    ElMessage[d.ok ? 'success' : 'warning']({ message: d.ok ? `已重新分发：${d.info || ''}` : `重试未完成：${d.info || ''}`, duration: 6000, showClose: true })
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function showContributionDispatch(row) {
+  try {
+    const d = await api(`/contributions/${row.id}/dispatch`)
+    if (!d.exists) { ElMessage.info('该投稿尚无分发任务'); return }
+    const hist = (d.history || []).map(h => `· ${h.action} ${h.ts || ''} ${h.detail || ''}`).join('\n') || '（无）'
+    await ElMessageBox.alert(
+      `状态：${d.status_label}（${d.status}）\n方式：${d.mode_label}（${d.mode}）\n尝试次数：${d.attempts}\n编号：${d.ref || '—'}\n分发时间：${d.dispatched_at || '—'}\n错误：${d.error || '—'}\n\n分发记录：\n${hist}`,
+      '分发记录', { confirmButtonText: '关闭', customClass: 'dispatch-detail-box' })
+  } catch (e) { if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e)) }
 }
 async function handleMediaRequest(row, review) {
   let note = ''
@@ -1576,7 +1649,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v0.9.17 · Asia/Shanghai</span>
+          <span>v0.9.18 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -1918,28 +1991,30 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <span v-else class="fold-sub">无待处理项</span>
               </template>
           <div v-if="mirrorStatus.missing_dirs?.length" class="panel">
-            <div class="panel-head"><h3>待创建目录</h3><el-tag type="warning" size="small">{{ mirrorStatus.missing_dirs.length }} 个</el-tag></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.missing_dirs" size="small">
+            <div class="panel-head"><h3>待创建目录</h3><el-tag type="warning" size="small">{{ mirrorStatus.missing_dirs.length }} 个</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !missingDirSelected.length" @click="retryFailedDirs">批量重建选中 ({{ missingDirSelected.length }})</el-button></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.missing_dirs" size="small" row-key="id" @selection-change="v => missingDirSelected = v.map(x => x.id)">
+              <el-table-column type="selection" width="42" align="center"/>
               <el-table-column prop="name" label="B 库应建目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="parent_id" label="父目录 ID" min-width="180"/>
               <el-table-column label="失败原因 / 处理建议" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || s.row.tip }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。相关作品标记 blocked 不是失败，修正后重新同步即可。</p>
+            <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。<b>v0.9.17.2：勾选后点「批量重建选中」只对这些目录重发 create_dir，不扫描 A 源头库；重建成功后下轮同步自动映射其下文件。</b></p>
           </div>
           <div v-if="mirrorStatus.counts?.dirs_pruned_zombie" class="panel">
             <div class="panel-head"><h3>已清理待重建目录映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条</el-tag><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearPrunedMappings">清空已清理映射</el-button></div>
             <p class="hint">这些是历史「清理无效映射」留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。旧版本无标记的行现在同样识别；确认后点「清空已清理映射」即可从清单彻底移除，不影响资源 / 分享 / 队列。</p>
           </div>
           <div v-if="mirrorStatus.file_errors?.length" class="panel">
-            <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.file_errors" size="small">
+            <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.file_errors" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
+              <el-table-column type="selection" width="42" align="center"/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
               <el-table-column prop="task_id" label="任务 ID" min-width="140"/>
               <el-table-column label="失败原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>下一轮「立即同步」会自动重试这些文件</b>，重试前会先核对 B 库，确认已存在的不会重复复制。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
+            <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>v0.9.17.2：勾选后点「批量重试选中」只对这些文件定向重发复制——只扫描其所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队</b>；也可等下一轮「立即同步」全量重试。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
           </div>
           <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length" class="panel">
             <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag><el-tag v-if="mirrorStatus.counts?.files_rename_skipped_legacy" type="info" size="small">历史不回刷 {{ mirrorStatus.counts.files_rename_skipped_legacy }} 个</el-tag></div>
@@ -2248,12 +2323,25 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-tag v-if="s.row.submit_count > 1" size="small" type="warning" effect="plain" :title="'累计 ' + s.row.submit_count + ' 次投稿，已合并为一条'">×{{ s.row.submit_count }}</el-tag>
                 </template></el-table-column>
                 <el-table-column label="用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
-                <el-table-column label="状态" width="96"><template #default="s">
+                <el-table-column label="审核状态" width="92"><template #default="s">
                   <el-tag size="small" :type="contributionStatusTag(s.row.status)">{{ contributionStatusLabel(s.row.status) }}</el-tag>
                 </template></el-table-column>
-                <el-table-column label="操作" width="230"><template #default="s">
+                <!-- v0.9.18：分发态与审核态分离，独立展示 -->
+                <el-table-column label="分发状态" width="110"><template #default="s">
+                  <el-tooltip v-if="s.row.dispatch_error" :content="s.row.dispatch_error" placement="top">
+                    <el-tag size="small" :type="dispatchStatusTag(s.row.dispatch_status)">{{ s.row.dispatch_status_label || '未分发' }}</el-tag>
+                  </el-tooltip>
+                  <el-tag v-else size="small" :type="dispatchStatusTag(s.row.dispatch_status)">{{ s.row.dispatch_status_label || '未分发' }}</el-tag>
+                </template></el-table-column>
+                <el-table-column label="分发方式/时间" width="140"><template #default="s">
+                  <div class="muted" style="line-height:1.4">{{ s.row.dispatch_mode_label || '—' }}</div>
+                  <div class="muted" style="line-height:1.4; font-size:11px">{{ s.row.dispatched_at ? new Date(s.row.dispatched_at).toLocaleString('zh-CN') : (s.row.dispatch_attempts ? `尝试 ${s.row.dispatch_attempts} 次` : '—') }}</div>
+                </template></el-table-column>
+                <el-table-column label="操作" width="290"><template #default="s">
                   <el-button size="small" type="primary" plain @click="handleContribution(s.row.id, 'approved')">通过</el-button>
                   <el-button size="small" @click="handleContribution(s.row.id, 'rejected')">拒绝</el-button>
+                  <el-button v-if="s.row.dispatch_status" size="small" type="warning" plain @click="showContributionDispatch(s.row)">记录</el-button>
+                  <el-button v-if="['failed','retry_wait'].includes(s.row.dispatch_status)" size="small" type="success" plain @click="retryContributionDispatch(s.row)">重试</el-button>
                   <el-button size="small" type="danger" plain @click="deleteContribution(s.row)">删除</el-button>
                 </template></el-table-column>
               </el-table></div>
@@ -2276,9 +2364,18 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="field"><label>a. 分辨率</label><el-select v-model="interactionCfg.tgto_rule_resolution" style="width:100%"><el-option label="4K" value="4k"/><el-option label="1080p" value="1080p"/><el-option label="720p" value="720p"/><el-option label="不限" value="all"/></el-select></div>
               <div class="field"><label>b. 画面效果</label><el-select v-model="interactionCfg.tgto_rule_effect" style="width:100%"><el-option label="全部效果" value="all"/><el-option label="杜比视界" value="dolby"/><el-option label="HDR" value="hdr"/><el-option label="SDR" value="sdr"/></el-select></div>
               <div class="field"><label>c. 自定义必含关键词</label><el-input v-model="interactionCfg.tgto_rule_required_keyword" placeholder="默认 265；留空则不启用必含条件"/></div>
-              <div class="field"><label>投稿转存监控 Bot chat_id</label><el-input v-model="interactionCfg.tgto_contribute_bot_chat_id" placeholder="投稿审核通过后把分享链接发到此 chat，留空则不转发"/></div>
+              <div class="field"><label>投稿转存监控 Bot chat_id（旧，已弃用）</label><el-input v-model="interactionCfg.tgto_contribute_bot_chat_id" placeholder="旧 Bot 私聊转发，已弃用；请改用下方中转群"/></div>
             </div>
-            <p class="hint">白名单采用「读取全量 → 合并 → 回写 → 回读校验」，只增量新增/删除本项目 kw_ 幂等规则，不覆盖、不清空 TgtoDrive 原有关键词；管理员在求片列表删除或拒绝时联动移除本项目规则。投稿审核通过后转发链接到上方 chat_id（用交互 Bot 发送），由监控 Bot 转存。</p>
+            <p class="hint">白名单采用「读取全量 → 合并 → 回写 → 回读校验」，只增量新增/删除本项目 kw_ 幂等规则，不覆盖、不清空 TgtoDrive 原有关键词；管理员在求片列表删除或拒绝时联动移除本项目规则。</p>
+            <div class="sec-band" style="margin-top:10px"><span class="sec-key">d</span><div><h3>投稿分发通道（v0.9.18）</h3><p>审核通过只改审核态；分发独立执行、失败不回退审核、可手动重试</p></div><span class="sec-line"></span></div>
+            <div class="form-grid">
+              <div class="field"><label>分发方式</label><el-select v-model="interactionCfg.contribution_dispatch_mode" style="width:100%">
+                <el-option label="中转群（推荐）" value="relay"/><el-option label="OpenAPI（需真机验证 transfer 接口）" value="openapi"/><el-option label="关闭分发（仅审核）" value="off"/>
+              </el-select></div>
+              <div class="field"><label>中转群 Chat ID</label><el-input v-model="interactionCfg.contribution_relay_chat_id" placeholder="如 -1001234567890；群内需有 TGtoDrive 个人账号并开启万能转发"/></div>
+              <div class="field" style="grid-column:1/-1"><label>中转消息模板（留空用默认；占位符 {ref} {title} {share_url} {code}）</label><el-input v-model="interactionCfg.contribution_relay_template" type="textarea" :rows="5" placeholder="【Ya-TG 审核通过】&#10;投稿编号：{ref}&#10;资源名称：{title}&#10;光鸭分享链接：{share_url}&#10;提取码：{code}&#10;来源：用户投稿&#10;审核状态：已通过"/></div>
+            </div>
+            <p class="hint">中转群方案：交互 Bot 发消息到群（不 Bot→Bot 私聊，规避 USER_BOT_TO_BOT_DISABLED），由群内 TGtoDrive 个人账号的万能转发把链接交给其 Bot 处理。消息只含投稿编号/资源名/链接/提取码，不含投稿人隐私。OpenAPI 通道调用 /api/media/resources/transfer，字段以实际接口为准；该接口在导出的规范中为 inferred（未真机验证），请先手工验证后再启用。两项均「保存 TgtoDrive 配置」即可生效。</p>
           </div>
 
           <p class="hint" style="text-align:right;margin:0">a/b/c 与 chat_id 也可随页面顶部「保存分发与互动配置」一起保存。</p>

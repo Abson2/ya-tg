@@ -21,6 +21,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto, tmdb
+from .contribution_links import extract_guangya_share_url
 from .models import (Bot, Channel, DiscoveredChat, MediaRequest, ProcessedUpdate,
                      QueueItem, Resource, UserContribution, utcnow)
 from .security import decrypt_secret
@@ -51,6 +52,8 @@ _UNRECOGNIZED_HINT = ("当前内容未识别为指令。请点下方菜单，或
                       "如正在交互中，请按提示输入，或回复「结束」退出。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
+# v0.9.18：从投稿文本里剥掉链接部分取剧名（配合光鸭链接强校验）
+_ANY_URL_CLEAN = re.compile(r"https?://[^\s]+", re.I)
 
 
 # v0.9.17 #281：投稿按作品去重合并——同 dedup_key 只保留一行、累加 submit_count，
@@ -939,10 +942,11 @@ async def notify_user(db: Session, tg_user_id: str, text: str) -> bool:
 
 
 async def forward_contribution_to_tgto(db: Session, share_url: str, title: str = "") -> tuple[bool, str]:
-    """v0.9.13 #254：投稿审核通过后，把分享链接转发到配置的 TgtoDrive 绑定 Bot chat。
+    """[已弃用 v0.9.18] 旧的「交互 Bot → TGtoDrive Bot 私聊」转发，仅保留兼容历史测试。
 
-    由该 Bot 监控链接自动转存。目标 chat_id 由管理页配置（tgto_contribute_bot_chat_id），
-    发送用交互 Bot 的 token；未配置或失败只返回状态供后台 note，绝不影响审核主流程。
+    该函数是 USER_BOT_TO_BOT_DISABLED 报错根因——Bot 向 Bot 私聊被 Telegram 禁止。
+    审核通过流程已改走 contribution_dispatch（中转群 relay / OpenAPI 双通道），
+    不再调用本函数。勿在新代码里使用；配置 tgto_contribute_bot_chat_id 也已弃用。
     返回 (是否发送, 说明)。
     """
     chat_id = (runtime_config.get(db, "tgto_contribute_bot_chat_id") or "").strip()
@@ -1331,13 +1335,16 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     # v0.9.8：投稿候选已选、正在等光鸭链接 —— 本次消息作为链接落库
     pending = _pick_get(tg_user_id)
     if pending and pending.get("flow") == FLOW_CONTRIB and pending.get("picked"):
-        urls = _SHARE_URL.findall(raw)
-        if urls:
+        # v0.9.18：链接强校验——只认光鸭 /s/ 分享链接，非光鸭链接不入库、明确提醒用户
+        share_url, url_err = extract_guangya_share_url(raw)
+        if url_err:
+            return "contribute_bad_url", f"{url_err}\n请重新发送光鸭分享链接，或回复「结束」退出。"
+        if share_url:
             picked = pending["picked"]
             row, created = upsert_contribution(
                 db, tg_user_id=str(tg_user_id), tg_username=tg_username,
                 title=str(picked.get("title") or "")[:512], content=raw[:4000],
-                share_url=urls[-1], tmdb_id=picked.get("tmdb_id"),
+                share_url=share_url, tmdb_id=picked.get("tmdb_id"),
                 media_type=picked.get("media_type") or "",
                 year=str(picked.get("year") or ""),
                 note="TMDB 候选选定；投稿转存接口待验证，当前仅登记")
@@ -1348,7 +1355,8 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                       if created else
                       f"「{picked.get('title')}」已有其它用户投稿，已合并登记（累计 {row.submit_count} 次），感谢支持！")
             return "contribute", thanks
-        return "contribute_await_url", "请发送该资源的光鸭分享链接（http/https 开头），或回复「结束」退出。"
+        # 无链接：仍在等链接，不清除会话态（保留候选），提示重发
+        return "contribute_await_url", "请发送该资源的光鸭分享链接（guangyapan.com/s/...），或回复「结束」退出。"
 
     cmd, *rest = raw.split(None, 1)
     arg = (rest[0] if rest else "").strip()
@@ -1442,9 +1450,11 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
         return "want", reply
 
     if builtin == "投稿":
-        urls = _SHARE_URL.findall(arg)
-        share_url = urls[-1] if urls else ""
-        title = _SHARE_URL.sub("", arg).strip()
+        # v0.9.18：链接强校验——非光鸭链接不进入投稿后台
+        share_url, url_err = extract_guangya_share_url(arg)
+        if url_err:
+            return "contribute_bad_url", url_err + "\n请用 /投稿 剧名 光鸭分享链接 重新提交。"
+        title = _ANY_URL_CLEAN.sub("", arg).strip()
         # v0.9.9 #208：有剧名先走 TMDB 候选，选完补链接，后台拿到中文名/年份/影号。
         # TMDB 未配置/无候选时仍可用用户剧名登记，但绝不再造「未命名投稿」。
         if not share_url and title:
@@ -1454,6 +1464,7 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
                 return "contribute_pick", _candidate_caption(FLOW_CONTRIB, title, candidates)
         if not title and not share_url:
             return "contribute_need_title", "请告诉我影视名称，或直接粘贴光鸭分享链接。"
+        # v0.9.18：只给链接、没给剧名且无候选 → final_title 用链接；链接已在上游校验为光鸭链接
         final_title = (title or share_url)[:512]
         row, created = upsert_contribution(
             db, tg_user_id=str(tg_user_id), tg_username=tg_username,

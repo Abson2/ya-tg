@@ -469,6 +469,29 @@ class UserContribution(Base):
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ContributionDispatch(Base):
+    """v0.9.18：投稿审核通过后的 TGtoDrive 分发任务（审核态与分发态彻底解耦）。
+
+    一条投稿 = 至多一条分发任务（contribution_id 唯一），重复点审核通过不会新建。
+    status 独立管理，分发失败绝不回写投稿审核状态：
+      pending / sending / submitted / failed / retry_wait
+    mode: relay（中转群，默认）/ openapi（TGtoDrive OpenAPI）
+    """
+    __tablename__ = "contribution_dispatches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    contribution_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/sending/submitted/failed/retry_wait
+    mode: Mapped[str] = mapped_column(String(16), default="relay")       # relay/openapi
+    attempts: Mapped[int] = mapped_column(Integer, default=0)           # 累计执行次数
+    # 中转群消息携带的唯一投稿编号（追踪用），OpenAPI 则为返回的任务 id
+    ref: Mapped[str] = mapped_column(String(128), default="")
+    error: Mapped[str] = mapped_column(Text, default="")                # 最近一次失败原因
+    last_response: Mapped[str] = mapped_column(Text, default="")        # 最近一次原始响应（脱敏后截断）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class MediaRequest(Base):
     """用户「我想看」→ TgtoDrive 关键词监控规则（幂等 id，不覆盖原有规则）。"""
     __tablename__ = "media_requests"

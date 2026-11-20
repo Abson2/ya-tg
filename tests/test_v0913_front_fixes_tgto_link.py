@@ -244,22 +244,23 @@ def test_delete_media_request_removes_whitelist(db):
 
 
 def test_contribution_approve_forwards_share_url(db):
-    c = UserContribution(title="投稿剧", share_url="https://share/guangya/x",
+    """v0.9.18：审核通过触发分发（分发逻辑已迁到 contribution_dispatch）。"""
+    c = UserContribution(title="投稿剧", share_url="https://www.guangyapan.com/s/x",
                          status="pending", tg_user_id="42")
     db.add(c)
     db.commit()
     calls = []
 
-    async def fake_forward(db_, share_url, title=""):
-        calls.append((share_url, title))
-        return True, "已转发至 TgtoDrive 监控 Bot"
+    async def fake_run(db_, cid, **kw):
+        calls.append(cid)
+        return True, "已提交", None
 
     body = main_mod.ContributionHandleInput(status="approved", note="")
-    with patch.object(bl, "forward_contribution_to_tgto", fake_forward), \
+    with patch.object(main_mod.contribution_dispatch, "run_dispatch_for_contribution", new=fake_run), \
          patch.object(bl, "notify_user", AsyncMock(return_value=False)):
         out = asyncio.run(main_mod.handle_contribution(c.id, body, db))
-    assert out["ok"] and calls and calls[0][0] == "https://share/guangya/x"
-    assert "转发" in db.get(UserContribution, c.id).note
+    assert out["ok"] and calls and calls[0] == c.id
+    assert db.get(UserContribution, c.id).status == "approved"
 
 
 def test_forward_contribution_requires_chat_id(db):

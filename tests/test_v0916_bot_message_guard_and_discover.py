@@ -109,7 +109,7 @@ def test_picked_then_link_still_registers(db):
                 "title": "十万狂花入梦来", "tmdb_id": 261315, "media_type": "tv", "year": "2026"}}
     bot_listener._pick_sessions["u5"] = sess
     action, reply = asyncio.run(bot_listener.handle_text(
-        db, "https://www.alipan.com/s/xyz789", tg_user_id="u5"))
+        db, "https://www.guangyapan.com/s/xyz789", tg_user_id="u5"))
     assert action == "contribute" and "登记" in reply
     db.flush()
     row = db.query(UserContribution).order_by(UserContribution.id.desc()).first()
@@ -303,20 +303,22 @@ def test_forward_rejects_ok_false_from_telegram(db):
 
 
 def test_handle_contribution_records_forward_failure(db):
-    """转发异常也写 note 并回显，杜绝'备注无任何字样'黑洞。"""
+    """v0.9.18：分发异常也不影响审核通过，原因如实回显（不再写投稿 note）。"""
     from app import main
-    c = UserContribution(tg_user_id="u1", title="剧", share_url="https://s/x",
+    from app import contribution_dispatch as cd_mod
+    c = UserContribution(tg_user_id="u1", title="剧",
+                         share_url="https://www.guangyapan.com/s/x",
                          status="pending", note="")
     db.add(c); db.commit()
     async def boom(*a, **kw):
-        raise RuntimeError("模拟转发异常")
-    with patch.object(bot_listener, "forward_contribution_to_tgto", new=boom), \
+        raise RuntimeError("模拟分发异常")
+    with patch.object(cd_mod, "run_dispatch_for_contribution", new=boom), \
          patch.object(bot_listener, "notify_user", new=AsyncMock(return_value=False)):
         out = asyncio.run(main.handle_contribution(
             c.id, main.ContributionHandleInput(status="approved", note=""), db))
     assert out["ok"] is True and out["forwarded"] is False
-    assert "转发异常" in out["forward_info"]
-    assert "转发异常" in (db.get(UserContribution, c.id).note or "")
+    assert "分发执行异常" in out["forward_info"]
+    assert db.get(UserContribution, c.id).status == "approved"  # 分发失败不改审核态
 
 
 # ---------------- v0.9.17 #280 求片审核参数传入 TgtoDrive ----------------

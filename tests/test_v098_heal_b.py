@@ -71,12 +71,12 @@ def rows_ok(session):
 
 def test_contribution_records_user_account(session):
     action, reply = _run(bot_listener.handle_text(
-        session, "/投稿 我的片子 https://pan.example/s/abc", tg_user_id="77", tg_username="bob"))
+        session, "/投稿 我的片子 https://www.guangyapan.com/s/abc", tg_user_id="77", tg_username="bob"))
     assert action == "contribute"
     session.flush()  # handle_text 只 add 不 commit
     c = session.query(UserContribution).first()
     assert c.tg_user_id == "77" and c.tg_username == "bob"
-    assert c.share_url == "https://pan.example/s/abc"
+    assert c.share_url == "https://www.guangyapan.com/s/abc"
 
 
 # ---- 2. 求片后台审核：采纳 / 拒绝（原因反馈）/ 删除 ----

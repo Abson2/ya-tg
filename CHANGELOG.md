@@ -8,6 +8,41 @@
 
 ---
 
+## v0.9.18 (2026-11-20)
+
+投稿链路重构：修复「审核已通过但转发被 Telegram 拒绝 `USER_BOT_TO_BOT_DISABLED`」，把**审核态与分发态彻底分离**，对用户投稿链接做**光鸭域名强校验**，分发支持**中转群（默认）/ OpenAPI** 双通道、失败可重试、重启可续处理。**不改推送闸门、不改认证、不虚构 TGtoDrive 能力**。
+
+### 一、报错根因与修复方向
+- 真机报错：`Bad Request: USER_BOT_TO_BOT_DISABLED`——旧 `forward_contribution_to_tgto()` 用交互 Bot 向 `tgto_contribute_bot_chat_id` **私聊**发消息，当该 chat 是 TGtoDrive Bot 私聊时，Telegram 禁止 Bot→Bot 通信直接拒绝。
+- 结论：**不再 Bot→Bot 私聊**。改为两条通道（见第四节），旧函数保留仅作兼容、不再被审核流程调用。
+- OpenAPI 能力核查：本地导出的完整 `tgto-openapi.json`（248 路径）**没有「提交光鸭分享链接即处理」的专用接口**；`/api/media/resources/transfer` 是「把已检索媒体资源转存到网盘」，入参 `candidate_item_id/slug/provider`、`share_url` 仅可选字段且标注 `inferred`（静态推导、未真机验证）。按需求决策树 → **无对应接口 → 默认走中转群**；OpenAPI 通道落地但需真机验证后再启用。
+
+### 二、光鸭分享链接强校验
+- 新增独立模块 `contribution_links.py`：仅接受 `guangyapan.com/s/<code>`（允许 `www.`/`m.`/裸域 + 查询串）；非光鸭链接不进入投稿后台、给用户明确提示「仅接受 guangyapan.com 的 /s/ 分享链接」。
+- 覆盖投稿三条路径：`/投稿 剧名 链接`、Reply 会话态补链接、TMDB 候选点选后补链接。只给剧名（无链接）不误判，仍走候选流程。
+
+### 三、审核态与分发态分离（核心）
+- 新增 `ContributionDispatch` 表：`contribution_id` 唯一（一条投稿至多一条任务），状态 `pending/sending/submitted/failed/retry_wait`，独立于投稿 `status`。
+- 审核通过：`handle_contribution` 先把投稿 `status=approved` **单独 commit**（分发成败绝不回退审核态），再幂等建任务并即时执行一次；重复点「通过」不新建、已 `submitted` 不自动重跑。
+- 分发结果只回显管理员（`"分发未完成…可在分发列手动重试"`），**不写投稿备注、不发投稿用户**；用户只收到审核结论通知。
+- off 模式：仅审核不建任务。删除投稿连带清理分发任务。
+
+### 四、双通道分发 + 重试 + 续处理
+- **relay（默认）**：交互 Bot 发消息到配置的中转群 chat_id（群内有 TGtoDrive 个人账号 + 万能转发），消息模板只含唯一投稿编号 `YATG-C-<id>`/资源名/链接/提取码，不含投稿人隐私；`ok=false` 如实判失败并提示「chat_id 必须是群，不要填 Bot 私聊」。
+- **openapi**：调 `POST {tgto_base_url}/api/media/resources/transfer`（Bearer Token，仅传 `share_url`+`source`，不猜 `candidate_item_id/slug`），记录返回任务 id；HTTP 200 但 `success:false` 也判失败。原始响应脱敏（抹 token）后落 `last_response`。
+- 新增端点：`GET /api/contributions/{cid}/dispatch`（分发记录+历史）、`POST /api/contributions/{cid}/dispatch/retry`（手动重试，已提交不重跑）。
+- 后台 job `_job_contribution_dispatch`（30s）扫 `pending/retry_wait` 续跑，**进程重启后可恢复未完成任务**；进程内锁避免并发抢写。
+
+### 五、后台界面与配置
+- 投稿表格新增列：审核状态、分发状态（带错误 tooltip）、分发方式/时间；操作加「记录」「重试（失败时）」按钮。
+- TgtoDrive 联动配置新增：分发方式（relay/openapi/off）、中转群 chat_id、中转消息模板（占位符 `{ref}/{title}/{share_url}/{code}`），随「保存 TgtoDrive 配置」生效。旧 `tgto_contribute_bot_chat_id` 标注弃用。
+
+### 六、验证
+- 新增 `tests/test_v0918_contribution_dispatch.py` **15 项**（强校验三路径、审核/分发分离、幂等防重复、中转成功无隐私、OpenAPI payload、重试、重启续处理、删除清理、前端静态等），覆盖需求 10 条验收点。
+- 更新老测试假链接（`pan.example`/`alipan.com`/`share.example`）为合法光鸭链接（测试意图是投稿入库，与域名无关）；v089 guard 计数随 v0.9.17.2 两个定向重试端点从 4→6。
+- 全量 pytest **589 passed，1 warning**；前端 build 成功（JS 1,098.96 kB）。
+- 真机待验（🟡）：中转群送达 + TGtoDrive 个人账号万能转发识别光鸭链接、OpenAPI transfer 接口真实字段/响应——本机连不上用户 TGtoDrive 实例（502），须在真机确认后再决定长期走哪条通道。
+
 ## v0.9.17.1 (2026-11-20)
 
 v0.9.17 上线后真机反馈三项交互问题：白名单开关状态错乱、已退出目标仍可选推送、求片列表同影视重复。**不改推送闸门、不改认证、不虚构能力**。

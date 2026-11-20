@@ -154,7 +154,7 @@ def test_end_flow_keyboard_carries_callback():
 def test_contribute_link_never_unnamed(db):
     with patch.object(bot_listener, "search_candidates", new=_fake_search([])):
         action, reply = asyncio.run(bot_listener.handle_text(
-            db, "投稿 https://www.alipan.com/s/abc123", tg_user_id="u6"))
+            db, "投稿 https://www.guangyapan.com/s/abc123", tg_user_id="u6"))
     assert action == "contribute"
     assert "未命名投稿" not in reply
     db.flush()  # autoflush=False：写完即查必须先 flush
@@ -184,7 +184,7 @@ def test_contribute_picked_then_link_reply_is_clean(db):
                        "media_type": "tv", "year": "2026"}}
     bot_listener._pick_sessions["u8"] = sess
     action, reply = asyncio.run(bot_listener.handle_text(
-        db, "https://www.alipan.com/s/xyz789", tg_user_id="u8"))
+        db, "https://www.guangyapan.com/s/xyz789", tg_user_id="u8"))
     assert action == "contribute"
     for bad in BANNED_USER_TEXT:
         assert bad not in reply, (bad, reply)
