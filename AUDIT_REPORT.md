@@ -353,3 +353,12 @@
 - **B-07 求片白名单 TMDB 元数据本地缓存——已修**：`tgto._tmdb_meta` 加进程内 TTL（24h）+ 硬上限（500，GC 1/5）缓存，只覆盖 upsert_keyword 这条链路（不动识别/英文名解析的 TMDB 调用）；失败/未配置结果不缓存（不固化暂时故障）；TMDB 配置变更时 `clear_tmdb_meta_cache()` 立即生效。同一 tmdb_id 重复采纳不再重复请求、不消耗 SCAN 限流配额。`tests/test_v103_tmdb_meta_cache.py` 4 项 + 既有 upsert 测试隔离缓存。
 - **分享/作品更新超时先核验远端——评估后不实现，如实记录**：核查 `GuangYaShareClient` 只有 create/update/delete 三个分享接口，无「列已有分享」接口；分享 URL 的 shareId 带随机后缀（如 `1970558251383148604_aey8...`），无法从 fileId 推导。缺少取证支撑的远端核验手段，猜接口会违反「不猜接口」红线。现有防护已覆盖主要重复场景：`ensure_share` 的 share_url 幂等 + 同目录 sibling 复用、`process_queue` 作品级去重（sent_keys_by_channel）、阶段四 B-01 队列进程锁（防手动/定时并发重复建分享）。真机若出现「建分享响应丢失导致重复链接」的具体案例，再按该接口补核验，不做预防性猜测。
 - **Bot 429/403 分级 + 目标独立状态 + 发送历史——部分已具备 + 补永久错误分级**：429 退避（`_send_telegram` 读 retry_after、`process_queue` 用它覆盖 backoff）、目标独立状态（QueueItem 按 channel_id 各自 attempts/error/next_retry_at）、发送历史（AuditLog `push_sent` + QueueItem.telegram_message_id/sent_at）此前已有。本阶段补：401/403（Token 失效 / Bot 被移出群 / 无权限 / bot blocked / chat not found）判为永久错误，直接 failed 不设 next_retry_at，避免重试 MAX_ATTEMPTS 次浪费配额、队列假活；429/网络错误仍退避重试。`tests/test_v103_bot_error_classification.py` 2 项。
+
+### 阶段六｜UI 升级（源码验证中，未发版）
+
+> 原则：功能保护清单第 8 节——现有 9 个 tab 与所有操作入口一个不删；不新增假数据、不虚构后端不支持的操作。
+
+- **深色主题——已加（纯附加层）**：`main.js` 引入 Element Plus 官方 `theme-chalk/dark/css-vars.css`；`App.vue` 新增 `ya_tg_theme` localStorage 偏好 + `html.dark` 类切换 + 顶栏月亮/太阳切换按钮（首屏即时应用防闪白）。原有 `:root` 浅色变量一行不改，仅追加 `html.dark{...}` 覆盖层处理 36 处硬编码浅色面板/表格。默认浅色与改造前完全一致。`tests/test_v104_dark_theme.py` 6 项护栏（9 tab 保留 / 批次四按钮保留 / 主题开关 / 附加层非改写 / 5 个移动断点保留 / 危险确认+防重保留）。
+- **任务中心分类视图——已加（第 10 个入口，纯聚合、零新增 API）**：FEATURE_PRESERVATION 第 8 节的 9 个原 tab 全部保留，任务中心作为「工作台」下的新增入口，用现有 `load()` / `pollMirrorStatus()` 已加载 ref（`mirrorStatus.pipeline`、`queue`、`contributions`、`mediaRequests`、`interactionStatus`、`batchInfo`）做纯前端聚合，覆盖 8 类：镜像 / 复制 / 改名 / 翻译识别 / 生成分享 / 推送队列 / 投稿 / 求片。**不新增任何 API、不造假数**：无数据显示 0、每类标注数据来源、点「查看明细」`setTab(c.target)` 跳到对应原始页操作。响应式纳入 1100px（4→2 列）与 680px（单列）断点，补深色覆盖。`tests/test_v104_task_center.py` 7 项（9 原 tab 保留 / 入口存在 / 8 类齐全 / 只用已加载 ref 无新 API / 每类标注来源 / 明细跳转 / 响应式+深色）。
+- **「重试当前」按钮——不实现，如实记录**：后端 `mirror_batch.request_control()` 只支持 `pause/resume/skip/cancel` 四个 action（阶段二 C4 已落地），无 `retry_current` 端点。前端若加该按钮将是无后端支撑的假操作，违反不造数/不虚构原则，故不加；失败任务的重试沿用既有「定向批量重试」（retry_failed_files/dirs，v0.9.17.2）与队列 retry 端点。
+- **阶段六验证**：`pytest tests/test_v104_dark_theme.py tests/test_v104_task_center.py` 13 项通过；前端 `npm run build` 通过（仅 chunk >500kB 既有警告）。未升版未打 tag，待阶段七统一发版。

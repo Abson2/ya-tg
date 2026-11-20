@@ -17,6 +17,16 @@ function setTab(name) {
   tab.value = name
   localStorage.setItem(TAB_STORAGE_KEY, name)
 }
+// 阶段六：深色主题。纯附加层——html.dark 类 + Element Plus 暗色变量，默认浅色不变。
+const THEME_KEY = 'ya_tg_theme'
+const isDark = ref(localStorage.getItem(THEME_KEY) === 'dark')
+function applyTheme(dark) {
+  isDark.value = !!dark
+  document.documentElement.classList.toggle('dark', isDark.value)
+  localStorage.setItem(THEME_KEY, isDark.value ? 'dark' : 'light')
+}
+function toggleTheme() { applyTheme(!isDark.value) }
+applyTheme(isDark.value)  // 首屏即时应用，避免闪白
 const clock = ref('')
 const viewMode = ref('series')  // v0.6.4：作品视图为默认，单集按剧聚合，不再散落
 const keyword = ref('')
@@ -511,7 +521,10 @@ async function batchControl(action) {
 }
 
 const navGroups = [
-  { label: '工作台', items: [{ key: '概览', icon: 'grid', label: '概览' }] },
+  { label: '工作台', items: [
+    { key: '概览', icon: 'grid', label: '概览' },
+    { key: '任务中心', icon: 'tasks', label: '任务中心' }
+  ] },
   { label: '光鸭资源', items: [
     { key: '光鸭授权', icon: 'key', label: '光鸭授权' },
     { key: '镜像同步', icon: 'copy', label: '镜像同步' },
@@ -530,6 +543,7 @@ const navGroups = [
 
 const paths = {
   grid: 'M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z',
+  tasks: 'M9 5h11M9 12h11M9 19h11M4 5l1.5 1.5L8 4M4 12l1.5 1.5L8 11M4 19l1.5 1.5L8 18',
   key: 'M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4',
   scan: 'M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M3 12h18',
   folder: 'M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
@@ -548,9 +562,84 @@ const paths = {
   shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',
   bolt: 'M13 2L3 14h9l-1 8 10-12h-9z',
   play: 'M5 3l14 9-14 9z',
-  logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9'
+  logout: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',
+  moon: 'M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z',
+  sun: 'M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4'
 }
 const icon = name => paths[name] || paths.grid
+
+// 阶段六：任务中心——纯聚合视图。数据源只用 load()/pollMirrorStatus() 已加载的 ref，
+// 不新增任何 API，不造任何假数；缺失数据一律显示 0 并标注来源，点击可跳到对应原始页。
+const taskCenter = computed(() => {
+  const s = mirrorStatus.value || {}
+  const node = k => (s.pipeline || []).find(n => n && n.key === k) || {}
+  const copyN = node('copy'), renameN = node('rename'), identN = node('identify'),
+        shareN = node('share'), pushN = node('push')
+  // 队列状态聚合（真实 queue ref，后端 /api/queue status ∈ pending/review/retry/failed/sent）
+  const q = { pending: 0, review: 0, retry: 0, failed: 0, sent: 0 }
+  for (const item of (queue.value || [])) { const st = item && item.status; if (st in q) q[st]++ }
+  // 投稿：审核态 status + 转存态 restore_status（v0.9.19 两态分离）
+  const c = contributions.value || []
+  const cPending = Number((interactionStatus.value || {}).contributions_pending || 0) ||
+                   c.filter(x => x.status === 'pending').length
+  const cRestorePending = c.filter(x => ['restoring', 'retry_wait', 'failed'].includes(x.restore_status)).length
+  const cDone = c.filter(x => x.status === 'approved' || x.status === 'transferred').length
+  // 求片：审核态 review_status + 同步态 status（管理员内部态，仅作计数）
+  const m = mediaRequests.value || []
+  const mPending = m.filter(x => (x.review_status || 'pending') === 'pending').length
+  const mDone = m.filter(x => x.review_status === 'approved').length
+  const mSynced = m.filter(x => x.status === 'synced').length
+  // 批次状态映射（真实 batchInfo，阶段二 C4）
+  const batchStatus = String(batchInfo.value?.status || 'idle')
+  const batchLabel = ({ idle: '空闲', running: '运行中', paused: '已暂停',
+                        cancelling: '取消中' })[batchStatus] || batchStatus
+  const mk = (label, value, tone) => ({ label, value, tone: tone || '' })
+  return [
+    { key: 'mirror', label: '镜像任务', icon: 'copy', target: '镜像同步',
+      status: batchStatus === 'running' ? 'active' : (['paused', 'cancelling'].includes(batchStatus) ? 'warn' : 'idle'),
+      metrics: [mk('批次状态', batchLabel, batchStatus === 'running' ? 'good' : ''),
+                mk('当前序列', batchInfo.value?.current_sequence || 0),
+                mk('严格顺序', mirrorStrict.value ? '开' : '关')],
+      note: '来源：批次状态接口 + 镜像进度接口（实时轮询）' },
+    { key: 'copy', label: '复制到 B 库', icon: 'copy', target: '镜像同步',
+      status: copyN.status || 'idle',
+      metrics: [mk('本轮完成', copyN.value || 0), mk('文件总数', copyN.total || 0)],
+      note: '来源：镜像进度流水线「复制到 B 库」节点' },
+    { key: 'rename', label: '英文改名', icon: 'file', target: '镜像同步',
+      status: (s.rename_errors?.length || s.untranslated_works?.length) ? 'warn' : (renameN.status || 'idle'),
+      metrics: [mk('本轮改名', renameN.value || 0),
+                mk('待解析英文名', s.untranslated_works?.length || 0, s.untranslated_works?.length ? 'bad' : ''),
+                mk('改名失败', s.rename_errors?.length || 0, s.rename_errors?.length ? 'bad' : '')],
+      note: '来源：镜像进度「英文改名」节点 + 未解析/失败诊断表' },
+    { key: 'translate', label: '翻译识别', icon: 'image', target: '镜像同步',
+      status: identN.status || 'idle',
+      metrics: [mk('本轮识别', identN.value || 0, identN.status === 'active' ? 'good' : ''),
+                mk('作品总数', identN.total || 0)],
+      note: '来源：镜像进度「入库识别」节点（TMDB / AI 元数据）' },
+    { key: 'share', label: '生成分享', icon: 'link', target: '镜像同步',
+      status: shareN.status || 'idle',
+      metrics: [mk('已分享', shareN.value || 0), mk('分享总数', shareN.total || 0)],
+      note: '来源：镜像进度「生成分享」节点（目录分享，队列每 30 秒消费）' },
+    { key: 'push', label: '推送队列', icon: 'send', target: '推送队列',
+      status: q.failed ? 'warn' : ((q.pending || q.retry || q.review) ? 'active' : (q.sent ? 'done' : 'idle')),
+      metrics: [mk('待发送', q.pending + q.review, (q.pending + q.review) ? 'good' : ''),
+                mk('重试中', q.retry, q.retry ? 'warn' : ''),
+                mk('失败', q.failed, q.failed ? 'bad' : ''),
+                mk('已发送', q.sent)],
+      note: '来源：推送队列接口（队列状态真实计数）' },
+    { key: 'contribution', label: '投稿处理', icon: 'shield', target: '分发与互动中心',
+      status: cPending || cRestorePending ? 'active' : (cDone ? 'done' : 'idle'),
+      metrics: [mk('待审核', cPending, cPending ? 'good' : ''),
+                mk('转存待处理', cRestorePending, cRestorePending ? 'warn' : ''),
+                mk('已通过', cDone)],
+      note: '来源：投稿列表 + 互动统计接口（审核态 / 转存态分离）' },
+    { key: 'request', label: '求片处理', icon: 'search', target: '分发与互动中心',
+      status: mPending ? 'active' : (mDone ? 'done' : 'idle'),
+      metrics: [mk('待审核', mPending, mPending ? 'good' : ''),
+                mk('已采纳', mDone), mk('已同步', mSynced)],
+      note: '来源：求片列表接口（审核态 / 同步态计数）' }
+  ]
+})
 
 const syntaxHint = computed(() => '{{#if year}}年份 {{year}}{{/if}} · 条件块支持嵌套')
 // 说明文字含 {{...}} 字面量，必须由 computed 返回字符串，不能直接写进 Vue 模板
@@ -1789,6 +1878,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         <div class="crumb"><span>Ya-TG</span><b>/</b><strong>{{ tab }}</strong></div>
         <div class="top-actions">
           <span class="clock" :title="'距自动退出还剩 ' + fmtRemaining(sessionRemaining)">{{ clock }}</span>
+          <el-button size="small" text :title="isDark ? '切换浅色主题' : '切换深色主题'" @click="toggleTheme">
+            <svg class="ico" viewBox="0 0 24 24"><path :d="icon(isDark ? 'sun' : 'moon')"/></svg>
+          </el-button>
           <span class="clock" :class="{ 'session-warn': sessionRemaining > 0 && sessionRemaining < 300 }">
             <svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px;vertical-align:-2px"><path :d="icon('clock')"/></svg>
             会话 {{ fmtRemaining(sessionRemaining) }}
@@ -1914,6 +2006,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <b class="tl-action">{{ a.action }}</b><span class="tl-detail">{{ a.detail || a.target_type }}</span>
               </div>
               <div v-if="!audit.length" class="empty">暂无操作记录</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 阶段六：任务中心——8 类任务的纯聚合视图，数据源全部来自已加载 ref，不造数 -->
+        <section v-else-if="tab === '任务中心'" class="fade">
+          <div class="page-head"><div><h2>任务中心</h2><p>镜像 / 复制 / 改名 / 翻译 / 分享 / 推送 / 投稿 / 求片，分类聚合真实任务状态</p></div>
+            <el-button plain :loading="asyncScanRunning" @click="refreshAll"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('refresh')"/></svg> 刷新数据</el-button></div>
+          <div class="task-notice">本页为跨模块聚合视图：所有数字来自各原始页面已加载的真实数据，点击「查看明细」跳转到对应页面操作；无数据的分类显示 0，不做估算。</div>
+          <div class="task-grid">
+            <div v-for="c in taskCenter" :key="c.key" class="panel task-card" :class="'task-' + c.status">
+              <div class="task-card-head">
+                <div class="task-title"><svg class="ico" viewBox="0 0 24 24"><path :d="icon(c.icon)"/></svg><b>{{ c.label }}</b></div>
+                <span class="task-state" :class="'st-' + c.status">{{ ({ active:'进行中', done:'已完成', warn:'需关注', idle:'空闲' })[c.status] || c.status }}</span>
+              </div>
+              <div class="task-metrics">
+                <div v-for="m in c.metrics" :key="m.label" class="task-metric">
+                  <span class="tm-value" :class="m.tone ? 'tm-' + m.tone : ''">{{ m.value }}</span>
+                  <span class="tm-label">{{ m.label }}</span>
+                </div>
+              </div>
+              <div class="task-card-foot"><small>{{ c.note }}</small><button class="link-btn" @click="setTab(c.target)">查看明细 →</button></div>
             </div>
           </div>
         </section>
@@ -2992,6 +3106,22 @@ button{font-family:inherit}
 .pipe-value span{font-size:13px;color:var(--yg-muted);font-weight:400}
 .pipe-detail{font-size:11px;color:var(--yg-muted);margin-top:6px;line-height:1.4}
 .home-flow .pipe-node{padding:10px}.home-flow .pipe-value{font-size:18px}
+/* 阶段六：任务中心分类聚合视图 */
+.task-notice{background:var(--yg-panel-soft);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:10px 14px;font-size:12px;color:var(--yg-muted);margin-bottom:18px}
+.task-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.task-card{margin-bottom:0;padding:18px 18px 14px;border-left:3px solid var(--yg-line)}
+.task-card.task-active{border-left-color:#f2a33c}.task-card.task-warn{border-left-color:#e2564f}.task-card.task-done{border-left-color:#19b3a6}
+.task-card-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:14px}
+.task-title{display:flex;align-items:center;gap:8px;font-size:14px}.task-title .ico{width:17px;height:17px;color:var(--yg-primary)}
+.task-state{font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;background:var(--yg-panel-soft);color:var(--yg-muted);white-space:nowrap}
+.task-state.st-active{color:#c47a12;background:rgba(242,163,60,.14)}.task-state.st-warn{color:#d9463d;background:rgba(226,86,79,.14)}
+.task-state.st-done{color:#0f9c90;background:rgba(25,179,166,.14)}
+.task-metrics{display:flex;flex-wrap:wrap;gap:14px 18px;min-height:44px}
+.task-metric{display:flex;flex-direction:column;gap:2px}.tm-value{font-size:21px;font-weight:780;font-variant-numeric:tabular-nums;line-height:1.1}
+.tm-value.tm-good{color:#c47a12}.tm-value.tm-warn{color:#d9463d}.tm-value.tm-bad{color:#d9463d}
+.tm-label{font-size:11px;color:var(--yg-muted)}
+.task-card-foot{margin-top:14px;padding-top:10px;border-top:1px dashed var(--yg-line);display:flex;justify-content:space-between;align-items:flex-end;gap:8px}
+.task-card-foot small{color:var(--yg-muted);font-size:10px;line-height:1.4;flex:1}.task-card-foot .link-btn{white-space:nowrap}
 .stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
 .panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}
@@ -3188,7 +3318,7 @@ button{font-family:inherit}
 .preset-btn.on{background:var(--yg-primary);border-color:var(--yg-primary);color:#fff;font-weight:600}
 .inline-label{display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:400}
 .inline-form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
-@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}.stats-cards,.pipeline-flow{grid-template-columns:repeat(3,1fr)}.link-modules{grid-template-columns:1fr;gap:0}.link-module .sec-band:not(:first-child){margin-top:22px}}
+@media(max-width:1100px){.sidebar{width:72px}.brand>div:last-child,.nav-group-label,.nav-text,.nav-badge,.sidebar-foot{display:none}.nav-item{justify-content:center;padding:12px}.content{padding:20px}.two-col,.three-col,.form-grid,.auth-summary,.kv-grid,.credential-bar,.manage-grid{grid-template-columns:1fr}.stats-cards,.pipeline-flow{grid-template-columns:repeat(3,1fr)}.task-grid{grid-template-columns:repeat(2,1fr)}.link-modules{grid-template-columns:1fr;gap:0}.link-module .sec-band:not(:first-child){margin-top:22px}}
 
 /* ============ v0.6.5 手机 / 触屏适配 ============ */
 /* ≤900px：侧栏从左侧竖排改为顶部横向导航，主区占满宽度 */
@@ -3243,6 +3373,7 @@ button{font-family:inherit}
   /* 5 列进度/统计条在手机上折行，避免卡片超出屏幕 */
   .stats-cards{grid-template-columns:repeat(2,1fr);gap:8px}
   .pipeline-flow{grid-template-columns:repeat(2,1fr);gap:8px}
+  .task-grid{grid-template-columns:1fr;gap:10px}
   .stat-num{font-size:22px}
   .hero{padding:18px;gap:14px}
   .hero h2{font-size:20px}
@@ -3292,4 +3423,43 @@ button{font-family:inherit}
 .disc-url{font-family:monospace;overflow-wrap:anywhere;word-break:break-all}
 .disc-guide-list{margin:0 0 12px;padding-left:20px;line-height:1.9}
 @media(max-width:820px){.disc-addtarget{grid-template-columns:1fr}}
+
+/* ============ 阶段六：深色主题（附加层，浅色默认不变，删掉 html.dark 即回到原样） ============ */
+:root{--yg-border:#e6e8eb;--yg-panel-soft:rgba(127,127,127,.05)}
+html.dark{
+  --yg-bg:#0f1422;--yg-surface:#1a2133;--yg-ink:#e6eaf5;--yg-muted:#96a0bd;--yg-line:#2b3450;
+  --yg-primary:#8b8bf0;--yg-primary-2:#a99bf7;--yg-teal:#3fd0c2;--yg-amber:#f5b65c;--yg-rose:#f07a90;
+  --yg-shadow:0 1px 2px rgba(0,0,0,.25),0 12px 32px rgba(0,0,0,.35);
+  --yg-shadow-lg:0 2px 4px rgba(0,0,0,.3),0 20px 48px rgba(0,0,0,.45);
+  --yg-border:#2b3450;--yg-panel-soft:rgba(255,255,255,.04);
+  --el-color-primary:#8b8bf0;
+  color-scheme:dark;
+}
+html.dark body{background:radial-gradient(1200px 600px at 100% -10%,#1b2140 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,#12262b 0%,transparent 55%),var(--yg-bg)}
+/* 面板/卡片/表格：把硬编码白底换成 surface 变量 */
+html.dark .panel,html.dark .card,html.dark .stat-card,html.dark .section-card,
+html.dark .method-card,html.dark .bot-card,html.dark .media-card,html.dark .login-card,
+html.dark .auth-summary-item,html.dark .credential-bar,html.dark .kv-grid>div,
+html.dark .cstep,html.dark .webqr-box,html.dark .preview-box,html.dark .mini-stat,
+html.dark .info-chip,html.dark .cmd-item,html.dark .row-btn,html.dark .series-card{
+  background:var(--yg-surface);color:var(--yg-ink);border-color:var(--yg-line)
+}
+html.dark .el-table th.el-table__cell{background:#202940!important;color:#b8c2dd}
+html.dark .el-table,html.dark .el-table tr,html.dark .el-table td.el-table__cell{background:var(--yg-surface);color:var(--yg-ink)}
+html.dark .el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell{background:#1e2638}
+html.dark .el-table__inner-wrapper::before,html.dark .el-table td.el-table__cell::before{background:var(--yg-line)}
+html.dark .topbar{background:var(--yg-surface)}
+html.dark .content{color:var(--yg-ink)}
+html.dark .crumb,html.dark .page-head h2,html.dark .panel-head h3{color:var(--yg-ink)}
+html.dark .stat-bar,html.dark .media-poster{background:#232c42}
+html.dark .status-tag,html.dark .tone-indigo .stat-icon,html.dark .tone-teal .stat-icon,
+html.dark .grp-ico.g-amber,html.dark .grp-ico.g-violet{color:var(--yg-ink)}
+html.dark .hero{background:linear-gradient(120deg,#1b2340,#172a2f);color:var(--yg-ink)}
+html.dark .unavailable-box,html.dark .mirror-lock-tip,html.dark .batch-control-row{background:#242c44}
+html.dark .el-input__wrapper,html.dark .el-select__wrapper,html.dark .el-textarea__inner{background:var(--yg-surface);box-shadow:0 0 0 1px var(--yg-line) inset}
+html.dark .el-dialog,html.dark .el-message-box,html.dark .el-popper{background:var(--yg-surface);color:var(--yg-ink)}
+html.dark .nav-item:hover{background:rgba(255,255,255,.06)}
+html.dark .task-notice{background:#242c44;color:var(--yg-muted)}
+html.dark .task-card-foot small,html.dark .tm-label{color:var(--yg-muted)}
+html.dark .task-state{background:rgba(255,255,255,.06)}
 </style>
