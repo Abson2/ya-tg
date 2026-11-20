@@ -20,8 +20,8 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from . import (ai_assist, bot_listener, contribution_restore, guangya_auth,
-               guangya_sms, log_retention, mirror, runtime_config, tgto, tmdb)
+from . import (admin_session, ai_assist, bot_listener, contribution_restore,
+               guangya_auth, guangya_sms, log_retention, mirror, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
@@ -105,9 +105,26 @@ def add_audit(db: Session, action: str, target_type: str = "", target_id: str = 
     db.add(AuditLog(action=action, target_type=target_type, target_id=str(target_id), detail=detail))
 
 
-def check_admin(x_admin_password: str | None = Header(default=None)):
+_SESSION_EXPIRED_MSG = "登录已过期，请重新输入密码"
+
+
+def check_admin(
+    x_admin_password: str | None = Header(default=None),
+    x_admin_session: str | None = Header(default=None),
+):
+    """v0.9.20：双通道鉴权。浏览器走会话 token（带 idle 超时），脚本/API 兼容明文密码。
+
+    - 带 X-Admin-Session：校验并刷新活跃时间；过期/invalid 一律 401 且给出可识别文案，
+      前端据此清 token 回登录页。
+    - 无 token 时回退 X-Admin-Password 明文比对（旧行为，向后兼容不破坏脚本/测试）。
+    """
     if settings.admin_password == "CHANGE_ME":
         raise HTTPException(503, "请先在 .env 设置 ADMIN_PASSWORD")
+    if x_admin_session:
+        state = admin_session.touch(x_admin_session)
+        if state == "ok":
+            return
+        raise HTTPException(401, _SESSION_EXPIRED_MSG if state == "expired" else "会话无效，请重新登录")
     if x_admin_password != settings.admin_password:
         raise HTTPException(401, "管理密码错误")
 
@@ -352,6 +369,39 @@ ADMIN = [Depends(check_admin)]
 @app.get("/api/health")
 def health():
     return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.19", "app": "Ya-TG"}
+
+
+# ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
+class AdminLoginInput(BaseModel):
+    password: str = ""
+
+
+@app.post("/api/auth/login")
+def admin_login(p: AdminLoginInput):
+    """用管理员密码换取会话 token。浏览器只存 token，不再永久保存明文密码。"""
+    import hmac
+    if settings.admin_password == "CHANGE_ME":
+        raise HTTPException(503, "请先在 .env 设置 ADMIN_PASSWORD")
+    if not hmac.compare_digest(str(p.password or ""), settings.admin_password):
+        raise HTTPException(401, "管理密码错误")
+    token = admin_session.create()
+    return {"ok": True, "token": token, "idle_seconds": admin_session.idle_seconds()}
+
+
+@app.get("/api/auth/session")
+def admin_session_status(x_admin_session: str | None = Header(default=None)):
+    """只读会话状态（**不刷新活跃时间**，避免前端轮询续命导致永不超时）。"""
+    state = admin_session.read(x_admin_session or "")
+    if state != "ok":
+        raise HTTPException(401, _SESSION_EXPIRED_MSG if state == "expired" else "会话无效，请重新登录")
+    return {"active": True, "remaining_seconds": admin_session.remaining_seconds(x_admin_session),
+            "idle_seconds": admin_session.idle_seconds()}
+
+
+@app.post("/api/auth/logout", dependencies=ADMIN)
+def admin_logout(x_admin_session: str | None = Header(default=None)):
+    admin_session.destroy(x_admin_session or "")
+    return {"ok": True}
 
 
 @app.get("/api/overview", dependencies=ADMIN)

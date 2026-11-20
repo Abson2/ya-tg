@@ -3,7 +3,11 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QRCode from 'qrcode'
 
-const password = ref(localStorage.getItem('ya_tg_password') || '')
+// v0.9.20：浏览器不再保存明文管理员密码，只存会话 token（服务端未活跃 2h 强制过期）。
+const SESSION_KEY = 'ya_tg_session'
+const password = ref('')                                    // 仅登录框临时持有，登录后清空
+const sessionToken = ref(localStorage.getItem(SESSION_KEY) || '')
+const sessionRemaining = ref(0)                             // 剩余未活跃秒数（轮询会话状态）
 const authed = ref(false)
 // v0.9.13 #252：刷新后保留当前页面。审核中心已删除，历史残留值回退到概览。
 const TAB_STORAGE_KEY = 'ya_tg_current_tab'
@@ -478,7 +482,7 @@ async function setDefaultTpl(t) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
-let clockTimer = null, webqrTimer = null, mirrorPollTimer = null
+let clockTimer = null, webqrTimer = null, mirrorPollTimer = null, sessionPollTimer = null
 // v0.9.10.2：进度看板实时轮询——任务运行中每 2 秒只拉 /mirror/status（不复跑整页 load），
 // 展示复制/改名/入库/分享/入队各阶段真实数量变化；空闲时降为 5 秒轻量刷新。
 function stageLabel(s) {
@@ -629,7 +633,8 @@ const healthChecks = computed(() => [
   { label: '队列 Worker', ok: true, hint: '每 30 秒轮询一次' }
 ])
 
-const headers = () => ({ 'X-Admin-Password': password.value, 'Content-Type': 'application/json' })
+// v0.9.20：主通道用会话 token；明文密码 header 仅保留给脚本/API 兼容，浏览器日常不再发送。
+const headers = () => ({ 'X-Admin-Session': sessionToken.value, 'Content-Type': 'application/json' })
 // FastAPI 的 detail 可能是字符串、dict 或 422 校验数组；直接 Error(obj) 会显示 [object Object]
 function errText(value, fallback = '请求失败') {
   if (value == null || value === '') return fallback
@@ -637,6 +642,20 @@ function errText(value, fallback = '请求失败') {
   if (Array.isArray(value)) return value.map(x => x?.msg || x?.message || JSON.stringify(x)).join('；')
   if (typeof value === 'object') return value.message || value.msg || value.detail || JSON.stringify(value)
   return String(value)
+}
+// v0.9.20：会话过期统一处理——清 token、回登录页、提示重新输入密码。
+// 用 flag 防止并发请求同时弹多个提示。
+let _expiryNotified = false
+function forceSessionExpired(reason) {
+  sessionToken.value = ''
+  localStorage.removeItem(SESSION_KEY)
+  authed.value = false
+  password.value = ''
+  if (!_expiryNotified) {
+    _expiryNotified = true
+    ElMessage.warning({ message: reason || '登录已过期，请重新输入密码', duration: 6000, showClose: true })
+    setTimeout(() => { _expiryNotified = false }, 1500)
+  }
 }
 async function api(path, opt = {}, timeoutMs = 0) {
   // v0.7.1：全量重扫可能耗时数分钟，允许单独放宽超时（AbortSignal 不影响其它请求）
@@ -646,7 +665,15 @@ async function api(path, opt = {}, timeoutMs = 0) {
     const r = await fetch('/api' + path, { ...opt, ...(ctl ? { signal: ctl.signal } : {}),
       headers: { ...headers(), ...(opt.headers || {}) } })
     const d = await r.json().catch(() => ({}))
-    if (!r.ok) throw Error(errText(d.detail ?? d.message, r.statusText))
+    if (!r.ok) {
+      const detail = errText(d.detail ?? d.message, r.statusText)
+      // v0.9.20：服务端判定会话过期/无效 → 强制回登录页；排除登录接口自身的密码错误
+      if (r.status === 401 && path !== '/auth/login' &&
+          (detail.includes('登录已过期') || detail.includes('会话无效'))) {
+        forceSessionExpired(detail)
+      }
+      throw Error(detail)
+    }
     return d
   } catch (e) {
     if (ctl && ctl.signal.aborted) throw Error('扫描仍在进行中，请稍后刷新资源库查看结果')
@@ -747,10 +774,50 @@ async function loadAuth() {
   await loadSms()
 }
 async function login() {
-  try { await load(); authed.value = true; localStorage.setItem('ya_tg_password', password.value) }
-  catch (e) { ElMessage.error(e.message) }
+  const pwd = password.value
+  if (!pwd) { ElMessage.warning('请输入管理员密码'); return }
+  try {
+    // v0.9.20：用密码换会话 token（登录端点无需鉴权，直接 fetch 避免 headers 带旧 token）
+    const r = await fetch('/api/auth/login', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) })
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) throw Error(errText(d.detail ?? d.message, r.statusText))
+    sessionToken.value = d.token
+    localStorage.setItem(SESSION_KEY, d.token)   // 只存 token，绝不写明文密码
+    password.value = ''                          // 立即清空登录框里的密码
+    await load()
+    authed.value = true
+    sessionRemaining.value = d.idle_seconds || 0
+    ElMessage.success(`已登录（闲置 ${Math.round((d.idle_seconds || 7200) / 60)} 分钟自动退出）`)
+  } catch (e) { ElMessage.error(e.message) }
 }
-function logout() { authed.value = false; password.value = ''; localStorage.removeItem('ya_tg_password') }
+async function logout() {
+  // 主动登出：通知服务端立即失效该会话，再清本地 token
+  try { await api('/auth/logout', { method: 'POST' }) } catch (e) {}
+  authed.value = false
+  sessionToken.value = ''
+  sessionRemaining.value = 0
+  password.value = ''
+  localStorage.removeItem(SESSION_KEY)
+  localStorage.removeItem('ya_tg_password')  // 清理历史版本遗留的明文密码
+}
+// v0.9.20：定时轮询会话状态（只读、不续期），剩余时间归零即强制重新登录
+async function pollSession() {
+  if (!authed.value || !sessionToken.value) return
+  try {
+    const s = await api('/auth/session')
+    sessionRemaining.value = s.remaining_seconds || 0
+  } catch (e) {
+    // 过期/无效已由 api() 统一处理（forceSessionExpired），这里只兜底清理本地态
+    if (!authed.value) { sessionToken.value = ''; localStorage.removeItem(SESSION_KEY) }
+  }
+}
+function fmtRemaining(sec) {
+  sec = Number(sec || 0)
+  if (sec <= 0) return '即将过期'
+  const h = Math.floor(sec / 3600), m = Math.ceil((sec % 3600) / 60)
+  return h > 0 ? `${h}小时${m}分` : `${m}分钟`
+}
 async function saveTask() {
   // v0.8.0：默认用预设间隔按钮，只有开启「自定义 Cron」才提交表达式
   // v0.8.3：根目录 ID 已从界面和提交体里完全移除，后端统一引用镜像同步里的 B 库 ID
@@ -1630,12 +1697,20 @@ function tick() {
   if (authed.value && smsStatus.value && smsStatus.value.logged_in) updateCountdown()
 }
 
-onMounted(() => {
-  tick(); clockTimer = setInterval(tick, 1000); if (password.value) login()
+onMounted(async () => {
+  tick(); clockTimer = setInterval(tick, 1000)
+  localStorage.removeItem('ya_tg_password')  // v0.9.20：清理历史版本遗留的明文密码
+  // v0.9.20：有 token 则尝试恢复会话（load 会验证 token 有效性；过期自动回登录页）
+  if (sessionToken.value) {
+    try { await load(); authed.value = true }
+    catch (e) { sessionToken.value = ''; localStorage.removeItem(SESSION_KEY) }
+  }
+  // 会话状态 30s 轮询一次（只读，不刷新活跃时间），剩余时间到期由服务端 401 强制退出
+  sessionPollTimer = setInterval(pollSession, 30000)
   // v0.9.10.2：实时进度轮询，登录后才启动；2 秒一次不影响服务器（单条只读查询）
   mirrorPollTimer = setInterval(pollMirrorStatus, 2000)
 })
-onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearInterval(mirrorPollTimer) })
+onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearInterval(mirrorPollTimer); clearInterval(sessionPollTimer) })
 </script>
 
 <template>
@@ -1645,10 +1720,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="login-brand"><img class="brand-logo lg" src="/logo.svg" alt="Ya-TG"/><div><h1>Ya-TG</h1><p>光鸭资源分发工作台</p></div></div>
       <div class="login-divider"></div>
       <h3>欢迎回来</h3>
-      <p class="login-hint">请输入管理员密码以访问控制台</p>
+      <p class="login-hint">请输入管理员密码以访问控制台。持续 2 小时无操作将自动退出并要求重新输入。</p>
       <el-input v-model="password" type="password" show-password placeholder="ADMIN_PASSWORD" @keyup.enter="login" size="large"/>
       <el-button type="primary" size="large" class="login-btn" @click="login">进入工作台</el-button>
-      <div class="login-foot"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('shield')"/></svg> 凭证仅保存在本机浏览器 · 北京时间调度</div>
+      <div class="login-foot"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('shield')"/></svg> 仅保存临时会话，不保存明文密码 · 北京时间调度</div>
     </div>
   </div>
 
@@ -1680,7 +1755,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <header class="topbar">
         <div class="crumb"><span>Ya-TG</span><b>/</b><strong>{{ tab }}</strong></div>
         <div class="top-actions">
-          <span class="clock">{{ clock }}</span>
+          <span class="clock" :title="'距自动退出还剩 ' + fmtRemaining(sessionRemaining)">{{ clock }}</span>
+          <span class="clock" :class="{ 'session-warn': sessionRemaining > 0 && sessionRemaining < 300 }">
+            <svg class="ico" viewBox="0 0 24 24" style="width:12px;height:12px;vertical-align:-2px"><path :d="icon('clock')"/></svg>
+            会话 {{ fmtRemaining(sessionRemaining) }}
+          </span>
           <el-button size="small" plain @click="verify">验证连接</el-button>
           <el-button size="small" type="primary" plain :loading="asyncScanRunning" @click="refreshAll">
             <svg class="ico" viewBox="0 0 24 24"><path :d="icon('refresh')"/></svg> 刷新
@@ -2811,7 +2890,7 @@ button{font-family:inherit}
 .main-wrap{flex:1;min-width:0}
 .topbar{height:66px;background:rgba(255,255,255,.88);backdrop-filter:blur(10px);border-bottom:1px solid var(--yg-line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0;z-index:20}
 .crumb{display:flex;align-items:center;gap:10px;color:var(--yg-muted);font-size:13px}.crumb b{color:#c8cfe3;font-weight:400}.crumb strong{color:var(--yg-ink);font-weight:700}
-.top-actions{display:flex;align-items:center;gap:10px}.clock{font-variant-numeric:tabular-nums;color:var(--yg-muted);font-size:12px;margin-right:6px}
+.top-actions{display:flex;align-items:center;gap:10px}.clock{font-variant-numeric:tabular-nums;color:var(--yg-muted);font-size:12px;margin-right:6px}.session-warn{color:#e5526b;font-weight:700}
 .top-actions .ico{margin-right:5px}
 .content{max-width:1480px;margin:0 auto;padding:26px 28px 60px}
 .fade{animation:fade .3s ease}@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}

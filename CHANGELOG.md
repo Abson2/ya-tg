@@ -8,6 +8,27 @@
 
 ---
 
+## v0.9.20 (2026-11-20)
+
+管理后台登录安全：**修复「浏览器永久明文保存管理员密码、永不失效」的风险**，改为会话 token 登录 + 未活跃自动过期。用户选择 2 小时未活跃有效期、浏览器只存 token 不存明文密码。
+
+### 问题
+- 旧实现：`localStorage.setItem('ya_tg_password', 密码)` 永久明文保存，页面加载自动登录；后端每次请求只做 `X-Admin-Password` 明文比对，无会话、无过期、无法强制下线。浏览器/设备遗留的密码长期有效。
+
+### 改造
+- 新增 `admin_session.py`：内存会话表（token → last_active，monotonic 时钟），`create/read/touch/destroy/clear_all`。
+  - 登录用 `ADMIN_PASSWORD` 换随机 token（`secrets.token_urlsafe(32)`），新增 `POST /api/auth/login`。
+  - 受保护端点走 `X-Admin-Session`：每次请求 `touch` 刷新活跃时间；`GET /api/auth/session` **只读不续期**（避免前端轮询把会话永久保活，这正是 idle 语义的关键）。
+  - `POST /api/auth/logout` 立即失效；`clear_all` 供改密码/重启强制全部下线。
+  - 未活跃超时（`ADMIN_IDLE_MINUTES`，默认 120 分钟，范围 1~1440）后 token 服务端强制 401「登录已过期，请重新输入密码」。
+- `check_admin` 改为双通道：token 主通道（带 idle 校验）+ 明文密码 `X-Admin-Password` 兼容通道（脚本/API/旧测试不破坏）。
+- 前端：移除明文密码持久化（挂载时清理历史 `ya_tg_password`），只把 token 存 `localStorage`；`api()` 统一识别 401 会话过期 → 清 token 回登录页提示重新输入；登录框输密码后即清空内存变量；顶栏显示会话剩余时间（<5 分钟标红）；30s 只读轮询续显示、不续期。
+
+### 验证
+- 新增 `tests/test_v0920_admin_session.py` 13 项（登录换 token、token 访问、idle 到期 401、只读轮询不续期、登出失效、明文兼容、clear_all、idle 边界、前端静态）。
+- 全量 pytest **607 passed，1 warning**；前端 build 成功。
+- 并发 / 多实例提示：会话为进程内存态，进程重启需重新登录（安全预期）；多副本部署各实例会话不共享，需 sticky 会话或改共享存储（当前单进程部署不受影响）。
+
 ## v0.9.19 (2026-11-20)
 
 投稿转存路线纠偏：**去掉 v0.9.18 的 TGtoDrive 分发通道（中转群 / OpenAPI），改为审核通过后直接调用光鸭自身转存 API，把用户投稿保存到配置的目标目录 ID**。不再经过 TgtoDrive、不再依赖 Telegram Bot 转发。审核态与转存态仍然分离。

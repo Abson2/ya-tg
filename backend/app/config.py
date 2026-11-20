@@ -6,6 +6,8 @@ class Settings(BaseSettings):
 
     # 管理端
     admin_password: str = "CHANGE_ME"
+    # v0.9.20：管理后台未活跃有效期（分钟），超过后会话失效需重新输密码；范围 1~1440
+    admin_idle_minutes: int = 120
     app_secret: str = "CHANGE_ME"
     database_url: str = "sqlite:///./app.db"
 
