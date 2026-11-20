@@ -96,11 +96,17 @@ def keyword_id(tmdb_id: int | None, season: int | None, title: str = "") -> str:
 
 def build_rule(*, title: str, tmdb_id: int | None = None, media_type: str = "tv",
                season: int | None = None, year: str = "", resolution: str = "",
-               effect: str = "", required_keyword: str = "") -> dict:
+               effect: str = "", required_keyword: str = "",
+               original_title: str = "", overview: str = "",
+               poster_path: str = "", backdrop_path: str = "",
+               poster_url: str = "", backdrop_url: str = "") -> dict:
     """构造一条结构化关键词规则，字段对齐 TgtoDrive 现有规则，来源标记为 ya-tg。
 
     v0.9.13 #254：新增 effect / required_keyword 两个真机字段。必含关键词必须同时
     写值（required_keyword）并打开开关（include_required_keyword），否则后端不编译进正则。
+    v0.9.15 #268：新增 TMDB 元数据字段（海报/背景/简介/原名），由 upsert_keyword 在
+    写入前查 tmdb.detail() 补全；TgtoDrive 前端「正在匹配 TMDB」取决于这些字段是否为空。
+    默认值全空串，保持旧的直接调用（如测试）完全兼容。
     """
     display = title.strip()
     if season and media_type == "tv":
@@ -127,12 +133,41 @@ def build_rule(*, title: str, tmdb_id: int | None = None, media_type: str = "tv"
         "source": RULE_SOURCE,
         "sharer": "",
         "custom_regex": "",
-        "original_title": "",
-        "overview": "",
-        "poster_path": "",
-        "poster_url": "",
-        "backdrop_path": "",
-        "backdrop_url": "",
+        "original_title": str(original_title or ""),
+        "overview": str(overview or ""),
+        "poster_path": str(poster_path or ""),
+        "poster_url": str(poster_url or ""),
+        "backdrop_path": str(backdrop_path or ""),
+        "backdrop_url": str(backdrop_url or ""),
+    }
+
+
+async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
+    """v0.9.15 #268：查 TMDB 详情补全规则元数据，供 TgtoDrive 前端「已匹配 TMDB」。
+
+    走 SCAN 场景限流（tmdb.detail 默认 SCAN）。任何失败都安全降级为空串，
+    绝不因为元数据缺失阻断求片审核把关键词写入白名单。
+    """
+    empty = {"original_title": "", "overview": "", "poster_path": "",
+             "poster_url": "", "backdrop_path": "", "backdrop_url": ""}
+    if not tmdb_id:
+        return empty
+    try:
+        from . import tmdb
+        if not tmdb.configured(db):  # 未配密钥直接降级，不消耗限流配额也不发网络请求
+            return empty
+        d = await tmdb.detail(int(tmdb_id), media_type or "tv", db)
+    except Exception:
+        return empty
+    poster = str(d.get("poster_path") or "")
+    backdrop = str(d.get("backdrop_path") or "")
+    return {
+        "original_title": str(d.get("original_title") or ""),
+        "overview": str(d.get("overview") or ""),
+        "poster_path": poster,
+        "poster_url": tmdb.poster_url(poster, "w500") if poster else "",
+        "backdrop_path": backdrop,
+        "backdrop_url": tmdb.poster_url(backdrop, "w780") if backdrop else "",
     }
 
 
@@ -190,9 +225,11 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
         raise TgtoError(f"TgtoDrive 未返回场景 {scene} 的配置，已中止写入")
     rules = _rules_of(obj)
     before = len(rules)
+    # v0.9.15 #268：先查 TMDB 详情补全海报/简介/原名，TgtoDrive 前端才显示「已匹配」
+    meta = await _tmdb_meta(db, tmdb_id, media_type)
     rule = build_rule(title=title, tmdb_id=tmdb_id, media_type=media_type,
                       season=season, year=year, resolution=resolution,
-                      effect=effect, required_keyword=required_keyword)
+                      effect=effect, required_keyword=required_keyword, **meta)
     rid = rule["id"]
     hit = next((x for x in rules if isinstance(x, dict) and str(x.get("id")) == rid), None)
     if hit is not None:
@@ -203,7 +240,9 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
         for k in ("keywords", "keyword_groups_any", "aliases", "media_name",
                   "preferred_name", "title", "tmdb_id", "media_type", "year",
                   "resolution", "effect", "required_keyword",
-                  "include_required_keyword", "include_year", "source"):
+                  "include_required_keyword", "include_year", "source",
+                  "original_title", "overview", "poster_path", "poster_url",
+                  "backdrop_path", "backdrop_url"):
             hit[k] = rule[k]
         action = "updated"
     else:

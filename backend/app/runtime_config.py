@@ -72,6 +72,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "contribution_enabled": ("contribution_enabled", "false"),
     "contribution_bot_token": ("contribution_bot_token", ""),  # v0.9.4 起仅作旧配置回退
     "interaction_bot_id": ("interaction_bot_id", ""),  # v0.9.4：交互 Bot 直接引用 bots 表 id（token 去重）
+    # v0.9.15 #276：交互 Bot 的用户名（getMe 成功后自动缓存；手动填写作兜底/覆盖）。
+    # 用于生成 https://t.me/<username>?startgroup=<payload> 官方授权链接，绝不存 token。
+    "interaction_bot_username": ("interaction_bot_username", ""),
     "contribution_update_offset": ("contribution_update_offset", "0"),
     "donation_enabled": ("donation_enabled", "false"),
     "donation_image_url": ("donation_image_url", ""),

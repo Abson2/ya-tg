@@ -21,8 +21,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto, tmdb
-from .models import (Bot, Channel, DiscoveredChat, MediaRequest, QueueItem, Resource,
-                     UserContribution, utcnow)
+from .models import (Bot, Channel, DiscoveredChat, MediaRequest, ProcessedUpdate,
+                     QueueItem, Resource, UserContribution, utcnow)
 from .security import decrypt_secret
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
@@ -270,12 +270,62 @@ def bot_user_id_from_token(token: str) -> str:
     return head if head.isdigit() else ""
 
 
+# v0.9.15 #276：startgroup 官方授权链接（让用户把 Bot 加进群；Bot API 无主动加群接口）
+async def get_bot_username(db: Session, token: str) -> tuple[str, str]:
+    """调 Telegram getMe 取当前 Bot 的 @username（startgroup 链接必需）。
+
+    返回 (username 不含 @, error)。绝不输出 token；getMe 失败返回空 username + 分类原因。
+    官方约束：Bot 必须先在 BotFather 设置 username 才能生成 t.me/<bot> 深链。
+    """
+    t = str(token or "").strip()
+    if not t:
+        return "", "未配置交互 Bot Token"
+    try:
+        data = await _api(db, t, "getMe", {})
+    except Exception as exc:
+        return "", f"getMe 请求失败：{str(exc)[:120]}"
+    if not isinstance(data, dict) or not data.get("ok"):
+        kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, 200)
+        return "", hint or "getMe 调用失败，无法读取 Bot 用户名"
+    me = data.get("result") or {}
+    username = str(me.get("username") or "").strip().lstrip("@")
+    if not username:
+        return "", "该 Bot 未在 BotFather 设置 username，无法生成授权链接；请先设置后重试。"
+    return username, ""
+
+
+def build_startgroup_url(bot_username: str, payload: str) -> str:
+    """拼 Telegram 官方 startgroup 深链。payload 为短期随机标识，绝不含 token。"""
+    name = str(bot_username or "").strip().lstrip("@")
+    if not name or not re.match(r"^[A-Za-z0-9_]{5,32}$", name):
+        return ""
+    p = re.sub(r"[^A-Za-z0-9_\-]", "", str(payload or ""))[:64]
+    return f"https://t.me/{name}?startgroup={p}" if p else f"https://t.me/{name}?startgroup"
+
+
+def new_startgroup_payload() -> str:
+    """生成短期随机 payload：yg_<unix秒36进制>_<8位随机>，不含 token 也不含敏感信息。"""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits
+    rand = "".join(secrets.choice(alphabet) for _ in range(8))
+    return f"yg_{int(time.time()):x}_{rand}"
+
+
 def record_discovered_chat(db: Session, chat: dict, *, source: str = "auto",
-                           flush: bool = True) -> DiscoveredChat | None:
+                           flush: bool = True, member_status: str = "",
+                           bot_username: str = "", bot_id_override: int | None = None,
+                           last_update_id: int = 0,
+                           count_message: bool = True) -> DiscoveredChat | None:
     """v0.9.14 #256：把一条 Telegram chat 对象 upsert 进发现池。
 
     只记录 group / supergroup / channel（私聊无需作为推送目标发现）。
     同一 bot+chat_id 幂等，累加消息数与最后出现时间。
+
+    v0.9.15 #276：
+    - member_status 非空时写入 ChatMember.status（left/kicked 只标记状态、不删记录）；
+    - bot_id_override 用于 my_chat_member 事件按消息携带的 bot 归属（缺省用 effective_bot_id）；
+    - bot_username 记录 /id@BotUsername 等场景的 Bot 用户名；last_update_id 记幂等审计。
 
     flush：默认 True（API / 测试「写完即查」需要）。poll_once 里传 False——
     轮询链路后面还有多次 await，flush 会持写事务跨 await，触发 database is locked；
@@ -287,7 +337,7 @@ def record_discovered_chat(db: Session, chat: dict, *, source: str = "auto",
     ctype = str(chat.get("type") or "").strip()
     if not chat_id or ctype not in ("group", "supergroup", "channel"):
         return None
-    bot_id = effective_bot_id(db)
+    bot_id = bot_id_override if bot_id_override is not None else effective_bot_id(db)
     row = db.scalar(select(DiscoveredChat).where(
         DiscoveredChat.bot_id == bot_id, DiscoveredChat.chat_id == chat_id))
     title = str(chat.get("title") or "").strip()
@@ -296,15 +346,34 @@ def record_discovered_chat(db: Session, chat: dict, *, source: str = "auto",
     if row is None:
         row = DiscoveredChat(bot_id=bot_id, chat_id=chat_id, chat_type=ctype,
                              title=title[:256], username=username[:128], source=source,
-                             first_seen_at=now, last_seen_at=now, message_count=1)
+                             first_seen_at=now, last_seen_at=now,
+                             member_status=(member_status or "unknown")[:24],
+                             bot_username=(bot_username or "")[:128],
+                             last_update_id=int(last_update_id or 0),
+                             message_count=1 if count_message else 0,
+                             updated_at=now)
         db.add(row)
     else:
         row.last_seen_at = now
-        row.message_count = int(row.message_count or 0) + 1
+        if count_message:
+            row.message_count = int(row.message_count or 0) + 1
+        row.updated_at = now
         if title:
             row.title = title[:256]
         if username:
             row.username = username[:128]
+        if member_status:
+            row.member_status = member_status[:24]
+            # Bot 被移出：发送权限随之失效，避免白名单仍显示可发送
+            if member_status in ("left", "kicked"):
+                row.perm_status = "not_member"
+                row.perm_can_send = False
+            elif row.perm_status == "not_member":
+                row.perm_status = "unknown"
+        if bot_username:
+            row.bot_username = bot_username[:128]
+        if last_update_id:
+            row.last_update_id = int(last_update_id)
         # 手动添加后又被自动发现：保留 manual 来源标记，避免被自动流水覆盖语义
         if row.source != "manual":
             row.source = source
@@ -1319,16 +1388,109 @@ async def _register_link_contribution(db: Session, raw: str, tg_user_id: str,
     return "contribute", f"已收到资源并登记投稿（{title}），感谢支持，我们会尽快处理。"
 
 
+ALLOWED_UPDATES = ["message", "callback_query", "my_chat_member", "channel_post"]
+
+
+def _is_update_processed(db: Session, uid: int) -> bool:
+    """v0.9.15 #276：update_id 幂等判断，防止重启/重复投递导致重复登记与重复回命令。"""
+    if not uid:
+        return False
+    return db.get(ProcessedUpdate, uid) is not None
+
+
+def _mark_update_processed(db: Session, uid: int, bot_id: int) -> None:
+    if uid and not _is_update_processed(db, uid):
+        db.add(ProcessedUpdate(update_id=uid, bot_id=bot_id, processed_at=utcnow()))
+
+
+def _tg_error_hint(data: dict, http_status: int) -> tuple[str, str]:
+    """把 Telegram 错误归一为 (短类目, 用户可读说明)。绝不返回 token/完整请求 URL。"""
+    desc = str((data or {}).get("description") or "")
+    low = desc.lower()
+    if http_status == 409 or "conflict" in low:
+        return "conflict", ("getUpdates 冲突：可能有另一个进程/实例正在用同一个 Bot Token 拉取更新，"
+                            "或本机有多余的轮询任务。请检查并停止重复实例；本轮已跳过，将退避重试。")
+    if http_status == 429 or "too many requests" in low or "retry after" in low:
+        retry = 0
+        try:
+            params = (data or {}).get("parameters") or {}
+            retry = int(params.get("retry_after") or 0)
+        except (ValueError, TypeError):
+            retry = 0
+        return "rate_limited", f"Telegram 限流 429，已按 retry_after≈{retry}s 退避，本轮跳过。"
+    if "not found" in low or "unauthorized" in low or "invalid token" in low:
+        return "auth", "Bot Token 无效或已被撤销，请在 Bot 管理更新 Token。"
+    if http_status >= 500:
+        return "server", f"Telegram 服务暂时不可用（HTTP {http_status}），本轮跳过，下轮重试。"
+    return "unknown", (desc[:120] or f"Telegram 请求失败（HTTP {http_status}）")
+
+
+def _handle_my_chat_member(db: Session, token: str, upd: dict, bot_id: int,
+                           stats: dict) -> None:
+    """v0.9.15 #276：Bot 自身成员状态变化——被拉入群/频道即登记，被移出只标记不删。
+
+    my_chat_member 与 chat_member 不同：前者是 Bot 自身状态，Telegram 无需管理员权限即可收到。
+    """
+    mc = upd.get("my_chat_member") or {}
+    chat = mc.get("chat") or {}
+    new_member = mc.get("new_chat_member") or mc.get("new_chat_participant") or {}
+    status = str(new_member.get("status") or "").strip()
+    chat_id = str(chat.get("id") or "")
+    if not chat_id or not status:
+        return
+    user_obj = new_member.get("user") or {}
+    bot_username = str(user_obj.get("username") or "") if isinstance(user_obj, dict) else ""
+    if not bot_username:
+        bot_username = str(new_member.get("username") or "")
+    row = record_discovered_chat(
+        db, chat, source="auto", flush=False, member_status=status,
+        bot_username=bot_username, bot_id_override=bot_id,
+        last_update_id=int(upd.get("update_id") or 0), count_message=False)
+    if row is not None:
+        stats["member_events"] = stats.get("member_events", 0) + 1
+        stats["actions"].append("member_joined" if status not in ("left", "kicked") else "member_left")
+
+
+def _handle_id_command(db: Session, token: str, chat: dict, *, bot_id: int,
+                       update_id: int = 0) -> str | None:
+    """v0.9.15 #276：群内 /id（含 /id@BotUsername）自动登记并回复群组信息。
+
+    只在 group/supergroup 生效；只登记、不加入白名单；即使 Bot 无发送权限也先落库。
+    返回给用户的回复文本；非 /id 命令返回 None。
+    """
+    ctype = str(chat.get("type") or "").strip()
+    if ctype not in ("group", "supergroup"):
+        return None
+    row = record_discovered_chat(db, chat, source="auto", flush=False,
+                                 bot_id_override=bot_id, last_update_id=int(update_id or 0))
+    if row is None:
+        return None
+    type_label = "超级群组" if ctype == "supergroup" else "群组"
+    bot_label = str(getattr(row, "bot_username", "") or "") or f"Bot#{bot_id}"
+    return ("群组信息：\n"
+            f"· 群组名称：{row.title or chat.get('title', '')}\n"
+            f"· 群组 ID：{row.chat_id}\n"
+            f"· 群组类型：{type_label}\n"
+            f"· Bot：{bot_label}\n\n"
+            "已登记，可以在 Ya-TG 管理后台选择加入推送白名单。")
+
+
 async def poll_once(db: Session) -> dict:
-    """拉取一次 Bot 更新。返回统计；关闭或未配置时直接跳过，不产生网络请求。
+    """拉取一次 Bot 更新（主交互 Bot）。返回统计；关闭或未配置时跳过，不产生网络请求。
 
     v0.9.2：新增 callback_query（inline 菜单按钮点击路由）。
+    v0.9.15 #276：
+      - allowed_updates 补 my_chat_member / channel_post；
+      - update_id 幂等台账 + offset「处理成功后才推进」，重启不丢、重复不重；
+      - my_chat_member 入群登记/退群标记、channel_post 频道发现、群内 /id 登记；
+      - 409 冲突 / 429 限流分类处理，退避且不输出 token。
     """
     if (runtime_config.get(db, "contribution_enabled") or "").lower() != "true":
         return {"enabled": False, "messages": 0}
     token = effective_token(db)
     if not token:
         return {"enabled": False, "messages": 0, "error": "未配置交互 Bot（请在 Bot 管理添加并选用，或配置投稿 Bot Token）"}
+    bot_id = effective_bot_id(db)
     # v0.9.9 #207：每个 token 首次轮询自动清空一次旧项目残留的 "/" 指令栏。
     # 指纹去重在 auto_clear_stale_commands 内部，正常轮询不产生额外请求。
     menu_cleared = await auto_clear_stale_commands(db, token)
@@ -1337,95 +1499,212 @@ async def poll_once(db: Session) -> dict:
     except ValueError:
         offset = 0
     base = runtime_config.telegram_base(db)
+    payload = {"offset": offset, "timeout": 2, "allowed_updates": ALLOWED_UPDATES}
+    err_key = f"bot_poll_error_{bot_id or 'global'}"
     try:
         async with httpx.AsyncClient(timeout=25) as client:
-            r = await client.get(f"{base}/bot{token}/getUpdates",
-                                 params={"offset": offset, "timeout": 2,
-                                         "allowed_updates": '["message","callback_query"]'})
-        data = r.json()
+            r = await client.get(f"{base}/bot{token}/getUpdates", params=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
     except Exception as exc:
+        runtime_config.set_many(db, {err_key: f"network: {str(exc)[:160]}"})
+        db.commit()
         return {"enabled": True, "messages": 0, "error": str(exc)[:200]}
+    # 兼容 mock/异常响应缺 status_code：按 200 处理，交由 ok=false 分支识别错误
+    http_status = getattr(r, "status_code", 200)
+    # Telegram 返回 ok=false 或 409/429：分类记录 + 退避，不推进 offset
+    if http_status == 409 or (isinstance(data, dict) and data.get("ok") is False and
+                              "conflict" in str(data.get("description", "")).lower()):
+        kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, http_status)
+        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
+        db.commit()
+        return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
+    if http_status == 429 or http_status >= 500:
+        kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, http_status)
+        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
+        db.commit()
+        return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
+    if isinstance(data, dict) and data.get("ok") is False:
+        kind, hint = _tg_error_hint(data, http_status)
+        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
+        db.commit()
+        return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
     updates = data.get("result") or [] if isinstance(data, dict) else []
     stats = {"enabled": True, "messages": len(updates), "handled": 0,
-             "blocked": 0, "callbacks": 0, "actions": [],
-             "menu_cleared": menu_cleared}
+             "blocked": 0, "callbacks": 0, "discovered": 0, "member_events": 0,
+             "actions": [], "menu_cleared": menu_cleared}
+    # 处理成功后才推进的最高 update_id；失败/跳过的事件也记账，避免卡死在同一条
+    max_committed = offset
     for upd in updates:
         uid = int(upd.get("update_id") or 0)
-        offset = max(offset, uid + 1)
-        # v0.9.2：inline 菜单按钮点击
-        cb = upd.get("callback_query") or {}
-        if cb:
-            try:
+        if _is_update_processed(db, uid):
+            continue  # 幂等：重启或重复投递已处理过的 update
+        try:
+            # 1) Bot 自身成员状态变化（入群/退群），独立于普通消息
+            if upd.get("my_chat_member"):
+                _handle_my_chat_member(db, token, upd, bot_id, stats)
+
+            # 2) inline 菜单按钮点击
+            cb = upd.get("callback_query") or {}
+            if cb:
                 out = await _handle_callback(db, token, cb)
                 if out == "blocked":
                     stats["blocked"] += 1
                 else:
                     stats["callbacks"] += 1
-            except Exception as exc:
-                stats.setdefault("errors", []).append(str(exc)[:120])
-            continue
-        msg = upd.get("message") or upd.get("channel_post") or {}
-        text = str(msg.get("text") or msg.get("caption") or "")
-        chat = msg.get("chat") or {}
-        user = msg.get("from") or {}
-        chat_id = str(chat.get("id") or "")
-        user_id = str(user.get("id") or chat_id)
-        # v0.9.14 #256：自动发现群/频道——Bot 收到群组消息即记录其 ID/名称/类型。
-        # 放在限制检查之前：即便用户被限制，群本身仍应被发现。异常隔离，不影响指令处理。
-        if chat and chat_id:
-            try:
-                record_discovered_chat(db, chat, flush=False)
-            except Exception:
-                pass
-        try:
-            # v0.9.0：使用限制——未关注频道 / 未加群的用户拒绝执行指令
-            ok, reason = await check_restriction(db, token, user_id)
-            if not ok:
-                stats["blocked"] = stats.get("blocked", 0) + 1
-                if chat_id and text.strip().startswith("/"):
-                    await _reply(db, token, chat_id, reason,
-                                 reply_markup=restriction_keyboard(db))
-                continue
-            action, reply = await handle_text(
-                db, text, tg_user_id=user_id,
-                tg_username=str(user.get("username") or ""))
-            if action != "ignored":
-                stats["handled"] += 1
-                # 归一化带载荷的 action，避免把图片 URL / id 串写进统计
-                stats["actions"].append(action.split(":", 1)[0] if ":" in action else action)
-            if reply and chat_id:
-                # v0.9.12：搜索——先回提示，再把已推送过的资源卡片逐个转发给用户
-                if action.startswith("search_cards:"):
-                    await _reply(db, token, chat_id, reply,
-                                 reply_markup=end_flow_keyboard() if _flow_get(user_id) else None)
-                    ids = [int(x) for x in action.split(":", 1)[1].split(",") if x.isdigit()]
-                    await _send_search_cards(db, token, chat_id, ids)
-                # v0.9.12：打赏——直接把打赏码图片发给用户，caption 是说明文字
-                elif action.startswith("donate_photo:"):
-                    await _send_photo(db, token, chat_id,
-                                      action.split(":", 1)[1], reply)
-                # /start、/help 附带 Telegram 私聊 Reply 键盘（输入框上方菜单）。
-                # 不调用 setMyCommands，不改 Telegram 底部指令栏；只回来源 chat。
-                elif action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
-                    await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
-                elif action in ("want_pick", "contribute_pick"):
-                    # v0.9.8：TMDB 候选列表附 inline 选择键盘
-                    sess = _pick_get(user_id)
-                    kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
-                    await _reply(db, token, chat_id, reply, reply_markup=kb)
-                elif action == "flow_end":
-                    # v0.9.9 #209：退出文字会话，回主 Reply 键盘
-                    await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
-                elif action in ("flow_want", "flow_contribute", "flow_search", "contribute_await_url"):
-                    # v0.9.9 #209：刚进入会话 / 等光鸭链接，附 inline「结束交互」按钮
-                    await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
-                elif _flow_get(user_id) or _pick_get(user_id):
-                    # v0.9.9 #209：会话态下其它回复也带结束按钮
-                    await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
-                else:
-                    await _reply(db, token, chat_id, reply)
+
+            # 3) 普通消息 / 频道新消息
+            msg = upd.get("message") or upd.get("channel_post") or {}
+            if msg:
+                text = str(msg.get("text") or msg.get("caption") or "")
+                chat = msg.get("chat") or {}
+                user = msg.get("from") or {}
+                chat_id = str(chat.get("id") or "")
+                user_id = str(user.get("id") or chat_id)
+                is_channel = bool(upd.get("channel_post"))
+                # v0.9.15 #276：群内 /id 登记（拦截，不进指令分发）
+                cmd_head = text.strip().split(None, 1)[0].lower().split("@")[0] if text.strip() else ""
+                is_id_cmd = cmd_head == "/id" and str(chat.get("type") or "") in ("group", "supergroup")
+                # 自动发现：群/频道消息即记录（放在限制检查之前）。
+                # 注意：/id 群消息由 _handle_id_command 统一登记——它内部也会调
+                # record_discovered_chat。若这里再登记一次，autoflush=False 下会留下
+                # 两条 pending 行、提交时触发 (bot_id,chat_id) UNIQUE 冲突。故 /id 跳过通用登记。
+                if chat and chat_id and not is_id_cmd:
+                    record_discovered_chat(db, chat, flush=False, last_update_id=uid)
+                    if is_channel:
+                        stats["discovered"] = stats.get("discovered", 0) + 1
+                id_reply = _handle_id_command(db, token, chat, bot_id=bot_id,
+                                              update_id=uid) if is_id_cmd else None
+                if id_reply and chat_id:
+                    await _reply(db, token, chat_id, id_reply)
+                    stats["handled"] += 1
+                    stats["actions"].append("id")
+                elif not is_channel and text:
+                    try:
+                        ok, reason = await check_restriction(db, token, user_id)
+                        if not ok:
+                            stats["blocked"] = stats.get("blocked", 0) + 1
+                            if chat_id and text.strip().startswith("/"):
+                                await _reply(db, token, chat_id, reason,
+                                             reply_markup=restriction_keyboard(db))
+                        else:
+                            action, reply = await handle_text(
+                                db, text, tg_user_id=user_id,
+                                tg_username=str(user.get("username") or ""))
+                            if action != "ignored":
+                                stats["handled"] += 1
+                                stats["actions"].append(
+                                    action.split(":", 1)[0] if ":" in action else action)
+                            if reply and chat_id:
+                                await _dispatch_reply(db, token, chat_id, text, action, reply, user_id)
+                    except Exception as exc:
+                        stats.setdefault("errors", []).append(str(exc)[:120])
+            _mark_update_processed(db, uid, bot_id)
+            if uid > max_committed:
+                max_committed = uid
         except Exception as exc:
             stats.setdefault("errors", []).append(str(exc)[:120])
-    runtime_config.set_many(db, {"contribution_update_offset": str(offset)})
+            # 该 update 处理失败也记账，避免每次重启都卡在同一条；错误已进 stats 可见
+            _mark_update_processed(db, uid, bot_id)
+            if uid > max_committed:
+                max_committed = uid
+    new_offset = max(offset, max_committed + 1)
+    runtime_config.set_many(db, {"contribution_update_offset": str(new_offset),
+                                 err_key: ""})  # 成功轮询清空上一轮错误状态
     db.commit()
+    stats["offset"] = new_offset
     return stats
+
+
+async def _dispatch_reply(db: Session, token: str, chat_id: str, text: str,
+                          action: str, reply: str, user_id: str) -> None:
+    """把 handle_text 的回复按 action 分派到合适的发送方式（从 poll_once 抽出，保持原语义）。"""
+    if action.startswith("search_cards:"):
+        await _reply(db, token, chat_id, reply,
+                     reply_markup=end_flow_keyboard() if _flow_get(user_id) else None)
+        ids = [int(x) for x in action.split(":", 1)[1].split(",") if x.isdigit()]
+        await _send_search_cards(db, token, chat_id, ids)
+    elif action.startswith("donate_photo:"):
+        await _send_photo(db, token, chat_id, action.split(":", 1)[1], reply)
+    elif action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
+        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+    elif action in ("want_pick", "contribute_pick"):
+        sess = _pick_get(user_id)
+        kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
+        await _reply(db, token, chat_id, reply, reply_markup=kb)
+    elif action == "flow_end":
+        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+    elif action in ("flow_want", "flow_contribute", "flow_search", "contribute_await_url"):
+        await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
+    elif _flow_get(user_id) or _pick_get(user_id):
+        await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
+    else:
+        await _reply(db, token, chat_id, reply)
+
+
+# ==================== v0.9.15 #277：智能添加（getChat 解析） ====================
+# 需求：数字 ID / @username / Telegram 公开链接 → 调 getChat 拿真实信息；
+# 私有邀请链接（t.me/+xxx 或 t.me/joinchat/xxx）不能当 Chat ID，给明确提示。
+
+_INVITE_MARKERS = ("t.me/+", "t.me/joinchat/", "telegram.me/+", "telegram.me/joinchat/")
+
+
+def parse_chat_input(raw: str) -> dict:
+    """纯解析：把一个输入框内容归一为 {kind, chat_id, error}。
+
+    kind: id / username / invite / empty / invalid
+    - 数字（含 -100 开头的超级群/频道）→ id
+    - @xxx 或 t.me/xxx / telegram.me/xxx → username（归一为 @xxx）
+    - 私有邀请链接 → invite（不解析 ID）
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return {"kind": "empty", "chat_id": "", "error": ""}
+    low = s.lower()
+    if any(m in low for m in _INVITE_MARKERS):
+        return {"kind": "invite", "chat_id": "", "error": (
+            "这是私有群组邀请链接，无法直接解析群组 ID。请先将 Bot 添加到群组，"
+            "再在群内发送 /id 自动获取群组信息。")}
+    # 去掉协议与域名前缀
+    if "t.me/" in low or "telegram.me/" in low:
+        tail = re.split(r"t\.me/|telegram\.me/", s, maxsplit=1, flags=re.I)[-1]
+        tail = tail.strip().strip("/").split("?", 1)[0].split("#", 1)[0]
+        if not tail or "/" in tail:
+            return {"kind": "invalid", "chat_id": "", "error": "链接格式无法识别，请检查后重试。"}
+        if tail.lstrip("-").isdigit():
+            return {"kind": "id", "chat_id": tail, "error": ""}
+        return {"kind": "username", "chat_id": "@" + tail.lstrip("@"), "error": ""}
+    # 裸 @用户名
+    if s.startswith("@"):
+        name = s.lstrip("@").strip()
+        if not re.match(r"^[A-Za-z0-9_]{5,32}$", name):
+            return {"kind": "invalid", "chat_id": "", "error": "用户名格式错误（应为 @字母数字下划线，5–32 位）。"}
+        return {"kind": "username", "chat_id": "@" + name, "error": ""}
+    # 裸数字 ID（可为负；频道/超级群 -100 开头）
+    if re.match(r"^-?\d{5,20}$", s):
+        return {"kind": "id", "chat_id": s, "error": ""}
+    return {"kind": "invalid", "chat_id": "", "error": (
+        "无法识别的输入。请填数字 Chat ID（如 -1001234567890）、"
+        "@用户名 或公开链接（https://t.me/xxx）。")}
+
+
+async def resolve_chat_via_getchat(db: Session, token: str, chat_ref: str) -> dict:
+    """调 Telegram getChat 校验并取真实 chat 元数据，供智能添加落库。
+
+    返回 {ok, chat:{id,title,type,username}, error_kind, error}。绝不输出 token。
+    """
+    data = await _api(db, token, "getChat", {"chat_id": chat_ref})
+    if not isinstance(data, dict) or not data.get("ok"):
+        kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, 200)
+        return {"ok": False, "error_kind": kind, "error": hint}
+    chat = data.get("result") or {}
+    if not isinstance(chat, dict) or not chat.get("id"):
+        return {"ok": False, "error_kind": "unknown", "error": "getChat 未返回有效 chat 信息。"}
+    return {"ok": True, "chat": {
+        "id": str(chat.get("id")),
+        "title": str(chat.get("title") or chat.get("first_name") or ""),
+        "type": str(chat.get("type") or ""),
+        "username": str(chat.get("username") or ""),
+    }}

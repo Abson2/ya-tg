@@ -83,7 +83,7 @@ def status(db: Session | None) -> dict:
     }
 
 
-async def _chat(messages: list[dict], db: Session | None, max_tokens: int = 300) -> str:
+async def _chat(messages: list[dict], db: Session | None, max_tokens: int = 600) -> str:
     c = _cfg(db)
     if not c["api_key"]:
         raise AiError("尚未配置 AI API Key，请到「TMDB 设置 → AI 辅助识别」填写")
@@ -106,7 +106,15 @@ async def _chat(messages: list[dict], db: Session | None, max_tokens: int = 300)
     choices = data.get("choices") or []
     if not choices:
         raise AiError(f"AI 接口未返回 choices：{str(data)[:200]}")
-    return str((choices[0].get("message") or {}).get("content") or "")
+    message = choices[0].get("message") or {}
+    content = str(message.get("content") or "")
+    # v0.9.15 #269：推理模型（如 deepseek-v4.1-flash）会先烧 reasoning_tokens，
+    # max_tokens 预算不足时 content 为空但答案在 reasoning_content 里。
+    # 正文为空则回退 reasoning_content，再交给 _extract_json 抽 JSON，
+    # 兼容「连接测试成功、翻译却报『AI 未返回 JSON 结果』」的矛盾。
+    if not content.strip():
+        content = str(message.get("reasoning_content") or "")
+    return content
 
 
 def _extract_json(text: str) -> dict:
@@ -184,7 +192,7 @@ async def disambiguate(name: str, candidates: list[dict], db: Session | None = N
     content = await _chat([
         {"role": "system", "content": DISAMBIGUATE_SYSTEM},
         {"role": "user", "content": f"文件名：{name}\n候选列表：{json.dumps(brief, ensure_ascii=False)}"},
-    ], db, max_tokens=180)
+    ], db, max_tokens=600)
     d = _extract_json(content)
     idx = d.get("index")
     if isinstance(idx, str) and idx.isdigit():
@@ -238,7 +246,7 @@ async def translate_title(title: str, year: str = "", db: Session | None = None)
         user += f"补充要求：{c['custom_prompt']}\n"
     try:
         content = await _chat([{"role": "system", "content": TRANSLATE_SYSTEM},
-                               {"role": "user", "content": user}], db, max_tokens=200)
+                               {"role": "user", "content": user}], db, max_tokens=600)
         d = _extract_json(content)
     except Exception as exc:
         return {"ok": False, "queries": [], "message": str(exc)}

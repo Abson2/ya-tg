@@ -18,13 +18,13 @@ from app import bot_listener as bl
 from app import main as main_mod
 from app import runtime_config
 from app.db import SessionLocal, json_dumps, migrate
-from app.models import AppConfig, Bot, Channel, DiscoveredChat
+from app.models import AppConfig, Bot, Channel, DiscoveredChat, ProcessedUpdate
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_VUE = ROOT / "frontend" / "src" / "App.vue"
 
 CFG_KEYS = ("interaction_bot_id", "contribution_enabled", "contribution_bot_token",
-            "push_routes_json", "bot_gate_mode")
+            "push_routes_json", "bot_gate_mode", "contribution_update_offset")
 
 
 def _run(coro):
@@ -43,7 +43,7 @@ def _set(db, key, value):
     db.flush()
 
 
-TABLES = [DiscoveredChat, Channel, Bot]
+TABLES = [DiscoveredChat, Channel, Bot, ProcessedUpdate]
 
 
 @pytest.fixture(autouse=True)
@@ -266,10 +266,17 @@ def test_manual_add_via_refresh(db):
     _seed_bot(db)
     p = main_mod.DiscoverRefreshInput(manual_chat_id="@publicchannel",
                                       manual_name="公开频道", manual_kind="channel")
-    res = _run(main_mod.discover_refresh(p, db))
-    assert res["added"]["chat_id"] == "@publicchannel"
+
+    async def fake_resolve(db_, token, ref):
+        return {"ok": True, "chat": {"id": "-100777", "title": "公开频道",
+                                     "type": "channel", "username": "publicchannel"}}
+
+    with patch.object(bl, "resolve_chat_via_getchat", fake_resolve):
+        res = _run(main_mod.discover_refresh(p, db))
+    assert res["added"]["chat_id"] == "-100777"
     assert res["added"]["source"] == "manual"
     assert res["added"]["chat_type"] == "channel"
+    assert res["added"]["username"] == "publicchannel"
 
 
 def test_set_whitelist_add_and_remove(db):

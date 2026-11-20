@@ -57,7 +57,7 @@ const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const showScanPanel = ref(false)
 // v0.9.4：Bot 交互配置——交互 Bot 复用 bots 表 token、白名单复用推送目标；内置四指令固定
-const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
+const interactionCfg = ref({ contribution_enabled: false, donation_enabled: false, tgto_base_url: '', tgto_scene: 'ENV_FILTER_GUANGYA', tgto_api_key: '', interaction_bot_id: '', interaction_bot_username: '', donation_image_url: '', donation_text: '', donation_button_text: '打赏支持',
   // v0.9.13 #254：TgtoDrive 频道监控白名单规则 a/b/c + 投稿转存监控 chat
   tgto_rule_resolution: '4k', tgto_rule_effect: 'all', tgto_rule_required_keyword: '265', tgto_contribute_bot_chat_id: '',
   bot_push_channels: [], bot_push_groups: [], bot_restrict_enabled: false, bot_restrict_cache_seconds: 120, bot_required_channels: [], bot_required_groups: [], bot_commands: [], bot_gate_mode: 'whitelist', bot_options: [],
@@ -85,9 +85,15 @@ function onRouteTargetPick(r, i) {
 }
 // v0.9.14 #258：自动发现群组 / 统一推送目标
 const discoverChats = ref([]), discovering = ref(false)
-const manualChatId = ref(''), manualChatName = ref(''), manualChatKind = ref('group')
+const manualChatId = ref(''), manualChatName = ref(''), manualChatKind = ref('auto')
 const discoverChecking = ref(-1)
 const TYPE_TAG = { group: '普通群', supergroup: '超级群', channel: '频道', private: '私聊' }
+const MEMBER_LABEL = { creator: '群主', administrator: '管理员', member: '已加入',
+  restricted: '受限', left: '已退出', kicked: '已被移出', unknown: '未知' }
+// v0.9.15 #278：筛选 + 批量 + 轮询错误状态
+const discFilterType = ref(''), discFilterBot = ref(''), discKeyword = ref('')
+const discShowInactive = ref(true), discSelected = ref([]), discPollError = ref('')
+const discBots = ref([])
 function permLabel(c) {
   if (!c.perm_checked_at) return '未检查'
   if (c.perm_status === 'ok' && c.perm_can_send) return '可发送'
@@ -98,6 +104,22 @@ function permLabel(c) {
 function permTagType(c) {
   if (!c.perm_checked_at) return 'info'
   return (c.perm_status === 'ok' && c.perm_can_send) ? 'success' : 'danger'
+}
+function memberTagType(c) {
+  return (c.member_status === 'left' || c.member_status === 'kicked') ? 'danger' : 'success'
+}
+async function loadDiscover() {
+  syncDiscBots()
+  const params = []
+  if (discFilterType.value) params.push('chat_type=' + encodeURIComponent(discFilterType.value))
+  if (discFilterBot.value) params.push('bot_id=' + encodeURIComponent(discFilterBot.value))
+  if (discKeyword.value.trim()) params.push('q=' + encodeURIComponent(discKeyword.value.trim()))
+  params.push('include_inactive=' + (discShowInactive.value ? 'true' : 'false'))
+  try {
+    const dc = await api('/discover/chats' + (params.length ? '?' + params.join('&') : ''))
+    discoverChats.value = dc.chats || []
+    discPollError.value = dc.poll_error || ''
+  } catch (e) {}
 }
 async function refreshDiscover() {
   discovering.value = true
@@ -110,11 +132,20 @@ async function refreshDiscover() {
     }
     const d = await api('/discover/refresh', { method: 'POST', body: JSON.stringify(body) })
     discoverChats.value = d.chats || []
-    if (d.added) { manualChatId.value = ''; manualChatName.value = ''; ElMessage.success('已手动添加目标') }
-    else ElMessage.success('发现完成')
-    if (d.polled && d.polled.error) ElMessage.warning('拉取更新失败：' + d.polled.error)
-    else if (d.polled && d.polled.messages) ElMessage.info(`本轮处理 ${d.polled.messages} 条更新，新群会在列表出现`)
-    else if (!manualChatId.value.trim()) ElMessage.info(d.hint || '暂无新群；请确认 Bot 已入群且群内有新消息')
+    discPollError.value = (d.polled && d.polled.error) || ''
+    if (d.added) {
+      manualChatId.value = ''; manualChatName.value = ''
+      ElMessage.success(`已添加：${d.added.title || d.added.chat_id}`)
+    } else if (d.add_error) {
+      ElMessage.error(d.add_error)  // 私有邀请链接 / getChat 失败的分类原因
+    } else ElMessage.success('发现完成')
+    if (d.polled && d.polled.error_kind === 'conflict') {
+      ElMessage.warning('Bot 轮询冲突：可能有另一个实例在使用同一 Token：' + d.polled.error)
+    } else if (d.polled && d.polled.messages) {
+      ElMessage.info(`本轮处理 ${d.polled.messages} 条更新；新增发现 ${d.polled.discovered || 0} 个目标`)
+    } else if (!manualChatId.value.trim() && !d.add_error) {
+      ElMessage.info(d.hint || '暂无新记录；请确保 Bot 已入群并等待成员状态变化或新消息事件')
+    }
   } catch (e) { ElMessage.error(e.message) }
   finally { discovering.value = false }
 }
@@ -137,6 +168,16 @@ async function toggleDiscoverWhitelist(c) {
     await load()  // 白名单变动同步到目录路由卡片
   } catch (e) { ElMessage.error(e.message) }
 }
+async function batchWhitelist(on) {
+  if (!discSelected.value.length) { ElMessage.warning('请先勾选目标'); return }
+  try {
+    const d = await api('/discover/chats/batch-whitelist', {
+      method: 'POST', body: JSON.stringify({ ids: discSelected.value.slice(), in_whitelist: on }) })
+    ElMessage.success(`批量${on ? '加入' : '移出'}白名单：成功 ${d.succeeded}/${d.total}`)
+    discSelected.value = []
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
 async function testDiscoverPush(c) {
   try {
     const d = await api(`/discover/chats/${c.id}/test`, { method: 'POST' })
@@ -151,6 +192,33 @@ async function deleteDiscoverChat(c) {
     ElMessage.success('已删除')
     await load()
   } catch (e) { ElMessage.error(e.message) }
+}
+// v0.9.15 #276：Bot 筛选来源（复用交互配置里的 bot_options，不含 token 明文）
+function syncDiscBots() {
+  try { discBots.value = (interactionCfg.value && interactionCfg.value.bot_options) || [] } catch (e) { discBots.value = [] }
+}
+// v0.9.15 #276：startgroup 官方授权链接（群组）/ 频道添加引导
+const inviteLink = ref(null), inviteLoading = ref(false), channelGuideVisible = ref(false)
+const inviteBotId = ref(null)
+async function genInviteLink(botId) {
+  inviteLoading.value = true
+  try {
+    const d = await api('/discover/invite-link', {
+      method: 'POST', body: JSON.stringify(botId ? { bot_id: botId } : {}) })
+    if (!d.ok) { ElMessage.error(d.error || '生成授权链接失败'); return }
+    inviteLink.value = d
+    ElMessage.success('已生成授权链接，复制后在 Telegram 打开选择目标群')
+  } catch (e) { ElMessage.error(e.message) }
+  finally { inviteLoading.value = false }
+}
+async function copyText(text, label) {
+  if (!text) { ElMessage.warning('无可复制内容'); return }
+  try { await navigator.clipboard.writeText(text); ElMessage.success((label || '内容') + '已复制') }
+  catch (e) { ElMessage.warning('复制失败，请手动选中复制：' + text) }
+}
+function openStartgroup() {
+  if (!inviteLink.value || !inviteLink.value.startgroup_url) { genInviteLink(); return }
+  window.open(inviteLink.value.startgroup_url, '_blank', 'noopener')
 }
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
@@ -911,6 +979,7 @@ async function postInteractionConfig() {
     donation_button_text: c.donation_button_text || '打赏支持',
     // v0.9.4：白名单由「推送目标」启用记录决定，不再单独提交 ID 列表
     interaction_bot_id: String(c.interaction_bot_id || ''),
+    interaction_bot_username: String(c.interaction_bot_username || ''),
     bot_restrict_enabled: !!c.bot_restrict_enabled, bot_restrict_cache_seconds: Number(c.bot_restrict_cache_seconds) || 0,
     bot_gate_mode: c.bot_gate_mode || 'whitelist',
     bot_required_channels: c.bot_required_channels || [], bot_required_groups: c.bot_required_groups || [],
@@ -1439,7 +1508,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v0.9.14 · Asia/Shanghai</span>
+          <span>v0.9.15 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -1866,6 +1935,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-input v-model="pushBotToken" type="password" show-password placeholder="留空表示不修改当前 Token；如 123456:ABC-DEF...；要删除请点下方「清除 Bot Token」"/>
                 <small>{{ pushCfg.bot ? ('当前 Bot：' + pushCfg.bot.name + ' · ' + (pushCfg.bot.token_masked || '未配置')) : '尚未配置 Bot，请填写 Token 后点「保存推送配置」' }}</small>
               </div>
+              <div class="field">
+                <label>Bot 用户名（@username，可留空自动读取）</label>
+                <el-input v-model="interactionCfg.interaction_bot_username" placeholder="如 my_tg_bot，不带 @；用于生成加群授权链接，留空则由 getMe 自动获取"/>
+                <small>生成「加入群组」链接需要 Bot 用户名；通常点击「生成授权链接」会自动从 Telegram 读取，此处仅作网络异常时的兜底。</small>
+              </div>
               <div class="field inline"><label>启用指令监听</label><el-switch v-model="interactionCfg.contribution_enabled"/></div>
             </div>
             <div class="form-grid" style="margin-top:10px">
@@ -1891,26 +1965,76 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="panel-foot"><el-button type="primary" :loading="pushSaving" @click="savePushRoutes">保存分发与互动配置（Bot + 白名单 + 使用限制 + 打赏）</el-button><el-button type="danger" plain :loading="pushSaving" :disabled="!pushCfg.bot?.token_masked" @click="clearPushBotToken">清除 Bot Token</el-button><span class="hint" style="margin-left:10px">上方三块配置共用此按钮；保存后刷新页面仍保留。</span></div>
           </div>
 
-          <!-- ===== v0.9.14 #258：自动发现群组 / 统一推送目标 ===== -->
+          <!-- ===== v0.9.14 #258 / v0.9.15 #276：自动发现群组 / 统一推送目标 / 官方加群 ===== -->
           <div class="bot-card">
-            <div class="bot-card-head"><span class="bot-ico">🔍</span><h3>自动发现群组 · 统一推送目标</h3><span class="restrict-sub">Bot 收到群消息自动记录群 ID / 名称 / 类型；勾选即可加入白名单、检查权限、测试推送</span><el-tag size="small" style="margin-left:auto">{{ discoverChats.length }} 个目标</el-tag></div>
-            <div class="discover-bar">
-              <el-input v-model="manualChatId" placeholder="手动添加：群/频道 ID 或 @用户名" style="max-width:260px" @keyup.enter="refreshDiscover"/>
-              <el-input v-model="manualChatName" placeholder="备注名称（选填）" style="max-width:160px"/>
-              <el-select v-model="manualChatKind" style="width:110px"><el-option label="群组" value="group"/><el-option label="频道" value="channel"/></el-select>
-              <el-button type="primary" :loading="discovering" @click="refreshDiscover">发现 / 添加</el-button>
+            <div class="bot-card-head"><span class="bot-ico">🔍</span><h3>自动发现群组 · 统一推送目标</h3><span class="restrict-sub">Bot 收到群消息 / 成员变化自动登记；勾选加入白名单、检查权限、测试推送</span><el-tag size="small" style="margin-left:auto">{{ discoverChats.length }} 个目标</el-tag></div>
+
+            <!-- 加入群组 / 添加频道（官方 Deep Linking，不主动加群） -->
+            <div class="disc-addtarget">
+              <div class="disc-addtarget-col">
+                <div class="disc-addtarget-title"><el-tag size="small" type="success">群组</el-tag> 用官方授权链接把 Bot 加进群</div>
+                <p class="hint" style="margin:6px 0">点「生成授权链接」→ 在 Telegram 打开 → 选择目标群添加。Bot 入群后由成员变化事件自动登记群 ID / 名称 / 类型，不会自动加白名单。</p>
+                <div class="discover-bar">
+                  <el-select v-model="inviteBotId" placeholder="主交互 Bot" clearable style="width:180px">
+                    <el-option v-for="b in discBots" :key="b.id" :label="b.name + (b.enabled ? '' : '（停用）')" :value="b.id"/>
+                  </el-select>
+                  <el-button :loading="inviteLoading" @click="genInviteLink(inviteBotId)">生成授权链接</el-button>
+                  <el-button type="primary" :disabled="!inviteLink" @click="openStartgroup">加入群组</el-button>
+                </div>
+                <template v-if="inviteLink">
+                  <div class="disc-invite-box">
+                    <div><span class="disc-sub">Bot 用户名：</span><b>@{{ inviteLink.bot_username }}</b>
+                      <el-button size="small" text @click="copyText(inviteLink.bot_username, 'Bot 用户名')">复制用户名</el-button></div>
+                    <div><span class="disc-sub">授权链接：</span><span class="disc-url">{{ inviteLink.startgroup_url }}</span>
+                      <el-button size="small" text @click="copyText(inviteLink.startgroup_url, '授权链接')">复制授权链接</el-button></div>
+                    <div class="disc-sub">有效期至 {{ inviteLink.expires_at }} · 加入后点上方「发现 / 刷新」或进群发 /id 登记</div>
+                  </div>
+                </template>
+              </div>
+              <div class="disc-addtarget-col">
+                <div class="disc-addtarget-title"><el-tag size="small" type="warning">频道</el-tag> 把 Bot 添加为频道管理员</div>
+                <p class="hint" style="margin:6px 0">频道不支持 startgroup 授权链接，需在 Telegram 频道管理里把 Bot 加为管理员并授予发布权限。Bot 入频道后由事件自动登记。</p>
+                <el-button type="warning" plain @click="channelGuideVisible = true">添加频道 · 查看引导</el-button>
+              </div>
             </div>
-            <p class="hint warn" style="margin:6px 0 10px">自动发现前提：Bot 已加入该群 + 群内有新消息；若开了隐私模式需设 Bot 为管理员或在群里 @Bot 说话。Telegram 不提供「列出已加入全部群」接口，只能从新消息里发现。</p>
-            <el-table :data="discoverChats" size="small" border v-if="discoverChats.length" style="width:100%">
-              <el-table-column label="目标" min-width="180">
-                <template #default="{row}"><div class="disc-name">{{ row.title || row.username || row.chat_id }}</div><div class="disc-sub">{{ row.chat_id }}<span v-if="row.username"> · {{ row.username }}</span></div></template>
+
+            <!-- 手动智能添加 + 发现刷新 -->
+            <div class="discover-bar" style="margin-top:12px">
+              <el-input v-model="manualChatId" placeholder="输入群组 ID / @用户名 / Telegram 链接" style="max-width:280px" @keyup.enter="refreshDiscover"/>
+              <el-input v-model="manualChatName" placeholder="备注名称（选填）" style="max-width:150px"/>
+              <el-select v-model="manualChatKind" style="width:110px"><el-option label="自动识别" value="auto"/><el-option label="群组" value="group"/><el-option label="频道" value="channel"/></el-select>
+              <el-button type="primary" :loading="discovering" @click="refreshDiscover">发现 / 刷新</el-button>
+            </div>
+            <p class="hint warn" style="margin:6px 0 10px">自动发现前提：Bot 已加入目标 + 有成员状态变化或新消息；隐私模式下需设 Bot 为管理员或在群里 @Bot 说话。私有邀请链接（t.me/+…）无法解析，请让 Bot 入群后发 /id。Telegram 不提供「列出已加入全部群」接口，只能事件驱动记录。</p>
+            <p v-if="discPollError" class="hint" style="color:#d03050;margin:0 0 10px">轮询异常：{{ discPollError }}（若为 409 冲突，说明有另一个实例用同一 Token 在取更新，请停掉后重试）</p>
+
+            <!-- 筛选 + 批量操作 -->
+            <div class="discover-bar" style="margin-bottom:10px">
+              <el-select v-model="discFilterType" placeholder="全部类型" clearable style="width:130px">
+                <el-option label="全部类型" value=""/><el-option label="普通群" value="group"/><el-option label="超级群" value="supergroup"/><el-option label="频道" value="channel"/>
+              </el-select>
+              <el-select v-model="discFilterBot" placeholder="全部 Bot" clearable style="width:160px">
+                <el-option label="全部 Bot" :value="null"/><el-option v-for="b in discBots" :key="b.id" :label="b.name" :value="b.id"/>
+              </el-select>
+              <el-input v-model="discKeyword" placeholder="名称 / ID / Username 搜索" clearable style="max-width:220px" @keyup.enter="loadDiscover"/>
+              <el-checkbox v-model="discShowInactive" @change="loadDiscover">显示已退出</el-checkbox>
+              <el-button @click="loadDiscover">筛选</el-button>
+              <el-button type="success" plain :disabled="!discSelected.length" @click="batchWhitelist(true)">批量加入白名单 ({{ discSelected.length }})</el-button>
+              <el-button type="danger" plain :disabled="!discSelected.length" @click="batchWhitelist(false)">批量移出白名单</el-button>
+            </div>
+
+            <el-table :data="discoverChats" size="small" border v-if="discoverChats.length" style="width:100%" @selection-change="v => discSelected = v.map(x => x.id)">
+              <el-table-column type="selection" width="42" align="center"/>
+              <el-table-column label="目标" min-width="170">
+                <template #default="{row}"><div class="disc-name">{{ row.title || row.username || row.chat_id }}</div><div class="disc-sub">{{ row.chat_id }}<span v-if="row.username"> · @{{ row.username }}</span></div></template>
               </el-table-column>
-              <el-table-column label="类型" width="100"><template #default="{row}"><el-tag size="small" :type="row.chat_type==='channel'?'warning':'info'">{{ TYPE_TAG[row.chat_type] || row.type_label || '未知' }}</el-tag></template></el-table-column>
-              <el-table-column label="来源" width="90"><template #default="{row}"><el-tag size="small" :type="row.source==='manual'?'success':''">{{ row.source==='manual'?'手动':'自动' }}</el-tag></template></el-table-column>
-              <el-table-column label="Bot" min-width="100"><template #default="{row}"><span class="disc-sub">{{ row.bot_name || '—' }}</span></template></el-table-column>
-              <el-table-column label="权限状态" width="120"><template #default="{row}"><el-tag size="small" :type="permTagType(row)">{{ permLabel(row) }}</el-tag></template></el-table-column>
-              <el-table-column label="白名单" width="90" align="center"><template #default="{row}"><el-switch v-model="row.in_whitelist" @change="toggleDiscoverWhitelist(row)"/></template></el-table-column>
-              <el-table-column label="操作" width="250" fixed="right">
+              <el-table-column label="类型" width="96"><template #default="{row}"><el-tag size="small" :type="row.chat_type==='channel'?'warning':'info'">{{ TYPE_TAG[row.chat_type] || row.type_label || '未知' }}</el-tag></template></el-table-column>
+              <el-table-column label="Bot" min-width="90"><template #default="{row}"><span class="disc-sub">{{ row.bot_name || '—' }}</span></template></el-table-column>
+              <el-table-column label="成员状态" width="100"><template #default="{row}"><el-tag size="small" :type="memberTagType(row)">{{ row.member_label || MEMBER_LABEL[row.member_status] || '未知' }}</el-tag></template></el-table-column>
+              <el-table-column label="权限" width="96"><template #default="{row}"><el-tag size="small" :type="permTagType(row)">{{ permLabel(row) }}</el-tag></template></el-table-column>
+              <el-table-column label="白名单" width="76" align="center"><template #default="{row}"><el-switch v-model="row.in_whitelist" @change="toggleDiscoverWhitelist(row)"/></template></el-table-column>
+              <el-table-column label="最后活动" min-width="130"><template #default="{row}"><span class="disc-sub">{{ row.last_seen_at || row.updated_at || '—' }}</span></template></el-table-column>
+              <el-table-column label="操作" width="230" fixed="right">
                 <template #default="{row}">
                   <el-button size="small" text :loading="discoverChecking===row.id" @click="checkDiscoverPerm(row)">检查权限</el-button>
                   <el-button size="small" text @click="testDiscoverPush(row)">测试推送</el-button>
@@ -1918,8 +2042,21 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </template>
               </el-table-column>
             </el-table>
-            <el-empty v-else description="暂无发现的群。把 Bot 拉进群并发一条消息后点「发现 / 添加」，或直接手填 ID 添加。" :image-size="60"/>
+            <el-empty v-else description="暂无发现记录。请确保 Bot 已加入群组，并等待收到成员状态变化或新消息事件。" :image-size="60"/>
           </div>
+
+          <!-- 频道添加引导弹窗 -->
+          <el-dialog v-model="channelGuideVisible" title="如何把 Bot 添加到频道" width="480px">
+            <ol class="disc-guide-list">
+              <li v-for="(step, i) in (inviteLink && inviteLink.channel_guide) || [
+                '在 Telegram 打开目标频道 → 频道管理 → 管理员 → 添加管理员',
+                '搜索你的 Bot 并添加，至少勾选「发布消息」权限（否则无法推送）',
+                '添加后频道有新消息时由 my_chat_member / channel_post 事件自动登记；需要推送时再勾选加入白名单'
+              ]" :key="i">{{ step }}</li>
+            </ol>
+            <p class="hint warn">若尚未生成授权链接，弹窗里的 Bot 用户名可能为空；请先到上方「交互 Bot 与推送配置」填写 Bot 用户名，或点「生成授权链接」自动读取。</p>
+            <template #footer><el-button type="primary" @click="channelGuideVisible = false">知道了</el-button></template>
+          </el-dialog>
 
           <!-- ===== 推送白名单 = 目录路由表（默认1条，+添加最多10条） ===== -->
           <div class="bot-card">
@@ -2821,4 +2958,12 @@ button{font-family:inherit}
 .route-targets{margin:2px 0}
 .route-target-row{display:flex;gap:6px;align-items:center;margin-bottom:6px;min-width:0}
 .route-target-row .el-select{min-width:0}
+/* v0.9.15 #276：加群/频道引导 + 授权链接 */
+.disc-addtarget{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.disc-addtarget-col{border:1px solid var(--yg-border,#e6e8eb);border-radius:10px;padding:12px;min-width:0;background:var(--yg-panel-soft,rgba(127,127,127,.04))}
+.disc-addtarget-title{display:flex;align-items:center;gap:8px;font-weight:600}
+.disc-invite-box{margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--yg-panel-soft,rgba(127,127,127,.06));font-size:12px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.disc-url{font-family:monospace;overflow-wrap:anywhere;word-break:break-all}
+.disc-guide-list{margin:0 0 12px;padding-left:20px;line-height:1.9}
+@media(max-width:820px){.disc-addtarget{grid-template-columns:1fr}}
 </style>

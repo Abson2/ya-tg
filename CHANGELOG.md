@@ -8,6 +8,41 @@
 
 ---
 
+## v0.9.15 (2026-11-20)
+
+大批量剧集任务稳定性专项：修复光鸭写接口 `code=117 无效token` 竞态、TgtoDrive 白名单规则缺 TMDB 元数据、推理模型 AI 翻译失败三个根因，剧集未翻译是前两者的连锁后果。**不改 A→B 镜像主链路语义、不改认证协议、不改推送闸门，海报仍优先**。
+
+### 一、WebFiles token 快照竞态 → code=117（#267）
+- 真机反馈：长同步任务几十分钟内 `create_dir` / `copy_file` 大面积 `code=117 无效token`，降级标准名仍失败；但当前 DB token 实测 `list_files("*")` 成功、审计显示每 60 秒定时刷新从未中断。根因不是登录失效，而是 `GuangYaWebFiles.__init__` 把 token 快照进 `self.headers`，长任务跨过后台 `_job_token_refresh` 刷新点后，光鸭签发新 token 使旧 token 作废，运行中的对象 header 停在旧值 → 写接口全 117。
+- 修复：token 不再快照。`_fresh_headers()` 每次请求前用**独立短会话**从库里读最新凭证重建 header，绕开长任务 session 的 ORM identity map 缓存（直接 `db.get(AuthToken,1)` 会命中旧对象）；`headers` 只读属性保留兼容旧调用，同样每次取最新值。
+- `list_files` / `_post_web` 遇 `code=117` 时调 `_refresh_token()`（独立短会话 `refresh(force=True)`，不污染长任务未提交事务）强制刷新并重建 header 重试，**只重试一次**避免循环；刷新后仍 117 则按登录失效抛错。
+
+### 二、TgtoDrive 白名单规则缺 TMDB 元数据（#268）
+- 真机反馈：求片审核写入的规则在 TgtoDrive 前端显示「正在匹配 TMDB」，手动添加的显示「已匹配」。根因是 `tgto.build_rule()` 把 `poster_path/poster_url/backdrop_path/backdrop_url/overview/original_title` 写死空串，从不查详情；TgtoDrive 前端据这些字段是否为空判定匹配状态。
+- 修复：`build_rule()` 新增六个可选元数据参数（默认空串，旧调用兼容）；`upsert_keyword()` 写入前调 `_tmdb_meta()` 用 `tmdb.detail()`（SCAN 场景限流）补全海报/背景/简介/原名，并拼好 `poster_url`（w500）/ `backdrop_url`（w780）；更新已有规则时同步覆盖这些字段。TMDB 未配密钥或查询失败一律安全降级为空串，不阻断求片审核入库。存量规则需重新采纳一次（或 TgtoDrive 后台补跑匹配）才会补上元数据。
+
+### 三、推理模型 AI 翻译失败（#269）
+- 真机反馈：配置 `deepseek-v4.1-flash` 后「测试连接」成功，但翻译报「AI 未返回 JSON 结果，已降级到本地识别」。根因是推理模型先烧 `reasoning_tokens`，`translate_title` 硬编码 `max_tokens=200` 被推理吃光，`content` 为空；连接测试用极简提示+独立调用不经过这条路径所以能过。
+- 修复：`_chat()` 取内容时 `content` 为空则回退 `message.reasoning_content` 再抽 JSON，兼容纯推理模型；token 预算默认 300→600、消歧 180→600、翻译 200→600。
+
+### 四、剧集未翻译（bug 3，连锁）
+- 无需单独代码改动：新入库作品 english_title 全空、Resource 未识别，是 bug 1&2（117 卡住复制 → B 库无实体 → 走不到改名/识别）叠加 `ai_enabled=false` 的连锁后果。修复 117 与 AI 推理模型后，改名链路（TMDB en-US → AI 直译 → 拼音兜底）即可自愈；存量空 english_title 通过「重新解析英文名并改名」(force) 清掉缓存重跑补齐。
+
+### 五、自动发现增强：事件驱动 + /id + 智能添加 + 官方加群（#271-#276，与三处根治修复合并发版）
+- 背景：上一版只能从普通群消息发现，私有群/无公开用户名群拿不到 Chat ID、点「发现」看不到已入群目标。本次改为事件驱动登记并补齐手动与加群入口。**保持单主交互 Bot 轮询**（用户确认「主bot即可」），发现记录仍按 bot_id 隔离；Telegram 无「列出已加入全部群」接口，不做历史枚举、不虚构扫描成功数。
+- `allowed_updates` 补齐 `my_chat_member` / `channel_post`（原代码读了 channel_post 却未声明，实际收不到）；新增 `ProcessedUpdate` 幂等表（update_id + bot_id），**处理成功后才推进 offset**，失败/重复事件不冒进，服务重启续处理、重复投递不重复记录；409 Conflict / 429 限流 / 5xx 分类记录到 `bot_poll_error_<bot_id>`，不输出 token。
+- `my_chat_member`：Bot 被拉入普通群/超级群/频道即登记 chat ID / 名称 / 类型 / 成员状态 / Bot 归属 / 发现时间；被移出或退出只标记 `left`/`kicked`、保留历史不删，并即时把发送权限置为 not_member。
+- `channel_post`：频道新消息自动发现频道并更新最后活动；`message`：群消息更新最后活动。
+- 私有群 `/id`（含 `/id@BotUsername`）：群内发 `/id` 即按当前 Bot 关联登记群信息并回复「群组名称/ID/类型/Bot」，不自动加白名单；即使 Bot 无发送权限也先落库。**修复**：`/id` 消息统一由 `_handle_id_command` 登记，`poll_once` 跳过通用登记，避免 autoflush=False 下双 pending 行触发 (bot_id,chat_id) UNIQUE 冲突。
+- 智能添加：数字 ID / `@username` / `https://t.me/xxx` 调 `getChat` 拿真实元数据落库；`t.me/+xxx` / `t.me/joinchat/xxx` 私有邀请链接明确提示用 `/id`、不解析不写入；错误按 ID 格式 / Bot 无权 / 目标不存在 / API 失败分类回显。
+- startgroup 官方授权链接（#276）：Bot API 无「主动加群」接口、邀请链接只对真人有效，唯一合规机制是 `https://t.me/<bot_username>?startgroup=<payload>`。`get_bot_username()` 调 `getMe` 动态取 Bot 用户名（可配置 `interaction_bot_username` 兜底），payload=`yg_<时间36进制>_<8位随机>`（短期随机、不含 token）；`POST /api/discover/invite-link` 支持指定 bot_id 多 Bot 独立生成，返回授权链接/用户名/有效期/频道引导。用户点链接在 Telegram 自选群添加，Bot 入群后由 my_chat_member 自动登记，**不自动加白名单**。频道不走 startgroup，前端提供「添加 Bot 为管理员并授予发布权限」引导。
+- 发现页 UI：手动智能输入框（提示「群组 ID / @用户名 / Telegram 链接」）、类型/Bot 筛选 + 关键词搜索、全选 + 批量加入/移出白名单、Username / 成员状态 / 权限 / 最后活动列、空状态文案改为「暂无发现记录。请确保 Bot 已加入群组，并等待收到成员状态变化或新消息事件。」、409 轮询冲突提示、加群/频道双引导卡 + 复制用户名/授权链接。
+- 数据库迁移：`discovered_chats` 新增 `member_status` / `bot_username` / `last_update_id` / `updated_at` 列（`db.py` 的 `_COLUMNS` 自动补列），新增 `processed_updates` 表（`Base.metadata.create_all` 自动建表），均不清空既有数据。
+
+### 六、验证
+- 新增专项测试 `tests/test_v0915_discover_enhance.py`（26 项）：覆盖 my_chat_member 入群（普通群/超级群/频道）、被移出只标记不删、私有群 /id 登记、智能添加三种输入、私有邀请链接拒绝、update_id 幂等、多 Bot 同群隔离、一个 Bot 退出不影响其它、offset 成功后才推进、409 不推进、allowed_updates 完整、channel_post 发现、startgroup URL/payload/getMe/多 Bot/兜底/无 Token/频道引导。
+- 全量 pytest 与前端 build 门禁见下方版本收尾记录。
+
 ## v0.9.14 (2026-11-20)
 
 新增「自动发现群组 / 统一推送目标管理」：Bot 收到群消息自动记录群 ID / 名称 / 类型，管理员在页面勾选即可加入推送白名单、检查 Bot 发送权限、测试推送；目录路由支持一个目录绑定多个频道/群。**不改 A→B 镜像主链路、不改认证协议、不改推送闸门语义，海报仍优先**。

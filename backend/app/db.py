@@ -137,6 +137,13 @@ _COLUMNS = {
         "media_type": "TEXT DEFAULT ''",
         "year": "TEXT DEFAULT ''",
     },
+    # v0.9.15 #276：发现目标补成员状态/归属 Bot 用户名/最后 update_id/更新时间
+    "discovered_chats": {
+        "member_status": "TEXT DEFAULT 'unknown'",
+        "bot_username": "TEXT DEFAULT ''",
+        "last_update_id": "BIGINT DEFAULT 0",
+        "updated_at": "DATETIME",
+    },
 }
 
 

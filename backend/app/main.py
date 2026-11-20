@@ -313,13 +313,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Ya-TG", version="0.9.14", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="0.9.15", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.14", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "0.9.15", "app": "Ya-TG"}
 
 
 @app.get("/api/overview", dependencies=ADMIN)
@@ -3812,6 +3812,7 @@ class InteractionConfigInput(BaseModel):
     tgto_contribute_bot_chat_id: str | None = None
     contribution_bot_token: str | None = None
     interaction_bot_id: str | None = None       # v0.9.4：交互 Bot 引用 bots 表 id（token 去重）；"" = 不选用
+    interaction_bot_username: str | None = None  # v0.9.15 #276：Bot @用户名（startgroup 链接兜底；getMe 会自动缓存）
     donation_image_url: str | None = None
     donation_text: str | None = None
     donation_button_text: str | None = None
@@ -3858,6 +3859,7 @@ def interaction_config_get(db: Session = Depends(get_db)):
     out["bot_gate_mode"] = bot_listener.gate_mode(db)
     # v0.9.4：交互 Bot 去重——回显选中的 bot id 与可选 bot 列表（不含 token 明文）
     out["interaction_bot_id"] = (runtime_config.get(db, "interaction_bot_id") or "").strip()
+    out["interaction_bot_username"] = (runtime_config.get(db, "interaction_bot_username") or "").strip().lstrip("@")
     out["bot_options"] = [{"id": b.id, "name": b.name, "enabled": b.enabled,
                            "token_masked": _mask_stored_token(b.token)}
                           for b in db.scalars(select(Bot).order_by(Bot.id)).all()]
@@ -3886,6 +3888,9 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
             if not bid.isdigit() or not db.get(Bot, int(bid)):
                 raise HTTPException(400, "interaction_bot_id 必须指向一个已存在的 Bot")
         values["interaction_bot_id"] = bid
+    # v0.9.15 #276：Bot 用户名兜底值（getMe 成功会自动覆盖缓存，这里只存人工填写值）
+    if p.interaction_bot_username is not None:
+        values["interaction_bot_username"] = str(p.interaction_bot_username).strip().lstrip("@")
     # v0.9.0：Bot 交互配置。列表序列化为 JSON，缺省 None 表示保持原值。
     if p.bot_push_channels is not None:
         values["bot_push_channels_json"] = json_dumps([str(x).strip() for x in p.bot_push_channels if str(x).strip()])
@@ -4087,6 +4092,12 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
 
 # ---------- v0.9.14 #255-#258：自动发现群组 + 统一推送目标管理 ----------
 _TYPE_LABELS = {"group": "普通群", "supergroup": "超级群", "channel": "频道", "private": "私聊"}
+# v0.9.15 #276：Bot 成员状态中文标签（left/kicked=已退出，保留历史不删）
+_MEMBER_LABELS = {
+    "creator": "群主", "administrator": "管理员", "member": "已加入",
+    "restricted": "受限", "left": "已退出", "kicked": "已被移出", "unknown": "未知",
+}
+
 
 
 def _discovered_kind(d: DiscoveredChat) -> str:
@@ -4103,32 +4114,64 @@ def _discovered_row(d: DiscoveredChat, bot_name: str = "") -> dict:
         "perm_status": d.perm_status or "unknown", "perm_can_send": bool(d.perm_can_send),
         "perm_detail": d.perm_detail or "",
         "perm_checked_at": d.perm_checked_at.isoformat() if d.perm_checked_at else None,
+        "member_status": d.member_status or "unknown",
+        "member_label": _MEMBER_LABELS.get(getattr(d, "member_status", ""), getattr(d, "member_status", "") or "未知"),
+        "active": str(getattr(d, "member_status", "") or "") not in ("left", "kicked"),
+        "bot_username": getattr(d, "bot_username", "") or "",
+        "last_update_id": int(getattr(d, "last_update_id", 0) or 0),
         "first_seen_at": d.first_seen_at.isoformat() if d.first_seen_at else None,
         "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+        "updated_at": d.updated_at.isoformat() if getattr(d, "updated_at", None) else None,
         "message_count": int(d.message_count or 0),
     }
 
 
 @app.get("/api/discover/chats", dependencies=ADMIN)
-def discover_chats(db: Session = Depends(get_db)):
+def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
+                   bot_id: int | None = None, whitelisted: bool | None = None,
+                   q: str = "", include_inactive: bool = True):
     """统一推送目标列表：发现的群 + 手动添加的频道/群。
 
     同时校正 in_whitelist——以目录路由表实际引用的 chat_id 为准（路由表是真相源），
     避免发现台账与白名单状态不一致。老库没有发现记录但路由里有目标的，这里不动
     （它们仍在「推送白名单（目录路由）」卡片里管理）。
+
+    v0.9.15 #278：新增 chat_type / bot_id / whitelisted / q / include_inactive 筛选。
     """
     rows = db.scalars(select(DiscoveredChat).order_by(DiscoveredChat.last_seen_at.desc())).all()
-    whitelisted = {t["chat_id"] for t in bot_listener.push_routes(db)}
+    whitelisted_ids = {t["chat_id"] for t in bot_listener.push_routes(db)}
     bot_names = {b.id: b.name for b in db.scalars(select(Bot)).all()}
     out = []
     for d in rows:
-        actual = d.chat_id in whitelisted
+        actual = d.chat_id in whitelisted_ids
         if bool(d.in_whitelist) != actual:
             d.in_whitelist = actual
-        out.append(_discovered_row(d, bot_names.get(d.bot_id, "")))
+        # 默认隐藏已退出/被移出的目标；include_inactive=True 时全部返回由前端标记
+        row = _discovered_row(d, bot_names.get(d.bot_id, ""))
+        out.append(row)
     if rows:
         db.commit()
-    return {"chats": out, "total": len(out)}
+    # 筛选
+    kw = (q or "").strip().lower()
+    filtered = []
+    for row in out:
+        if chat_type and row["chat_type"] != chat_type:
+            continue
+        if bot_id is not None and int(row["bot_id"] or 0) != int(bot_id):
+            continue
+        if whitelisted is not None and bool(row["in_whitelist"]) != bool(whitelisted):
+            continue
+        if kw and kw not in (row["title"] or "").lower() and kw not in (row["chat_id"] or "").lower() \
+                and kw not in (row["username"] or "").lower():
+            continue
+        if not include_inactive and not row["active"]:
+            continue
+        filtered.append(row)
+    # v0.9.15 #276：附带主 Bot 轮询错误状态（409 冲突 / 429 限流），供前端提示
+    _main_bot_id = bot_listener.effective_bot_id(db)
+    poll_err = runtime_config.get(db, f"bot_poll_error_{_main_bot_id or 'global'}") or ""
+    return {"chats": filtered, "total": len(filtered), "all_count": len(out),
+            "poll_error": poll_err, "main_bot_id": _main_bot_id}
 
 
 class DiscoverRefreshInput(BaseModel):
@@ -4157,40 +4200,61 @@ async def discover_refresh(p: DiscoverRefreshInput = DiscoverRefreshInput(),
         except Exception as exc:
             polled = {"enabled": True, "error": str(exc)[:200]}
     added = None
+    add_error = ""
     chat_id = str(p.manual_chat_id or "").strip()
     if chat_id:
-        # @用户名 / t.me 链接归一为 chat_id（Telegram sendMessage 接受 @username 形式）
-        candidate = chat_id
-        if candidate.startswith("https://t.me/"):
-            candidate = "@" + candidate.rstrip("/").split("/")[-1].lstrip("@")
-        elif not candidate.startswith("@") and not candidate.lstrip("-").isdigit():
-            candidate = "@" + candidate.lstrip("@")
-        ctype = "channel" if str(p.manual_kind or "").lower() == "channel" else "group"
-        bot_id = bot_listener.effective_bot_id(db)
-        row = db.scalar(select(DiscoveredChat).where(
-            DiscoveredChat.bot_id == bot_id, DiscoveredChat.chat_id == candidate))
-        if row is None:
-            now = utcnow()
-            row = DiscoveredChat(bot_id=bot_id, chat_id=candidate,
-                                 chat_type=ctype, title=str(p.manual_name or "").strip()[:256],
-                                 username=candidate if candidate.startswith("@") else "",
-                                 source="manual", first_seen_at=now, last_seen_at=now,
-                                 message_count=0)
-            db.add(row)
+        parsed = bot_listener.parse_chat_input(chat_id)
+        if parsed["kind"] == "invite":
+            add_error = parsed["error"]  # 私有邀请链接：明确提示，不解析不写入
+        elif parsed["kind"] in ("invalid", "empty"):
+            add_error = parsed["error"] or "输入格式无法识别。"
+        elif token:
+            # v0.9.15 #277：调 getChat 校验并取真实元数据（数字 ID / @用户名 / t.me 链接）
+            resolved = await bot_listener.resolve_chat_via_getchat(db, token, parsed["chat_id"])
+            if not resolved.get("ok"):
+                add_error = resolved.get("error") or "Bot 无法访问该目标，请确认 Bot 已加入或用户名正确。"
+            else:
+                real = resolved["chat"]
+                ctype = str(real.get("type") or "").strip()
+                if ctype not in ("group", "supergroup", "channel"):
+                    add_error = f"getChat 返回类型「{ctype or '未知'}」不是群组或频道，不能作为推送目标。"
+                else:
+                    bot_id = bot_listener.effective_bot_id(db)
+                    row = db.scalar(select(DiscoveredChat).where(
+                        DiscoveredChat.bot_id == bot_id, DiscoveredChat.chat_id == real["id"]))
+                    if row is None:
+                        now = utcnow()
+                        row = DiscoveredChat(bot_id=bot_id, chat_id=real["id"],
+                                             chat_type=ctype,
+                                             title=(str(p.manual_name or "").strip() or real["title"])[:256],
+                                             username=real["username"][:128], source="manual",
+                                             first_seen_at=now, last_seen_at=now,
+                                             message_count=0, member_status="member",
+                                             updated_at=now)
+                        db.add(row)
+                    else:
+                        row.source = "manual"
+                        row.last_seen_at = utcnow()
+                        row.updated_at = utcnow()
+                        row.chat_type = ctype
+                        if real["username"]:
+                            row.username = real["username"][:128]
+                        if real["title"]:
+                            row.title = real["title"][:256]
+                        if str(row.member_status or "") in ("", "unknown"):
+                            row.member_status = "member"
+                    db.flush()
+                    added = _discovered_row(row)
+                    add_audit(db, "discover_manual_added", target_type="chat",
+                              target_id=real["id"], detail=ctype)
         else:
-            row.source = "manual"
-            row.last_seen_at = utcnow()
-            if p.manual_name:
-                row.title = str(p.manual_name).strip()[:256]
-        db.flush()
-        added = _discovered_row(row)
-        add_audit(db, "discover_manual_added", target_type="chat", target_id=candidate, detail=ctype)
+            add_error = "未配置交互 Bot，无法通过 getChat 校验目标；请先在 Bot 管理配置并选用 Bot。"
     db.commit()
     chats = discover_chats(db)
-    return {"ok": True, "added": added, "polled": polled,
+    return {"ok": True, "added": added, "add_error": add_error, "polled": polled,
             "chats": chats["chats"], "total": chats["total"],
             "hint": ("自动发现需 Bot 已入群且群内有新消息；若 Bot 开了隐私模式，"
-                     "请设为群管理员或在群里 @Bot 发一条消息后再点发现。")}
+                     "请设为群管理员或在群里 @Bot 发一条消息后再点发现。私有群请在群内发 /id 登记。")}
 
 
 @app.post("/api/discover/chats/{cid}/permission", dependencies=ADMIN)
@@ -4316,6 +4380,100 @@ def discover_delete_chat(cid: int, db: Session = Depends(get_db)):
     add_audit(db, "discover_chat_deleted", target_type="chat", target_id=chat_id)
     db.commit()
     return {"ok": True}
+
+
+class DiscoverBatchInput(BaseModel):
+    ids: list[int] = []
+    in_whitelist: bool = True
+    dir_id: str = ""
+
+
+@app.post("/api/discover/chats/batch-whitelist", dependencies=ADMIN)
+def discover_batch_whitelist(p: DiscoverBatchInput, db: Session = Depends(get_db)):
+    """v0.9.15 #278：批量加入/移出推送白名单，逐条复用单目标逻辑，单条失败不影响其它。"""
+    results = []
+    for cid in p.ids[:500]:
+        try:
+            res = discover_set_whitelist(
+                cid, DiscoverWhitelistInput(in_whitelist=p.in_whitelist, dir_id=p.dir_id), db)
+            results.append({"id": cid, "ok": bool(res.get("ok"))})
+        except HTTPException as exc:
+            results.append({"id": cid, "ok": False, "error": str(exc.detail)[:120]})
+        except Exception as exc:
+            results.append({"id": cid, "ok": False, "error": str(exc)[:120]})
+    ok_count = sum(1 for r in results if r["ok"])
+    add_audit(db, "discover_batch_whitelist", target_type="chat",
+              detail=json_dumps({"count": len(results), "ok": ok_count,
+                                 "in_whitelist": bool(p.in_whitelist)}))
+    return {"ok": True, "total": len(results), "succeeded": ok_count, "results": results}
+
+
+class DiscoverInviteInput(BaseModel):
+    bot_id: int | None = None   # 指定 Bot id（多 Bot 独立生成）；留空=主交互 Bot
+
+
+@app.post("/api/discover/invite-link", dependencies=ADMIN)
+async def discover_invite_link(p: DiscoverInviteInput = DiscoverInviteInput(),
+                               db: Session = Depends(get_db)):
+    """v0.9.15 #276：生成 Telegram 官方 startgroup 深链，让用户把 Bot 加进群。
+
+    Bot API 没有「让 Bot 主动加群」接口，邀请链接只对真人账号有效；唯一合规机制是
+    https://t.me/<bot_username>?startgroup=<payload>，由用户在 Telegram 里选群添加。
+    Bot 加入后由主 Bot 的 getUpdates 收到 my_chat_member 事件自动登记（不自动加白名单）。
+    频道不走 startgroup，返回「添加为管理员」引导。
+
+    payload 为短期随机标识（yg_<时间>_<随机>），不含 token 也不含敏感信息。
+    """
+    token = ""
+    bot_label = ""
+    bot_id = 0
+    if p.bot_id:
+        bot = db.get(Bot, int(p.bot_id))
+        if not bot:
+            raise HTTPException(404, "指定的 Bot 不存在")
+        bot_id = bot.id
+        bot_label = bot.name or f"Bot {bot.id}"
+        try:
+            token = decrypt_secret(bot.token) if bot.token else ""
+        except Exception:
+            token = ""
+    else:
+        token = bot_listener.effective_token(db)
+        bot_id = bot_listener.effective_bot_id(db)
+        bot_label = "主交互 Bot"
+    if not token:
+        return {"ok": False, "error": "未配置交互 Bot Token，无法生成授权链接。请先在 Bot 管理中添加并选用 Bot。"}
+
+    username, err = await bot_listener.get_bot_username(db, token)
+    if not username:
+        # 人工填写的 username 作为兜底（getMe 网络异常时仍可出链接）
+        fallback = (runtime_config.get(db, "interaction_bot_username") or "").strip().lstrip("@")
+        if fallback:
+            username = fallback
+            err = ""
+    if not username:
+        return {"ok": False, "error": err or "无法获取 Bot 用户名"}
+
+    payload = bot_listener.new_startgroup_payload()
+    url = bot_listener.build_startgroup_url(username, payload)
+    if not url:
+        return {"ok": False, "error": f"Bot 用户名「{username}」格式非法，无法生成授权链接。"}
+    add_audit(db, "discover_invite_link", target_type="bot", target_id=str(bot_id or 0),
+              detail=json_dumps({"bot_username": username}))
+    db.commit()
+    return {
+        "ok": True, "bot_id": bot_id, "bot_name": bot_label, "bot_username": username,
+        "startgroup_url": url, "payload": payload,
+        "expires_at": (utcnow() + timedelta(hours=24)).isoformat(),
+        "hint": ("点「加入群组」后在 Telegram 选择目标群即可把该 Bot 加入；成功后系统通过 "
+                 "my_chat_member 事件自动登记群 ID / 名称 / 类型，不会自动加入推送白名单，"
+                 "请确认后再勾选。若列表未刷新，进群发 /id 或在群里发一条消息后点「发现 / 刷新」。"),
+        "channel_guide": [
+            "在 Telegram 打开目标频道 → 频道右上角进入管理 → 管理员 → 添加管理员",
+            f"搜索 @{username} 并添加，至少勾选「发布消息」权限（否则无法推送）",
+            "添加后频道有新版时由 my_chat_member / channel_post 事件自动登记；需要推送时再勾选加入白名单",
+        ],
+    }
 
 
 @app.post("/api/push/bot/token/clear", dependencies=ADMIN)

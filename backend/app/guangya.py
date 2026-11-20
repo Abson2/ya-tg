@@ -142,24 +142,78 @@ class GuangYaWebFiles:
 
     def __init__(self, db: Session):
         from .models import AuthToken
-        from .security import decrypt_secret
 
         t = db.get(AuthToken, 1)
         if not t or not t.access_token_enc or t.flow not in ("sms", "tgto", "webqr"):
             raise WebFileError("尚未登录光鸭，请在管理页用短信验证码或 App 扫码登录", 401)
         self.db = db
         self.base = settings.guangya_share_base.rstrip("/")
-        did = getattr(t, "device_id", "") or ""
-        if not did:
-            raise WebFileError("短信登录凭证缺少设备 ID（did），请重新登录", 401)
-        self.headers = {
-            "Authorization": "Bearer " + decrypt_secret(t.access_token_enc),
-            "did": did,
-            "dt": "4",
-            "Content-Type": "application/json",
-            "Origin": "https://www.guangyapan.com",
-            "Referer": "https://www.guangyapan.com/",
-        }
+        # v0.9.15 #267：不再把 token 快照进 self.headers。一次镜像任务持续几十分钟，
+        # 后台 _job_token_refresh 每 60s 刷新并替换 DB 中 access_token_enc，光鸭签发新
+        # token 后旧 token 作废；运行中的对象 header 停在旧 token → create_dir/copy_file
+        # 全部 code=117。改为每次请求前调 _fresh_headers() 从库里读当前凭证。
+
+    def _fresh_headers(self) -> dict:
+        """每次请求前从 DB 读最新凭证重建 header。
+
+        用独立短会话读取：长任务的 self.db 可能因 ORM identity map 缓存旧的 AuthToken
+        对象，直接 db.get 会拿到过期 token；独立会话每次读到的都是最新 DB 值。
+        若 _header_override 被显式注入（旧契约测试用 object.__new__ 构造），直接返回它。
+        """
+        override = getattr(self, "_header_override", None)
+        if override is not None:
+            return override
+        from .db import SessionLocal
+        from .models import AuthToken
+        from .security import decrypt_secret
+
+        s = SessionLocal()
+        try:
+            t = s.get(AuthToken, 1)
+            if not t or not t.access_token_enc or t.flow not in ("sms", "tgto", "webqr"):
+                raise WebFileError("光鸭登录凭证已失效，请重新登录", 401)
+            did = getattr(t, "device_id", "") or ""
+            if not did:
+                raise WebFileError("短信登录凭证缺少设备 ID（did），请重新登录", 401)
+            return {
+                "Authorization": "Bearer " + decrypt_secret(t.access_token_enc),
+                "did": did,
+                "dt": "4",
+                "Content-Type": "application/json",
+                "Origin": "https://www.guangyapan.com",
+                "Referer": "https://www.guangyapan.com/",
+            }
+        finally:
+            s.close()
+
+    async def _refresh_token(self) -> None:
+        """遇 117 强制刷新凭证。用独立短会话，避免污染长任务 session 的未提交写事务。"""
+        from .db import SessionLocal
+        s = SessionLocal()
+        try:
+            await guangya_auth.refresh(s, force=True)
+        finally:
+            s.close()
+
+    @property
+    def headers(self) -> dict:
+        """兼容只读访问（旧测试/外部工具）。真实请求一律走 _fresh_headers 取最新值。
+
+        v0.9.15 #267：不再是构造时快照，每次读取都从库里取当前凭证。
+        若被显式赋值（旧契约测试用 object.__new__ 注入假 header），则走该 override。
+        """
+        if getattr(self, "_header_override", None) is not None:
+            return self._header_override
+        return self._fresh_headers()
+
+    @headers.setter
+    def headers(self, value: dict):
+        # 仅供测试/工具注入；生产链路不赋值，请求始终经 _fresh_headers 读最新凭证
+        self._header_override = value
+
+    def _retry_headers(self) -> dict:
+        """兼容旧测试/外部读取的 header 视图；真实请求一律走 _fresh_headers。"""
+        return self._fresh_headers()
 
     async def list_files(self, parent_id: str = "", page: int = 0, page_size: int = 100) -> dict:
         # v0.8.4：与 w.har 中网页端真实请求体对齐。旧版自造的 needSubFolderStat
@@ -172,9 +226,11 @@ class GuangYaWebFiles:
             "sortType": 1,
         }
         last_error = ""
+        refreshed = False
         for attempt in range(3):
+            headers = self._fresh_headers()  # v0.9.15 #267：每请求重建，避开 token 快照
             async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-                r = await client.post(f"{self.base}{self.LIST_PATH}", json=body, headers=self.headers)
+                r = await client.post(f"{self.base}{self.LIST_PATH}", json=body, headers=headers)
             data = self._json(r)
             code = data.get("code")
             # 网页端成功约定同分享接口：code=0 或 msg=success
@@ -182,7 +238,15 @@ class GuangYaWebFiles:
                 return data.get("data") or {}
             msg = str(data.get("msg") or data.get("message") or r.text[:200])
             last_error = f"网页端文件列表失败 code={code} msg={msg}"
-            # 登录态失效：不再重试，交由上层提示重新登录
+            # v0.9.15 #267：117=旧 token 作废（后台已刷新），强制刷新后重建 header 重试一次
+            if code == 117 and not refreshed:
+                refreshed = True
+                try:
+                    await self._refresh_token()
+                except Exception:
+                    pass  # 刷新失败继续重试循环，下一轮 _fresh_headers 取当前库内 token
+                continue
+            # 其它登录态失效：不再重试，交由上层提示重新登录
             if code in (401, 116, 117) or any(k in msg.lower() for k in ("login", "登录", "unauthor", "token")):
                 raise WebFileError(last_error, code)
             if r.status_code >= 500 or r.status_code == 429:
@@ -192,17 +256,29 @@ class GuangYaWebFiles:
         raise WebFileError(last_error)
 
     async def _post_web(self, path: str, body: dict) -> dict:
-        """网页端写接口统一 POST，返回 data 段；沿用 list_files 的鉴权与重试约定。"""
+        """网页端写接口统一 POST，返回 data 段；沿用 list_files 的鉴权与重试约定。
+
+        v0.9.15 #267：header 每请求重建，117 强制刷新凭证重试一次（仅一次，避免循环）。
+        """
         last_error = ""
+        refreshed = False
         for attempt in range(3):
+            headers = self._fresh_headers()
             async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
-                r = await client.post(f"{self.base}{path}", json=body, headers=self.headers)
+                r = await client.post(f"{self.base}{path}", json=body, headers=headers)
             data = self._json(r)
             code = data.get("code")
             if r.status_code == 200 and (code == 0 or data.get("msg") == "success"):
                 return data.get("data") or {}
             msg = str(data.get("msg") or data.get("message") or r.text[:200])
             last_error = f"网页端 {path} 失败 code={code} msg={msg}"
+            if code == 117 and not refreshed:
+                refreshed = True
+                try:
+                    await self._refresh_token()
+                except Exception:
+                    pass
+                continue
             if code in (401, 116, 117) or any(k in msg.lower() for k in
                                              ("login", "登录", "unauthor", "token")):
                 raise WebFileError(last_error, code)

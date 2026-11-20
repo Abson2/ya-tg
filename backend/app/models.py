@@ -173,10 +173,31 @@ class DiscoveredChat(Base):
     perm_can_send: Mapped[bool] = mapped_column(Boolean, default=False)
     perm_detail: Mapped[str] = mapped_column(Text, default="")
     perm_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # v0.9.15 #276：Bot 自身在该 chat 的成员状态（Telegram ChatMember.status）：
+    # creator/administrator/member/restricted/left/kicked/unknown。
+    # 与 perm_status（能否发消息）分离：member_status 表示"Bot 在不在这个群"，
+    # left/kicked 时保留历史记录、只标记状态，不删除（多 Bot 场景互不影响）。
+    member_status: Mapped[str] = mapped_column(String(24), default="unknown")
+    bot_username: Mapped[str] = mapped_column(String(128), default="")  # /id@BotUsername 归属识别
+    last_update_id: Mapped[int] = mapped_column(BigInteger, default=0)  # 最后关联 update_id（幂等审计）
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utcnow)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     message_count: Mapped[int] = mapped_column(Integer, default=0)
     __table_args__ = (UniqueConstraint("bot_id", "chat_id", name="uq_discovered_bot_chat"),)
+
+
+class ProcessedUpdate(Base):
+    """v0.9.15 #276：getUpdates 已处理 update_id 台账，保证重启/重复投递幂等。
+
+    poll_once 处理一条 update 前先查此表，已存在则跳过（不重复登记、不重复回命令）；
+    处理成功（含明确跳过的事件）后插入 update_id，再推进 offset。
+    定期清理旧记录由 maintain 逻辑按天数删除，避免无限增长。
+    """
+    __tablename__ = "processed_updates"
+    update_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(Integer, default=0)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Rule(Base):
