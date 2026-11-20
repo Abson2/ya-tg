@@ -147,6 +147,25 @@ _SEASON_DIR = re.compile(
 
 
 # ---------- v0.8.1：分类目录识别与 1:1 路径镜像 ----------
+def natural_key(name: str) -> tuple:
+    """阶段二路线B C2：确定性自然排序键。S02 排在 S10 前、E9 排在 E10 前。
+
+    返回由 (类型标记, 数值, 文本) 三元组组成的元组，保证任意片段可比较
+    （纯 int/str 混排在 Python3 会 TypeError）。仅用于决定遍历/处理顺序，
+    不参与身份、指纹、唯一键或映射语义。
+    """
+    parts = re.split(r"(\d+)", str(name or ""))
+    key: list[tuple[int, int, str]] = []
+    for p in parts:
+        if not p:
+            continue
+        if p.isdigit():
+            key.append((1, int(p), ""))
+        else:
+            key.append((0, 0, p.lower()))
+    return tuple(key)
+
+
 def _has_video(node: dict) -> bool:
     return any(_is_video(_dir_name(f)) for f in node.get("files") or [])
 
@@ -179,7 +198,10 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
     cache: dict[str, bool] = {}
     out: list[tuple[dict, list[tuple[str, str]]]] = []
     root_node = nodes.get(root) or {"children": []}
-    stack = [(cid, []) for cid in root_node.get("children") or []]
+    # 阶段二路线B C2：根子目录按自然序反序入栈，stack.pop() 得到稳定正序。
+    root_children = sorted(root_node.get("children") or [],
+                           key=lambda cid: natural_key(nodes.get(cid, {}).get("name", "")))
+    stack = [(cid, []) for cid in reversed(root_children)]
     while stack:
         did, cats = stack.pop()
         node = nodes.get(did)
@@ -197,7 +219,10 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
             out.append((node, cats))
             continue
         if (hint and node.get("children")) or (not _has_video(node) and not _looks_like_work(node["name"])):
-            for child in node.get("children") or []:
+            # C2：分类目录下探同样按自然序反序入栈，保持 DFS 稳定
+            kids = sorted(node.get("children") or [],
+                          key=lambda cid: natural_key(nodes.get(cid, {}).get("name", "")))
+            for child in reversed(kids):
                 stack.append((child, cats + [(node["name"], did)]))
             continue
         out.append((node, cats))
@@ -509,16 +534,21 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         node = {"id": did, "name": name, "parent": parent, "path": display,
                 "files": [], "children": []}
         nodes[did] = node
-        for it in items:
+        # 阶段二路线B C2：确定性排序。先按 natural_key 排序再反序入栈，
+        # 使 stack.pop() 按自然序访问；files 同理保持自然序。仅为顺序，不改语义。
+        ordered = sorted(items, key=lambda it: natural_key(_dir_name(it)))
+        dirs_to_push: list[tuple[str, str, str, str]] = []
+        for it in ordered:
             fid = str(it.get("fileId") or "")
             if not fid:
                 continue
             if int(it.get("resType", 1) or 1) == 2:
                 node["children"].append(fid)
-                stack.append((fid, _dir_name(it), display, did))
+                dirs_to_push.append((fid, _dir_name(it), display, did))
             else:
                 node["files"].append(it)
                 a_files += 1
+        stack.extend(reversed(dirs_to_push))
     if stats is not None:
         stats["walk_dirs"] = len(nodes)
         stats["walk_list_calls"] = list_calls
@@ -561,19 +591,23 @@ def _work_dir_of(node: dict, nodes: dict[str, dict], root: str) -> dict | None:
 def _media_files(work: dict, nodes: dict[str, dict]) -> list[tuple[dict, dict]]:
     """从影视主目录出发 BFS，收集所有 (所属目录节点, 文件条目)，兼容未整理/Season 两种层级。"""
     out: list[tuple[dict, dict]] = []
-    stack = [work["id"]]
-    seen = set()
-    while stack:
-        did = stack.pop()
+    seen: set[str] = set()
+    # 阶段二路线B C2：确定性排序——父目录先、子目录按自然序，文件按自然序。
+    # 用递归 DFS 保证"目录整体先于其子树"的稳定顺序，避免栈序受网盘返回顺序影响。
+    def visit(did: str) -> None:
         if did in seen:
-            continue
+            return
         seen.add(did)
         node = nodes.get(did)
         if not node:
-            continue
-        for it in node["files"]:
+            return
+        for it in sorted(node["files"], key=lambda f: natural_key(_dir_name(f))):
             out.append((node, it))
-        stack.extend(node["children"])
+        for cid in sorted(node["children"],
+                          key=lambda x: natural_key(nodes.get(x, {}).get("name", ""))):
+            visit(cid)
+
+    visit(work["id"])
     return out
 
 
