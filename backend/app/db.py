@@ -98,6 +98,29 @@ _COLUMNS = {
     # 四模块重构 阶段A：分享任务表增加索引列（表本身由 create_all 新建，老库若已存在补列）
     "share_tasks": {
         "dedup_key": "TEXT",
+        "queue_type": "TEXT DEFAULT 'fresh'",
+        "submitted_at": "DATETIME",
+    },
+    # v1.1：当前/历史分享记录表（真相源），表由 create_all 新建，老库补列兜底
+    "share_records": {
+        "work_key": "TEXT DEFAULT ''",
+        "share_dir_id": "TEXT DEFAULT ''",
+        "share_url": "TEXT DEFAULT ''",
+        "share_status": "TEXT DEFAULT 'active'",
+        "current_flag": "INTEGER DEFAULT 1",
+        "cancelled_at": "DATETIME",
+        "failure_reason": "TEXT DEFAULT ''",
+        "last_verified_at": "DATETIME",
+        "created_at": "DATETIME",
+    },
+    # 四模块重构 v1.1：模块间事件表（表本身由 create_all 新建，这里给极老库补列兜底）
+    "mirror_events": {
+        "idem_key": "TEXT DEFAULT ''",
+        "consumed_at": "DATETIME",
+    },
+    "resource_events": {
+        "idem_key": "TEXT DEFAULT ''",
+        "consumed_at": "DATETIME",
     },
     "auth_tokens": {
         "device_id": "TEXT DEFAULT ''",

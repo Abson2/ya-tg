@@ -61,10 +61,12 @@ def _beat() -> None:
         except Exception:
             pass  # 心跳是辅助诊断，绝不阻断同步
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from . import ai_assist, mirror_batch, tmdb
+from .db import SessionLocal
 from .file_naming import (english_file_name, pinyin_title, sanitize_english_title,
                           with_conflict_suffix, work_core_title)
 from .guangya import GuangYaWebFiles, WebFileError
@@ -495,10 +497,22 @@ async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRul
             return seq - 1
         if action == "cancel":
             rule.batch_status = "cancelled"
+            # 阶段二 C5：余下未终结序列任务全部落 cancelled（docstring 承诺兑现）
+            try:
+                n = mirror_batch.cancel_remaining(db, batch_id)
+                stats["cancelled_tasks"] = n
+            except Exception:
+                pass
             db.commit()
             stats["cancelled"] = True
             return seq - 1
         if action == "skip":
+            # 阶段二 C5：当前任务落 skipped 终态（即使尚未 add_sequence_task 也补占位行）
+            try:
+                mirror_batch.mark_sequence_status(db, batch_id, seq, "skipped",
+                                                  error="skip by control")
+            except Exception:
+                pass
             stats["skipped"] += 1
             db.commit()
             continue
@@ -1392,6 +1406,7 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     最后一层保证永远有可用 ASCII 剧名，绝不会因为某部剧查不到英文名而卡住
     复制 / 入库 / 分享 / 推送主链路。
     """
+    media_id = int(getattr(media, "id", 0) or 0)
     cached = str(getattr(media, "english_title", "") or "").strip()
     src_existing = str(getattr(media, "english_source", "") or "").strip()
     # v0.9.6：用户点「清空待处理清单」后会置 english_source=ignored。非强制解析时
@@ -1404,9 +1419,16 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     core, year = work_core_title(media.title_standard)
     eng, source = "", ""
     if not core:
-        media.english_title, media.english_source = "", ""
-        db.commit()
+        _persist_english_title(db, media_id, "", "")
         return "", ""
+
+    # ===== 事务分层（v1.1 修 database is locked）=====
+    # 根因：本函数在 SQLite 上先 SELECT 拿读快照，再 await TMDB/AI 网络 6~16s，
+    # 期间其它并发 job 提交写，最后 UPDATE 想把「读事务升级为写事务」时快照已过期，
+    # 抛 SQLITE_BUSY_SNAPSHOT——这种锁冲突 busy_timeout=30s 不生效（不是等待能解决的）。
+    # 修法：①所有只读 SELECT 集中在解析前做完并立即 commit 释放读锁；
+    #      ②TMDB/AI 网络 await 期间不持有任何事务；
+    #      ③只在最后用独立短事务做一次 UPDATE，带写锁重试。
 
     # 1) 收集可复用的识别结果：A 目录里的 {tmdb-} 标记 + 已回填 B fileId 的 Resource
     tm = _TMDB_TAG.search(str(media.title_standard or ""))
@@ -1458,6 +1480,13 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
         if ident_m:
             tid = int(ident_m.group(1))
 
+    # 只读阶段结束：立即提交，释放读快照，绝不让读事务跨越下面的网络 await。
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("[mirror] 英文名解析前释放读事务失败 media=%s：%s", media_id, exc)
+
     # 2) TMDB en-US：已知/推断类型优先，未知或被拒时补查另一类型。每次都过 _bounded()
     #    硬超时，双查最坏 2×6 秒；绝不像旧版那样无上限串行 + 每类再等 AI。
     if tid and not eng:
@@ -1489,9 +1518,54 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
         if v:
             eng, source = v, "pinyin"
 
-    media.english_title, media.english_source = eng, source
-    db.commit()
+    _persist_english_title(db, media_id, eng, source)
     return eng, source
+
+
+def _persist_english_title(db: Session, media_id: int, eng: str, source: str) -> None:
+    """把解析出的英文名写回 MirrorMedia：独立短 Session + Core UPDATE + 写锁重试。
+
+    真机 v1.0.0 `OperationalError: database is locked [UPDATE mirror_media SET
+    english_title=?, english_source=?]` 的根因：调用方 `_resolve_english_title`
+    在**同一个 db Session** 上先 SELECT 建读快照 → await TMDB/AI 网络 6~16s（其间
+    tmdb/ai_assist 内部又用该 db 读配置，autobegin 新的读事务）→ 再 UPDATE 想升级
+    成写事务时快照已过期，抛 SQLITE_BUSY_SNAPSHOT。这种情况 busy_timeout=30s 无效
+    （不是等待能解决的），必须换连接。
+
+    修法：用**全新的独立 Session** 做这一条 UPDATE，绝不复用被网络调用污染过的
+    读快照；Core UPDATE 不走 ORM 对象避免 identity 问题；再叠加写锁退避重试兜底。
+    独立 Session 自己在 finally 关闭，异常一律吞掉，绝不因一次写冲突拖垮主链路。
+    """
+    if not media_id:
+        return
+    last_exc: Exception | None = None
+    for attempt in range(8):
+        try:
+            with SessionLocal() as write_db:
+                write_db.execute(update(MirrorMedia).where(MirrorMedia.id == media_id).values(
+                    english_title=eng, english_source=source))
+                write_db.commit()
+            # 同步刷新调用方 Session 中的对象（若仍被引用），避免陈旧值误导后续逻辑
+            try:
+                obj = db.get(MirrorMedia, media_id)
+                if obj is not None:
+                    obj.english_title, obj.english_source = eng, source
+            except Exception:
+                pass
+            return
+        except OperationalError as exc:
+            last_exc = exc
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                logger.warning("[mirror] 英文名回写失败（非锁冲突）media=%s：%s", media_id, exc)
+                return
+            if attempt == 7:
+                logger.warning("[mirror] 英文名回写重试 8 次仍锁，放弃 media=%s：%s",
+                               media_id, last_exc)
+                return
+            time.sleep(0.05 * (2 ** attempt))
+        except Exception as exc:
+            logger.warning("[mirror] 英文名回写异常 media=%s：%s", media_id, exc)
+            return
 
 
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,

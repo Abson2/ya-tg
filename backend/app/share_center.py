@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import runtime_config
@@ -23,8 +24,10 @@ from .config import settings
 from .db import json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import (AuditLog, DistributionEvent, QueueItem, Resource,
-                     ShareTask, utcnow)
-from .utils import series_dir_info, work_group_key
+                     ShareRecord, ShareTask, utcnow)
+from .utils import as_utc, series_dir_info, work_group_key
+
+logger = logging.getLogger(__name__)
 
 # 状态机（强制项4：任务接收确认）
 ST_PLANNED = "planned"
@@ -92,10 +95,109 @@ def _ensure_share_scope(db: Session, res: Resource) -> None:
 
 
 def find_first_task(db: Session, work_key: str) -> ShareTask | None:
-    """整剧首次分享任务（分享链接真相源）。"""
+    """整剧首次分享任务（兼容旧数据；真相源优先 current_share_record）。"""
     return db.scalar(select(ShareTask).where(
         ShareTask.work_key == work_key, ShareTask.kind == "first",
         ShareTask.status != ST_CANCELLED).order_by(ShareTask.id).limit(1))
+
+
+def current_share(db: Session, work_key: str) -> ShareRecord | None:
+    """读取作品当前有效分享记录（追更复用链接的真相源）。"""
+    return db.scalar(select(ShareRecord).where(
+        ShareRecord.work_key == work_key, ShareRecord.current_flag == 1).limit(1))
+
+
+def upsert_share_record(db: Session, res: Resource, *, share_id: str,
+                        share_url: str, share_status: str = "active") -> ShareRecord:
+    """建/更新当前有效分享记录：先把旧 current 作废(current_flag=0)保留历史，
+    再建新 current（部分唯一索引保证同一作品仅一条 current=1）。"""
+    wk = task_work_key(res)
+    old = current_share(db, wk)
+    if old and old.share_url == share_url and old.current_flag == 1:
+        # 同一链接：仅刷新状态/核验时间，不制造新记录
+        old.share_id = share_id or old.share_id
+        old.share_status = share_status
+        old.last_verified_at = utcnow()
+        db.flush()
+        return old
+    if old:
+        old.current_flag = 0
+        db.flush()
+    rec = ShareRecord(
+        work_key=wk, resource_id=res.id,
+        resource_type=res.media_type or "",
+        share_dir_id=res.share_dir_id or "",
+        share_id=share_id, share_url=share_url,
+        share_status=share_status, current_flag=1)
+    db.add(rec)
+    db.flush()
+    return rec
+
+
+def retire_share_record(db: Session, work_key: str, *, reason: str = "") -> int:
+    """B 库删除/分享失效：作废当前分享记录（保留历史），返回作废条数。"""
+    cur = current_share(db, work_key)
+    if not cur or not cur.current_flag:
+        return 0
+    cur.current_flag = 0
+    cur.share_status = "cancelled"
+    cur.cancelled_at = utcnow()
+    if reason:
+        cur.failure_reason = reason[:1000]
+    db.flush()
+    return 1
+
+
+def classify_queue(db: Session, work_key: str, kind: str) -> str:
+    """三类队列归属（设计文档 §4.2）：
+    - followup：已有当前有效分享记录（追更/恢复，复用原链接）
+    - stock：首次但由存量批次标记（share_tasks.queue_type 预设）
+    - fresh：其余全新资源
+    """
+    if kind in ("update", "restore"):
+        return "followup"
+    if current_share(db, work_key):
+        return "followup"
+    return "fresh"
+
+
+def _int_cfg(db: Session, key: str, default: int = 0) -> int:
+    try:
+        return max(0, int(runtime_config.get(db, key) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def can_publish(db: Session, task: ShareTask) -> tuple[bool, str]:
+    """统一发布门禁（设计文档 §4.7）：过不了就等待/阻塞，绝不提前调用分发中心。"""
+    res = db.get(Resource, task.resource_id)
+    if not res:
+        return False, "资源不存在"
+    # force（手动强推）绕过海报/识别闸门（v0.9.11 口径：手动强制动作），但仍校验 B 库目录存在。
+    if task.kind != "force":
+        if res.identify_status != "identified":
+            return False, "资源未识别成功"
+        if not (res.poster_path or "").strip():
+            return False, "资源无海报（发布标准）"
+    if task.kind in ("update", "restore"):
+        cur = current_share(db, task.work_key)
+        if not cur or not cur.share_url or cur.share_status != "active":
+            return False, "追更资源无有效原分享链接"
+    # 配额门禁：分队列按当日已提交数统计
+    qtype = task.queue_type or "fresh"
+    quota_key = {"stock": "stock_daily_quota", "fresh": "fresh_daily_quota",
+                 "followup": "followup_daily_quota"}.get(qtype, "fresh_daily_quota")
+    daily = _int_cfg(db, quota_key) or _int_cfg(db, "push_daily_limit")
+    if daily > 0:
+        # 用 func.date 归一到日期字符串，避开 SQLite naive/aware datetime 比较错误
+        today_str = utcnow().date().isoformat()
+        used = db.scalar(select(func.count(ShareTask.id)).where(
+            ShareTask.queue_type == qtype,
+            ShareTask.submitted_at.isnot(None),
+            func.date(ShareTask.submitted_at) == today_str)) or 0
+        if int(used) >= daily:
+            return False, f"{qtype} 队列当日配额已满({daily})"
+    return True, ""
 
 
 def _dedup_key(kind: str, work_key: str, event_id: int) -> str | None:
@@ -133,14 +235,36 @@ def ensure_task(
     if dkey:
         existing = db.scalar(select(ShareTask).where(ShareTask.dedup_key == dkey).limit(1))
     if existing and not force:
+        # 规则2（B库删除→镜像补齐重建）：旧的 first 任务已 cancelled，重新入库时要复活它，
+        # 否则 dedup_key=work_key 唯一约束会挡住新建、作品永远无法重新分享推送。
+        if existing.status == ST_CANCELLED:
+            existing.status = ST_PLANNED
+            existing.error = ""
+            existing.share_id, existing.share_url = "", ""
+            existing.share_status = "not_created"
+            existing.attempts = 0
+            existing.next_retry_at = None
+            existing.submitted_at = None
+            existing.published_at = None
+            existing.queue_type = classify_queue(db, wk, kind)
+            existing.resource_id = res.id
+            existing.share_dir_id = res.share_dir_id or ""
+            existing.share_scope = res.share_scope or existing.share_scope
+            existing.channel_targets = json_dumps(channel_targets or json.loads(existing.channel_targets or "[]"))
+            db.flush()
+            return existing, True
         return existing, False
 
     parent = None
     if kind in ("update", "restore"):
         parent = find_first_task(db, wk)
+    # 追更/恢复：优先用当前分享记录的链接，找不到再回退首次任务
+    cur = current_share(db, wk)
+    qtype = classify_queue(db, wk, kind)
     task = ShareTask(
         work_key=wk,
         kind=kind,
+        queue_type=qtype,
         resource_id=res.id,
         share_dir_id=res.share_dir_id or "",
         share_scope=res.share_scope or "file",
@@ -151,10 +275,11 @@ def ensure_task(
         channel_targets=json_dumps(channel_targets or []),
         dedup_key=dkey,
     )
-    # 追更/恢复复用首次分享链接（规则1：更新复用原链接）
-    if parent and parent.share_url:
-        task.share_id = parent.share_id
-        task.share_url = parent.share_url
+    # 追更/恢复复用当前有效分享链接（规则1：更新复用原链接，真相源=share_records）
+    reuse = cur if (cur and cur.share_url) else parent
+    if reuse and reuse.share_url:
+        task.share_id = reuse.share_id
+        task.share_url = reuse.share_url
         task.share_status = "active"
         task.status = ST_READY
     elif (res.share_url or "").strip():
@@ -183,6 +308,15 @@ async def build_share(db: Session, task: ShareTask) -> str:
     task.status = ST_BUILDING
     task.attempts = int(task.attempts or 0) + 1
     db.commit()  # await 前落盘，不跨网络持写事务（项目红线）
+
+    # 同作品幂等复用真相源：当前有效分享记录（一部剧只一个有效分享）
+    cur = current_share(db, task.work_key)
+    if cur and cur.share_url:
+        task.share_id, task.share_url = cur.share_id, cur.share_url
+        task.share_status = "active"
+        task.status = ST_READY
+        db.commit()
+        return task.share_url
 
     # 同目录幂等复用：先查 share_tasks，再查 resources 兄弟缓存
     if task.share_scope == "series_dir" and task.share_dir_id:
@@ -234,9 +368,14 @@ async def build_share(db: Session, task: ShareTask) -> str:
     task.share_status = "active"
     task.status = ST_READY
     task.error = ""
-    # 双写回资源缓存（兼容旧前端/导出；真相源仍是 share_tasks）
+    # 双写回资源缓存（兼容旧前端/导出）
     res.share_id, res.share_url = share_id, share_url
     res.share_status, res.share_duration = "active", settings.share_duration
+    # 真相源：写当前有效分享记录（旧记录作废保留历史）
+    try:
+        upsert_share_record(db, res, share_id=share_id, share_url=share_url, share_status="active")
+    except Exception:
+        pass  # 记录写入失败不回滚已建分享（分享已真实存在）
     db.add(AuditLog(action="share_created", target_type="share_task", target_id=str(task.id),
                     detail=json_dumps({"work_key": task.work_key, "kind": task.kind,
                                        "file_id": target_id, "share_id": share_id})))
@@ -291,6 +430,7 @@ def submit_to_dispatch(db: Session, task: ShareTask) -> int:
             q = _upsert_queue_item(db, task, ch_id)
             ids.append(q.id)
     task.status = ST_SUBMITTED
+    task.submitted_at = utcnow()
     task.channel_targets = json.dumps(targets, ensure_ascii=False)
     # 溯源：关联事件 → 分享任务 + 推送队列项
     if task.parent_event_id:
@@ -368,13 +508,16 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
     stats = {"built": 0, "submitted": 0, "skipped": 0, "failed": 0}
     now = utcnow()
     candidates = list(db.scalars(select(ShareTask).where(
-        ShareTask.status.in_([ST_PLANNED, ST_FAILED]),
-        ShareTask.kind != "force",  # force 由显式 API 立即处理，不进后台轮转
+        # ready 也要扫：force 任务在 ensure_task 时因资源已有 share_url 直接置 ready，
+        # 若只扫 planned/failed 则这些 ready 任务永远不被提交，「立即推送」卡死。
+        ShareTask.status.in_([ST_PLANNED, ST_READY, ST_FAILED]),
+        or_(ShareTask.scheduled_at.is_(None), ShareTask.scheduled_at <= now),
     ).order_by(ShareTask.priority.desc(), ShareTask.id).limit(limit)).all())
     # failed 任务需过退避窗口
     due = []
     for t in candidates:
-        if t.status == ST_FAILED and t.next_retry_at and t.next_retry_at > now:
+        # SQLite 读回的 DateTime 可能是 naive，统一 as_utc 再比较（项目通用红线）
+        if t.status == ST_FAILED and t.next_retry_at and (as_utc(t.next_retry_at) or now) > now:
             continue
         if t.status == ST_FAILED and int(t.attempts or 0) >= max_attempts:
             continue
@@ -385,28 +528,87 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
                 await build_share(db, task)
                 stats["built"] += 1
             if task.status == ST_READY:
+                # 统一发布门禁（§4.7）：未达标只阻塞等待，绝不提前调用分发中心
+                ok, reason = can_publish(db, task)
+                if not ok:
+                    task.status = ST_PLANNED
+                    task.error = f"发布门禁阻塞：{reason}"
+                    task.scheduled_at = now + timedelta(seconds=60)
+                    db.commit()
+                    stats["skipped"] += 1
+                    continue
                 n = submit_to_dispatch(db, task)
                 if n:
                     stats["submitted"] += n
                 else:
                     stats["skipped"] += 1
-        except GuangYaError as exc:
-            task.status = ST_FAILED
-            task.error = str(exc)[:1000]
-            task.next_retry_at = now + timedelta(seconds=backoff_seconds(int(task.attempts or 0)))
-            db.commit()
-            stats["failed"] += 1
         except Exception as exc:
-            task.status = ST_FAILED
-            task.error = f"分享任务异常：{str(exc)[:800]}"
+            # 分享失败降级（设计文档 §4.6 / 场景10）：分享只是消息里的「获取资源」入口，
+            # 建分享失败绝不能让整条推送卡死——对齐旧链「建分享失败仍发送消息」语义：
+            # 立即标 ready（share_url 为空）照常提交，分发中心按空链接发无按钮正文。
+            # 任务留 error 供前端诊断；下一轮 run_cycle 会自动重试建分享（task.status 已是
+            # submitted/accepted/published，不再进 planned 候选——故另用 ShareRecord 修复
+            # job 补建，这里不阻塞推送）。分享失败与推送失败彻底解耦。
+            task.error = f"[建分享失败·降级无链接推送] {str(exc)[:600]}"
+            task.status = ST_READY
+            task.share_url = ""
+            task.next_retry_at = None
             db.commit()
-            stats["failed"] += 1
+            stats["degraded"] = int(stats.get("degraded", 0)) + 1
+            # 降级后继续走门禁+提交（不 continue），确保消息送达
+            try:
+                ok, reason = can_publish(db, task)
+                if ok:
+                    n = submit_to_dispatch(db, task)
+                    if n:
+                        stats["submitted"] = int(stats.get("submitted", 0)) + n
+                else:
+                    stats["skipped"] = int(stats.get("skipped", 0)) + 1
+            except Exception:
+                db.rollback()
+    return stats
+
+
+def consume_resource_events(db: Session, limit: int = 100) -> dict:
+    """消费资源库事件（设计文档 §3.7/§6.2）：把资源变化转成分享中心动作。
+
+    - identified/restored：确保该作品有 first 任务；restored 场景 ensure_task 会复活
+      被 cancelled 的旧任务（规则2 重建闭环）。
+    - removed：兜底作废当前分享记录（生产者 _reconcile_library 已作废，这里幂等）。
+    幂等：事件处理完置 consumed_at；同一事件重复消费不会重复建任务。
+    """
+    from . import events as _ev
+    stats = {"consumed": 0, "tasks_created": 0, "records_retired": 0, "skipped": 0}
+    for ev in _ev.pending_resource_events(db, limit=limit):
+        try:
+            if ev.type == _ev.RESOURCE_REMOVED:
+                try:
+                    stats["records_retired"] += retire_share_record(
+                        db, ev.work_key, reason="resource_removed_event")
+                except Exception:
+                    pass
+            elif ev.type in (_ev.RESOURCE_NEW, _ev.RESOURCE_RESTORED):
+                res = db.get(Resource, ev.resource_id) if ev.resource_id else None
+                if not res or res.identify_status != "identified":
+                    stats["skipped"] += 1
+                else:
+                    _, created = ensure_task(db, res, kind="first")
+                    stats["tasks_created"] += 1 if created else 0
+            _ev.mark_consumed(db, ev)
+            stats["consumed"] += 1
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center] 消费资源事件 #%s 失败：%s", ev.id, exc)
     return stats
 
 
 def cancel_task(db: Session, task: ShareTask, *, cancel_queue: bool = True) -> int:
-    """取消分享任务：终态 cancelled，并可撤销未发送的交接队列项。"""
+    """取消分享任务：终态 cancelled，作废当前分享记录（保留历史），并撤销未发送队列项。"""
     task.status = ST_CANCELLED
+    try:
+        retire_share_record(db, task.work_key, reason="share task cancelled")
+    except Exception:
+        pass
     cancelled = 0
     if cancel_queue and task.share_url:
         for q in db.scalars(select(QueueItem).where(

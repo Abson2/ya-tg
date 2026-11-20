@@ -498,15 +498,21 @@ async def _scheduled_scan(root: str) -> None:
 async def _job_share_center() -> None:
     """四模块重构：分享中心调度周期（建分享→提交分发）。
 
-    灰度开关 share_center_enabled 关闭时立即返回（默认，零开销、零行为变化）；
-    开启时扫描 planned 分享任务，建分享并提交到分发中心。全程独立 Session，
-    异常自行吞掉并留应用日志，不影响其它定时任务。
+    v1.1 默认开启（share_center_enabled=true）：扫描 planned 分享任务，建分享并
+    提交到分发中心。开关关闭仅作旧链排障用。全程独立 Session，异常自行吞掉并留
+    应用日志，不影响其它定时任务。
     """
     from . import share_center as _sc
     with SessionLocal() as db:
         try:
             if not _sc.is_enabled(db):
                 return
+            # 先消费资源库事件（新入库/追更/删除出库 → 分享任务），再跑分享调度
+            try:
+                _sc.consume_resource_events(db, limit=100)
+            except Exception as exc:
+                db.rollback()
+                logger.warning("[share_center] 消费资源事件周期异常：%s", exc)
             await _sc.run_cycle(db, limit=20)
         except Exception as exc:
             db.rollback()
@@ -566,8 +572,8 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     _schedule_queue_worker(queue_trigger)
-    # 四模块重构：分享中心调度（开关关闭时仅占一个空转 job，无行为变化）
-    scheduler.add_job(_job_share_center, "interval", seconds=20, id="share_center",
+    # 四模块重构：分享中心调度（v1.1 默认开启，5s 一轮缩短入队→建分享→提交的延迟窗口）
+    scheduler.add_job(_job_share_center, "interval", seconds=5, id="share_center",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_token_refresh, "interval", seconds=60, id="token_refresh",
                       max_instances=1, coalesce=True)
@@ -595,13 +601,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=True)
 
 
-app = FastAPI(title="Ya-TG", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.1.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.0.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.1.0", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1073,6 +1079,17 @@ async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
                      "enqueued": "已入队"}
         pretty = "、".join(f"{label_map.get(k, k)} {v}" for k, v in diag.items() if v)
         r.last_message = ((r.last_message or "") + f" · 入队诊断：{pretty}")[-1000:]
+    # 镜像 → 资源库事件（设计文档 §2.9）：批次级完成通知，供资源库精确定位本轮刷新范围；
+    # 资源库仍以 B 库全量扫描为准，事件只加快刷新、不替代核验。
+    try:
+        from . import events as _ev
+        _ev.emit_mirror_event(
+            db, work_key=f"mirror:{r.id}:{scan.get('batch_id') or ''}",
+            rule_id=int(r.id or 0), batch_id=str(scan.get("batch_id") or ""),
+            title_standard=f"镜像同步完成 files={out['files']}",
+            scope=_ev.MIRROR_COMPLETED)
+    except Exception:
+        pass
     # 只读统计，绝不在这里处理：内容变化事件仍由常规扫描链路消化
     out["changes_pending"] = int(db.scalar(
         select(func.count()).select_from(DistributionEvent).where(
@@ -2175,7 +2192,7 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     # 按 stale 资源作品键取消未终结的 ShareTask；A 库仍在时镜像下一轮补齐 B 库，
     # 新资源重新入库后走 _enqueue_ready 建新的 first 任务→重新分享推送（闭环）。
     try:
-        from . import share_center
+        from . import events, share_center
         stale_keys = {work_group_key(x) for x in stale}
         if stale_keys:
             active = [share_center.ST_PLANNED, share_center.ST_READY,
@@ -2186,6 +2203,16 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
                 share_center.ShareTask.status.in_(active))).all()
             for st in stale_tasks:
                 st.status = share_center.ST_CANCELLED
+            # 作废当前有效分享记录（保留历史），真相源与任务状态一致
+            for wk in stale_keys:
+                try:
+                    share_center.retire_share_record(db, wk, reason="B库整部删除出库")
+                except Exception:
+                    pass
+                # 产出资源出库事件（规则2：分享中心消费后确保取消分享；镜像补齐再重建）
+                events.emit_resource_event(
+                    db, event_type=events.RESOURCE_REMOVED, work_key=wk,
+                    payload={"reason": "b_library_removed", "share_ids": sorted(share_ids)})
     except Exception:
         pass
     for x in stale:
@@ -2964,23 +2991,41 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
         QueueItem.channel_id == rule.channel_id).limit(1))
     if exists:
         return False
+    auto_publish = bool(rule.auto_publish)
     db.add(QueueItem(resource_id=x.id, channel_id=rule.channel_id,
-                     status="pending" if rule.auto_publish else "review"))
+                     status="pending" if auto_publish else "review"))
     db.flush()  # autoflush=False：立即落库，供同批次后续单集的去重查询看到
-    # 四模块重构 阶段B：影子登记到分享中心（双写期）。不改变本函数返回值与 QueueItem 行为，
-    # 灰度开关开启后由 share_center.run_cycle 接管。影子异常被内部吞掉，绝不影响主入队。
+    # 四模块重构：登记到分享中心主链。只对 auto_publish 入队项登记——review（人工审核）
+    # 项不能被分享中心 run_cycle 自动建分享并提交发送，否则绕过审核闸门。
+    # 登记异常被内部吞掉，绝不影响主入队；未登记到的项 publisher 会走旧链兜底不漏发。
+    if auto_publish:
+        try:
+            from . import share_center
+            sc_task = share_center.shadow_register(db, x, kind="first",
+                                                   channel_ids=[rule.channel_id])
+            if sc_task is not None:
+                q = db.scalar(select(QueueItem).where(
+                    QueueItem.resource_id == x.id,
+                    QueueItem.channel_id == rule.channel_id).limit(1))
+                if q:
+                    q.share_task_id = sc_task.id
+                    q.push_reason = "first"
+                    db.flush()
+        except Exception:
+            pass
+    # 资源库 → 分享中心事件：新入库(identified)或镜像补齐后重建(restored)。
+    # 有 cancelled 的旧 first 任务说明曾被 B 库删除，这次重新入库应视为 restored（规则2）。
     try:
-        from . import share_center
-        sc_task = share_center.shadow_register(db, x, kind="first",
-                                               channel_ids=[rule.channel_id])
-        if sc_task is not None:
-            q = db.scalar(select(QueueItem).where(
-                QueueItem.resource_id == x.id,
-                QueueItem.channel_id == rule.channel_id).limit(1))
-            if q:
-                q.share_task_id = sc_task.id
-                q.push_reason = "first"
-                db.flush()
+        from . import events, share_center
+        from .models import ShareTask
+        wk = work_group_key(x)
+        ever_cancelled = db.scalar(select(ShareTask.id).where(
+            ShareTask.work_key == wk, ShareTask.kind == "first",
+            ShareTask.status == share_center.ST_CANCELLED).limit(1))
+        etype = events.RESOURCE_RESTORED if ever_cancelled else events.RESOURCE_NEW
+        events.emit_resource_event(db, event_type=etype, work_key=wk, resource_id=x.id,
+                                   payload={"share_dir_id": x.share_dir_id or "",
+                                            "media_type": x.media_type or ""})
     except Exception:
         pass
     return True
@@ -3943,6 +3988,7 @@ def share_tasks_list(status: str = "", limit: int = 200, db: Session = Depends(g
     rows = list(db.scalars(q.order_by(share_center.ShareTask.id.desc()).limit(min(limit, 500))).all())
     return {"enabled": share_center.is_enabled(db), "items": [
         {"id": t.id, "work_key": t.work_key, "kind": t.kind, "status": t.status,
+         "queue_type": t.queue_type or "fresh",
          "share_url": t.share_url, "share_id": t.share_id,
          "parent_task_id": t.parent_task_id, "parent_event_id": t.parent_event_id,
          "resource_id": t.resource_id, "attempts": t.attempts, "error": t.error,
@@ -3979,8 +4025,18 @@ def share_center_status(db: Session = Depends(get_db)):
     """
     from . import share_center as _sc
     from sqlalchemy import func as _fn
+    from .models import ShareRecord
     rows = db.execute(select(_sc.ShareTask.status, _fn.count()).group_by(_sc.ShareTask.status)).all()
-    return {"enabled": _sc.is_enabled(db), "counts": {str(s): int(n) for s, n in rows}}
+    qrows = db.execute(select(_sc.ShareTask.queue_type, _fn.count()).group_by(_sc.ShareTask.queue_type)).all()
+    current_shares = db.scalar(select(_fn.count()).select_from(ShareRecord).where(
+        ShareRecord.current_flag == 1)) or 0
+    history_shares = db.scalar(select(_fn.count()).select_from(ShareRecord)) or 0
+    return {
+        "enabled": _sc.is_enabled(db),
+        "counts": {str(s): int(n) for s, n in rows},
+        "queues": {str(q or "fresh"): int(n) for q, n in qrows},
+        "share_records": {"current": int(current_shares), "total": int(history_shares)},
+    }
 
 
 @app.post("/api/resources/{rid}/publish", dependencies=ADMIN)
@@ -4044,7 +4100,10 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         else:
             db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
             added += 1
-    # 四模块重构 阶段B：手动强推登记 force 影子任务（force 不去重、优先级最高）
+    # v1.1：autoflush=False，上面新 add 的 QueueItem 必须先 flush 才能被下面查询看到，
+    # 否则 force 任务 channel_targets=[] → submit_to_dispatch 返回 0 → 强推消息发不出去。
+    db.flush()
+    # 四模块重构：手动强推登记 force 任务（force 不去重、优先级最高）
     try:
         from . import share_center
         ch_ids = sorted({q.channel_id for q in db.scalars(select(QueueItem).where(

@@ -25,6 +25,10 @@ def test_scan_to_share_to_push_flow():
                      access_token_enc=encrypt_secret("fake-access"),
                      refresh_token_enc=encrypt_secret("fake-refresh"),
                      expires_at=None, flow="test"))
+    # v1.1：建分享走网页端 client，给它一个占位授权让 __init__ 通过；
+    # create 方法由测试 patch 提供假响应。扫描仍走 OpenAPI（flow=test → WebFiles 未启用）。
+    from app import runtime_config
+    runtime_config.set_many(db, {"guangya_share_authorization": "Bearer test-share-token"})
     db.flush()
     bot = Bot(name="test-bot", token=encrypt_secret("123456:AAFakeToken"))
     db.add(bot)
@@ -82,7 +86,17 @@ def test_scan_to_share_to_push_flow():
         assert queued == 2
         result = asyncio.run(process_queue())
         assert result["sent"] == 2
-        assert result["shares_created"] == 2
+        # v1.1 新链：建分享在分享中心 run_cycle 完成（process_queue 内部已驱动一轮），
+        # publisher 的 shares_created 只统计旧链兜底路径，新链下可为 0。验证真相源即可。
+        from app.models import ShareTask, ShareRecord
+        db2 = SessionLocal()
+        try:
+            assert db2.scalar(select(func.count(ShareTask.id))) == 2
+            assert db2.scalar(select(func.count(ShareRecord.id))) == 2
+            assert all((t.share_url or "").startswith("https://share.test/")
+                       for t in db2.scalars(select(ShareTask)).all())
+        finally:
+            db2.close()
 
     db = SessionLocal()
     try:

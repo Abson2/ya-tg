@@ -37,7 +37,15 @@ const overview = ref({}), task = ref({ cron: '*/30 * * * *', enabled: true })
 const resources = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 // 四模块重构：分享中心任务列表与状态（独立命名，避免与光鸭 shareStatus 冲突）
-const shareCenterTasks = ref([]), shareCenterStatus = ref({ enabled: false, counts: {} })
+const shareCenterTasks = ref([]), shareCenterStatus = ref({ enabled: false, counts: {}, queues: {}, share_records: {} })
+// 分享中心三类队列筛选（设计文档 §4.2）：all/stock/fresh/followup
+const shareQueueFilter = ref('all')
+const shareStatusCounts = computed(() => shareCenterStatus.value.counts || {})
+const shareQueueCounts = computed(() => shareCenterStatus.value.queues || {})
+const shareFilteredTasks = computed(() => {
+  const q = shareQueueFilter.value
+  return q === 'all' ? shareCenterTasks.value : (shareCenterTasks.value || []).filter(t => (t.queue_type || 'fresh') === q)
+})
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN', scan_min_interval: '', scan_max_calls: '', bot_min_interval: '', bot_max_calls: '', rate_window_seconds: '' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
@@ -1883,7 +1891,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v1.0.0 · Asia/Shanghai</span>
+          <span>v1.1.0 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -2788,20 +2796,34 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
         <section v-else-if="tab === '推送队列'" class="fade">
           <div class="page-head"><div><h2>分享中心</h2><p>分享生命周期 · 整剧一次目录分享 · 更新复用链接独立推送 · 与分发中心交接确认</p></div><div class="head-tools"><el-tag :type="shareCenterStatus.enabled ? 'success' : 'info'" size="small">{{ shareCenterStatus.enabled ? '新链已启用' : '旧链兼容模式' }}</el-tag><el-button size="small" type="primary" :loading="runningQueue" @click="shareRunCycle">跑一轮分享</el-button></div></div>
+          <!-- 总览（设计文档 §4.8）：三类队列积压 + 当前有效分享 + 各状态计数 -->
+          <div class="task-grid" style="margin-bottom:16px">
+            <div class="task-card"><div class="task-num">{{ shareQueueCounts.fresh || 0 }}</div><div class="task-label">全新资源</div></div>
+            <div class="task-card"><div class="task-num">{{ shareQueueCounts.stock || 0 }}</div><div class="task-label">存量资源</div></div>
+            <div class="task-card"><div class="task-num">{{ shareQueueCounts.followup || 0 }}</div><div class="task-label">追更资源</div></div>
+            <div class="task-card"><div class="task-num">{{ (shareCenterStatus.share_records || {}).current || 0 }}</div><div class="task-label">当前有效分享</div></div>
+          </div>
           <div class="panel" style="margin-bottom:16px">
-            <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个分享任务；更新生成独立任务并复用原链接。状态：planned→ready→submitted→accepted→published</span></div>
-            <el-table :data="shareCenterTasks" stripe max-height="480">
+            <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个有效分享；更新生成独立任务复用原链接；状态 planned→ready→submitted→accepted→published</span></div>
+            <el-radio-group v-model="shareQueueFilter" size="small" style="margin-bottom:12px">
+              <el-radio-button label="all">全部 {{ shareCenterTasks.length }}</el-radio-button>
+              <el-radio-button label="fresh">全新 {{ shareQueueCounts.fresh || 0 }}</el-radio-button>
+              <el-radio-button label="stock">存量 {{ shareQueueCounts.stock || 0 }}</el-radio-button>
+              <el-radio-button label="followup">追更 {{ shareQueueCounts.followup || 0 }}</el-radio-button>
+            </el-radio-group>
+            <el-table :data="shareFilteredTasks" stripe max-height="480">
               <el-table-column prop="id" label="ID" width="70"/>
-              <el-table-column prop="work_key" label="作品" min-width="160" show-overflow-tooltip/>
+              <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
+              <el-table-column prop="queue_type" label="队列" width="90"><template #default="s"><el-tag size="small" :type="s.row.queue_type === 'followup' ? 'primary' : (s.row.queue_type === 'stock' ? 'warning' : 'info')">{{ s.row.queue_type || 'fresh' }}</el-tag></template></el-table-column>
               <el-table-column prop="kind" label="类型" width="90"><template #default="s"><el-tag size="small" :type="s.row.kind === 'force' ? 'warning' : (s.row.kind === 'update' ? 'primary' : 'info')">{{ s.row.kind }}</el-tag></template></el-table-column>
               <el-table-column prop="status" label="状态" width="120"><template #default="s"><span class="status-tag">{{ s.row.status }}</span></template></el-table-column>
               <el-table-column prop="parent_task_id" label="追更自" width="90"><template #default="s">{{ s.row.parent_task_id || '—' }}</template></el-table-column>
-              <el-table-column prop="share_url" label="分享链接" min-width="200" show-overflow-tooltip/>
+              <el-table-column prop="share_url" label="分享链接" min-width="180" show-overflow-tooltip/>
               <el-table-column prop="attempts" label="尝试" width="70"/>
               <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip/>
               <el-table-column label="操作" width="90"><template #default="s"><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
             </el-table>
-            <div v-if="!shareCenterTasks.length" class="empty">暂无分享任务（识别入库后自动生成）</div>
+            <div v-if="!shareFilteredTasks.length" class="empty">该队列暂无分享任务（识别入库后自动生成）</div>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>推送队列</h3><span class="hint">分发中心消费队列；失败项按指数退避自动重试，可手动重置</span></div>

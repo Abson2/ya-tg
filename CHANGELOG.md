@@ -8,6 +8,36 @@
 
 ---
 
+## v1.1.0 (2026-11-20)
+
+按《四大模块重构开发设计与实施任务书》**100% 落地主链**：v1.0.0 只是「界面改名 + 影子登记 + 默认关闭」，本版推翻灰度模式，让分享中心真正接管发布主链，并修复真机 P0。用户已清空历史影视数据，本版不兼容旧灰度状态，升级后走全新机制。
+
+### 真机 P0 修复
+- **SQLite `database is locked` 根治**：`mirror.py` 英文名解析原在同一 Session 先 SELECT 建读快照、`await` TMDB/AI 网络、再 UPDATE 升级写事务，快照过期触发 `SQLITE_BUSY_SNAPSHOT`。改为网络 `await` 前 `commit()` 释放读事务，最终写入走 `_persist_english_title()`：独立短 Session + Core `UPDATE` + 8 次写锁退避重试，成功后回刷调用方 ORM 对象。
+- **「先复制后批量改名」提速**：复制与改名彻底分阶段，`sync_rule()` 只负责 A→B 复制，英文名解析/批量改名在复制完成后的独立阶段执行，消除「边复制边改」观感与串行慢速。
+- **strict skip/cancel 落库**：`mirror_batch.mark_sequence_status()` / `cancel_remaining()` 让暂停/跳过/取消在序列任务表留终态，不再只改统计。
+
+### 四模块主链接管（默认启用）
+- **`share_center_enabled` 默认 `true`**：分享中心从影子模式转为发布主链。生产者（`_enqueue_ready` / `process_change_events` / `publish_resource`）与消费者（publisher）全部走新链，任务接收确认 `submitted→accepted` 原子领取保留。
+- **真相源 `share_records` 表**：同一 `work_key` 仅一条 `current_flag=1`（部分唯一索引），历史记录可保留多条；追更/恢复优先复用当前分享记录，不重复建分享。
+- **三类队列**：`stock` 存量 / `fresh` 全新 / `followup` 追更，`ShareTask.queue_type` 归属 + 前端三队列筛选与总览卡片。
+- **发布门禁与配额**：`can_publish()` 校验资源存在/识别状态/海报/追更原分享有效性/当日配额；配额按队列读 `stock|fresh|followup_daily_quota` 与 `push_daily_limit`；`force` 手动强推绕过海报门禁保持既有语义。
+- **分享失败降级**：建分享失败不阻断推送，任务置 `ready` + 空链接仍提交分发中心，分享与推送彻底解耦。
+- **事件总线 `events.py`**：新增 `mirror_events` / `resource_events` 持久化表，幂等生产/消费（MIRROR_COMPLETED/UPDATED/RESTORED/DELETED/FAILED、RESOURCE_NEW/EPISODE_ADDED/FILE_UPDATED/REMOVED/RESTORED）；`share_center` 后台 job 5s 一轮，`consume_resource_events()` 驱动下游刷新。
+- **publisher 自驱动**：`process_queue` 内主动 `consume_resource_events()` + `run_cycle()`，「立即推送」不依赖定时 job 也能走新链。
+
+### 两条锁定业务规则闭环
+- **规则1 追更复用原链接**：`update/restore` 为独立 `ShareTask`（含 `parent_task_id`/`parent_event_id`），`share_url` 复用当前有效分享记录，不重建分享但再次推送。
+- **规则2 B 库删除闭环**：`_reconcile_library` 对账删除时 `delete_share` + 取消 active ShareTask + `retire_share_record()` + 产 `RESOURCE_REMOVED`；A 库仍存在则镜像补齐 B 库，重新入库 `_enqueue_ready` 复活 cancelled first 任务重建分享推送。
+
+### API / 前端
+- 新增 `/api/share/center/status`（原 `/api/share/status` 与光鸭会话状态冲突已改名）返回 `counts`/`queues`/`share_records`；`/api/share/tasks` 返回 `queue_type`。
+- 前端分享中心上移，加全新/存量/追更/有效分享四总览卡 + 三队列筛选；分页与状态周结合并。
+
+### 验证与状态
+- 全量 pytest **769 passed**；新增 `tests/test_v110_four_module_mainchain.py` 10 项（写锁独立 Session、三队列、ShareRecord 单例、门禁配额、追更复用、B库删除作废、cancelled 复活、事件幂等）；前端 build 通过。
+- 升级前请备份 `./db` 与 `./logs`；回滚见 `ROLLBACK.md`（可切回 `IMAGE_TAG=v1.0.0`）。真机验收见 `VERIFICATION_CHECKLIST.md`。
+
 ## v1.0.0 (2026-11-20)
 
 重大版本：从 v0.9.20 跨越式升级，合并「全项目整改（阶段一~七）」+「四模块重构」两批改动。所有高风险变更均为**可选/默认关闭**，灰度开关保证生产行为与 v0.9.20 一致。

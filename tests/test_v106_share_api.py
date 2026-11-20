@@ -31,7 +31,7 @@ def test_share_center_status_route_contract():
             assert r.status_code == 200
             body = r.json()
             assert "enabled" in body and "counts" in body, f"路由冲突回归：{body}"
-            assert body["enabled"] is False, "灰度默认应关闭"
+            assert body["enabled"] is True, "v1.1 分享中心默认接管主链"
             # 旧端点：光鸭分享会话状态，保持原结构不被覆盖
             r = await c.get("/api/share/status", headers=h)
             assert r.status_code == 200

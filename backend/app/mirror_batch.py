@@ -111,6 +111,46 @@ def add_sequence_task(db: Session, *, rule_id: int, media_id: int,
     return task
 
 
+def mark_sequence_status(db: Session, batch_id: str, sequence_id: int,
+                         status: str, *, error: str = "") -> MirrorTask | None:
+    """把指定序列任务落成终态（skip/cancel 用），带终态时间。
+
+    sequence_id 可能尚无任务行（skip 发生在 add_sequence_task 之前），此时
+    现场补一条 skipped/cancelled 占位行，保证任务序列完整可追溯、进度统计准确。
+    """
+    task = db.scalar(select(MirrorTask).where(
+        MirrorTask.batch_id == batch_id,
+        MirrorTask.sequence_id == sequence_id).limit(1))
+    if task is None:
+        task = MirrorTask(
+            rule_id=0, media_id=0, task_id="", status=status,
+            task_status=status, batch_id=batch_id, sequence_id=sequence_id,
+            parent_sequence_id=0, retry_count=0, error=error or f"{status} by control",
+            finished_at=utcnow())
+        db.add(task)
+    else:
+        task.task_status = status
+        task.status = status
+        task.finished_at = utcnow()
+        if error:
+            task.error = error[:1000]
+    db.commit()
+    return task
+
+
+def cancel_remaining(db: Session, batch_id: str) -> int:
+    """批次取消：把该批次所有未终结序列任务标 cancelled，返回取消条数。"""
+    pending = pending_sequences(db, batch_id)
+    now = utcnow()
+    for t in pending:
+        t.task_status = "cancelled"
+        t.status = "cancelled"
+        t.finished_at = now
+    if pending:
+        db.commit()
+    return len(pending)
+
+
 def sequence_tasks(db: Session, batch_id: str) -> list[MirrorTask]:
     """按 sequence_id 升序返回某批次全部任务。"""
     return list(db.scalars(select(MirrorTask).where(

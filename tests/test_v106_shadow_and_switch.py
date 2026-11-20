@@ -1,11 +1,11 @@
-"""四模块重构 阶段B：影子登记 + 灰度开关护栏。
+"""四模块重构：分享中心登记 + 主链开关护栏。
 
 覆盖：
-  - 灰度开关默认关闭（空/未知值），is_enabled=False；true/1/yes/on 开启；
-  - _enqueue_ready 入队后影子登记 ShareTask（first），QueueItem.share_task_id 回填；
-  - 影子登记异常不影响主入队链（注入 ensure_task 抛错，QueueItem 仍写入）；
-  - process_change_events 更新事件登记 update 影子任务，ev.share_task_id 回填；
-  - 双写期 QueueItem.status 仍是 pending/review（旧链行为不变，零回归）。
+  - v1.1 主链默认开启 is_enabled=True；false/no 可回退旧链排障；
+  - _enqueue_ready 入队后登记 ShareTask（first），QueueItem.share_task_id 回填；
+  - 登记异常不影响主入队链（注入 ensure_task 抛错，QueueItem 仍写入）；
+  - process_change_events 更新事件登记 update 任务，ev.share_task_id 回填；
+  - review（auto_publish=False）项不登记分享任务，绕过审核闸门属违规。
 """
 import os
 import shutil
@@ -53,16 +53,19 @@ def _seed(db):
     return res, rule, ch
 
 
-def test_switch_defaults_off(env):
+def test_switch_defaults_on(env):
     from app import share_center as sc
     S, _, rc = env
     with S() as db:
-        assert sc.is_enabled(db) is False
+        # v1.1：分享中心默认接管主链
+        assert sc.is_enabled(db) is True
         rc.set_many(db, {"share_center_enabled": "true"})
         assert sc.is_enabled(db) is True
         rc.set_many(db, {"share_center_enabled": "1"})
         assert sc.is_enabled(db) is True
         rc.set_many(db, {"share_center_enabled": "no"})
+        assert sc.is_enabled(db) is False
+        rc.set_many(db, {"share_center_enabled": "false"})
         assert sc.is_enabled(db) is False
 
 
@@ -93,6 +96,23 @@ def test_shadow_failure_does_not_break_enqueue(env, monkeypatch):
         res, rule, ch = _seed(db)
         assert main._enqueue_ready(db, res, rule) is True
         assert db.scalar(select(QueueItem).where(QueueItem.resource_id == res.id)) is not None
+
+
+def test_review_item_not_registered(env):
+    """auto_publish=False 的 review 项不得登记分享任务，避免绕过人工审核闸门。"""
+    from app import main
+    from app.models import QueueItem, Rule, ShareTask
+    S, _, _ = env
+    with S() as db:
+        res, _, _ = _seed(db)
+        rule = db.scalars(select(Rule).limit(1)).first()
+        rule.auto_publish = False
+        db.commit()
+        assert main._enqueue_ready(db, res, rule) is True
+        q = db.scalar(select(QueueItem).where(QueueItem.resource_id == res.id))
+        assert q is not None and q.status == "review"
+        assert not q.share_task_id
+        assert db.scalar(select(ShareTask).where(ShareTask.resource_id == res.id)) is None
 
 
 def test_change_event_registers_update_task(env):

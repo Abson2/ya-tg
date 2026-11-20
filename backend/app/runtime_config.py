@@ -115,8 +115,15 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tg_group_link": ("tg_group_link", ""),
     # v0.9.10：推送消息正文里的机器人跳转文字链接（指向推送 Bot 本身），留空则不显示
     "tg_bot_link": ("tg_bot_link", ""),
-    # 四模块重构：分享中心灰度开关（默认 false=走旧链，零回归；true=分享中心交接生效）
-    "share_center_enabled": ("share_center_enabled", "false"),
+    # 四模块重构：分享中心主链开关。v1.1 起默认 true=分享中心真正接管主链
+    # （建分享→提交→原子领取→只读链接发送→回执）；设 false 可临时回退旧链排障。
+    "share_center_enabled": ("share_center_enabled", "true"),
+    # 发布配额（设计文档 §4.6）：三队列每小时/每日上限，后台可配，0=不限。
+    "share_daily_limit": ("share_daily_limit", "0"),
+    "push_daily_limit": ("push_daily_limit", "0"),
+    "stock_daily_quota": ("stock_daily_quota", "0"),
+    "fresh_daily_quota": ("fresh_daily_quota", "0"),
+    "followup_daily_quota": ("followup_daily_quota", "0"),
 }
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import logging
 import re
 from datetime import timedelta
 
@@ -20,6 +21,7 @@ from .utils import (backoff_seconds, is_video_file, parse_media_name, parse_tech
 
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
+logger = logging.getLogger(__name__)
 
 
 def human_size(size: int) -> str:
@@ -399,18 +401,37 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                 or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
             ).order_by(QueueItem.id).limit(limit)
         ).all())
-        # 四模块重构 阶段C：分享中心交接确认（灰度开关开启时生效）。
-        # 开关关闭：rows 原样处理（旧链零回归）。开关开启：只处理已被分享中心领取
-        # （status_ext=accepted）的队列项，未交接的留下一轮，杜绝「未确认就发送」。
+        # 四模块重构：分享中心主链接收确认（v1.1 默认开启）。
+        # 开关关闭：rows 原样处理（旧链排障用）。开关开启：
+        #   ① 先原子领取 submitted→accepted；
+        #   ② 对「分享中心管理的项」（share_task_id>0）只处理已 accepted 的，未交接留下一轮，
+        #      杜绝「未确认就发送」（强制项4）；
+        #   ③ 对「非分享中心项」（share_task_id=0，如人工审核后放行、历史残留、临时回退期
+        #      直接入队的项）照常处理走 ensure_share 旧路径，避免漏发——这些项不属分享中心，
+        #      不受交接确认约束。数据已清空的新部署下几乎全是①，③只是稳健兜底。
         from . import share_center as _sc
         sc_enabled = _sc.is_enabled(db)
         if sc_enabled:
-            claimed = _sc.claim_tasks(db, worker="publisher", limit=limit)
-            accepted_ids = set()
-            for q in rows:
-                if q.status_ext == _sc.ST_ACCEPTED:
-                    accepted_ids.add(q.id)
-            rows = [q for q in rows if q.id in accepted_ids]
+            # 先消费资源事件 + 自己驱动一轮建分享/提交，不依赖独立 5s job 的时序：
+            # 「立即处理队列」/手动 queue/run 必须也能把 planned 任务推到 submitted，
+            # 否则入队项 status_ext 为空会一直卡住不被本函数消费（真机漏发风险）。
+            try:
+                _sc.consume_resource_events(db, limit=100)
+                await _sc.run_cycle(db, limit=max(limit, 20))
+            except Exception as exc:
+                db.rollback()
+                logger.exception("[publisher] 分享中心提交周期异常")
+            # 重新读取 rows（run_cycle 可能刚新建/重置了队列项的 status_ext）
+            rows = list(db.scalars(
+                select(QueueItem).where(
+                    or_(QueueItem.status == "pending", QueueItem.status == "retry"),
+                    or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
+                ).order_by(QueueItem.id).limit(limit)
+            ).all())
+            _sc.claim_tasks(db, worker="publisher", limit=limit)
+            rows = [q for q in rows
+                    if (q.share_task_id and q.status_ext == _sc.ST_ACCEPTED)
+                    or not q.share_task_id]
         # v0.9.11.1：一次性预构建「本轮涉及频道」的 sent 作品键映射，消除原逐条
         # O(N·M) 全表反查（每条 pending 都按 channel_id 扫全部 sent，再逐条
         # db.get(Resource) + 算键）。作品键 _work_group_key 只依赖 share_dir_id /

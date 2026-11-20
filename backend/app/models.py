@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Float, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Float, Text, ForeignKey, UniqueConstraint, Index, column
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -588,6 +588,82 @@ class ShareTask(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
+    # 三类资源队列（设计文档 §4.2）：stock(存量) / fresh(全新) / followup(追更)。
+    # 与 kind 解耦：kind 描述动作，queue_type 描述队列归属与配额统计口径。
+    queue_type: Mapped[str] = mapped_column(String(16), default="fresh", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("dedup_key", name="uq_share_task_dedup"),)
+
+
+class ShareRecord(Base):
+    """当前及历史分享记录（设计文档 §4.3）——一部资源同一时刻仅一条 current_flag=1。
+
+    与 ShareTask 分工：ShareTask 是「一次建分享+推送」的动作生命周期；ShareRecord 是
+    「资源 → 有效分享链接」的真相源，追更/恢复直接读 current 记录复用链接。
+    """
+    __tablename__ = "share_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    resource_id: Mapped[int] = mapped_column(Integer, default=0)
+    resource_type: Mapped[str] = mapped_column(String(16), default="")
+    share_dir_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    share_id: Mapped[str] = mapped_column(String(64), default="")
+    share_url: Mapped[str] = mapped_column(Text, default="")
+    share_status: Mapped[str] = mapped_column(String(24), default="active")
+    current_flag: Mapped[int] = mapped_column(Integer, default=1, index=True)  # 1=当前有效
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_reason: Mapped[str] = mapped_column(Text, default="")
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 部分唯一索引：同一 work_key 只允许一条 current_flag=1；历史(current_flag=0)可保留多条。
+    __table_args__ = (
+        Index("uq_share_record_current", "work_key", unique=True,
+              sqlite_where=(column("current_flag") == 1)),
+    )
+
+
+# ============================================================================
+# 四模块重构 阶段A：模块间内部事件表（设计文档 §3.3 / §4.3 / §7）
+# 单向数据流：镜像同步 → mirror_events → 资源库 → resource_events → 分享中心。
+# 生产者在自己事务内落事件并 commit；消费者幂等处理（幂等键唯一 + consumed_at）。
+# 事件保留不删，可重放、可追溯。
+# ============================================================================
+
+class MirrorEvent(Base):
+    """镜像同步完成的作品到位事件（镜像同步 → 资源库）。
+
+    scope: new(本轮新同步) / restored(A 库补齐 B 库)。
+    idem_key 唯一：rule_id + batch_id + work_key，避免同一批次重复落事件。
+    """
+    __tablename__ = "mirror_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    idem_key: Mapped[str] = mapped_column(String(256), default="", unique=True, index=True)
+    rule_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    batch_id: Mapped[str] = mapped_column(String(64), default="")
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    title_standard: Mapped[str] = mapped_column(String(512), default="")
+    media_id: Mapped[int] = mapped_column(Integer, default=0)  # MirrorMedia.id
+    b_file_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON: B 库 fileId 清单
+    dir_hints: Mapped[str] = mapped_column(Text, default="{}")   # JSON: B 库目录线索
+    scope: Mapped[str] = mapped_column(String(16), default="new")
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ResourceEvent(Base):
+    """资源库状态变化事件（资源库 → 分享中心）。
+
+    type: identified / updated / removed / restored（设计文档 §7）。
+    idem_key 唯一：type + resource_id + fingerprint/work_key，消费者幂等。
+    """
+    __tablename__ = "resource_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    idem_key: Mapped[str] = mapped_column(String(256), default="", unique=True, index=True)
+    type: Mapped[str] = mapped_column(String(16), default="identified", index=True)
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    resource_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")  # share_dir_id / B fileId / 海报 / 旧 share 等
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
