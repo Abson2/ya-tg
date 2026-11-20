@@ -43,6 +43,24 @@ import logging
 import re
 import time
 
+# v0.9.21：镜像锁进度心跳钩子。默认 no-op；main.py 在 lifespan 注入
+# `_mirror_lock.heartbeat`，让长复制/改名轮询每轮证明「还在进展」。这里不 import
+# main，避免循环依赖；钩子失败绝不影响复制主链路。
+_progress_heartbeat = None
+
+
+def set_progress_heartbeat(fn) -> None:
+    global _progress_heartbeat
+    _progress_heartbeat = fn
+
+
+def _beat() -> None:
+    if _progress_heartbeat is not None:
+        try:
+            _progress_heartbeat()
+        except Exception:
+            pass  # 心跳是辅助诊断，绝不阻断同步
+
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -356,6 +374,7 @@ async def _poll_tasks_batch(api: GuangYaWebFiles, tasks: list[tuple[MirrorTask, 
     for i in range(max_polls):
         if i:
             await asyncio.sleep(interval)
+        _beat()  # v0.9.21：每轮轮询打点，长剧复制持续推进不会被误判为卡死
         still = []
         for task in pending:
             try:
@@ -942,6 +961,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         for idx, (row, source_fid, target_parent) in enumerate(copy_jobs):
             if idx:
                 await asyncio.sleep(idle)
+            _beat()  # v0.9.21：逐文件复制推进打点
             try:
                 task_id = await api.copy_file([source_fid], target_parent)
             except Exception as exc:
@@ -1390,6 +1410,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
             fid_to_norm.setdefault(str(v), k)
         first = True
         for idx, row in enumerate(rows):
+            _beat()  # v0.9.21：逐个文件改名推进打点，长剧批量改名不被误判卡死
             fname = str(row.file_name or "")
             # v0.8.9：预算与熔断。已达标跳过不消耗「尝试次数」，保证下轮能
             # 快速跳过已改名的文件、把预算留给真正还没改的那部分。

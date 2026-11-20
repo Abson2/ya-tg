@@ -8,6 +8,24 @@
 
 ---
 
+## v0.9.21 (2026-11-20)
+
+镜像同步卡死 / 英文名改不动的**根因修复与自愈加固**（源码验证阶段，未升版）。针对真机「新济公活佛尚未解析到英文剧名、148 个僵尸任务、改名端点 409」的诊断，逐条核对代码后**只修确实成立的 3 项**，纠正 1 项过时诊断，明确 2 项不动。
+
+### 诊断核对（不盲从）
+- **P0-1 token 快照竞态 code=117 — 诊断基于旧代码，当前已免疫，不改**。`guangya.py` 在 v0.9.15 #267 已实现：`_fresh_headers()` 每次请求用独立短会话从 DB 读最新 token（绕开 ORM identity map 缓存）、`headers` 改动态 property、遇 117 强制 refresh 重试一次；`create_dir`/`copy_file`/`rename_file` 全走 `_post_web`（每请求重建 header + 117 刷新），`list_files` 同样。用户建议的两种修法**正是现有实现**。148 个僵尸任务与 117 无当前代码因果，按僵尸自愈处理。
+- **不建议动的两项 — 保持**：英文名解析链路（缓存→Resource→TMDB→AI→拼音四层兜底、6s/10s 硬超时、单作品只解析一次）实测三部剧均出英文，健壮；「按名+大小回填 fileId」设计正确（真实 HAR 证实复制响应不回传副本 ID）。
+
+### 修复（3 项）
+- **P0-2 镜像锁加进度心跳**：`_TimedMirrorLock` 的 `STALE_SECONDS` 语义从「持有起点」改为「距最后心跳」；新增 `heartbeat()`，长任务在复制/改名/轮询推进阶段打点，超过阈值无进展才判残留接管。`info()` 保留 `held_seconds`（前端契约不变）并新增 `idle_seconds`。**附带修正原并发 bug**：残留回收分支旧实现先 `release()` 再覆盖 owner，导致锁实际 unlocked、新持有者不互斥、`info()` 空 owner、finally release 抛 RuntimeError；改为直接覆盖状态接管、保持 locked。心跳经 `mirror.set_progress_heartbeat()` 注入，避免循环依赖。
+- **P1-3 僵尸任务自愈**：新增 `reap_stale_mirror_tasks(db, stale_minutes)` + 后台 job `_job_mirror_task_reap`（每 5 分钟），把超过 30 分钟仍未终结的 `pending/running/unknown` 复制任务标 failed 并写明原因、回填 finished_at；镜像锁正被占用时跳过本轮避免误伤；幂等。
+- **P1-4 报错文案区分状态**：新增纯函数 `untranslated_reason(lock_info, tmdb_ok, ai_ok)`，待翻译项原因按「被镜像任务占用（带 owner + held/idle 秒）> 配置缺失 > 部分配置 > 配置正常待重跑」分级，不再一律甩锅「补齐 TMDB/AI 配置」把排查带偏。
+
+### 验证
+- 新增 `tests/test_v0921_mirror_lock_and_zombie.py` 8 项（心跳防误收 / 无心跳回收 / 未持锁打点 / 僵尸标 failed / 未超时不误伤 / 幂等 / pending+unknown 覆盖 / 文案四态 + 诊断静态检查）。
+- 全量 pytest **614 passed，1 warning**；专项与 v0.9.6 锁回归 20 passed。前端未改动。
+- **状态**：源码验证阶段（commit `[skip ci]`，未升版未打 tag），等待用户真机验证 / 发版指令。
+
 ## v0.9.20 (2026-11-20)
 
 管理后台登录安全：**修复「浏览器永久明文保存管理员密码、永不失效」的风险**，改为会话 token 登录 + 未活跃自动过期。用户选择 2 小时未活跃有效期、浏览器只存 token 不存明文密码。

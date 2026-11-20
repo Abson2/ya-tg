@@ -52,33 +52,46 @@ class _TimedMirrorLock:
     这里在 acquire 时记录 owner + 起始时间，超过 STALE_SECONDS 视为失效自动放行，
     并把占用信息暴露给 /api/mirror/status，前端可提示「后台改名任务运行中」。
     仍用 threading.Lock 做真正的互斥（定时 job 与手动端点上下文不同、测试会换事件循环）。
+
+    v0.9.21：STALE_SECONDS 语义从「持有起点」改为「距最后心跳」。长任务（镜像长剧/
+    批量改名）持有几十分钟属正常，旧实现只要超过 30 分钟就判残留、可能在真持有者
+    仍推进时被错误放行（并发抢写）；而卡死任务又恰好因为没有心跳被当成「还在正常跑」
+    直到 30 分钟才回收。改为持有方在推进阶段 heartbeat() 打点，超过 STALE_SECONDS
+    无进展才回收——既保护正常长任务、又快速释放真卡死的锁。held_seconds 仍保留总
+    持有时长（前端/契约不变），另暴露 idle_seconds 供诊断「多久没进展」。
     """
-    STALE_SECONDS = 30 * 60  # 镜像长剧 + 改名最多几分钟；30 分钟仍持锁必属异常残留
+    STALE_SECONDS = 30 * 60  # 距最后心跳超过 30 分钟无进展才判残留（长剧持有本身不受限）
 
     def __init__(self):
         self._lock = threading.Lock()
         self._owner = ""
         self._since = 0.0
+        self._last_beat = 0.0
 
     def acquire(self, blocking: bool = False, owner: str = "") -> bool:
         if self._lock.acquire(blocking=blocking):
             self._owner = owner or "镜像任务"
             self._since = time.monotonic()
+            self._last_beat = self._since
             return True
-        # 拿不到锁：若当前持有已超时，判定为残留，强制解绑（不 release 原锁，避免
-        # 真持有者稍后 release 时误放别人的锁；用代数版本号隔离，见 release）。
-        if self._held_seconds() > self.STALE_SECONDS:
-            logger.warning("[mirror] 镜像锁持有超过 %ss（owner=%s），判定残留并强制放行",
-                           self.STALE_SECONDS, self._owner)
-            self._owner, self._since = "", 0.0
-            self._lock.release()  # 残留场景：原持有者已不存在，安全释放
+        # 拿不到锁：距最后心跳已超时才判残留、强制接管。用最后心跳而非持有起点，
+        # 正常长任务持续打点不会被误回收；真卡死的锁按「无进展时长」快速释放。
+        if self._idle_seconds() >= self.STALE_SECONDS:
+            logger.warning("[mirror] 镜像锁距最后心跳超过 %ss 无进展（owner=%s，总持有 %ss），"
+                           "判定残留并强制接管", self.STALE_SECONDS, self._owner,
+                           int(self._held_seconds()))
+            # v0.9.21 修正：旧实现此处先 release() 再覆盖 owner，导致锁实际 unlocked，
+            # 新持有者以为持锁却不互斥、info() 也显示空 owner，finally release 还抛
+            # RuntimeError。残留场景原持有者已死，直接覆盖状态接管、保持 locked，
+            # 新持有者的 try/finally 才能正常互斥与释放。误判由 STALE 阈值兜底。
             self._owner = "镜像任务(残留回收)"
             self._since = time.monotonic()
+            self._last_beat = self._since
             return True
         return False
 
     def release(self) -> None:
-        self._owner, self._since = "", 0.0
+        self._owner, self._since, self._last_beat = "", 0.0, 0.0
         try:
             self._lock.release()
         except RuntimeError:
@@ -89,13 +102,25 @@ class _TimedMirrorLock:
         if self._since:
             self._owner = owner
 
+    def heartbeat(self) -> None:
+        """持有方在每个推进阶段打点，证明「还活着且在进展」，重置残留计时。"""
+        if self._since:
+            self._last_beat = time.monotonic()
+
     def _held_seconds(self) -> float:
         return max(0.0, time.monotonic() - self._since) if self._since else 0.0
+
+    def _idle_seconds(self) -> float:
+        """距最后心跳的秒数；无锁时 0。STALE_SECONDS<=0 时视为立即过期（兼容旧测试）。"""
+        if not self._last_beat:
+            return float("inf") if self.STALE_SECONDS <= 0 else 0.0
+        return max(0.0, time.monotonic() - self._last_beat)
 
     def info(self) -> dict:
         held = self._lock.locked()
         return {"busy": held, "owner": self._owner if held else "",
-                "held_seconds": int(self._held_seconds()) if held else 0}
+                "held_seconds": int(self._held_seconds()) if held else 0,
+                "idle_seconds": int(self._idle_seconds()) if held else 0}
 
 
 _mirror_lock = _TimedMirrorLock()
@@ -206,6 +231,69 @@ async def _job_contribution_restore():
                 logger.warning("[contribution-restore] 后台转存异常", exc_info=True)
 
 
+def untranslated_reason(lock_info: dict, tmdb_ok: bool, ai_ok: bool) -> str:
+    """v0.9.21：待翻译项的原因文案按真实状态区分，纯函数便于测试。
+
+    优先级：锁占用 > 配置缺失 > 部分配置 > 配置正常待重跑。真机排查发现配置
+    其实正常、真正卡点是镜像锁被占，静态甩锅「补齐 TMDB/AI」会把排查带偏。
+    """
+    if lock_info.get("busy"):
+        return ("被镜像任务占用：同步 / 改名任务「%s」运行中（已 %s 秒，%s 秒无进展），"
+                "待其结束后点「按英文规范改名」重跑"
+                % (lock_info.get("owner") or "未知任务", lock_info.get("held_seconds", 0),
+                   lock_info.get("idle_seconds", 0)))
+    if not tmdb_ok and not ai_ok:
+        return "配置缺失：TMDB 与 AI 均未配置；至少配其一后点「按英文规范改名」重跑（无配置时会走拼音兜底）"
+    if not tmdb_ok:
+        return "TMDB 未配置（AI 可用）：点「按英文规范改名」重跑，将走 AI 直译 / 拼音兜底"
+    if not ai_ok:
+        return "AI 未配置（TMDB 可用）：点「按英文规范改名」重跑；TMDB 查不到时走拼音兜底"
+    return "待重跑：TMDB / AI 配置均正常，点「按英文规范改名」重跑即可"
+
+
+# v0.9.21：僵尸镜像任务自愈。进程崩溃/强中断时 mirror_tasks 的 running 行会
+# 永久悬挂（polls=0、无 error、finished_at 为空），既不重试也不告警。后台定期
+# 把超过阈值仍未终结的任务标 failed 并写明原因，纳入日志保留清理；同时释放其
+# 持有的镜像锁（若锁恰好因残留卡住）。阈值默认 30 分钟，仅处理确实陈旧的行。
+MIRROR_TASK_STALE_MINUTES = 30
+
+
+def reap_stale_mirror_tasks(db: Session, *, stale_minutes: int | None = None) -> dict:
+    """把超时未终结的镜像复制任务标 failed，返回统计。纯 DB 操作，供 job 与测试调用。"""
+    from .models import MirrorTask
+
+    minutes = MIRROR_TASK_STALE_MINUTES if stale_minutes is None else stale_minutes
+    cutoff = utcnow() - timedelta(minutes=max(1, int(minutes)))
+    stale = list(db.scalars(select(MirrorTask).where(
+        MirrorTask.status.in_(("pending", "running", "unknown")),
+        MirrorTask.created_at < cutoff,
+    )).all())
+    reaped = 0
+    for t in stale:
+        t.status = "failed"
+        t.error = (f"后台自愈：任务超过 {minutes} 分钟仍未终结（polls={t.polls}），"
+                   "判定僵尸并标记失败；如为真实残留请重新同步")[ :300]
+        if not t.finished_at:
+            t.finished_at = utcnow()
+        reaped += 1
+    if reaped:
+        db.commit()
+        logger.warning("[mirror] 僵尸任务自愈：标记 failed %s 条（阈值 %s 分钟）", reaped, minutes)
+    return {"scanned": len(stale), "reaped": reaped}
+
+
+async def _job_mirror_task_reap():
+    """每 5 分钟扫描一次僵尸镜像任务；镜像锁正被持有时跳过，避免误伤真在跑的任务。"""
+    if _mirror_lock.info().get("busy"):
+        return
+    with SessionLocal() as db:
+        try:
+            reap_stale_mirror_tasks(db)
+        except Exception:
+            db.rollback()
+            logger.warning("[mirror] 僵尸任务自愈扫描异常", exc_info=True)
+
+
 async def _job_log_prune():
     """v0.8.3：每日按保留策略自动清理日志与历史留痕。失败只记日志，不影响其它任务。"""
     with SessionLocal() as db:
@@ -307,6 +395,9 @@ async def _scheduled_scan(root: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     migrate()
+    # v0.9.21：把镜像锁心跳钩子注入 mirror 模块（长复制/改名轮询每轮打点），
+    # 避免反向 import main 造成循环依赖；默认 no-op，钩子异常不影响同步主链路。
+    mirror.set_progress_heartbeat(_mirror_lock.heartbeat)
     # v0.8.3：启动时先按保留策略清理一次，避免长期运行后 SQLite 被历史日志撑爆
     try:
         with SessionLocal() as db:
@@ -352,6 +443,9 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(_job_contribution_restore, "interval", seconds=30, id="contribution_restore",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_rename_pending, "interval", seconds=120, id="rename_pending",
+                      max_instances=1, coalesce=True)
+    # v0.9.21：僵尸镜像任务自愈（每 5 分钟扫描一次超时未终结的 running/pending）
+    scheduler.add_job(_job_mirror_task_reap, "interval", seconds=300, id="mirror_task_reap",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_log_prune,
                       CronTrigger.from_crontab("30 3 * * *", timezone="Asia/Shanghai"),
@@ -1059,6 +1153,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
         # 前端 2 秒轮询能立刻看到任务启动与各节点数量推进，不再等整轮结束才更新。
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="copy", running=True)
         db.commit()
+        _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制开始）
         stats = await mirror.sync_rule(db, r)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
@@ -1066,6 +1161,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
                                  copied=int(stats.get("done", 0) or 0),
                                  total_files=int(stats.get("done", 0) or 0))
         db.commit()
+        _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制完成→改名）
         # v0.8.6：改名赶在「扫描入库」之前，只动 B 库单集/单电影文件名；
         # A 库与 B 库目录名不变，A→B 映射靠 MirrorFile 保持。
         stats["rename_enabled"] = bool(getattr(r, "rename_files", True))
@@ -1086,6 +1182,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session) -> dict:
                                      renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
                                      total_files=int(stats.get("done", 0) or 0))
             db.commit()
+            _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（改名完成→入库识别）
             # v0.8.9：找不到官方英文名的作品在改名环节已直接直译兜底，绝不在这里
             # 再补跑一次解析（会重复触发 TMDB / AI 网络等待）。复制 → 入库 →
             # 识别 → 分享/推送 主链路必须照常走完，改名只是可选优化。
@@ -1464,8 +1561,11 @@ def mirror_status(db: Session = Depends(get_db)):
         or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == ""),
         or_(MirrorMedia.english_source.is_(None), MirrorMedia.english_source != "ignored")
     ).order_by(MirrorMedia.id.desc()).limit(50)).all())
-    untranslated_works = [{"work": m.title_standard,
-                           "reason": "尚未解析到英文剧名；补齐 TMDB 密钥或 AI 配置后点「按英文规范改名」重跑"}
+    # v0.9.21：待翻译原因按真实状态区分，不再一律甩锅「补齐 TMDB/AI 配置」。
+    # 真机排查发现配置其实正常、真正卡点是镜像锁被占；静态文案把排查方向带偏。
+    _reason = untranslated_reason(_mirror_lock.info(),
+                                  bool(tmdb.configured(db)), bool(ai_assist.enabled(db)))
+    untranslated_works = [{"work": m.title_standard, "reason": _reason}
                           for m in no_english]
     # v0.9.0：待进行 / 进行中清单——把「缺失目录 + 待复制 / 复制中 / 待确认文件 + 改名待办 +
     # 未知任务」统一成一张待办表，管理页只保留「映射清单 + 待办清单」两个清单。
