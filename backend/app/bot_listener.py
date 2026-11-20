@@ -21,7 +21,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tgto, tmdb
-from .models import Bot, Channel, MediaRequest, QueueItem, Resource, UserContribution, utcnow
+from .models import (Bot, Channel, DiscoveredChat, MediaRequest, QueueItem, Resource,
+                     UserContribution, utcnow)
 from .security import decrypt_secret
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
@@ -116,10 +117,30 @@ def push_routes_raw(db: Session) -> list[dict]:
                     group_id = legacy_chat
                 else:
                     channel_id = legacy_chat
+        # v0.9.14 #257：一条路由可绑定多个目标 {kind, chat_id, name}，合并去重后回填
+        # 到 channel_id/group_id（取每个 kind 的第一个），保留老前端双字段兼容。
+        targets = []
+        seen_t = set()
+        for t in (item.get("targets") if isinstance(item.get("targets"), list) else []):
+            if not isinstance(t, dict):
+                continue
+            t_chat = str(t.get("chat_id") or "").strip()
+            t_kind = "group" if str(t.get("kind") or "").lower() == "group" else "channel"
+            if not t_chat or (t_kind, t_chat) in seen_t:
+                continue
+            seen_t.add((t_kind, t_chat))
+            targets.append({"kind": t_kind, "chat_id": t_chat,
+                            "name": str(t.get("name") or "").strip()[:128]})
+        if targets:
+            if not channel_id:
+                channel_id = next((t["chat_id"] for t in targets if t["kind"] == "channel"), "")
+            if not group_id:
+                group_id = next((t["chat_id"] for t in targets if t["kind"] == "group"), "")
         if not channel_id and not group_id:
             continue
         out.append({"dir_id": str(item.get("dir_id") or "").strip(),
                     "channel_id": channel_id, "group_id": group_id,
+                    "targets": targets,
                     "note": str(item.get("note") or "").strip()[:120]})
     return out
 
@@ -132,10 +153,17 @@ def push_routes(db: Session) -> list[dict]:
     """
     out = []
     for r in push_routes_raw(db):
-        for kind, chat in (("channel", r["channel_id"]), ("group", r["group_id"])):
-            if chat:
-                out.append({"dir_id": r["dir_id"], "kind": kind, "chat_id": chat,
-                            "note": r["note"]})
+        # v0.9.14 #257：优先用 targets 列表（一个目录绑多个频道/群），老数据回退双字段。
+        targets = r.get("targets") or []
+        if targets:
+            for t in targets:
+                out.append({"dir_id": r["dir_id"], "kind": t["kind"], "chat_id": t["chat_id"],
+                            "note": r["note"], "target_name": t.get("name", "")})
+        else:
+            for kind, chat in (("channel", r["channel_id"]), ("group", r["group_id"])):
+                if chat:
+                    out.append({"dir_id": r["dir_id"], "kind": kind, "chat_id": chat,
+                                "note": r["note"]})
     return out
 
 
@@ -218,6 +246,141 @@ def effective_token(db: Session) -> str:
                 return ""
         return ""
     return runtime_config.get(db, "contribution_bot_token") or ""
+
+
+def effective_bot_id(db: Session) -> int:
+    """v0.9.14：当前交互 Bot 对应的 bots.id（发现目标归属），取不到返回 0。
+
+    与 effective_token 同源：优先 interaction_bot_id，否则 contribution_bot_token 场景
+    没有 Bot 记录时返回 0（发现的群仍会记录 bot_id=0，供无 Bot 管理页场景兜底展示）。
+    """
+    raw = (runtime_config.get(db, "interaction_bot_id") or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return 0
+
+
+def bot_user_id_from_token(token: str) -> str:
+    """Telegram Bot token 形如 `123456789:AAxx...`，冒号前即 Bot 的数字 user_id。
+
+    用于 getChatMember 查询 Bot 自己在群里的身份/权限。解析失败返回空串。
+    """
+    t = str(token or "").strip()
+    head = t.split(":", 1)[0]
+    return head if head.isdigit() else ""
+
+
+def record_discovered_chat(db: Session, chat: dict, *, source: str = "auto",
+                           flush: bool = True) -> DiscoveredChat | None:
+    """v0.9.14 #256：把一条 Telegram chat 对象 upsert 进发现池。
+
+    只记录 group / supergroup / channel（私聊无需作为推送目标发现）。
+    同一 bot+chat_id 幂等，累加消息数与最后出现时间。
+
+    flush：默认 True（API / 测试「写完即查」需要）。poll_once 里传 False——
+    轮询链路后面还有多次 await，flush 会持写事务跨 await，触发 database is locked；
+    那里由 poll_once 末尾统一 commit。
+    """
+    if not isinstance(chat, dict):
+        return None
+    chat_id = str(chat.get("id") or "").strip()
+    ctype = str(chat.get("type") or "").strip()
+    if not chat_id or ctype not in ("group", "supergroup", "channel"):
+        return None
+    bot_id = effective_bot_id(db)
+    row = db.scalar(select(DiscoveredChat).where(
+        DiscoveredChat.bot_id == bot_id, DiscoveredChat.chat_id == chat_id))
+    title = str(chat.get("title") or "").strip()
+    username = str(chat.get("username") or "").strip()
+    now = utcnow()
+    if row is None:
+        row = DiscoveredChat(bot_id=bot_id, chat_id=chat_id, chat_type=ctype,
+                             title=title[:256], username=username[:128], source=source,
+                             first_seen_at=now, last_seen_at=now, message_count=1)
+        db.add(row)
+    else:
+        row.last_seen_at = now
+        row.message_count = int(row.message_count or 0) + 1
+        if title:
+            row.title = title[:256]
+        if username:
+            row.username = username[:128]
+        # 手动添加后又被自动发现：保留 manual 来源标记，避免被自动流水覆盖语义
+        if row.source != "manual":
+            row.source = source
+    if flush:
+        db.flush()
+    return row
+
+
+async def check_chat_permission(db: Session, token: str, chat_id: str,
+                                chat_type: str = "group") -> dict:
+    """v0.9.14 #256：用 getChatMember 检查 Bot 在该群/频道是否有发送消息权限。
+
+    返回 {ok, status, can_send, detail}：
+      - status: ok / no_permission / not_member / unknown
+      - can_send: 能否发消息（频道需 can_post_messages；群需 can_send_messages 或管理员）
+    不抛异常，失败以 unknown 返回，便于前端展示「未检测到」而非误判为有权限。
+    """
+    result = {"ok": False, "status": "unknown", "can_send": False, "detail": ""}
+    bot_uid = bot_user_id_from_token(token)
+    if not token or not chat_id:
+        result["detail"] = "缺少 Bot Token 或 chat_id"
+        return result
+    payload = {"chat_id": str(chat_id).strip()}
+    if bot_uid:
+        payload["user_id"] = int(bot_uid)
+    else:
+        # token 无法解析 Bot ID 时退化为 getMe 取 id（多一次请求，仅在异常 token 场景）
+        me = await _api(db, token, "getMe", {})
+        me_res = me.get("result") or {}
+        if not me.get("ok") or not me_res.get("id"):
+            result["detail"] = "无法获取 Bot 自身 ID（getMe 失败）"
+            return result
+        payload["user_id"] = int(me_res["id"])
+    try:
+        data = await _api(db, token, "getChatMember", payload)
+    except Exception as exc:
+        result["detail"] = f"权限检查请求失败：{str(exc)[:120]}"
+        return result
+    if not data.get("ok"):
+        desc = str(data.get("description") or "")[:160]
+        low = desc.lower()
+        if "not found" in low or "member" in low or "kicked" in low:
+            result["status"] = "not_member"
+            result["detail"] = "Bot 不在该群/频道，或已被移出；请先把 Bot 拉进去"
+        else:
+            result["detail"] = desc or "getChatMember 调用失败"
+        return result
+    member = data.get("result") or {}
+    status = str(member.get("status") or "")
+    if status in ("left", "kicked"):
+        result.update(status="not_member", detail=f"Bot 已离开或被移出（{status}）")
+        return result
+    # 频道：只有管理员/创建者且 can_post_messages 才能发言；普通成员（订阅者）不能发
+    if chat_type == "channel":
+        can = status in ("creator", "administrator") and bool(member.get("can_post_messages"))
+        result.update(ok=True, status="ok" if can else "no_permission", can_send=can,
+                      detail=("Bot 可在该频道发消息" if can else
+                              "Bot 需在频道中为管理员且开启「发布消息」权限"))
+        return result
+    # 群 / 超级群：creator 必可发；administrator 看 can_send_messages（老 API 无该字段时默认可发）；
+    # member（普通成员）默认就能在群里发言——Telegram ChatMemberMember 不带 can_send_messages 字段，
+    # 不能因为没有该字段就判为不可发；restricted 才严格看 can_send_messages；其余视为无权限。
+    if status == "creator":
+        can = True
+    elif status == "administrator":
+        can = bool(member.get("can_send_messages", True))
+    elif status == "member":
+        can = bool(member.get("can_send_messages", True))
+    elif status == "restricted":
+        can = bool(member.get("can_send_messages"))
+    else:
+        can = False
+    result.update(ok=True, status="ok" if can else "no_permission", can_send=can,
+                  detail=("Bot 可在该群发消息" if can else
+                          f"Bot 在该群无发送权限（身份：{status or '未知'}）"))
+    return result
 
 
 def gate_mode(db: Session) -> str:
@@ -1207,6 +1370,13 @@ async def poll_once(db: Session) -> dict:
         user = msg.get("from") or {}
         chat_id = str(chat.get("id") or "")
         user_id = str(user.get("id") or chat_id)
+        # v0.9.14 #256：自动发现群/频道——Bot 收到群组消息即记录其 ID/名称/类型。
+        # 放在限制检查之前：即便用户被限制，群本身仍应被发现。异常隔离，不影响指令处理。
+        if chat and chat_id:
+            try:
+                record_discovered_chat(db, chat, flush=False)
+            except Exception:
+                pass
         try:
             # v0.9.0：使用限制——未关注频道 / 未加群的用户拒绝执行指令
             ok, reason = await check_restriction(db, token, user_id)

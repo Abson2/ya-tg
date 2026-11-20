@@ -148,6 +148,37 @@ class Channel(Base):
     kind: Mapped[str] = mapped_column(String(16), default="channel")
 
 
+class DiscoveredChat(Base):
+    """v0.9.14 #255-#258：统一推送目标池（Bot 自动发现的群 + 管理员手动添加的频道/群）。
+
+    与 Channel 的关系：Channel 是队列/发送层依赖的记录，为所有推送来源的落点；
+    DiscoveredChat 是「候选 + 状态」台账——记录从哪来、什么类型、Bot 有无发送权限、
+    是否已勾选加入白名单。加入白名单时同步落一条 Channel 供发送层使用。
+
+    chat_type 取 Telegram 原生值：group / supergroup / channel / private；
+    source 取 auto（poll_once 从群消息发现）/ manual（管理员手填 ID 或 @用户名）。
+    """
+    __tablename__ = "discovered_chats"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bot_id: Mapped[int] = mapped_column(ForeignKey("bots.id"), default=0)
+    chat_id: Mapped[str] = mapped_column(String(128), index=True)
+    title: Mapped[str] = mapped_column(String(256), default="")       # 群名称 / 频道名
+    chat_type: Mapped[str] = mapped_column(String(24), default="group")
+    username: Mapped[str] = mapped_column(String(128), default="")    # 公开用户名 @xxx
+    source: Mapped[str] = mapped_column(String(16), default="auto")   # auto / manual
+    # 白名单状态：True=已勾选加入推送白名单（Channel 同步启用）
+    in_whitelist: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Bot 发送权限检查缓存（getChatMember）
+    perm_status: Mapped[str] = mapped_column(String(24), default="unknown")  # ok/no_permission/not_member/unknown
+    perm_can_send: Mapped[bool] = mapped_column(Boolean, default=False)
+    perm_detail: Mapped[str] = mapped_column(Text, default="")
+    perm_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (UniqueConstraint("bot_id", "chat_id", name="uq_discovered_bot_chat"),)
+
+
 class Rule(Base):
     __tablename__ = "dispatch_rules"
     id: Mapped[int] = mapped_column(primary_key=True)

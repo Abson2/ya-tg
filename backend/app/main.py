@@ -25,7 +25,7 @@ from . import (ai_assist, bot_listener, guangya_auth, guangya_sms, log_retention
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
-from .models import (AuditLog, AuthToken, Bot, Channel, DistributionEvent,
+from .models import (AuditLog, AuthToken, Bot, Channel, DiscoveredChat, DistributionEvent,
                      MediaRequest, MessageTemplate, MirrorDir, MirrorFile, MirrorMedia, MirrorRule,
                      MirrorTask, QueueItem, Resource, ResourceScanBatch, ResourceVersion, Rule,
                      ScanCursor, ScanTask, UserContribution)
@@ -3922,6 +3922,12 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
 
 
 # ---------- v0.9.5：推送白名单 = 目录路由表（全局单 Bot） ----------
+class PushTargetInput(BaseModel):
+    kind: str = "channel"  # channel/group
+    chat_id: str = ""
+    name: str = ""         # 展示名（群名/频道名），纯展示
+
+
 class PushRouteInput(BaseModel):
     dir_id: str = ""       # 影视库 B 的下属目录 ID；空=根目录通配
     kind: str = "channel"  # 老字段：channel/group；v0.9.8 起前端改用双字段，保留兼容
@@ -3929,6 +3935,8 @@ class PushRouteInput(BaseModel):
     # v0.9.8：频道 ID 与群 ID 两个独立可填字段，可只填其一或两个都填
     channel_id: str = ""
     group_id: str = ""
+    # v0.9.14 #257：一个目录可绑定多个频道/群目标（与双字段并存，targets 优先）
+    targets: list[PushTargetInput] = []
     note: str = ""         # v0.9.6：备注，便于肉眼区分不同目录（纯展示，不参与匹配）
 
 
@@ -3983,20 +3991,45 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
                     group_id = legacy
                 else:
                     channel_id = legacy
-        if not channel_id and not group_id:
-            continue  # 频道/群都为空的路由跳过
+        # v0.9.14 #257：一目录多目标。targets 优先；归一化并按 (kind,chat_id) 去重。
+        targets = []
+        seen = set()
+        for t in (getattr(item, "targets", None) or []):
+            t_chat = str(t.chat_id or "").strip()
+            t_kind = "group" if str(t.kind or "").lower() == "group" else "channel"
+            if not t_chat or (t_kind, t_chat) in seen:
+                continue
+            seen.add((t_kind, t_chat))
+            targets.append({"kind": t_kind, "chat_id": t_chat,
+                            "name": str(t.name or "").strip()[:128]})
+        if targets:
+            # 同步双字段（取各 kind 第一个）供老前端/下游兼容
+            channel_id = channel_id or next((t["chat_id"] for t in targets if t["kind"] == "channel"), "")
+            group_id = group_id or next((t["chat_id"] for t in targets if t["kind"] == "group"), "")
+        else:
+            # 无 targets：从双字段合成（兼容老前端只传 channel_id/group_id）
+            if channel_id:
+                targets.append({"kind": "channel", "chat_id": channel_id, "name": ""})
+            if group_id:
+                targets.append({"kind": "group", "chat_id": group_id, "name": ""})
+        if not targets:
+            continue  # 无任何目标的路由跳过
         routes.append({"dir_id": str(item.dir_id or "").strip(),
                        "channel_id": channel_id, "group_id": group_id,
+                       "targets": targets,
                        "note": str(item.note or "").strip()[:120]})
     if len(routes) > 10:
         raise HTTPException(400, "推送白名单最多 10 条")
-    # 展开成目标列表供 Channel 同步：一条路由的频道与群各算一个目标
+    # 展开成目标列表供 Channel 同步：一条路由的每个目标各算一个目标（跨路由按 chat_id 复用）
     channel_targets = []
+    seen_targets = set()
     for r in routes:
-        if r["channel_id"]:
-            channel_targets.append({"kind": "channel", "chat_id": r["channel_id"]})
-        if r["group_id"]:
-            channel_targets.append({"kind": "group", "chat_id": r["group_id"]})
+        for t in r["targets"]:
+            key = (t["kind"], t["chat_id"])
+            if key in seen_targets:
+                continue
+            seen_targets.add(key)
+            channel_targets.append({"kind": t["kind"], "chat_id": t["chat_id"], "name": t.get("name", "")})
 
     bot = _global_bot(db)
     # token 有实质新值（非掩码/非占位）时更新或创建全局单 Bot
@@ -4050,6 +4083,239 @@ def push_routes_save(p: PushRoutesInput, db: Session = Depends(get_db)):
               detail=json_dumps({"count": len(routes)}))
     db.commit()
     return {"ok": True, "routes": routes, "count": len(routes)}
+
+
+# ---------- v0.9.14 #255-#258：自动发现群组 + 统一推送目标管理 ----------
+_TYPE_LABELS = {"group": "普通群", "supergroup": "超级群", "channel": "频道", "private": "私聊"}
+
+
+def _discovered_kind(d: DiscoveredChat) -> str:
+    """只有 channel 归为频道；group/supergroup/其它一律按群处理（决定 Channel.kind）。"""
+    return "channel" if str(d.chat_type or "").lower() == "channel" else "group"
+
+
+def _discovered_row(d: DiscoveredChat, bot_name: str = "") -> dict:
+    return {
+        "id": d.id, "bot_id": d.bot_id, "bot_name": bot_name,
+        "chat_id": d.chat_id, "title": d.title, "username": d.username,
+        "chat_type": d.chat_type, "type_label": _TYPE_LABELS.get(d.chat_type, d.chat_type or "未知"),
+        "source": d.source, "in_whitelist": bool(d.in_whitelist),
+        "perm_status": d.perm_status or "unknown", "perm_can_send": bool(d.perm_can_send),
+        "perm_detail": d.perm_detail or "",
+        "perm_checked_at": d.perm_checked_at.isoformat() if d.perm_checked_at else None,
+        "first_seen_at": d.first_seen_at.isoformat() if d.first_seen_at else None,
+        "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
+        "message_count": int(d.message_count or 0),
+    }
+
+
+@app.get("/api/discover/chats", dependencies=ADMIN)
+def discover_chats(db: Session = Depends(get_db)):
+    """统一推送目标列表：发现的群 + 手动添加的频道/群。
+
+    同时校正 in_whitelist——以目录路由表实际引用的 chat_id 为准（路由表是真相源），
+    避免发现台账与白名单状态不一致。老库没有发现记录但路由里有目标的，这里不动
+    （它们仍在「推送白名单（目录路由）」卡片里管理）。
+    """
+    rows = db.scalars(select(DiscoveredChat).order_by(DiscoveredChat.last_seen_at.desc())).all()
+    whitelisted = {t["chat_id"] for t in bot_listener.push_routes(db)}
+    bot_names = {b.id: b.name for b in db.scalars(select(Bot)).all()}
+    out = []
+    for d in rows:
+        actual = d.chat_id in whitelisted
+        if bool(d.in_whitelist) != actual:
+            d.in_whitelist = actual
+        out.append(_discovered_row(d, bot_names.get(d.bot_id, "")))
+    if rows:
+        db.commit()
+    return {"chats": out, "total": len(out)}
+
+
+class DiscoverRefreshInput(BaseModel):
+    manual_chat_id: str = ""      # 手动输入 ID 或 @用户名
+    manual_name: str = ""         # 展示名
+    manual_kind: str = "group"    # group / channel
+
+
+@app.post("/api/discover/refresh", dependencies=ADMIN)
+async def discover_refresh(p: DiscoverRefreshInput = DiscoverRefreshInput(),
+                           db: Session = Depends(get_db)):
+    """触发一次「发现」：
+
+    1) 主动拉一次 getUpdates（Telegram 无「列出已加入群」接口，只能从更新里看到群）；
+       复用 poll_once 的 offset 与处理链，不丢消息、不重复处理。
+    2) 若填了 manual_chat_id，手动登记一个目标（ID 或 @用户名/公开链接）。
+
+    自动发现的前提：Bot 已在群里 + 群里产生新消息 + （若开了隐私模式）Bot 被设为管理员
+    或有人 @Bot 发消息。否则 Telegram 不会把这些消息下发给 Bot。
+    """
+    token = bot_listener.effective_token(db)
+    polled = {"enabled": False}
+    if token:
+        try:
+            polled = await bot_listener.poll_once(db)
+        except Exception as exc:
+            polled = {"enabled": True, "error": str(exc)[:200]}
+    added = None
+    chat_id = str(p.manual_chat_id or "").strip()
+    if chat_id:
+        # @用户名 / t.me 链接归一为 chat_id（Telegram sendMessage 接受 @username 形式）
+        candidate = chat_id
+        if candidate.startswith("https://t.me/"):
+            candidate = "@" + candidate.rstrip("/").split("/")[-1].lstrip("@")
+        elif not candidate.startswith("@") and not candidate.lstrip("-").isdigit():
+            candidate = "@" + candidate.lstrip("@")
+        ctype = "channel" if str(p.manual_kind or "").lower() == "channel" else "group"
+        bot_id = bot_listener.effective_bot_id(db)
+        row = db.scalar(select(DiscoveredChat).where(
+            DiscoveredChat.bot_id == bot_id, DiscoveredChat.chat_id == candidate))
+        if row is None:
+            now = utcnow()
+            row = DiscoveredChat(bot_id=bot_id, chat_id=candidate,
+                                 chat_type=ctype, title=str(p.manual_name or "").strip()[:256],
+                                 username=candidate if candidate.startswith("@") else "",
+                                 source="manual", first_seen_at=now, last_seen_at=now,
+                                 message_count=0)
+            db.add(row)
+        else:
+            row.source = "manual"
+            row.last_seen_at = utcnow()
+            if p.manual_name:
+                row.title = str(p.manual_name).strip()[:256]
+        db.flush()
+        added = _discovered_row(row)
+        add_audit(db, "discover_manual_added", target_type="chat", target_id=candidate, detail=ctype)
+    db.commit()
+    chats = discover_chats(db)
+    return {"ok": True, "added": added, "polled": polled,
+            "chats": chats["chats"], "total": chats["total"],
+            "hint": ("自动发现需 Bot 已入群且群内有新消息；若 Bot 开了隐私模式，"
+                     "请设为群管理员或在群里 @Bot 发一条消息后再点发现。")}
+
+
+@app.post("/api/discover/chats/{cid}/permission", dependencies=ADMIN)
+async def discover_check_permission(cid: int, db: Session = Depends(get_db)):
+    """检查 Bot 在该群/频道是否有发送消息权限，并回写缓存。"""
+    d = db.get(DiscoveredChat, cid)
+    if not d:
+        raise HTTPException(404, "目标不存在")
+    token = bot_listener.effective_token(db)
+    if not token:
+        return {"ok": False, "status": "unknown", "can_send": False,
+                "detail": "未配置交互 Bot Token，无法检查权限"}
+    res = await bot_listener.check_chat_permission(db, token, d.chat_id, d.chat_type)
+    d.perm_status = res["status"]
+    d.perm_can_send = bool(res["can_send"])
+    d.perm_detail = res.get("detail", "")
+    d.perm_checked_at = utcnow()
+    db.commit()
+    return {"ok": res["ok"], "status": res["status"], "can_send": res["can_send"],
+            "detail": res.get("detail", ""), "row": _discovered_row(d)}
+
+
+class DiscoverWhitelistInput(BaseModel):
+    in_whitelist: bool = True
+    dir_id: str = ""      # 加入时绑定到的目录；空=整库通配
+
+
+@app.post("/api/discover/chats/{cid}/whitelist", dependencies=ADMIN)
+def discover_set_whitelist(cid: int, p: DiscoverWhitelistInput,
+                           db: Session = Depends(get_db)):
+    """勾选/取消勾选把目标加入或移出推送白名单（目录路由表）。
+
+    加入：确保有启用 Channel（发送层落点），并向路由表追加一条 dir_id 目标；
+    移出：从路由表移除该 chat_id 的所有目标、停用对应 Channel，并同步受影响记录。
+    """
+    d = db.get(DiscoveredChat, cid)
+    if not d:
+        raise HTTPException(404, "目标不存在")
+    routes = bot_listener.push_routes_raw(db)
+    chat_id = d.chat_id
+    if p.in_whitelist:
+        bot = _global_bot(db)
+        if not bot:
+            raise HTTPException(400, "请先在「交互 Bot 与推送配置」填写 Bot Token")
+        # 已有则不重复追加
+        kind = _discovered_kind(d)
+        if not any(t["chat_id"] == chat_id for r in routes for t in r["targets"]):
+            routes.append({"dir_id": str(p.dir_id or "").strip(),
+                           "channel_id": chat_id if kind == "channel" else "",
+                           "group_id": chat_id if kind == "group" else "",
+                           "targets": [{"kind": kind, "chat_id": chat_id, "name": d.title}],
+                           "note": d.title or "发现目标"})
+        # 确保 Channel 落点
+        ch = db.scalar(select(Channel).where(Channel.chat_id == chat_id).limit(1))
+        if not ch:
+            ch = Channel(bot_id=bot.id, name=f"{_ROUTE_CHANNEL_PREFIX}{kind}:{chat_id}",
+                         chat_id=chat_id, kind=kind, enabled=True)
+            db.add(ch)
+        else:
+            ch.enabled = True
+            ch.bot_id = bot.id
+        d.in_whitelist = True
+        msg = "已加入推送白名单"
+    else:
+        # 从所有路由移除该 chat_id
+        for r in routes:
+            r["targets"] = [t for t in r["targets"] if t["chat_id"] != chat_id]
+            if r["channel_id"] == chat_id:
+                r["channel_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "channel"), "")
+            if r["group_id"] == chat_id:
+                r["group_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "group"), "")
+        routes = [r for r in routes if r["targets"]]
+        for ch in db.scalars(select(Channel).where(Channel.chat_id == chat_id)).all():
+            ch.enabled = False
+        d.in_whitelist = False
+        msg = "已移出推送白名单"
+    runtime_config.set_many(db, {"push_routes_json": json_dumps(routes)})
+    add_audit(db, "discover_whitelist_toggled", target_type="chat", target_id=chat_id,
+              detail=json_dumps({"in_whitelist": bool(p.in_whitelist)}))
+    db.commit()
+    return {"ok": True, "in_whitelist": bool(p.in_whitelist), "message": msg,
+            "route_count": len(routes)}
+
+
+@app.post("/api/discover/chats/{cid}/test", dependencies=ADMIN)
+async def discover_test_push(cid: int, db: Session = Depends(get_db)):
+    """向发现的群/频道直接发一条测试推送（复用现有 Bot 测试链）。"""
+    d = db.get(DiscoveredChat, cid)
+    if not d:
+        raise HTTPException(404, "目标不存在")
+    bot = _global_bot(db)
+    if not bot:
+        return {"ok": False, "message": "未配置交互 Bot，无法测试推送"}
+    try:
+        token = decrypt_secret(bot.token)
+    except Exception as exc:
+        return {"ok": False, "message": f"Bot Token 解密失败：{exc}"}
+    if not token:
+        return {"ok": False, "message": "Bot Token 为空，请先配置"}
+    label = d.title or d.username or d.chat_id
+    return await _send_test_message(token, d.chat_id, bot.name, label, db)
+
+
+@app.delete("/api/discover/chats/{cid}", dependencies=ADMIN)
+def discover_delete_chat(cid: int, db: Session = Depends(get_db)):
+    """从发现池删除目标；若它在白名单里，同时从路由移除并停用 Channel。"""
+    d = db.get(DiscoveredChat, cid)
+    if not d:
+        raise HTTPException(404, "目标不存在")
+    chat_id = d.chat_id
+    if d.in_whitelist:
+        routes = bot_listener.push_routes_raw(db)
+        for r in routes:
+            r["targets"] = [t for t in r["targets"] if t["chat_id"] != chat_id]
+            if r["channel_id"] == chat_id:
+                r["channel_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "channel"), "")
+            if r["group_id"] == chat_id:
+                r["group_id"] = next((t["chat_id"] for t in r["targets"] if t["kind"] == "group"), "")
+        runtime_config.set_many(db, {"push_routes_json": json_dumps([r for r in routes if r["targets"]])})
+        for ch in db.scalars(select(Channel).where(Channel.chat_id == chat_id)).all():
+            ch.enabled = False
+    db.delete(d)
+    add_audit(db, "discover_chat_deleted", target_type="chat", target_id=chat_id)
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/push/bot/token/clear", dependencies=ADMIN)

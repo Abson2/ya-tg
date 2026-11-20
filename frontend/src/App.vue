@@ -67,14 +67,91 @@ const interactionCfg = ref({ contribution_enabled: false, donation_enabled: fals
 // v0.9.5：推送白名单 = 目录路由表 + 全局单 Bot
 const pushCfg = ref({ bot: null, max_routes: 10 })
 // v0.9.8：一条路由的频道 ID 与群 ID 分别填写，可只填其一或两个都填
-const pushRoutes = ref([{ dir_id: '', channel_id: '', group_id: '', note: '' }])
+// v0.9.14 #257：targets 支持一个目录绑定多个频道/群（与双字段并存，targets 优先）
+const pushRoutes = ref([{ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' }])
 const pushSaving = ref(false), pushBotToken = ref('')
 const broadcastText = ref(''), broadcastSending = ref(false)
 function addPushRoute() {
   if (pushRoutes.value.length >= (pushCfg.value.max_routes || 10)) { ElMessage.warning('推送白名单最多 10 条'); return }
-  pushRoutes.value.push({ dir_id: '', channel_id: '', group_id: '', note: '' })
+  pushRoutes.value.push({ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' })
 }
 function removePushRoute(i) { pushRoutes.value.splice(i, 1) }
+// v0.9.14 #257：路由目标多选——从已发现/手动目标里挑，写入 targets
+function addRouteTarget(r) { r.targets = r.targets || []; r.targets.push({ kind: 'channel', chat_id: '', name: '' }) }
+function removeRouteTarget(r, i) { r.targets.splice(i, 1) }
+function onRouteTargetPick(r, i) {
+  const d = discoverChats.value.find(x => x.chat_id === r.targets[i].chat_id)
+  if (d) { r.targets[i].kind = d.chat_type === 'channel' ? 'channel' : 'group'; r.targets[i].name = d.title || d.username || '' }
+}
+// v0.9.14 #258：自动发现群组 / 统一推送目标
+const discoverChats = ref([]), discovering = ref(false)
+const manualChatId = ref(''), manualChatName = ref(''), manualChatKind = ref('group')
+const discoverChecking = ref(-1)
+const TYPE_TAG = { group: '普通群', supergroup: '超级群', channel: '频道', private: '私聊' }
+function permLabel(c) {
+  if (!c.perm_checked_at) return '未检查'
+  if (c.perm_status === 'ok' && c.perm_can_send) return '可发送'
+  if (c.perm_status === 'not_member') return 'Bot 不在群'
+  if (c.perm_status === 'no_permission') return '无发送权限'
+  return '未知'
+}
+function permTagType(c) {
+  if (!c.perm_checked_at) return 'info'
+  return (c.perm_status === 'ok' && c.perm_can_send) ? 'success' : 'danger'
+}
+async function refreshDiscover() {
+  discovering.value = true
+  try {
+    const body = {}
+    if (manualChatId.value.trim()) {
+      body.manual_chat_id = manualChatId.value.trim()
+      body.manual_name = manualChatName.value.trim()
+      body.manual_kind = manualChatKind.value
+    }
+    const d = await api('/discover/refresh', { method: 'POST', body: JSON.stringify(body) })
+    discoverChats.value = d.chats || []
+    if (d.added) { manualChatId.value = ''; manualChatName.value = ''; ElMessage.success('已手动添加目标') }
+    else ElMessage.success('发现完成')
+    if (d.polled && d.polled.error) ElMessage.warning('拉取更新失败：' + d.polled.error)
+    else if (d.polled && d.polled.messages) ElMessage.info(`本轮处理 ${d.polled.messages} 条更新，新群会在列表出现`)
+    else if (!manualChatId.value.trim()) ElMessage.info(d.hint || '暂无新群；请确认 Bot 已入群且群内有新消息')
+  } catch (e) { ElMessage.error(e.message) }
+  finally { discovering.value = false }
+}
+async function checkDiscoverPerm(c) {
+  discoverChecking.value = c.id
+  try {
+    const d = await api(`/discover/chats/${c.id}/permission`, { method: 'POST' })
+    const idx = discoverChats.value.findIndex(x => x.id === c.id)
+    if (idx >= 0 && d.row) discoverChats.value[idx] = d.row
+    ElMessage[d.ok ? 'success' : 'warning'](d.detail || '权限检查完成')
+  } catch (e) { ElMessage.error(e.message) }
+  finally { discoverChecking.value = -1 }
+}
+async function toggleDiscoverWhitelist(c) {
+  try {
+    const d = await api(`/discover/chats/${c.id}/whitelist`, {
+      method: 'POST', body: JSON.stringify({ in_whitelist: !c.in_whitelist }) })
+    c.in_whitelist = d.in_whitelist
+    ElMessage.success(d.message)
+    await load()  // 白名单变动同步到目录路由卡片
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function testDiscoverPush(c) {
+  try {
+    const d = await api(`/discover/chats/${c.id}/test`, { method: 'POST' })
+    ElMessage[d.ok ? 'success' : 'error'](d.message || (d.ok ? '测试消息已发送' : '测试失败'))
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function deleteDiscoverChat(c) {
+  const ok = await confirmBox(`确认删除目标「${c.title || c.chat_id}」？若已加入白名单会同时移出。`)
+  if (!ok) return
+  try {
+    await api(`/discover/chats/${c.id}`, { method: 'DELETE' })
+    ElMessage.success('已删除')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
 // v0.9.8 #194：推送效果报表（只展示后端真实可得指标）
@@ -469,9 +546,13 @@ async function load() {
     const pr = await api('/push/routes')
     pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
     pushRoutes.value = (pr.routes && pr.routes.length)
-      ? pr.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '', note: r.note || '' }))
-      : [{ dir_id: '', channel_id: '', group_id: '', note: '' }]
+      ? pr.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '',
+        targets: (r.targets || []).map(t => ({ kind: t.kind || 'channel', chat_id: t.chat_id || '', name: t.name || '' })),
+        note: r.note || '' }))
+      : [{ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' }]
   } catch (e) {}
+  // v0.9.14 #258：自动发现群组 / 统一推送目标
+  try { const dc = await api('/discover/chats'); discoverChats.value = dc.chats || [] } catch (e) {}
   try { interactionStatus.value = await api('/interaction/status') } catch (e) {}
   try { contributions.value = await api('/contributions?limit=50') } catch (e) {}
   try { mediaRequests.value = await api('/media-requests?limit=50') } catch (e) {}
@@ -747,12 +828,18 @@ async function pruneMirrorMappings() {
 // ---------- 用户互动 ----------
 async function savePushRoutes() {
   // v0.9.6.1：交互 Bot / 目录路由 / 使用限制 / 打赏统一保存，避免填了使用限制却没保存。
-  const routes = (pushRoutes.value || []).map(r => ({
-    dir_id: String(r.dir_id || '').trim(),
-    channel_id: String(r.channel_id || '').trim(),
-    group_id: String(r.group_id || '').trim(),
-    note: String(r.note || '').trim()
-  })).filter(r => r.channel_id || r.group_id)
+  const routes = (pushRoutes.value || []).map(r => {
+    const targets = (r.targets || []).map(t => ({
+      kind: t.kind || 'channel', chat_id: String(t.chat_id || '').trim(), name: String(t.name || '').trim()
+    })).filter(t => t.chat_id)
+    return {
+      dir_id: String(r.dir_id || '').trim(),
+      channel_id: String(r.channel_id || '').trim(),
+      group_id: String(r.group_id || '').trim(),
+      targets,
+      note: String(r.note || '').trim()
+    }
+  }).filter(r => r.channel_id || r.group_id || r.targets.length)
   const body = { routes }
   const token = String(pushBotToken.value || '').trim()
   if (token) body.bot_token = token
@@ -1804,6 +1891,36 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="panel-foot"><el-button type="primary" :loading="pushSaving" @click="savePushRoutes">保存分发与互动配置（Bot + 白名单 + 使用限制 + 打赏）</el-button><el-button type="danger" plain :loading="pushSaving" :disabled="!pushCfg.bot?.token_masked" @click="clearPushBotToken">清除 Bot Token</el-button><span class="hint" style="margin-left:10px">上方三块配置共用此按钮；保存后刷新页面仍保留。</span></div>
           </div>
 
+          <!-- ===== v0.9.14 #258：自动发现群组 / 统一推送目标 ===== -->
+          <div class="bot-card">
+            <div class="bot-card-head"><span class="bot-ico">🔍</span><h3>自动发现群组 · 统一推送目标</h3><span class="restrict-sub">Bot 收到群消息自动记录群 ID / 名称 / 类型；勾选即可加入白名单、检查权限、测试推送</span><el-tag size="small" style="margin-left:auto">{{ discoverChats.length }} 个目标</el-tag></div>
+            <div class="discover-bar">
+              <el-input v-model="manualChatId" placeholder="手动添加：群/频道 ID 或 @用户名" style="max-width:260px" @keyup.enter="refreshDiscover"/>
+              <el-input v-model="manualChatName" placeholder="备注名称（选填）" style="max-width:160px"/>
+              <el-select v-model="manualChatKind" style="width:110px"><el-option label="群组" value="group"/><el-option label="频道" value="channel"/></el-select>
+              <el-button type="primary" :loading="discovering" @click="refreshDiscover">发现 / 添加</el-button>
+            </div>
+            <p class="hint warn" style="margin:6px 0 10px">自动发现前提：Bot 已加入该群 + 群内有新消息；若开了隐私模式需设 Bot 为管理员或在群里 @Bot 说话。Telegram 不提供「列出已加入全部群」接口，只能从新消息里发现。</p>
+            <el-table :data="discoverChats" size="small" border v-if="discoverChats.length" style="width:100%">
+              <el-table-column label="目标" min-width="180">
+                <template #default="{row}"><div class="disc-name">{{ row.title || row.username || row.chat_id }}</div><div class="disc-sub">{{ row.chat_id }}<span v-if="row.username"> · {{ row.username }}</span></div></template>
+              </el-table-column>
+              <el-table-column label="类型" width="100"><template #default="{row}"><el-tag size="small" :type="row.chat_type==='channel'?'warning':'info'">{{ TYPE_TAG[row.chat_type] || row.type_label || '未知' }}</el-tag></template></el-table-column>
+              <el-table-column label="来源" width="90"><template #default="{row}"><el-tag size="small" :type="row.source==='manual'?'success':''">{{ row.source==='manual'?'手动':'自动' }}</el-tag></template></el-table-column>
+              <el-table-column label="Bot" min-width="100"><template #default="{row}"><span class="disc-sub">{{ row.bot_name || '—' }}</span></template></el-table-column>
+              <el-table-column label="权限状态" width="120"><template #default="{row}"><el-tag size="small" :type="permTagType(row)">{{ permLabel(row) }}</el-tag></template></el-table-column>
+              <el-table-column label="白名单" width="90" align="center"><template #default="{row}"><el-switch v-model="row.in_whitelist" @change="toggleDiscoverWhitelist(row)"/></template></el-table-column>
+              <el-table-column label="操作" width="250" fixed="right">
+                <template #default="{row}">
+                  <el-button size="small" text :loading="discoverChecking===row.id" @click="checkDiscoverPerm(row)">检查权限</el-button>
+                  <el-button size="small" text @click="testDiscoverPush(row)">测试推送</el-button>
+                  <el-button size="small" text type="danger" @click="deleteDiscoverChat(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-empty v-else description="暂无发现的群。把 Bot 拉进群并发一条消息后点「发现 / 添加」，或直接手填 ID 添加。" :image-size="60"/>
+          </div>
+
           <!-- ===== 推送白名单 = 目录路由表（默认1条，+添加最多10条） ===== -->
           <div class="bot-card">
             <div class="bot-card-head"><span class="bot-ico">📺</span><h3>推送白名单（目录路由）</h3><span class="restrict-sub">不同 B 库目录 → 同一 Bot → 不同频道 / 群聊；默认 1 条，最多 10 条</span><el-tag size="small" style="margin-left:auto">{{ pushRoutes.length }} / {{ pushCfg.max_routes || 10 }}</el-tag></div>
@@ -1811,7 +1928,18 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="field"><label>目录 ID（影视库 B 的下属目录，留空=根目录全部）</label><el-input v-model="r.dir_id" placeholder="留空表示整个 B 库；填目录 fileId 则只推该目录及其子目录"/></div>
               <div class="field"><label>备注（选填，便于肉眼区分目录）</label><el-input v-model="r.note" maxlength="120" placeholder="如：国产剧 / 动画电影 / 欧美剧集"/></div>
               <div class="field"><label>频道 ID（可留空）</label><el-input v-model="r.channel_id" placeholder="频道 chat_id，如 -1001234567890；频道需 Bot 为管理员"/><el-button size="small" text :disabled="!r.channel_id || !pushCfg.bot" @click="testPushRoute(r, r.channel_id)">测试频道</el-button></div>
-              <div class="field"><label>群 ID（可留空）</label><el-input v-model="r.group_id" placeholder="群 chat_id，如 -1001234567890；群只需 Bot 已加入"/><el-button size="small" text :disabled="!r.group_id || !pushCfg.bot" @click="testPushRoute(r, r.group_id)">测试群</el-button></div>
+              <div class="field"><label>群 ID（可留空，兼容旧版单目标）</label><el-input v-model="r.group_id" placeholder="群 chat_id，如 -1001234567890；群只需 Bot 已加入"/><el-button size="small" text :disabled="!r.group_id || !pushCfg.bot" @click="testPushRoute(r, r.group_id)">测试群</el-button></div>
+              <div class="field route-targets" v-if="(r.targets || []).length">
+                <label>额外推送目标（一个目录可绑定多个频道/群；上方单目标字段也会一并推送）</label>
+                <div v-for="(t, ti) in r.targets" :key="ti" class="route-target-row">
+                  <el-select v-model="t.chat_id" filterable allow-create placeholder="选已发现目标或手填 chat_id" style="flex:1" @change="onRouteTargetPick(r, ti)">
+                    <el-option v-for="c in discoverChats" :key="c.chat_id" :label="(c.title || c.username || c.chat_id) + ' · ' + (TYPE_TAG[c.chat_type] || c.chat_type)" :value="c.chat_id"/>
+                  </el-select>
+                  <el-select v-model="t.kind" style="width:96px"><el-option label="频道" value="channel"/><el-option label="群组" value="group"/></el-select>
+                  <el-button size="small" text type="danger" @click="removeRouteTarget(r, ti)">移除</el-button>
+                </div>
+              </div>
+              <div class="field"><el-button size="small" text type="primary" @click="addRouteTarget(r)">+ 添加推送目标（多目标）</el-button></div>
               <div class="route-actions"><el-button size="small" text type="danger" :disabled="pushRoutes.length <= 1" @click="removePushRoute(i)">删除</el-button></div>
             </div>
             <div class="panel-foot"><el-button size="small" type="primary" plain :disabled="pushRoutes.length >= (pushCfg.max_routes || 10)" @click="addPushRoute">+ 添加路由</el-button><span class="hint" style="margin-left:10px">频道需 Bot 为管理员；群聊只需 Bot 已加入。保存后新识别的影视按目录路由推送。</span></div>
@@ -2686,4 +2814,11 @@ button{font-family:inherit}
   .series-card .media-actions .el-button{font-size:10px;padding:4px 6px}
   .stat-card{padding:14px}
 }
+/* v0.9.14 #258：自动发现群组 / 多目标路由 */
+.discover-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.disc-name{font-weight:600;overflow-wrap:anywhere;word-break:break-word}
+.disc-sub{color:var(--yg-muted);font-size:12px;overflow-wrap:anywhere;word-break:break-word}
+.route-targets{margin:2px 0}
+.route-target-row{display:flex;gap:6px;align-items:center;margin-bottom:6px;min-width:0}
+.route-target-row .el-select{min-width:0}
 </style>

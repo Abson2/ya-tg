@@ -8,6 +8,34 @@
 
 ---
 
+## v0.9.14 (2026-11-20)
+
+新增「自动发现群组 / 统一推送目标管理」：Bot 收到群消息自动记录群 ID / 名称 / 类型，管理员在页面勾选即可加入推送白名单、检查 Bot 发送权限、测试推送；目录路由支持一个目录绑定多个频道/群。**不改 A→B 镜像主链路、不改认证协议、不改推送闸门语义，海报仍优先**。
+
+### 一、自动发现群组（#256）
+- 新增 `discovered_chats` 表（bot_id + chat_id 唯一）：记录 chat_id、群/频道名称、Telegram 原生 chat_type（group/supergroup/channel）、公开用户名、来源（auto/manual）、权限检查缓存、首次/末次出现时间与消息数。
+- `bot_listener.poll_once()` 收到群/超级群/频道消息即 upsert 进发现池（放在使用限制检查之前，被限制用户的群也会被记录）；私聊不记录。发现写入 `flush=False`，由 poll_once 末尾统一 commit，避免跨 await 持写事务触发 `database is locked`。
+- `record_discovered_chat()` 同一 bot+chat 幂等，累加消息数、刷新名称，`manual` 来源不被自动流水覆盖。
+- **Telegram 客观边界**：官方无「列出 Bot 已加入全部群」接口，只能从更新里的新消息发现；自动发现需 Bot 已入群 + 群内有新消息，开了隐私模式需设 Bot 为管理员或 @Bot 发言。管理页已明确提示。
+
+### 二、Bot 发送权限检查（#256）
+- `check_chat_permission()` 用 `getChatMember(chat_id, Bot 自身 ID)` 判定：Bot ID 从 token 冒号前解析，异常时回退 `getMe`。频道需 creator/administrator 且 `can_post_messages`；群按 creator/admin 默认可发、member/restricted 看 `can_send_messages`，left/kicked 判为不在群。结果带缓存回写 `discovered_chats`。
+- 检查失败一律返回 unknown/no_permission，不误判为有权限；「检查权限」按钮单独触发，`/api/discover/chats/{id}/permission`。
+
+### 三、统一推送目标管理（#258）
+- `GET /api/discover/chats` 统一列表（发现 + 手动 + 权限/白名单状态），白名单状态以目录路由表实际引用为准实时校正，避免台账与真相源不一致。
+- `POST /api/discover/refresh` 触发一次 poll_once 拉取更新（复用 offset 不丢消息），并可手动登记 ID 或 @用户名/公开链接（归一为 @username 形式，Telegram sendMessage 原生支持）。
+- `POST /api/discover/chats/{id}/whitelist` 勾选加入/移出：加入时确保有启用 Channel 落点并向路由表追加目标；移出时从所有路由移除、停用 Channel。`DELETE` 删除目标并联动清理。`POST .../test` 直接向该群/频道发测试消息（复用现有测试链）。
+- 管理页新增「自动发现群组 · 统一推送目标」卡片：表格统一显示目标 / 类型徽章（普通群·超级群·频道）/ 来源 / Bot / 权限状态 / 白名单开关 / 检查·测试·删除操作。
+
+### 四、目录路由多目标（#257）
+- 路由项新增 `targets:[{kind, chat_id, name}]`，一个目录可同时绑定多个频道/群；`push_routes_raw` / `push_routes` 优先展开 targets，缺 targets 时回退老的 channel_id/group_id 双字段，老数据与老前端兼容。
+- `push_routes_save` 归一化 targets、跨路由按 chat_id 复用 Channel；管理页路由卡新增「+ 添加推送目标（多目标）」，可从已发现目标下拉选取或手填 chat_id。
+
+### 五、验证与新配置项
+- 新增专项测试 `tests/test_v0914_discover_groups.py`（18 项）：发现幂等/类型过滤、poll_once 接入、getChatMember 权限判定（群/频道/离开、普通成员缺省可发）、多目标展开与兼容、白名单勾选/删除联动、前端 UI 静态断言。
+- 无新增运行时配置项（发现台账落库、权限检查按需触发）。全量 pytest 与前端 build 门禁见下方版本收尾记录。
+
 ## v0.9.13 (2026-11-20)
 
 6 项优化合集：搜索卡片 HTML 外泄修复、项目图标进浏览器/管理页、手机端卡片防溢出、刷新保持当前页、删除无用审核中心，以及 TgtoDrive 频道监控白名单联动（求片审核写入 / 删单联动移除 / 投稿审核转发）。**不改 A→B 镜像主链路、不改认证协议，海报仍优先**。
