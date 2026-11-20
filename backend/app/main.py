@@ -4139,17 +4139,22 @@ def _whitelist_configured_chats(db: Session) -> list[tuple[str, str, str]]:
 
 
 def _discovered_row(d: DiscoveredChat, bot_name: str = "") -> dict:
+    # v0.9.17 热修：权限检查已判 not_member 时，成员状态列以它为准展示，
+    # 避免「成员状态=已加入、权限=Bot 不在群」自相矛盾（不改库，事件更新后自然恢复）。
+    raw_member = str(getattr(d, "member_status", "") or "")
+    perm = str(getattr(d, "perm_status", "") or "")
+    eff_member = "left" if (perm == "not_member" and raw_member not in ("left", "kicked")) else (raw_member or "unknown")
     return {
         "id": d.id, "bot_id": d.bot_id, "bot_name": bot_name,
         "chat_id": d.chat_id, "title": d.title, "username": d.username,
         "chat_type": d.chat_type, "type_label": _TYPE_LABELS.get(d.chat_type, d.chat_type or "未知"),
         "source": d.source, "in_whitelist": bool(d.in_whitelist),
-        "perm_status": d.perm_status or "unknown", "perm_can_send": bool(d.perm_can_send),
+        "perm_status": perm or "unknown", "perm_can_send": bool(d.perm_can_send),
         "perm_detail": d.perm_detail or "",
         "perm_checked_at": d.perm_checked_at.isoformat() if d.perm_checked_at else None,
-        "member_status": d.member_status or "unknown",
-        "member_label": _MEMBER_LABELS.get(getattr(d, "member_status", ""), getattr(d, "member_status", "") or "未知"),
-        "active": str(getattr(d, "member_status", "") or "") not in ("left", "kicked"),
+        "member_status": eff_member,
+        "member_label": _MEMBER_LABELS.get(eff_member, eff_member or "未知"),
+        "active": eff_member not in ("left", "kicked"),
         "bot_username": getattr(d, "bot_username", "") or "",
         "last_update_id": int(getattr(d, "last_update_id", 0) or 0),
         "first_seen_at": d.first_seen_at.isoformat() if d.first_seen_at else None,
@@ -4185,26 +4190,33 @@ def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
         out.append(row)
         seen_chat_ids.add(str(d.chat_id).strip())
     # v0.9.16 #279：把「已在白名单/目录路由里配置、但发现台账里还没有记录」的目标
-    # 补进列表。Telegram 无列群接口、历史消息不可回溯，这些 chat_id 是管理员已确认
-    # 真实存在且在推送的目标——让它们在统一列表可见，而不是对着空列表反复点刷新。
+    # 真正落库为 DiscoveredChat（source=whitelist），赋真实主键——这样「检查权限 /
+    # 测试推送 / 加入移出白名单 / 删除」都能按 id 操作，不再因虚拟 id=0 报「目标不存在」。
+    # Telegram 无列群接口、历史消息不可回溯，这些 chat_id 是管理员已确认真实存在的目标；
     # 只补真实配置里的 chat_id，不虚构任何"扫描发现"数量。
     known_chats = _whitelist_configured_chats(db)
     main_bot_id = bot_listener.effective_bot_id(db)
+    appended = False
     for ctype, chat_id, title in known_chats:
         if chat_id in seen_chat_ids:
             continue
         seen_chat_ids.add(chat_id)
-        out.append({
-            "id": 0, "bot_id": main_bot_id, "bot_name": bot_names.get(main_bot_id, "主交互 Bot"),
-            "chat_id": chat_id, "title": title or chat_id, "username": "",
-            "chat_type": ctype, "type_label": _TYPE_LABELS.get(ctype, ctype or "未知"),
-            "source": "whitelist", "in_whitelist": True,
-            "perm_status": "unknown", "perm_can_send": True, "perm_detail": "来自白名单配置（未做权限检查）",
-            "perm_checked_at": None, "member_status": "unknown", "member_label": "来自配置",
-            "active": True, "bot_username": "", "last_update_id": 0,
-            "first_seen_at": None, "last_seen_at": None, "updated_at": None, "message_count": 0,
-        })
-    if rows:
+        now = utcnow()
+        # 目录路由的 target_name 缺省是 "route-<kind>:<chat_id>" 占位串，不当展示名
+        clean_title = str(title or "").strip()
+        if not clean_title or clean_title.startswith("route-") or clean_title == chat_id:
+            clean_title = ""
+        row_obj = DiscoveredChat(
+            bot_id=main_bot_id, chat_id=chat_id, chat_type=ctype,
+            title=clean_title[:256], username="", source="whitelist",
+            in_whitelist=True, perm_status="unknown", perm_can_send=False,
+            member_status="unknown", message_count=0,
+            first_seen_at=now, last_seen_at=now, updated_at=now)
+        db.add(row_obj)
+        db.flush()  # 取真实主键，供本轮出参立即返回
+        appended = True
+        out.append(_discovered_row(row_obj, bot_names.get(main_bot_id, "")))
+    if rows or appended:
         db.commit()
     # 筛选
     kw = (q or "").strip().lower()
@@ -4345,6 +4357,13 @@ async def discover_check_permission(cid: int, db: Session = Depends(get_db)):
     d.perm_can_send = bool(res["can_send"])
     d.perm_detail = res.get("detail", "")
     d.perm_checked_at = utcnow()
+    # v0.9.17 热修：权限检查发现 Bot 不在群时，同步成员状态为已退出，
+    # 避免「成员状态=已加入、权限=Bot 不在群」自相矛盾；拿到真实 ChatMember.status 时回写。
+    real_member_status = res.get("member_status") or ""
+    if res["status"] == "not_member":
+        d.member_status = "left"
+    elif real_member_status in ("creator", "administrator", "member", "restricted", "left", "kicked"):
+        d.member_status = real_member_status
     db.commit()
     return {"ok": res["ok"], "status": res["status"], "can_send": res["can_send"],
             "detail": res.get("detail", ""), "row": _discovered_row(d)}
@@ -4375,11 +4394,28 @@ def discover_set_whitelist(cid: int, p: DiscoverWhitelistInput,
         # 已有则不重复追加
         kind = _discovered_kind(d)
         if not any(t["chat_id"] == chat_id for r in routes for t in r["targets"]):
-            routes.append({"dir_id": str(p.dir_id or "").strip(),
-                           "channel_id": chat_id if kind == "channel" else "",
-                           "group_id": chat_id if kind == "group" else "",
-                           "targets": [{"kind": kind, "chat_id": chat_id, "name": d.title}],
-                           "note": d.title or "发现目标"})
+            # v0.9.17 热修：优先把「整库通配（dir_id=""）」目标并入已有通配路由的
+            # targets，而不是总 append 新行——路由表硬上限 10 条（push_routes_raw
+            # 只 raw[:10]），满额时新增的第 11 条会被静默截断，导致白名单开关弹回。
+            wildcard = next((r for r in routes if not str(r.get("dir_id") or "").strip()), None)
+            new_target = {"kind": kind, "chat_id": chat_id, "name": d.title or ""}
+            if wildcard is not None:
+                wildcard.setdefault("targets", []).append(new_target)
+                # 同步双字段（兼容旧前端），只在空时补
+                if kind == "group" and not wildcard.get("group_id"):
+                    wildcard["group_id"] = chat_id
+                if kind == "channel" and not wildcard.get("channel_id"):
+                    wildcard["channel_id"] = chat_id
+            else:
+                # 没有通配路由可并入时才会新增行；push_routes_raw 硬上限 10 条，
+                # 满额新增会被静默截断致开关弹回——这里明确拒绝并给出可操作提示。
+                if len(routes) >= 10:
+                    raise HTTPException(400, "推送路由已达 10 条上限，无法新增；请先在「推送白名单（目录路由）」删除一条，或把某条路由的目录 ID 留空改为整库通配后再加入")
+                routes.append({"dir_id": str(p.dir_id or "").strip(),
+                               "channel_id": chat_id if kind == "channel" else "",
+                               "group_id": chat_id if kind == "group" else "",
+                               "targets": [new_target],
+                               "note": d.title or "发现目标"})
         # 确保 Channel 落点
         ch = db.scalar(select(Channel).where(Channel.chat_id == chat_id).limit(1))
         if not ch:
@@ -4619,6 +4655,12 @@ def contributions(status: str = "", limit: int = 100, db: Session = Depends(get_
              "tg_user_id": c.tg_user_id, "tg_username": c.tg_username,
              "tmdb_id": getattr(c, "tmdb_id", None), "media_type": getattr(c, "media_type", "") or "",
              "year": getattr(c, "year", "") or "",
+             # v0.9.17 #281：同作品去重合并计数字段（老库迁移默认 1/空）
+             "submit_count": int(getattr(c, "submit_count", 1) or 1),
+             "dedup_key": getattr(c, "dedup_key", "") or "",
+             "last_share_url": getattr(c, "last_share_url", "") or "",
+             "last_tg_user_id": getattr(c, "last_tg_user_id", "") or "",
+             "last_submitted_at": c.last_submitted_at.isoformat() if getattr(c, "last_submitted_at", None) else None,
              "status": c.status, "note": c.note,
              "created_at": c.created_at, "handled_at": c.handled_at}
             for c in db.scalars(stmt).all()]
@@ -4642,17 +4684,21 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     db.commit()
     # v0.9.2：审核结论主动回复投稿用户一次（事务性通知，不刷屏）
     notice = ""
+    forward_info = ""       # v0.9.17：转发结果回显+落 note，不再静默吞异常
+    forward_ok = False
     if p.status == "approved":
         notice = f"你的投稿「{c.title}」已通过审核，感谢支持！"
         # v0.9.13 #254：审核通过把分享链接转发到 TgtoDrive 绑定 Bot 监控转存。
-        # 结果只写后台 note，转发失败不影响审核与用户通知。
+        # v0.9.17：无论成功/失败/异常都把原因写进后台 note 并回显，杜绝"备注无任何字样"
+        # 的黑洞；转发失败绝不影响审核主流程与用户通知。
         try:
-            sent, info = await bot_listener.forward_contribution_to_tgto(
+            forward_ok, forward_info = await bot_listener.forward_contribution_to_tgto(
                 db, c.share_url, c.title)
-            c.note = (c.note + " | " if c.note else "") + info[:200]
+        except Exception as exc:
+            forward_ok, forward_info = False, f"转发异常：{str(exc)[:160]}"
+        if forward_info:
+            c.note = (c.note + " | " if c.note else "") + forward_info[:200]
             db.commit()
-        except Exception:
-            pass
     elif p.status == "rejected":
         notice = f"你的投稿「{c.title}」未通过审核。" + (f"原因：{p.note}" if p.note else "")
     elif p.status == "transferred":
@@ -4660,7 +4706,8 @@ async def handle_contribution(cid: int, p: ContributionHandleInput, db: Session 
     notified = False
     if notice and c.tg_user_id:
         notified = await bot_listener.notify_user(db, c.tg_user_id, notice)
-    return {"ok": True, "notified": notified}
+    return {"ok": True, "notified": notified,
+            "forwarded": forward_ok, "forward_info": forward_info}
 
 
 @app.delete("/api/contributions/{cid}", dependencies=ADMIN)
@@ -4746,22 +4793,30 @@ async def handle_media_request(rid: int, p: MediaRequestHandleInput,
               detail=json_dumps({"review_status": p.review_status, "note": p.note[:200]}))
     db.commit()  # 先落审核态，再做外部网络调用，绝不跨 await 持写事务
 
-    # v0.9.13 #254：审核通过才把影视信息 + a/b/c 字段增量写入 TgtoDrive 白名单；
-    # 拒绝时若此前已同步，则联动移除本项目规则。任何失败只写后台 note，不发用户。
+    # v0.9.17 #280：审核通过才把影视信息 + a/b/c 字段增量写入 TgtoDrive 白名单；
+    # 拒绝时若此前已同步，则联动移除本项目规则。任何失败/冲突都把真实原因写进 note
+    # 并随回执返回，杜绝"前端说已通知、用户却发现参数没传进 TgtoDrive"的黑洞。
     sync_info = ""
+    sync_ok = False
+    applied = None
     if p.review_status == "adopted":
         try:
             res = await tgto.upsert_keyword(
                 db, title=r.title, tmdb_id=r.tmdb_id,
                 media_type=r.media_type or "tv", season=r.season, year=r.year or "")
-            r.status = "synced" if res.get("ok") else "failed"
-            r.note = (res.get("message") or res.get("status") or "")[:300]
-            if res.get("ok"):
+            sync_ok = bool(res.get("ok"))
+            applied = res.get("applied")
+            r.status = "synced" if sync_ok else "failed"
+            detail = res.get("detail") or res.get("message") or res.get("status") or ""
+            r.note = (str(detail) + (f" | 规则ID={res.get('rule_id')}" if res.get("rule_id") else ""))[:500]
+            if sync_ok:
                 r.synced_at = utcnow()
-            sync_info = f"；白名单{res.get('status', 'ok')}"
+            sync_info = (f"白名单{res.get('status', 'ok')}" if sync_ok
+                         else f"白名单{res.get('status', 'failed')}未写入：{detail}")
         except Exception as exc:
-            r.status, r.note = "failed", str(exc)[:300]
-            sync_info = "；白名单同步失败（仅后台可见）"
+            sync_ok = False
+            r.status, r.note = "failed", f"白名单同步异常：{str(exc)[:300]}"
+            sync_info = r.note
         db.commit()
     elif p.review_status == "rejected" and r.status == "synced":
         try:
@@ -4780,7 +4835,8 @@ async def handle_media_request(rid: int, p: MediaRequestHandleInput,
     if notice and r.tg_user_id:
         notified = await bot_listener.notify_user(db, r.tg_user_id, notice)
     return {"ok": True, "notified": notified, "review_status": r.review_status,
-            "sync": sync_info or "ok"}
+            "sync_ok": sync_ok, "sync": sync_info or "ok",
+            "sync_note": r.note or "", "applied": applied}
 
 
 @app.delete("/api/media-requests/{rid}", dependencies=ADMIN)

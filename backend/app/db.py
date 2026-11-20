@@ -136,6 +136,12 @@ _COLUMNS = {
         "tmdb_id": "INTEGER",
         "media_type": "TEXT DEFAULT ''",
         "year": "TEXT DEFAULT ''",
+        # v0.9.17 #281：同作品去重合并计数
+        "dedup_key": "TEXT DEFAULT ''",
+        "submit_count": "INTEGER DEFAULT 1",
+        "last_share_url": "TEXT DEFAULT ''",
+        "last_tg_user_id": "TEXT DEFAULT ''",
+        "last_submitted_at": "DATETIME",
     },
     # v0.9.15 #276：发现目标补成员状态/归属 Bot 用户名/最后 update_id/更新时间
     "discovered_chats": {

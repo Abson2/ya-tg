@@ -8,6 +8,42 @@
 
 ---
 
+## v0.9.17 (2026-11-20)
+
+v0.9.16 真机热修合集：修复「发现/刷新」白名单目标点操作报「目标不存在」、成员状态与权限自相矛盾、白名单开关弹回、投稿审核通过不转发监控 Bot、求片参数未写入 TgtoDrive、投稿同作品多条待审批。**不重构、不改推送闸门、不改认证、不虚构扫描能力**。
+
+### 一、白名单兜底目标落库为真实记录（#279 热修）
+- 真机反馈：发现列表出现 `route-group:-1003708133864` 这类目标，点任一操作按钮报「目标不存在」。根因是 v0.9.16 的 `discover_chats()` 把白名单/目录路由里配置的目标以**虚拟行 `id=0`** 返回，前端带着 id=0 调 `/api/discover/chats/{cid}/permission|whitelist|test|DELETE`，后端 `db.get(DiscoveredChat, 0)` 恒为 None → 404。
+- 修复：这些目标改为**真正落库** `DiscoveredChat`（`source=whitelist`，bot_id=主交互 Bot），用 `db.flush()` 取真实主键后返回；`bot_id+chat_id` 唯一保证重复发现不重复落库、不覆盖真实标题；按 `chat_id` 去重。`permission` / `whitelist` / `test` / `delete` 四个端点按真实 id 正常工作。
+- 标题清理：目录路由 target_name 的占位串（`route-group:<id>` 等 `route-` 前缀或等于 chat_id）不再当展示名，留空由前端回退显示 chat_id。
+- 无需数据迁移：v0.9.16 未落库的虚拟行在升级后首次打开发现页时自动补落库。
+
+### 二、成员状态与权限状态一致性
+- 真机反馈：目标「成员状态=已加入」却同时提示「Bot 不在群」（用户已设 Bot 为管理员、测试消息可通）。
+- 修复：`check_chat_permission()` 回传 `member_status`；`discover_check_permission()` 在判 `not_member` 时同步 `member_status=left`，拿到真实 ChatMember.status 时回写；`_discovered_row()` 展示层以权限为准校正成员状态（不改库，事件更新后自然恢复）。
+
+### 三、白名单开关打开后弹回关闭
+- 根因：路由表硬上限 10 条（`push_routes_raw()` 只读 `raw[:10]`），从发现页加第 11 条被静默截断，列表校正把 `in_whitelist` 改回 false。
+- 修复：加入白名单时优先并入已有 `dir_id=""` 的整库通配路由 targets；无通配且已满 10 条时明确返回 400 与可操作提示；前端 `toggleDiscoverWhitelist()` 失败回滚开关。
+
+### 四、投稿审核通过未转发到监控 Bot（#279 后续）
+- 根因：`handle_contribution()` 用 `except: pass` 吞掉转发异常、`forward_contribution_to_tgto()` 未检查 Telegram `ok=false`，用户「备注无任何字样」。
+- 修复：转发成功/失败/异常一律写 note 并随回执回显；检查 `ok=false` 并带出 `description`；前端审核通过时展示转发结果或失败原因。
+
+### 五、求片审核通过参数未写入 TgtoDrive（#280）
+- 真机反馈：求片采纳后前端提示成功，去 TgtoDrive 却发现规则没变/缺年份。
+- 定位：① 前端 `handleMediaRequest` 采纳后无条件弹成功，完全忽略后端 `sync` 诊断；② 命令式 `/求片 剧名 ID` 登记不带年份、`_tmdb_meta()` 不补 year，真机规则 `year=""`/`include_year=False`；③ 真机样本 `kw_297253_1` 的 `source=tmdb`，`upsert_keyword()` 对非 `ya-tg` 来源直接 conflict 不写（护栏，保留）——但原因被前端吞掉。
+- 修复：`_tmdb_meta()` 补 `year` 并在写入前用它补全；`upsert_keyword()` 回执带 `status/applied` 参数快照与 conflict `detail`；`handle_media_request()` 把真实成功/失败原因写 note 并回传 `sync_ok/sync/sync_note/applied`；前端按 `sync_ok` 分别展示写入参数或失败原因。
+
+### 六、投稿同作品去重合并计数（#281）
+- 真机反馈：同一影视被多人投稿，后台出现多条待审批。
+- 修复：新增 `upsert_contribution()` 统一三处投稿入口——按 `dedup_key`（优先 `tmdb:ID:类型`，无 TMDB 回退规范化标题）去重；重复投稿不新增行，`submit_count+1`、刷新最新链接/投稿人，pending 行保持待审批、已结案行不动原审批结论；用户侧提示「已合并登记（累计 N 次）」。新增字段 `dedup_key/submit_count/last_share_url/last_tg_user_id/last_submitted_at`（`db.py` 轻量迁移，老库默认 1/空）；后台列表显示 `×N` 合并标记。
+- 决策点：已结案投稿被重复投时**不重开审批**（只计数）；如需改为重开，把 `upsert_contribution()` 命中分支改为重置 `status=pending` 即可。
+
+### 七、验证
+- 专项 `tests/test_v0916_bot_message_guard_and_discover.py` 增至 **27 项**：新增白名单落库/幂等、成员状态一致性、路由满额弹回、Telegram `ok=false`、转发异常写 note、TMDB year 补全、upsert 参数快照、conflict 回显、去重键逻辑、重复投稿合并计数、结案状态保持、API 计数回显。
+- 全量 pytest **557 passed，1 warning**；前端 build 成功。
+
 ## v0.9.16 (2026-11-20)
 
 v0.9.15 真机反馈三项修复：Bot 交互边界收紧（非指令内容不再误登记投稿）、Bot 用户名自动读取与复制兼容、群/频道发现列表兜底与诚实诊断。**不重构、不改推送闸门、不改认证、不虚构扫描能力**。

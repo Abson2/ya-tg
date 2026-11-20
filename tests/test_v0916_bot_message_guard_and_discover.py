@@ -22,7 +22,8 @@ from app.models import (AppConfig, Bot, Channel, DiscoveredChat, MediaRequest,
 TABLES = (UserContribution, MediaRequest, DiscoveredChat, Channel, Bot)
 CFG_KEYS = ("contribution_enabled", "interaction_bot_id", "interaction_bot_username",
             "push_routes_json", "bot_push_channels_json", "bot_push_groups_json",
-            "contribution_bot_token")
+            "contribution_bot_token", "tgto_rule_resolution", "tgto_rule_effect",
+            "tgto_rule_required_keyword")
 
 CANDIDATES = [{"tmdb_id": 261315, "title": "十万狂花入梦来", "year": "2026",
                "media_type": "tv", "vote_average": 9.0}]
@@ -170,18 +171,38 @@ def test_whitelist_configured_chats_from_channels(db):
 
 
 def test_discover_chats_merges_whitelist_when_pool_empty(db):
-    """发现台账为空时，白名单里已配置的目标仍出现在列表。"""
+    """发现台账为空时，白名单里已配置的目标落库为真实记录（有 id），可后续操作。"""
     from app import main
     b = Bot(name="b", token="x", enabled=True)
     db.add(b); db.flush()
     runtime_config.set_many(db, {"interaction_bot_id": str(b.id),
                                  "push_routes_json": '[{"dir_id":"","targets":['
-                                                     '{"kind":"channel","chat_id":"-1008888888","name":"我的频道"}]}]'})
+                                                     '{"kind":"channel","chat_id":"-1008888888","name":"route-group:-1008888888"}]}]'})
     out = main.discover_chats(db)
     chats = out["chats"]
     assert any(c["chat_id"] == "-1008888888" for c in chats)
     merged = [c for c in chats if c["chat_id"] == "-1008888888"][0]
     assert merged["source"] == "whitelist" and merged["in_whitelist"] is True
+    # 真机 bug：虚拟 id=0 导致点「检查权限/测试推送/删除」报「目标不存在」
+    assert isinstance(merged["id"], int) and merged["id"] > 0
+    assert db.get(DiscoveredChat, merged["id"]) is not None
+    # 目录路由占位名 route-group:<id> 不当展示标题
+    assert not str(merged["title"]).startswith("route-")
+
+
+def test_whitelist_merge_is_idempotent(db):
+    """重复发现不再重复落库（bot_id+chat_id 唯一），标题不覆盖真实名。"""
+    from app import main
+    b = Bot(name="b", token="x", enabled=True)
+    db.add(b); db.flush()
+    db.add(Channel(bot_id=b.id, name="官方频道", chat_id="-1007777777",
+                   enabled=True, kind="channel"))
+    db.commit()
+    first = main.discover_chats(db)
+    id1 = [c for c in first["chats"] if c["chat_id"] == "-1007777777"][0]["id"]
+    second = main.discover_chats(db)
+    matches = [c for c in second["chats"] if c["chat_id"] == "-1007777777"]
+    assert len(matches) == 1 and matches[0]["id"] == id1
 
 
 def test_discover_refresh_returns_diagnosis(db):
@@ -191,3 +212,227 @@ def test_discover_refresh_returns_diagnosis(db):
     out = asyncio.run(main.discover_refresh(main.DiscoverRefreshInput(), db))
     assert out["ok"] is True
     assert out["diagnosis"], "应返回诊断说明，而非静默的'新增发现 0'"
+
+
+# ---------------- v0.9.17 成员状态/权限一致性 ----------------
+def test_check_permission_returns_member_status():
+    """check_chat_permission 返回真实 ChatMember.status，供成员状态列同步。"""
+    from app import bot_listener as bl
+    async def fake_left(d, token, method, payload):
+        return {"ok": True, "result": {"status": "left"}}
+    with patch.object(bl, "_api", new=fake_left):
+        res = asyncio.run(bl.check_chat_permission(None, "123:AA", "-1001", "group"))
+    assert res["status"] == "not_member" and res["member_status"] == "left"
+
+
+def test_discovered_row_reconciles_member_status():
+    """权限已判 not_member 时，成员状态展示为已退出，避免两列矛盾（不改库）。"""
+    from app import main
+    d = DiscoveredChat(bot_id=1, chat_id="-1001", chat_type="supergroup",
+                       title="测试群", source="auto",
+                       member_status="member", perm_status="not_member")
+    row = main._discovered_row(d)
+    assert row["member_status"] == "left" and row["member_label"] == "已退出"
+    assert row["active"] is False
+    # 原始持久状态未被改动
+    assert d.member_status == "member"
+
+
+def test_discovered_row_keeps_real_left_status():
+    """已经是 left 的不被误改。"""
+    from app import main
+    d = DiscoveredChat(bot_id=1, chat_id="-1002", chat_type="supergroup",
+                       member_status="left", perm_status="not_member")
+    row = main._discovered_row(d)
+    assert row["member_status"] == "left"
+
+
+# ---------------- v0.9.17 白名单开关弹回（路由满额） ----------------
+def test_whitelist_toggle_no_rebound_when_routes_full(db):
+    """路由满 10 条时，从发现页加入白名单并入通配路由，重载后不弹回。"""
+    import json
+    from app import main
+    b = Bot(name="b", token="x", enabled=True); db.add(b); db.flush()
+    routes = [{"dir_id": "", "channel_id": "-1000", "group_id": "",
+               "targets": [{"kind": "channel", "chat_id": "-1000", "name": "全局频道"}], "note": ""}]
+    routes += [{"dir_id": f"dir{i}", "channel_id": f"-100{i}", "group_id": "",
+                "targets": [{"kind": "channel", "chat_id": f"-100{i}", "name": f"c{i}"}], "note": ""}
+               for i in range(1, 10)]
+    runtime_config.set_many(db, {"interaction_bot_id": str(b.id),
+                                 "push_routes_json": json.dumps(routes)})
+    d = DiscoveredChat(bot_id=b.id, chat_id="-1003702445011", chat_type="supergroup",
+                       title="光鸭云盘资源分享群", source="auto", in_whitelist=False)
+    db.add(d); db.commit()
+    r = main.discover_set_whitelist(d.id, main.DiscoverWhitelistInput(in_whitelist=True), db)
+    assert r["ok"] is True and r["route_count"] == 10  # 并入，不新增第 11 条
+    out = main.discover_chats(db)
+    row = [x for x in out["chats"] if x["id"] == d.id][0]
+    assert row["in_whitelist"] is True  # 重载后仍开，不弹回
+
+
+def test_whitelist_toggle_rejects_when_no_wildcard_and_full(db):
+    """无通配路由且已满 10 条时明确拒绝，不静默写入被截断。"""
+    import json
+    from fastapi import HTTPException
+    from app import main
+    b = Bot(name="b", token="x", enabled=True); db.add(b); db.flush()
+    routes = [{"dir_id": f"dir{i}", "channel_id": f"-100{i}", "group_id": "",
+               "targets": [{"kind": "channel", "chat_id": f"-100{i}", "name": f"c{i}"}], "note": ""}
+              for i in range(10)]
+    runtime_config.set_many(db, {"interaction_bot_id": str(b.id),
+                                 "push_routes_json": json.dumps(routes)})
+    d = DiscoveredChat(bot_id=b.id, chat_id="-1003702445011", chat_type="supergroup",
+                       title="群", source="auto", in_whitelist=False)
+    db.add(d); db.commit()
+    with pytest.raises(HTTPException) as ei:
+        main.discover_set_whitelist(d.id, main.DiscoverWhitelistInput(in_whitelist=True), db)
+    assert ei.value.status_code == 400 and "上限" in ei.value.detail
+
+
+# ---------------- v0.9.17 投稿转发诊断（不再静默吞） ----------------
+def test_forward_rejects_ok_false_from_telegram(db):
+    """Telegram 返回 ok=false 不误报为已转发，带出 description。"""
+    from app import bot_listener as bl
+    runtime_config.set_many(db, {"tgto_contribute_bot_chat_id": "-100监控群"})
+    async def fake_api(d, t, method, payload):
+        return {"ok": False, "description": "Bad Request: chat not found"}
+    with patch.object(bl, "effective_token", return_value="tok"), \
+         patch.object(bl, "_api", new=fake_api):
+        ok, msg = asyncio.run(bl.forward_contribution_to_tgto(db, "https://s/x", "标题"))
+    assert ok is False and "chat not found" in msg
+
+
+def test_handle_contribution_records_forward_failure(db):
+    """转发异常也写 note 并回显，杜绝'备注无任何字样'黑洞。"""
+    from app import main
+    c = UserContribution(tg_user_id="u1", title="剧", share_url="https://s/x",
+                         status="pending", note="")
+    db.add(c); db.commit()
+    async def boom(*a, **kw):
+        raise RuntimeError("模拟转发异常")
+    with patch.object(bot_listener, "forward_contribution_to_tgto", new=boom), \
+         patch.object(bot_listener, "notify_user", new=AsyncMock(return_value=False)):
+        out = asyncio.run(main.handle_contribution(
+            c.id, main.ContributionHandleInput(status="approved", note=""), db))
+    assert out["ok"] is True and out["forwarded"] is False
+    assert "转发异常" in out["forward_info"]
+    assert "转发异常" in (db.get(UserContribution, c.id).note or "")
+
+
+# ---------------- v0.9.17 #280 求片审核参数传入 TgtoDrive ----------------
+def test_tmdb_meta_fills_year_for_command_want(db):
+    """命令式 /求片 不带年份时，_tmdb_meta 从 TMDB 详情补 year。"""
+    from app import tgto
+    import app.tmdb as tmdb_mod
+    async def fake_detail(tid, mtype, db_=None):
+        return {"year": "2026", "poster_path": "/p.jpg", "overview": "简介",
+                "original_title": "OT", "backdrop_path": ""}
+    with patch.object(tmdb_mod, "configured", return_value=True), \
+         patch.object(tmdb_mod, "detail", new=fake_detail):
+        meta = asyncio.run(tgto._tmdb_meta(db, 297253, "tv"))
+    assert meta["year"] == "2026" and meta["poster_url"]
+
+
+def test_upsert_keyword_uses_tmdb_year_and_reports_applied(db):
+    """year 入参为空时用 TMDB 补全，且回执带出真正写入的参数快照。"""
+    from app import tgto
+    runtime_config.set_many(db, {"tgto_rule_resolution": "4k", "tgto_rule_effect": "all",
+                                 "tgto_rule_required_keyword": "265"})
+    store = {"current": {"key": "ENV_FILTER_GUANGYA", "rules": []},
+             "scenes": {"ENV_FILTER_GUANGYA": {"key": "ENV_FILTER_GUANGYA", "rules": []}}}
+    captured = {}
+    async def fake_fetch(db_):
+        return store, "ENV_FILTER_GUANGYA"
+    async def fake_save(db_, data, scene, obj):
+        captured["rules"] = list(obj["rules"])
+    async def fake_meta(db_, tmdb_id, media_type):
+        return {"year": "2026", "original_title": "", "overview": "", "poster_path": "",
+                "poster_url": "", "backdrop_path": "", "backdrop_url": ""}
+    with patch.object(tgto, "fetch_config", fake_fetch), \
+         patch.object(tgto, "save_config", fake_save), \
+         patch.object(tgto, "_tmdb_meta", new=fake_meta):
+        out = asyncio.run(tgto.upsert_keyword(db, title="伟大的长征", tmdb_id=297253))
+    assert out["ok"] and out["status"] == "created"
+    assert captured["rules"][0]["year"] == "2026"
+    assert captured["rules"][0]["include_year"] is True
+    assert out["applied"]["year"] == "2026" and out["applied"]["resolution"] == "4k"
+
+
+def test_media_request_conflict_is_visible(db):
+    """采纳遇他人规则 id 冲突时，回执 sync_ok=False + 真实原因，不再伪装成功。"""
+    from app import main
+    from app import tgto
+    req = MediaRequest(title="冲突剧", tmdb_id=666, media_type="tv", year="2025",
+                       keyword_id=tgto.keyword_id(666, 1, "冲突剧"),
+                       status="pending", review_status="pending")
+    db.add(req); db.commit()
+    async def conflict(db_, **kw):
+        return {"ok": False, "status": "conflict", "rule_id": "kw_666_1",
+                "message": "该规则 id 已存在且不是本项目创建",
+                "detail": "TgtoDrive 现有规则 source=tmdb，为防覆盖他人规则未写入",
+                "applied": {}}
+    with patch.object(tgto, "upsert_keyword", conflict), \
+         patch.object(bot_listener, "notify_user", new=AsyncMock(return_value=False)):
+        out = asyncio.run(main.handle_media_request(
+            req.id, main.MediaRequestHandleInput(review_status="adopted"), db))
+    assert out["ok"] is True and out["sync_ok"] is False
+    assert "conflict" in out["sync"] and "source=tmdb" in out["sync_note"]
+    row = db.get(MediaRequest, req.id)
+    assert row.status == "failed" and "source=tmdb" in (row.note or "")
+
+
+# ---------------- v0.9.17 #281 投稿去重合并计数 ----------------
+def test_contribution_dedup_key_logic(db):
+    """去重键：优先 tmdb:ID:类型，无 TMDB 回退规范化标题。"""
+    from app import bot_listener as bl
+    k1 = bl.contribution_dedup_key(tmdb_id=123, media_type="tv", title="任意名", share_url="")
+    k2 = bl.contribution_dedup_key(tmdb_id=123, media_type="tv", title="另一个名", share_url="")
+    assert k1 == k2 == "tmdb:123:tv"
+    a = bl.contribution_dedup_key(tmdb_id=None, media_type="", title="伟大的 长征！", share_url="")
+    b = bl.contribution_dedup_key(tmdb_id=None, media_type="", title="伟大 的长征", share_url="")
+    assert a == b and a.startswith("title:")
+
+
+def test_upsert_contribution_merges_duplicate_and_counts(db):
+    """同作品重复投稿只保留一行、累加计数、保留 pending、刷新最新链接。"""
+    from app import bot_listener as bl
+    row1, new1 = bl.upsert_contribution(
+        db, tg_user_id="u1", tg_username="alice", title="同一部剧", content="", 
+        share_url="https://s/one", tmdb_id=900, media_type="tv")
+    row2, new2 = bl.upsert_contribution(
+        db, tg_user_id="u2", tg_username="bob", title="同一部剧别称", content="",
+        share_url="https://s/two", tmdb_id=900, media_type="tv")
+    assert new1 is True and new2 is False
+    assert row1.id == row2.id and row2.submit_count == 2
+    assert row2.share_url == "https://s/two" and row2.last_tg_user_id == "u2"
+    assert row2.last_share_url == "https://s/two" and row2.status == "pending"
+    assert db.query(UserContribution).count() == 1
+
+
+def test_upsert_contribution_keeps_closed_status_and_bumps_count(db):
+    """已结案投稿被重复投时不重开审批，只累加计数并记最新链接。"""
+    from app import bot_listener as bl
+    row1, _ = bl.upsert_contribution(
+        db, tg_user_id="u1", tg_username="", title="已通过剧", content="",
+        share_url="https://s/a", tmdb_id=901, media_type="tv")
+    row1.status = "approved"
+    db.commit()
+    row2, new2 = bl.upsert_contribution(
+        db, tg_user_id="u3", tg_username="", title="已通过剧", content="",
+        share_url="https://s/b", tmdb_id=901, media_type="tv")
+    assert new2 is False and row2.status == "approved"
+    assert row2.submit_count == 2 and row2.share_url == "https://s/a"
+    assert row2.last_share_url == "https://s/b"
+    assert db.query(UserContribution).count() == 1
+
+
+def test_contributions_api_exposes_merge_count(db):
+    """后台列表 API 回显合并计数字段。"""
+    from app import main
+    from app import bot_listener as bl
+    bl.upsert_contribution(db, tg_user_id="u1", tg_username="", title="计数剧",
+                           content="", share_url="https://s/x", tmdb_id=902, media_type="tv")
+    bl.upsert_contribution(db, tg_user_id="u2", tg_username="", title="计数剧",
+                           content="", share_url="https://s/y", tmdb_id=902, media_type="tv")
+    rows = main.contributions("", 100, db)
+    assert len(rows) == 1 and rows[0]["submit_count"] == 2

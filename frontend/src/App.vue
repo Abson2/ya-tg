@@ -162,13 +162,16 @@ async function checkDiscoverPerm(c) {
   finally { discoverChecking.value = -1 }
 }
 async function toggleDiscoverWhitelist(c) {
+  // v0.9.17 热修：v-model 在 change 时已翻转开关，请求失败必须回滚，
+  // 否则接口报 400/404 后开关停在错误状态，看起来"打开了其实没生效"。
+  const prev = !!c.in_whitelist
   try {
     const d = await api(`/discover/chats/${c.id}/whitelist`, {
-      method: 'POST', body: JSON.stringify({ in_whitelist: !c.in_whitelist }) })
+      method: 'POST', body: JSON.stringify({ in_whitelist: !prev }) })
     c.in_whitelist = d.in_whitelist
     ElMessage.success(d.message)
     await load()  // 白名单变动同步到目录路由卡片
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) { c.in_whitelist = prev; ElMessage.error(e.message) }
 }
 async function batchWhitelist(on) {
   if (!discSelected.value.length) { ElMessage.warning('请先勾选目标'); return }
@@ -1078,7 +1081,15 @@ async function handleContribution(id, status) {
       note = String(r.value || '').trim()
     } catch (e) { return }
   }
-  try { await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note }) }); await load() }
+  try {
+    const d = await api(`/contributions/${id}/handle`, { method: 'POST', body: JSON.stringify({ status, note }) })
+    // v0.9.17：审核通过时把 TgtoDrive 转发结果如实回显，管理员当场可见
+    if (status === 'approved' && d && 'forwarded' in d) {
+      const msg = d.forwarded ? `投稿已通过，链接已转发监控 Bot` : `投稿已通过，但转发未完成：${d.forward_info || '未知原因'}`
+      ElMessage[d.forwarded ? 'success' : 'warning']({ message: msg, duration: 6000, showClose: true })
+    } else ElMessage.success('已处理')
+    await load()
+  }
   catch (e) { ElMessage.error(e.message) }
 }
 async function handleMediaRequest(row, review) {
@@ -1092,8 +1103,19 @@ async function handleMediaRequest(row, review) {
     } catch (e) { return }
   }
   try {
-    await api(`/media-requests/${row.id}/handle`, { method: 'POST', body: JSON.stringify({ review_status: review, note }) })
-    ElMessage.success(review === 'adopted' ? '已采纳，已通知用户' : review === 'rejected' ? '已拒绝，已通知用户' : '已重置为待处理')
+    const d = await api(`/media-requests/${row.id}/handle`, { method: 'POST', body: JSON.stringify({ review_status: review, note }) })
+    if (review === 'adopted') {
+      // v0.9.17 #280：采纳结果分成功/失败展示真实同步回执——杜绝"提示已采纳、参数却没进 TgtoDrive"的黑洞
+      if (d && d.sync_ok === false) {
+        ElMessage.error({ message: `已标记采纳，但关键词未写入 TgtoDrive：${d.sync_note || d.sync || '未知原因'}`, duration: 8000, showClose: true })
+      } else {
+        const a = d && d.applied
+        const parts = a ? [a.resolution, a.effect, a.required_keyword ? ('必含:' + a.required_keyword) : '', a.year].filter(Boolean) : []
+        ElMessage.success({ message: `已采纳，关键词已写入 TgtoDrive${parts.length ? '（' + parts.join(' · ') + '）' : ''}`, duration: 6000, showClose: true })
+      }
+    } else {
+      ElMessage.success(review === 'rejected' ? '已拒绝，已通知用户' : '已重置为待处理')
+    }
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -2206,6 +2228,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <a v-if="safeHttpUrl(s.row.share_url)" :href="safeHttpUrl(s.row.share_url)" target="_blank" rel="noopener noreferrer" class="title-link" :title="s.row.share_url">{{ s.row.title || '未命名投稿' }}</a>
                   <span v-else>{{ s.row.title || '未命名投稿' }}</span><span v-if="s.row.year" class="muted"> · {{ s.row.year }}</span>
                   <el-tag v-if="s.row.tmdb_id" size="small" type="info" effect="plain">#{{ s.row.tmdb_id }}</el-tag>
+                  <el-tag v-if="s.row.submit_count > 1" size="small" type="warning" effect="plain" :title="'累计 ' + s.row.submit_count + ' 次投稿，已合并为一条'">×{{ s.row.submit_count }}</el-tag>
                 </template></el-table-column>
                 <el-table-column label="用户" width="120"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
                 <el-table-column label="状态" width="96"><template #default="s">

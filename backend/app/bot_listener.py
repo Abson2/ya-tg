@@ -51,6 +51,70 @@ _UNRECOGNIZED_HINT = ("当前内容未识别为指令。请点下方菜单，或
                       "如正在交互中，请按提示输入，或回复「结束」退出。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
+
+
+# v0.9.17 #281：投稿按作品去重合并——同 dedup_key 只保留一行、累加 submit_count，
+# 后台审批只显示一条。键优先 tmdb:ID:类型，无 TMDB 回退规范化标题（去空白/标点/大小写）。
+def _norm_contrib_title(title: str) -> str:
+    s = str(title or "").strip().lower()
+    s = re.sub(r"[\s\W_]+", "", s, flags=re.UNICODE)  # 仅保留字母/数字/中日韩文字
+    return s[:120]
+
+
+def contribution_dedup_key(*, tmdb_id: int | None, media_type: str,
+                           title: str, share_url: str) -> str:
+    if tmdb_id:
+        return f"tmdb:{int(tmdb_id)}:{str(media_type or '').strip().lower()}"
+    norm = _norm_contrib_title(title) or _norm_contrib_title(share_url)
+    return f"title:{norm}" if norm else ""
+
+
+def upsert_contribution(db: Session, *, tg_user_id: str, tg_username: str,
+                        title: str, content: str, share_url: str,
+                        tmdb_id: int | None = None, media_type: str = "",
+                        year: str = "", note: str = "") -> tuple[UserContribution, bool]:
+    """投稿入库：同作品去重累加计数（返回 (行, 是否新建)）。
+
+    v0.9.17 #281：重复投稿不新增行——submit_count+1，覆盖"最新链接/最新投稿人"，
+    原 status 保持不变（已通过/已拒绝的审批结论不被重复投稿冲掉）；dedup_key 为空
+    （既无标题又无链接的异常输入）时不合并，按新行登记避免误并。
+    """
+    key = contribution_dedup_key(tmdb_id=tmdb_id, media_type=media_type,
+                                 title=title, share_url=share_url)
+    now = utcnow()
+    existing = None
+    if key:
+        existing = db.scalar(select(UserContribution).where(
+            UserContribution.dedup_key == key).order_by(UserContribution.id).limit(1))
+    if existing is None:
+        row = UserContribution(
+            tg_user_id=str(tg_user_id), tg_username=str(tg_username or ""),
+            title=str(title)[:512], content=str(content)[:4000], share_url=share_url,
+            status="pending", note=note, tmdb_id=tmdb_id, media_type=media_type or "",
+            year=str(year or ""), dedup_key=key, submit_count=1,
+            last_share_url=share_url, last_tg_user_id=str(tg_user_id),
+            last_submitted_at=now)
+        db.add(row)
+        db.flush()  # autoflush=False：写完即查/取主键必须显式 flush
+        return row, True
+    # 命中已有：累加计数、刷新最新投稿信息；保留原 status（审批结论不被冲掉）
+    existing.submit_count = int(existing.submit_count or 1) + 1
+    existing.last_share_url = share_url
+    existing.last_tg_user_id = str(tg_user_id)
+    existing.last_submitted_at = now
+    existing.tg_username = str(tg_username or "")
+    # pending 行同步最新链接/标题，让管理员审批到的是当前资源；已结案行不动原字段
+    if existing.status == "pending":
+        if share_url:
+            existing.share_url = share_url
+        if tmdb_id:
+            existing.tmdb_id = tmdb_id
+            existing.media_type = media_type or existing.media_type
+            existing.year = str(year or "") or existing.year
+    db.flush()
+    return existing, False
+
+
 # 使用限制检查结果缓存：{tg_user_id: (checked_ts, ok, reason)}
 _restrict_cache: dict[str, tuple[float, bool, str]] = {}
 
@@ -397,7 +461,8 @@ async def check_chat_permission(db: Session, token: str, chat_id: str,
       - can_send: 能否发消息（频道需 can_post_messages；群需 can_send_messages 或管理员）
     不抛异常，失败以 unknown 返回，便于前端展示「未检测到」而非误判为有权限。
     """
-    result = {"ok": False, "status": "unknown", "can_send": False, "detail": ""}
+    result = {"ok": False, "status": "unknown", "can_send": False,
+              "detail": "", "member_status": ""}
     bot_uid = bot_user_id_from_token(token)
     if not token or not chat_id:
         result["detail"] = "缺少 Bot Token 或 chat_id"
@@ -423,12 +488,14 @@ async def check_chat_permission(db: Session, token: str, chat_id: str,
         low = desc.lower()
         if "not found" in low or "member" in low or "kicked" in low:
             result["status"] = "not_member"
+            result["member_status"] = "left"
             result["detail"] = "Bot 不在该群/频道，或已被移出；请先把 Bot 拉进去"
         else:
             result["detail"] = desc or "getChatMember 调用失败"
         return result
     member = data.get("result") or {}
     status = str(member.get("status") or "")
+    result["member_status"] = status
     if status in ("left", "kicked"):
         result.update(status="not_member", detail=f"Bot 已离开或被移出（{status}）")
         return result
@@ -855,12 +922,17 @@ async def forward_contribution_to_tgto(db: Session, share_url: str, title: str =
         return False, "未配置交互 Bot Token，无法转发"
     text = f"📥 投稿转存\n{title}\n{share_url}" if title else f"📥 投稿转存\n{share_url}"
     try:
-        await _api(db, token, "sendMessage",
-                   {"chat_id": chat_id, "text": text[:4000],
-                    "disable_web_page_preview": False})
-        return True, "已转发至 TgtoDrive 监控 Bot"
+        data = await _api(db, token, "sendMessage",
+                          {"chat_id": chat_id, "text": text[:4000],
+                           "disable_web_page_preview": False})
     except Exception as exc:
-        return False, f"转发失败：{str(exc)[:160]}"
+        return False, f"转发请求失败：{str(exc)[:160]}"
+    # v0.9.17 热修：_api 返回 {"ok":false,...} 不抛异常，必须判 ok，
+    # 否则 Telegram 拒绝（chat not found / bot 被禁）会被误报为"已转发"。
+    if isinstance(data, dict) and not data.get("ok"):
+        desc = str(data.get("description") or "")[:160]
+        return False, f"转发被 Telegram 拒绝：{desc or '未知原因'}（请确认 Bot 已在该 chat 且有发送权限）"
+    return True, "已转发至 TgtoDrive 监控 Bot"
 
 
 def main_keyboard() -> dict:
@@ -1029,14 +1101,16 @@ async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id:
     # 投稿：若会话里已存链接（先发链接再选片）则直接落库，否则提示补链接
     secret = str(sess.get("secret") or "").strip()
     if secret:
-        db.add(UserContribution(tg_user_id=str(uid), tg_username=tg_username,
-                                title=title[:512], content=sess.get("query", "")[:4000],
-                                share_url=secret, status="pending",
-                                tmdb_id=tmdb_id, media_type=media_type, year=year,
-                                note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
+        row, created = upsert_contribution(
+            db, tg_user_id=str(uid), tg_username=tg_username,
+            title=title[:512], content=sess.get("query", "")[:4000], share_url=secret,
+            tmdb_id=tmdb_id, media_type=media_type, year=year,
+            note="TMDB 候选选定；投稿转存接口待验证，当前仅登记")
         _pick_clear(uid)
-        return await _edit_or_send(db, token, chat_id, message_id,
-                                   f"投稿已登记：{title}\n感谢支持，我们会尽快处理。", main_keyboard())
+        thanks = (f"投稿已登记：{title}\n感谢支持，我们会尽快处理。"
+                  if created else
+                  f"「{title}」已有其它用户投稿，已合并登记（累计 {row.submit_count} 次），感谢支持！")
+        return await _edit_or_send(db, token, chat_id, message_id, thanks, main_keyboard())
     # 记住已选候选，等下一条消息补链接
     sess["picked"] = {"title": title, "tmdb_id": tmdb_id,
                       "media_type": media_type, "year": year}
@@ -1228,18 +1302,20 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
         urls = _SHARE_URL.findall(raw)
         if urls:
             picked = pending["picked"]
-            db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                                    title=str(picked.get("title") or "")[:512],
-                                    content=raw[:4000], share_url=urls[-1], status="pending",
-                                    tmdb_id=picked.get("tmdb_id"),
-                                    media_type=picked.get("media_type") or "",
-                                    year=str(picked.get("year") or ""),
-                                    note="TMDB 候选选定；投稿转存接口待验证，当前仅登记"))
+            row, created = upsert_contribution(
+                db, tg_user_id=str(tg_user_id), tg_username=tg_username,
+                title=str(picked.get("title") or "")[:512], content=raw[:4000],
+                share_url=urls[-1], tmdb_id=picked.get("tmdb_id"),
+                media_type=picked.get("media_type") or "",
+                year=str(picked.get("year") or ""),
+                note="TMDB 候选选定；投稿转存接口待验证，当前仅登记")
             _pick_clear(tg_user_id)
             _flow_clear(tg_user_id)
             # v0.9.9 #208：用户回复只给友好文案，管理员侧状态只在后台 note 可见
-            return "contribute", (f"投稿已登记：{picked.get('title')}\n"
-                                  "感谢支持，我们会尽快处理。")
+            thanks = (f"投稿已登记：{picked.get('title')}\n感谢支持，我们会尽快处理。"
+                      if created else
+                      f"「{picked.get('title')}」已有其它用户投稿，已合并登记（累计 {row.submit_count} 次），感谢支持！")
+            return "contribute", thanks
         return "contribute_await_url", "请发送该资源的光鸭分享链接（http/https 开头），或回复「结束」退出。"
 
     cmd, *rest = raw.split(None, 1)
@@ -1349,13 +1425,15 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
         if not title and not share_url:
             return "contribute_need_title", "请告诉我影视名称，或直接粘贴光鸭分享链接。"
         final_title = (title or share_url)[:512]
-        db.add(UserContribution(tg_user_id=str(tg_user_id), tg_username=tg_username,
-                                title=final_title, content=raw[:4000],
-                                share_url=share_url, status="pending",
-                                note="投稿转存接口待验证，当前仅登记，不自动入库"))
+        row, created = upsert_contribution(
+            db, tg_user_id=str(tg_user_id), tg_username=tg_username,
+            title=final_title, content=raw[:4000], share_url=share_url,
+            note="投稿转存接口待验证，当前仅登记，不自动入库")
         # v0.9.9 #208：用户侧只给友好确认，「转存接口待验证」等管理员信息只在后台 note
-        return "contribute", (f"投稿已登记：{final_title}\n"
-                              "感谢支持，我们会尽快处理。")
+        thanks = (f"投稿已登记：{final_title}\n感谢支持，我们会尽快处理。"
+                  if created else
+                  f"「{final_title}」已有其它用户投稿，已合并登记（累计 {row.submit_count} 次），感谢支持！")
+        return "contribute", thanks
 
     if custom:
         return "custom", str(custom.get("reply") or custom.get("description") or "已收到指令。")

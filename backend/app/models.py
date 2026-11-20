@@ -458,6 +458,13 @@ class UserContribution(Base):
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     media_type: Mapped[str] = mapped_column(String(16), default="")
     year: Mapped[str] = mapped_column(String(16), default="")
+    # v0.9.17 #281：同作品去重合并——dedup_key 优先 tmdb:ID:类型，无 TMDB 回退规范化标题；
+    # 重复投稿累加 submit_count 而不新增行，后台只保留一条待审批。
+    dedup_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    submit_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_share_url: Mapped[str] = mapped_column(Text, default="")
+    last_tg_user_id: Mapped[str] = mapped_column(String(64), default="")
+    last_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

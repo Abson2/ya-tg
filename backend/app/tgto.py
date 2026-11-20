@@ -149,7 +149,7 @@ async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
     绝不因为元数据缺失阻断求片审核把关键词写入白名单。
     """
     empty = {"original_title": "", "overview": "", "poster_path": "",
-             "poster_url": "", "backdrop_path": "", "backdrop_url": ""}
+             "poster_url": "", "backdrop_path": "", "backdrop_url": "", "year": ""}
     if not tmdb_id:
         return empty
     try:
@@ -168,6 +168,9 @@ async def _tmdb_meta(db: Session, tmdb_id: int | None, media_type: str) -> dict:
         "poster_url": tmdb.poster_url(poster, "w500") if poster else "",
         "backdrop_path": backdrop,
         "backdrop_url": tmdb.poster_url(backdrop, "w780") if backdrop else "",
+        # v0.9.17 #280：命令式 /求片 不带年份，从 TMDB 详情补 year，供 build_rule 写
+        # include_year / year；取不到仍为空串，安全降级不阻断写入。
+        "year": str(d.get("year") or ""),
     }
 
 
@@ -227,15 +230,30 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
     before = len(rules)
     # v0.9.15 #268：先查 TMDB 详情补全海报/简介/原名，TgtoDrive 前端才显示「已匹配」
     meta = await _tmdb_meta(db, tmdb_id, media_type)
+    # v0.9.17 #280：命令式 /求片 登记时 year 为空；用 TMDB 详情补上，确保 include_year
+    # 与 year 真机字段有值（用户反馈"参数没传进 TgtoDrive"的主因之一）。
+    resolved_year = str(year or "").strip() or str(meta.get("year") or "").strip()
     rule = build_rule(title=title, tmdb_id=tmdb_id, media_type=media_type,
-                      season=season, year=year, resolution=resolution,
-                      effect=effect, required_keyword=required_keyword, **meta)
+                      season=season, year=resolved_year, resolution=resolution,
+                      effect=effect, required_keyword=required_keyword,
+                      original_title=meta.get("original_title", ""),
+                      overview=meta.get("overview", ""),
+                      poster_path=meta.get("poster_path", ""),
+                      poster_url=meta.get("poster_url", ""),
+                      backdrop_path=meta.get("backdrop_path", ""),
+                      backdrop_url=meta.get("backdrop_url", ""))
     rid = rule["id"]
     hit = next((x for x in rules if isinstance(x, dict) and str(x.get("id")) == rid), None)
+    # 诊断快照：审核回执里带回本次"真正写入"的参数，杜绝"前端说成功、用户以为没传"的黑洞
+    applied = {"title": title, "tmdb_id": tmdb_id, "media_type": media_type,
+               "season": season, "year": resolved_year, "resolution": resolution,
+               "effect": effect, "required_keyword": required_keyword}
     if hit is not None:
         if str(hit.get("source") or "") != RULE_SOURCE:
             return {"ok": False, "status": "conflict", "rule_id": rid,
-                    "message": "该规则 id 已存在且不是本项目创建，已保留原规则不做覆盖"}
+                    "message": "该规则 id 已存在且不是本项目创建，已保留原规则不做覆盖",
+                    "detail": f"TgtoDrive 现有规则 source={hit.get('source') or '空'}，id={rid}；为防覆盖他人规则未写入。请确认是否同一作品，或换用其它 TMDB ID/季。",
+                    "applied": applied}
         # 只更新本项目自己创建的规则，且仅覆盖关键词相关字段
         for k in ("keywords", "keyword_groups_any", "aliases", "media_name",
                   "preferred_name", "title", "tmdb_id", "media_type", "year",
@@ -264,7 +282,8 @@ async def upsert_keyword(db: Session, *, title: str, tmdb_id: int | None = None,
     if len(after_rules) < before:
         raise TgtoError("回写后规则数量异常减少，已中止（可能覆盖失败）")
     return {"ok": True, "status": action, "rule_id": rid,
-            "rules_before": before, "rules_after": len(after_rules)}
+            "rules_before": before, "rules_after": len(after_rules),
+            "applied": applied}
 
 
 async def remove_keyword(db: Session, *, tmdb_id: int | None,
