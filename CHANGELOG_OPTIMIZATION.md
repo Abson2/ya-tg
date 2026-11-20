@@ -45,7 +45,18 @@
 - 交付文档：`TEST_REPORT` / `PERFORMANCE_REPORT` / `SECURITY_REPORT` / `DEPLOYMENT` / `ROLLBACK` + 已有 `AUDIT_REPORT` / `FEATURE_PRESERVATION` / `STRICT_SEQUENCE_DESIGN`。
 - 全量回归 741 passed（含故障注入）；前端 build 通过。
 
+## 四模块重构（新批次，基线 `1437b95`）
+- 设计先行：先交付 `FOUR_MODULE_REFACTOR_AUDIT.md`（调用链 + 数据库关系 + 四强制审计项）+ `FOUR_MODULE_REFACTOR_DESIGN.md`（四模块职责 + 事件模型 + 迁移顺序 + 验收用例），审计阶段不改业务代码。
+- 阶段A 数据层：新增 `share_tasks` 表 + `push_queue` 6 个交接列 + `distribution_events` 2 个溯源列（`db._COLUMNS` 幂等 ALTER）；作品键统一 `utils.work_group_key`。
+- 阶段A 分享中心模块 `share_center.py`：任务状态机 planned→ready→submitted→accepted→published/failed/cancelled；first 整剧唯一、update 复用原链接独立任务、force 不去重；`run_cycle` 建分享+提交。
+- 阶段B 触发点迁移：`_enqueue_ready`/`process_change_events`/`publish_resource` 影子登记 ShareTask（异常吞掉不影响主链）；调度 job `_job_share_center`（开关关闭零开销）；灰度开关 `share_center_enabled`（runtime_config 注册，默认 false）。
+- 阶段C 交接闭环：publisher 开关开启时只消费 accepted 队列项、只读 ShareTask URL 不反建、回执 published/failed；`_reconcile_library` 出库取消 ShareTask（规则2）；`claim_tasks` 原子领取（强制项4）。
+- 阶段D 前端：导航「推送队列」改名「分享中心」并上移到光鸭资源组（key 保留兼容断言）；新增分享任务表格 + 跑一轮/取消操作；任务中心 push 卡片改名。
+- 后端新 API：`GET /api/share/tasks`、`POST /api/share/tasks/{id}/cancel`、`POST /api/share/run`、`GET /api/share/status`。
+- 新增测试 16 项（test_v106_* 四文件）；全量回归 757 passed（741 基线 +16）；前端 build 通过。
+- **灰度默认关闭**：`share_center_enabled=false` 时新旧链行为与改造前完全一致（零回归），需真机验证后再开启新链。
+
 ## 功能一致性声明
 - 默认行为不变：`strict=False` 走旧引擎；英文名解析与按名+大小回填用户明确不动；分享=推送粒度红线、目录分享、白名单闸门、Bot 三件事边界均未改。
-- 新增能力均为可选/附加：严格顺序模式（主动开启）、深色主题（主动切换）、任务中心（聚合视图无副作用）。
+- 新增能力均为可选/附加：严格顺序模式（主动开启）、深色主题（主动切换）、任务中心（聚合视图无副作用）、**四模块分享中心新链（灰度开关默认关闭）**。
 - 逐功能保护清单见 `FEATURE_PRESERVATION.md`。

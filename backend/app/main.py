@@ -495,6 +495,24 @@ async def _scheduled_scan(root: str) -> None:
             logger.warning("[scan] 定时全量扫描异常", exc_info=True)
 
 
+async def _job_share_center() -> None:
+    """四模块重构：分享中心调度周期（建分享→提交分发）。
+
+    灰度开关 share_center_enabled 关闭时立即返回（默认，零开销、零行为变化）；
+    开启时扫描 planned 分享任务，建分享并提交到分发中心。全程独立 Session，
+    异常自行吞掉并留应用日志，不影响其它定时任务。
+    """
+    from . import share_center as _sc
+    with SessionLocal() as db:
+        try:
+            if not _sc.is_enabled(db):
+                return
+            await _sc.run_cycle(db, limit=20)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center] 调度周期异常", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     migrate()
@@ -548,6 +566,9 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     _schedule_queue_worker(queue_trigger)
+    # 四模块重构：分享中心调度（开关关闭时仅占一个空转 job，无行为变化）
+    scheduler.add_job(_job_share_center, "interval", seconds=20, id="share_center",
+                      max_instances=1, coalesce=True)
     scheduler.add_job(_job_token_refresh, "interval", seconds=60, id="token_refresh",
                       max_instances=1, coalesce=True)
     scheduler.add_job(_job_bot_poll, "interval", seconds=10, id="bot_poll",
@@ -2150,6 +2171,23 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
                 pass  # 单个分享取消失败不阻断对账
     q = db.query(QueueItem).filter(QueueItem.resource_id.in_(ids)).delete(
         synchronize_session=False)
+    # 四模块重构 阶段C 规则2：B 库整部删除 → 分享中心取消原分享任务（出库解耦）。
+    # 按 stale 资源作品键取消未终结的 ShareTask；A 库仍在时镜像下一轮补齐 B 库，
+    # 新资源重新入库后走 _enqueue_ready 建新的 first 任务→重新分享推送（闭环）。
+    try:
+        from . import share_center
+        stale_keys = {work_group_key(x) for x in stale}
+        if stale_keys:
+            active = [share_center.ST_PLANNED, share_center.ST_READY,
+                      share_center.ST_SUBMITTED, share_center.ST_ACCEPTED,
+                      share_center.ST_PUBLISHING]
+            stale_tasks = db.scalars(select(share_center.ShareTask).where(
+                share_center.ShareTask.work_key.in_(list(stale_keys)),
+                share_center.ShareTask.status.in_(active))).all()
+            for st in stale_tasks:
+                st.status = share_center.ST_CANCELLED
+    except Exception:
+        pass
     for x in stale:
         db.delete(x)
     add_audit(db, "library_reconciled", target_type="library",
@@ -2197,6 +2235,14 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
         if rep.share_url:
             ev.share_reused = True
             stats["share_reused"] += 1
+        # 四模块重构 阶段B/C：更新事件登记独立分享任务（追更，复用原链接，独立事件 ID）
+        try:
+            from . import share_center
+            sc_task = share_center.shadow_register(db, rep, kind="update", event_id=ev.id)
+            if sc_task is not None:
+                ev.share_task_id = sc_task.id
+        except Exception:
+            pass
         ids = [m.id for m in members]
         q = db.scalar(select(QueueItem).where(
             QueueItem.resource_id.in_(ids)).order_by(QueueItem.id).limit(1))
@@ -2921,6 +2967,22 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     db.add(QueueItem(resource_id=x.id, channel_id=rule.channel_id,
                      status="pending" if rule.auto_publish else "review"))
     db.flush()  # autoflush=False：立即落库，供同批次后续单集的去重查询看到
+    # 四模块重构 阶段B：影子登记到分享中心（双写期）。不改变本函数返回值与 QueueItem 行为，
+    # 灰度开关开启后由 share_center.run_cycle 接管。影子异常被内部吞掉，绝不影响主入队。
+    try:
+        from . import share_center
+        sc_task = share_center.shadow_register(db, x, kind="first",
+                                               channel_ids=[rule.channel_id])
+        if sc_task is not None:
+            q = db.scalar(select(QueueItem).where(
+                QueueItem.resource_id == x.id,
+                QueueItem.channel_id == rule.channel_id).limit(1))
+            if q:
+                q.share_task_id = sc_task.id
+                q.push_reason = "first"
+                db.flush()
+    except Exception:
+        pass
     return True
 
 
@@ -3867,6 +3929,57 @@ async def queue_run():
     return await process_queue(limit=50)
 
 
+# ============================================================================
+# 四模块重构：分享中心 API（阶段D 前端对接）
+# ============================================================================
+
+@app.get("/api/share/tasks", dependencies=ADMIN)
+def share_tasks_list(status: str = "", limit: int = 200, db: Session = Depends(get_db)):
+    """分享任务列表（前端「分享中心」页面）。"""
+    from . import share_center
+    q = select(share_center.ShareTask)
+    if status:
+        q = q.where(share_center.ShareTask.status == status)
+    rows = list(db.scalars(q.order_by(share_center.ShareTask.id.desc()).limit(min(limit, 500))).all())
+    return {"enabled": share_center.is_enabled(db), "items": [
+        {"id": t.id, "work_key": t.work_key, "kind": t.kind, "status": t.status,
+         "share_url": t.share_url, "share_id": t.share_id,
+         "parent_task_id": t.parent_task_id, "parent_event_id": t.parent_event_id,
+         "resource_id": t.resource_id, "attempts": t.attempts, "error": t.error,
+         "created_at": t.created_at.isoformat() if t.created_at else "",
+         "published_at": t.published_at.isoformat() if t.published_at else ""}
+        for t in rows]}
+
+
+@app.post("/api/share/tasks/{tid}/cancel", dependencies=ADMIN)
+def share_task_cancel(tid: int, db: Session = Depends(get_db)):
+    """取消分享任务（撤销未发送的交接队列项）。"""
+    from . import share_center
+    task = db.get(share_center.ShareTask, tid)
+    if not task:
+        raise HTTPException(404, "分享任务不存在")
+    n = share_center.cancel_task(db, task)
+    add_audit(db, "share_task_cancelled", target_type="share_task", target_id=str(tid))
+    return {"ok": True, "queue_revoked": n}
+
+
+@app.post("/api/share/run", dependencies=ADMIN)
+async def share_run():
+    """手动跑一轮分享中心调度（建分享→提交分发）。"""
+    from . import share_center as _sc
+    with SessionLocal() as db:
+        return await _sc.run_cycle(db, limit=20)
+
+
+@app.get("/api/share/status", dependencies=ADMIN)
+def share_status(db: Session = Depends(get_db)):
+    """分享中心状态：开关 + 各状态计数（前端任务中心聚合用）。"""
+    from . import share_center as _sc
+    from sqlalchemy import func as _fn
+    rows = db.execute(select(_sc.ShareTask.status, _fn.count()).group_by(_sc.ShareTask.status)).all()
+    return {"enabled": _sc.is_enabled(db), "counts": {str(s): int(n) for s, n in rows}}
+
+
 @app.post("/api/resources/{rid}/publish", dependencies=ADMIN)
 async def publish_resource(rid: int, db: Session = Depends(get_db)):
     """把单个资源按所有启用规则 + 目录路由（频道/群）入队并立即推送一次。
@@ -3928,6 +4041,19 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         else:
             db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
             added += 1
+    # 四模块重构 阶段B：手动强推登记 force 影子任务（force 不去重、优先级最高）
+    try:
+        from . import share_center
+        ch_ids = sorted({q.channel_id for q in db.scalars(select(QueueItem).where(
+            QueueItem.resource_id == x.id, QueueItem.status == "pending")).all()})
+        force_task = share_center.shadow_register(db, x, kind="force", channel_ids=ch_ids)
+        if force_task is not None:
+            for q in db.scalars(select(QueueItem).where(
+                    QueueItem.resource_id == x.id, QueueItem.status == "pending")).all():
+                q.share_task_id = force_task.id
+                q.push_reason = "force"
+    except Exception:
+        pass
     db.commit()
     result = await process_queue(limit=50)
     # v0.6.2：把本次入队项的即时结果带回前端，避免"点了没反应"的错觉。

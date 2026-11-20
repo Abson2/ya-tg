@@ -226,6 +226,14 @@ class QueueItem(Base):
     telegram_message_id: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 四模块重构 阶段A：分享中心 ↔ 分发中心交接字段（老库走 db._COLUMNS ALTER 补列）
+    # share_task_id 指向 share_tasks.id，是「一次分享/推送任务」的独立 ID（强制项3）
+    share_task_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    push_reason: Mapped[str] = mapped_column(String(16), default="")  # first/update/force/restore
+    event_id: Mapped[int] = mapped_column(Integer, default=0)  # 关联 resource/distribution 事件
+    status_ext: Mapped[str] = mapped_column(String(24), default="")  # submitted/accepted/publishing/done（空=旧链）
+    accept_worker: Mapped[str] = mapped_column(String(64), default="")
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("resource_id", "channel_id", name="uq_resource_channel"),)
 
 
@@ -458,6 +466,9 @@ class DistributionEvent(Base):
     queue_id: Mapped[int] = mapped_column(Integer, default=0)
     share_reused: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 四模块重构 阶段A：事件 → 分享任务溯源（强制项3：更新推送独立事件 ID）
+    share_task_id: Mapped[int] = mapped_column(Integer, default=0)
+    push_task_ids: Mapped[str] = mapped_column(Text, default="")  # JSON 数组：本次事件触发的 push_queue.id
     __table_args__ = (UniqueConstraint("work_key", "fingerprint", name="uq_event_work_fingerprint"),)
 
 
@@ -536,3 +547,47 @@ class MediaRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ============================================================================
+# 四模块重构 阶段A：分享中心（原推送队列前移并改造）
+# 设计原则（FOUR_MODULE_REFACTOR_DESIGN.md）：
+#   - 分享是实体，不是发送瞬间的一个动作：每次分享/推送有独立任务 ID 与生命周期。
+#   - 一部剧只建一个分享（按 B 库目录 ID），更新复用原链接但生成独立推送任务。
+#   - 分享中心提交（submitted）→ 分发中心原子领取（accepted）→ 发送 → 回执。
+#   - resources.share_* 保留为只读缓存，真相源在本表；不删旧列，兼容回滚。
+# ============================================================================
+
+class ShareTask(Base):
+    """分享任务：一次「建分享 + 推送」的完整生命周期（分享中心真相源）。
+
+    kind: first(首次) / update(追更) / force(手动强推) / restore(删除后重建)
+    status: planned→building→ready→submitted→accepted→publishing→published/failed/cancelled
+    """
+    __tablename__ = "share_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    kind: Mapped[str] = mapped_column(String(16), default="first")
+    resource_id: Mapped[int] = mapped_column(Integer, default=0)  # 代表单集（建分享/消息构造用）
+    # 分享对象：B 库目录 ID（强制项2）。share_scope=file 时 dir_id 为空、用 resource.file_id。
+    share_dir_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    share_scope: Mapped[str] = mapped_column(String(16), default="file")
+    share_id: Mapped[str] = mapped_column(String(64), default="")
+    share_url: Mapped[str] = mapped_column(Text, default="")
+    share_status: Mapped[str] = mapped_column(String(24), default="not_created")
+    # 追更关系链：update/restore 指向首次任务，复用其 share_url（强制项3）
+    parent_task_id: Mapped[int] = mapped_column(Integer, default=0)
+    parent_event_id: Mapped[int] = mapped_column(Integer, default=0)  # resource/distribution 事件
+    status: Mapped[str] = mapped_column(String(24), default="planned", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)  # force>first>update>restore
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    channel_targets: Mapped[str] = mapped_column(Text, default="[]")  # JSON：[{channel_id,...}] 提交时快照
+    # 幂等键：first=<work_key>（整剧唯一一次）；update/restore=<event_id>；force=None(允许重复强推)
+    # NULL 表示不做 DB 层去重；非空时唯一约束挡住同一事件的重复提交。
+    dedup_key: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("dedup_key", name="uq_share_task_dedup"),)

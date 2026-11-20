@@ -36,6 +36,8 @@ const seriesGroups = ref([])   // v0.6.4：/api/library/series 聚合结果
 const overview = ref({}), task = ref({ cron: '*/30 * * * *', enabled: true })
 const resources = ref([])
 const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
+// 四模块重构：分享中心任务列表与状态（独立命名，避免与光鸭 shareStatus 冲突）
+const shareCenterTasks = ref([]), shareCenterStatus = ref({ enabled: false, counts: {} })
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
 const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN', scan_min_interval: '', scan_max_calls: '', bot_min_interval: '', bot_max_calls: '', rate_window_seconds: '' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
@@ -528,11 +530,12 @@ const navGroups = [
   { label: '光鸭资源', items: [
     { key: '光鸭授权', icon: 'key', label: '光鸭授权' },
     { key: '镜像同步', icon: 'copy', label: '镜像同步' },
-    { key: '资源库', icon: 'folder', label: '资源库' }
+    { key: '资源库', icon: 'folder', label: '资源库' },
+    // 四模块重构：原「推送队列」改名「分享中心」并上移；key 保留兼容既有断言与 section
+    { key: '推送队列', icon: 'send', label: '分享中心' }
   ] },
   { label: '分发与互动', items: [
-    { key: '分发与互动中心', icon: 'link', label: '分发与互动中心' },
-    { key: '推送队列', icon: 'send', label: '推送队列' }
+    { key: '分发与互动中心', icon: 'link', label: '分发与互动中心' }
   ] },
   { label: '系统', items: [
     { key: 'TMDB 设置', icon: 'image', label: 'TMDB 设置' },
@@ -620,13 +623,13 @@ const taskCenter = computed(() => {
       status: shareN.status || 'idle',
       metrics: [mk('已分享', shareN.value || 0), mk('分享总数', shareN.total || 0)],
       note: '来源：镜像进度「生成分享」节点（目录分享，队列每 30 秒消费）' },
-    { key: 'push', label: '推送队列', icon: 'send', target: '推送队列',
+    { key: 'push', label: '分享中心', icon: 'send', target: '推送队列',
       status: q.failed ? 'warn' : ((q.pending || q.retry || q.review) ? 'active' : (q.sent ? 'done' : 'idle')),
       metrics: [mk('待发送', q.pending + q.review, (q.pending + q.review) ? 'good' : ''),
                 mk('重试中', q.retry, q.retry ? 'warn' : ''),
                 mk('失败', q.failed, q.failed ? 'bad' : ''),
                 mk('已发送', q.sent)],
-      note: '来源：推送队列接口（队列状态真实计数）' },
+      note: '来源：分享中心任务 + 推送队列接口（真实计数）' },
     { key: 'contribution', label: '投稿处理', icon: 'shield', target: '分发与互动中心',
       status: cPending || cRestorePending ? 'active' : (cDone ? 'done' : 'idle'),
       metrics: [mk('待审核', cPending, cPending ? 'good' : ''),
@@ -792,7 +795,8 @@ async function load() {
     'templates', 'templates/presets', 'audit', 'diagnostics', 'telegram/config',
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
-    'contributions?limit=50', 'media-requests?limit=50', 'logs/overview']
+    'contributions?limit=50', 'media-requests?limit=50', 'logs/overview',
+    'share/tasks?limit=200', 'share/status']
   const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
   const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   overview.value = v(0) || overview.value
@@ -836,6 +840,9 @@ async function load() {
     logOverview.value = { total_rows: lg.total_rows || 0, total_pruneable: lg.total_pruneable || 0,
       container_log: lg.container_log || '' }
   }
+  // 四模块重构：分享中心任务与状态（新接口失败不影响主界面）
+  const st = v(22); if (st) shareCenterTasks.value = st.items || []
+  const ss = v(23); if (ss) shareCenterStatus.value = ss
   // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
   try { await loadTgExtra() } catch (e) {}
   try { await loadPushStats() } catch (e) {}
@@ -1677,6 +1684,15 @@ async function identify(row, auto) {
 async function approve(id) { await api(`/review/${id}/approve`, { method: 'POST' }); ElMessage.success('已通过'); await load() }
 async function reject(id) { await api(`/review/${id}/reject`, { method: 'POST' }); ElMessage.success('已拒绝'); await load() }
 async function retry(id) { await api(`/queue/${id}/retry`, { method: 'POST' }); ElMessage.success('已重新入队'); await load() }
+// 四模块重构：分享中心操作
+async function shareRunCycle() {
+  try { const d = await api('/share/run', { method: 'POST' }); ElMessage.success(`分享中心：建分享 ${d.built || 0} · 提交 ${d.submitted || 0} · 失败 ${d.failed || 0}`); await load() }
+  catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+async function shareCancelTask(id) {
+  try { await ElMessageBox.confirm('取消该分享任务？将撤销未发送的推送队列项。', '确认', { type: 'warning' }); await api(`/share/tasks/${id}/cancel`, { method: 'POST' }); ElMessage.success('已取消'); await load() }
+  catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+}
 // v0.9.2：网页端扫码登录——光鸭 App 扫一扫，免开放平台应用凭证
 async function startWebqr() {
   try {
@@ -2771,8 +2787,24 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         </section>
 
         <section v-else-if="tab === '推送队列'" class="fade">
-          <div class="page-head"><div><h2>推送队列</h2><p>失败项按指数退避自动重试，可手动重置</p></div><div class="head-tools"><el-tag type="success">{{ overview.sent || 0 }} 已推送</el-tag><el-tag type="danger">{{ overview.failed || 0 }} 失败</el-tag></div></div>
+          <div class="page-head"><div><h2>分享中心</h2><p>分享生命周期 · 整剧一次目录分享 · 更新复用链接独立推送 · 与分发中心交接确认</p></div><div class="head-tools"><el-tag :type="shareCenterStatus.enabled ? 'success' : 'info'" size="small">{{ shareCenterStatus.enabled ? '新链已启用' : '旧链兼容模式' }}</el-tag><el-button size="small" type="primary" :loading="runningQueue" @click="shareRunCycle">跑一轮分享</el-button></div></div>
+          <div class="panel" style="margin-bottom:16px">
+            <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个分享任务；更新生成独立任务并复用原链接。状态：planned→ready→submitted→accepted→published</span></div>
+            <el-table :data="shareCenterTasks" stripe max-height="480">
+              <el-table-column prop="id" label="ID" width="70"/>
+              <el-table-column prop="work_key" label="作品" min-width="160" show-overflow-tooltip/>
+              <el-table-column prop="kind" label="类型" width="90"><template #default="s"><el-tag size="small" :type="s.row.kind === 'force' ? 'warning' : (s.row.kind === 'update' ? 'primary' : 'info')">{{ s.row.kind }}</el-tag></template></el-table-column>
+              <el-table-column prop="status" label="状态" width="120"><template #default="s"><span class="status-tag">{{ s.row.status }}</span></template></el-table-column>
+              <el-table-column prop="parent_task_id" label="追更自" width="90"><template #default="s">{{ s.row.parent_task_id || '—' }}</template></el-table-column>
+              <el-table-column prop="share_url" label="分享链接" min-width="200" show-overflow-tooltip/>
+              <el-table-column prop="attempts" label="尝试" width="70"/>
+              <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip/>
+              <el-table-column label="操作" width="90"><template #default="s"><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
+            </el-table>
+            <div v-if="!shareCenterTasks.length" class="empty">暂无分享任务（识别入库后自动生成）</div>
+          </div>
           <div class="panel">
+            <div class="panel-head"><h3>推送队列</h3><span class="hint">分发中心消费队列；失败项按指数退避自动重试，可手动重置</span></div>
             <el-table :data="queue" stripe max-height="640"><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="resource" label="资源" min-width="200"/><el-table-column prop="channel" label="频道"/><el-table-column prop="status" label="状态" width="100"><template #default="s"><span class="status-tag" :class="'st-'+s.row.status">{{ s.row.status }}</span></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="next_retry_at" label="下次重试"/><el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip/><el-table-column label="操作" width="90"><template #default="s"><el-button size="small" @click="retry(s.row.id)">重试</el-button></template></el-table-column></el-table>
             <div v-if="!queue.length" class="empty big">队列为空</div>
           </div>

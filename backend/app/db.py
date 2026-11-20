@@ -87,6 +87,17 @@ _COLUMNS = {
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
+        # 四模块重构 阶段A：分享中心 ↔ 分发中心交接列（老库 ALTER 补列）
+        "share_task_id": "INTEGER DEFAULT 0",
+        "push_reason": "TEXT DEFAULT ''",
+        "event_id": "INTEGER DEFAULT 0",
+        "status_ext": "TEXT DEFAULT ''",
+        "accept_worker": "TEXT DEFAULT ''",
+        "accepted_at": "DATETIME",
+    },
+    # 四模块重构 阶段A：分享任务表增加索引列（表本身由 create_all 新建，老库若已存在补列）
+    "share_tasks": {
+        "dedup_key": "TEXT",
     },
     "auth_tokens": {
         "device_id": "TEXT DEFAULT ''",
@@ -163,6 +174,11 @@ _COLUMNS = {
         "last_share_url": "TEXT DEFAULT ''",
         "last_tg_user_id": "TEXT DEFAULT ''",
         "last_submitted_at": "DATETIME",
+    },
+    # 四模块重构 阶段A：分发事件 → 分享/推送任务溯源（强制项3）
+    "distribution_events": {
+        "share_task_id": "INTEGER DEFAULT 0",
+        "push_task_ids": "TEXT DEFAULT ''",
     },
     # v0.9.15 #276：发现目标补成员状态/归属 Bot 用户名/最后 update_id/更新时间
     "discovered_chats": {

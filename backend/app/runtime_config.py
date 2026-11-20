@@ -115,6 +115,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tg_group_link": ("tg_group_link", ""),
     # v0.9.10：推送消息正文里的机器人跳转文字链接（指向推送 Bot 本身），留空则不显示
     "tg_bot_link": ("tg_bot_link", ""),
+    # 四模块重构：分享中心灰度开关（默认 false=走旧链，零回归；true=分享中心交接生效）
+    "share_center_enabled": ("share_center_enabled", "false"),
 }
 
 

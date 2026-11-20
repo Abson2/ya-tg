@@ -399,6 +399,18 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                 or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
             ).order_by(QueueItem.id).limit(limit)
         ).all())
+        # 四模块重构 阶段C：分享中心交接确认（灰度开关开启时生效）。
+        # 开关关闭：rows 原样处理（旧链零回归）。开关开启：只处理已被分享中心领取
+        # （status_ext=accepted）的队列项，未交接的留下一轮，杜绝「未确认就发送」。
+        from . import share_center as _sc
+        sc_enabled = _sc.is_enabled(db)
+        if sc_enabled:
+            claimed = _sc.claim_tasks(db, worker="publisher", limit=limit)
+            accepted_ids = set()
+            for q in rows:
+                if q.status_ext == _sc.ST_ACCEPTED:
+                    accepted_ids.add(q.id)
+            rows = [q for q in rows if q.id in accepted_ids]
         # v0.9.11.1：一次性预构建「本轮涉及频道」的 sent 作品键映射，消除原逐条
         # O(N·M) 全表反查（每条 pending 都按 channel_id 扫全部 sent，再逐条
         # db.get(Resource) + 算键）。作品键 _work_group_key 只依赖 share_dir_id /
@@ -471,9 +483,15 @@ async def _process_queue_impl(limit: int = 20) -> dict:
             need_share = not res.share_url
             share_error = ""
             try:
-                await ensure_share(db, res)
-                if need_share:
-                    shared += 1
+                # 四模块重构 阶段C：开关开启且队列项由分享中心管理时，只读交接的
+                # ShareTask.share_url（分享中心已建好），分发中心绝不反建分享。
+                sc_url = _sc.share_url_for_queue_item(db, q) if sc_enabled else None
+                if sc_url is not None:
+                    res.share_url = sc_url  # 可能为空=降级无链接推送
+                else:
+                    await ensure_share(db, res)
+                    if need_share:
+                        shared += 1
             except Exception as exc:
                 # v0.9.10：建分享失败不再跳过发送——分享只是消息里的「获取资源」入口，
                 # 失败时仍要把资源通知送出去（正文无链接、无按钮），否则群/频道一条都
@@ -520,6 +538,15 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                     q.next_retry_at = plus_seconds(utcnow(), retry_delay)
                     q.status = "retry" if q.attempts < MAX_ATTEMPTS else "failed"
                 failed += 1
+            # 四模块重构 阶段C：发送结果回执给分享中心（终态 published/failed）
+            if sc_enabled and q.share_task_id:
+                try:
+                    if ok:
+                        _sc.mark_result(db, q.share_task_id, ok=True, message_id=message_id)
+                    elif q.status == "failed":
+                        _sc.mark_result(db, q.share_task_id, ok=False, error=q.error)
+                except Exception:
+                    pass
             # v0.9.10：本条发送结果立即落盘，绝不把写事务带进下一轮的 sleep / 网络 await。
             db.commit()
         return {"sent": sent, "failed": failed, "shares_created": shared}

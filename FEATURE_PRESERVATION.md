@@ -105,6 +105,16 @@
 
 > 阶段六 UI 升级护栏：上述 9 个原 tab 一个不删（`tests/test_v104_dark_theme.py::test_all_tab_entries_preserved` + `test_v104_task_center.py::test_all_original_tabs_still_preserved` 双重守护）；批次控制 pause/resume/skip/cancel 四按钮保留；深色主题为附加层不改浅色默认。
 
+## 9. 四模块重构保护（四模块重构批次）
+| 保护对象 | 保护方式 | 验证 |
+| --- | --- | --- |
+| 原「推送队列」tab 语义 | key 保留 `'推送队列'`，仅显示 label 改「分享中心」并上移导航组 | `test_v104_dark_theme` / `test_v104_task_center` 13 项全过 |
+| 分发与互动中心零改动 | Bot 发送链路、白名单、投稿/求片、TGtoDrive 联动代码未改；publisher 仅在开关开启时新增交接读取分支 | 全量回归 + 互动相关测试全过 |
+| 灰度开关默认关闭 | `share_center_enabled=false`（runtime_config DEFAULTS）时新旧链行为与改造前一致；影子登记异常被吞不影响主入队 | `test_v106_shadow_and_switch` 覆盖关闭默认 + 影子失败不阻断 |
+| 作品级去重红线 | 分享中心统一 `utils.work_group_key`；first 整剧唯一、QueueItem uq_resource_channel 唯一约束保留 | `test_v106_share_center` / `test_v065_push_logic` |
+| 目录分享红线 | ShareTask.share_dir_id 来自 B 库 dir_chain/parent_id，series_dir 按目录建分享 | `test_v106_share_center` + 既有 series_share 测试 |
+| 数据迁移兼容 | 新表 create_all、新列 _COLUMNS 幂等 ALTER，不删旧列；resources.share_* 保留为缓存 | `test_v106_share_schema` 新库+老库两路径 |
+
 ---
 
 ## 回归执行约定（阶段七）
