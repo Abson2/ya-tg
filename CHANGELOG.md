@@ -8,6 +8,19 @@
 
 ---
 
+## v1.5.1 (2026-11-21)
+
+**v1.5.0 真机试跑 P0 修复（三项）**：v1.5.0 上线后真机连续暴露全局推送停摆、TG 发送循环卡死、缺集不自动补三类 P0。本版逐项根治，均为保守修复，不改发送核心、不改镜像 full/half 模式语义、不动默认开关。全量 pytest **895 passed**，前端 build 通过。回滚 `IMAGE_TAG=v1.5.0`。
+
+- **P0 全局推送停摆 + building 僵尸（`95d81ab`）**：真机「我不是药神」q49 频道发出、q50 群聊 pending 从未领取，全局群聊 40 条 pending 仅 1 条发出。根因两处叠加：①`build_share` 进入 building 时先 `commit()` 落盘，后续异常 `rollback()` 救不回，而 `run_cycle` 候选不扫 building → task 卡死成僵尸（attempts 累至 1354）；②队列取样每轮只取前 20 条，`status_ext=''` 且带 `share_task_id` 的交接态僵尸项既不被 `claim_tasks` 领取、又被 publisher 交接闸门过滤，永久占满队头。修复：`ShareTask.building_at` + `share_building_timeout_minutes`(默认 5) 每轮自愈重置超时 building、异常降级清 building_at；队列取样窗口扩大到 `max(limit*10, 200)` 并按「可消费优先」排序，最终发送仍截断 limit 防一次刷屏；手动 retry 端点同步重置 `status_ext=submitted`。
+- **P0 第七次 TG 发送循环卡死 + 资源库手动推送推不出去（`74e4a1f`）**：真机「英雄连 / 让子弹飞 / 赌侠」队列项全部 `accepted` 但 `sent_at` 为空、`accepted_at` 同毫秒——worker 批量领取后卡在单条 TG 网络等待，整轮不退出。取证 `_send_telegram` 硬编码 `timeout=20`、sendPhoto 失败再回退 sendMessage（单条最坏约 40s）、逐条串行 + 全局 `_queue_lock` 整轮持有。修复：`telegram_http_timeout_seconds`(默认 8) / `telegram_send_hard_limit_seconds`(默认 12) 可配，HTTP 超时按配置注入，`asyncio.wait_for` 给单条发送加硬上限、超时按失败退避重试，保留 `_queue_lock` 防重复消费。资源库手动推送按钮保留，修复入队后未设 `status_ext` 导致变空 ext 僵尸被闸门过滤的问题——现同步置 `status_ext=submitted`。
+- **P0 缺集不自动补（`ead9def`）**：真机「我不是大师」S01E23 在 B 库真缺失但映射仍标 synced。取证主循环 v0.8.7 本就具备「synced 但 B 缺集 → 复用同一行补复制」能力，断链在 prepass 未识别缺集、且按部轮转下缺集剧排在尾部要等多轮。`reconcile_mappings_prepass` 新增缺集识别（synced 且 A 仍在、B 逐集反查不到、`b_file_count < 已同步数` 排除 name_mismatch 误伤），返回 `missing_keys` → `sync_rule` 抽成 `priority_works` 先于正常批次同轮执行、**不占 `max_works` 部数预算**；预扫描只登记不预改映射（补复制仍交主循环复用同一行），full/half 删除语义不变。
+- **测试**：新增 `test_v155_push_stall_building_zombie`(7) / `test_v156_tg_send_timeout`(5) / `test_v157_manual_publish_status_ext`(2)，`test_v148_mirror_prepass` 补缺集 3 项；全量 895 passed 零回归。
+
+> 真机验收重点：①building 僵尸不再复现、群聊队列恢复消费；②accepted 项能真正发出、不再同毫秒领取后停滞；③资源库手动推送生效；④B 库缺集在下一轮镜像自动补回（`last_message` 显示「另优先补齐 N 部缺集（不占限额）」）。
+
+---
+
 ## v1.5.0 (2026-11-21)
 
 **资源库 / 分享中心重构阶段二~六全落地 + 镜像同步 1.1 + 三处死锁根治**：按《Ya-TG 资源库优化与分享中心重新设计开发建议书》推进，遵循「资源库唯一管理入口、分享中心唯一发布入口、分发与互动中心唯一发送入口、B 库为实际存在状态最终依据」。全程不改发送核心（`_send_telegram` / `_build_message` / `process_queue`），默认全部保守值（自动发布 / 自动清理 / 资源解耦均关）。版本号四处一致升至 1.5.0；全量 pytest **878 passed**，前端 build 通过。回滚 `IMAGE_TAG=v1.4.4`。
