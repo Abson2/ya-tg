@@ -597,6 +597,33 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
 # 2026-11-21 事故：事件 #6 identified|work:开封府 卡 8 小时，pending 按 id 升序，
 # 它永远排第一 → 每轮都先在它身上等写锁超时 → 死亡螺旋。
 MAX_EVENT_CONSUME_FAILURES = 3
+# v1.4.2 洞1根治：失败计数改进程内存态，**绝不写 DB**。
+# 2026-11-21 第四次复现（事件 #10）：v1.4.0 把 fail_n 写进 payload_json 再 commit，
+# 但真机写锁被占时这个恢复用的 commit 自己也等 30s → 失败 → rollback → 计数没落库，
+# 下次重读还是 0 → fail_n 永远停在「第 1 次」，到不了 3 次跳过阈值。
+# 解药（记失败次数）与毒药（写锁）共用同一条写通道 = 死循环。改内存态彻底断开：
+# 计数只在进程内累加，不碰 DB；进程重启计数清零可接受（重启本身释放写锁，是新一轮）。
+# 只记 id→次数，无个人信息；上限清理避免长期运行内存增长。
+_EVENT_FAIL_COUNT: dict[int, int] = {}
+_EVENT_FAIL_COUNT_MAX = 4096
+
+
+def _bump_event_fail(event_id: int) -> int:
+    """内存态累加事件失败次数，返回累加后的值。不写 DB、不抛异常。"""
+    try:
+        n = int(_EVENT_FAIL_COUNT.get(event_id, 0) or 0) + 1
+    except (TypeError, ValueError):
+        n = 1
+    if len(_EVENT_FAIL_COUNT) >= _EVENT_FAIL_COUNT_MAX:
+        # 简单有界清理：清掉最老的一半（dict 插入序），避免无界增长。
+        for k in list(_EVENT_FAIL_COUNT)[: _EVENT_FAIL_COUNT_MAX // 2]:
+            _EVENT_FAIL_COUNT.pop(k, None)
+    _EVENT_FAIL_COUNT[event_id] = n
+    return n
+
+
+def _clear_event_fail(event_id: int) -> None:
+    _EVENT_FAIL_COUNT.pop(event_id, None)
 
 
 def consume_resource_events(db: Session, limit: int = 100) -> dict:
@@ -632,37 +659,39 @@ def consume_resource_events(db: Session, limit: int = 100) -> dict:
                     _, created = ensure_task(db, res, kind="first")
                     stats["tasks_created"] += 1 if created else 0
             _ev.mark_consumed(db, ev)
+            _clear_event_fail(ev.id)  # v1.4.2：成功即清计数，防止陈旧计数误伤下次失败
             stats["consumed"] += 1
         except Exception as exc:
-            # 失败先回滚本条的部分写，再独立记录失败次数（二次异常不影响主流程）
+            # v1.4.2 洞1根治：失败计数走进程内存态，**不写 DB、不再 db.commit()**。
+            # 旧版在这里写 payload_json._consume_fail 再 commit，写锁被占时这个恢复事务
+            # 自己也卡 30s→rollback→计数没落库→fail_n 永远=1→到不了3次跳过阈值（第四次复现根因）。
+            # 现在计数纯内存累加，恢复路径零 DB 写，与毒药（写锁）彻底解耦。
             try:
                 db.rollback()
             except Exception:
                 pass
             stats["failed_once"] += 1
-            fail_n = 1
-            try:
-                payload = json.loads(ev.payload_json or "{}") or {}
-                fail_n = int(payload.get("_consume_fail", 0) or 0) + 1
-                payload["_consume_fail"] = fail_n
-                payload["_consume_last_error"] = str(exc)[:300]
-                ev.payload_json = json.dumps(payload, ensure_ascii=False)
-                if fail_n >= MAX_EVENT_CONSUME_FAILURES:
-                    # 毒事件：连续失败到阈值，强制消费跳过，释放队头。
-                    # 事件本身不删（保留可追溯），下游有定时全量对账兜底，
-                    # 漏掉一次事件通知不会丢数据。
+            fail_n = _bump_event_fail(ev.id)
+            if fail_n >= MAX_EVENT_CONSUME_FAILURES:
+                # 毒事件：连续失败到阈值，强制消费跳过，释放队头。
+                # mark_consumed 本身要写库；若此刻写锁仍被占，它也会抛异常，
+                # 被本 except 的 try 吞掉——下一次失败计数继续累加、再次尝试跳过，
+                # 直到写锁释放后成功。计数不因跳过失败而丢失（内存态），这是与旧版的关键区别。
+                marked = False
+                try:
                     _ev.mark_consumed(db, ev)
+                    marked = True
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                if marked:
+                    _clear_event_fail(ev.id)
                     stats["skipped_poison"] += 1
                     logger.error(
                         "[share_center] 事件 #%s 连续失败 %s 次，强制跳过避免队头死锁：%s",
                         ev.id, fail_n, exc)
-                else:
-                    db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
             logger.warning("[share_center] 消费资源事件 #%s 失败（第 %s 次）：%s",
                            ev.id, fail_n, exc)
     return stats

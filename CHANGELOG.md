@@ -8,6 +8,19 @@
 
 ---
 
+## v1.4.2 (2026-11-21)
+
+**P0 第四次死锁根治**：v1.4.0/v1.4.1 的分享中心修复仍有两个洞，真机重启 40 分钟后复发——事件 #10 卡 `database is locked`、所有 APScheduler job missed、`_job_rename_pending` 跑不起来，3 部剧只有 1 部改好（开封府 58 文件没改名）。本版从根因断开死锁链，不再靠重启续命。
+
+- **洞1：毒事件失败计数的"解药用了毒药通道"**（`share_center.py`）。v1.4.0 把 `fail_n` 写进 `payload_json._consume_fail` 再 `db.commit()`，但真机写锁被占时这个**恢复事务自己也等 30s→失败→rollback→计数没落库**，下次重读还是 0 → `fail_n` 永远停在「第 1 次」，到不了 3 次强制跳过阈值，毒事件永久占队头。修复：失败计数改**进程内存态**（`_EVENT_FAIL_COUNT`，有界清理），全程不写 DB、恢复路径零写操作；成功消费或强制跳过后清计数；`mark_consumed` 若因锁失败，下次累加继续重试直到锁释放，计数不丢。附带：payload 不再被恢复逻辑改写。
+- **洞2：run_cycle 仍在主协程做同步写**（`main.py`）。v1.4.0 只把"事件消费"挪进 `to_thread`，但 `_job_share_center` 后半段 `await run_cycle()` 留在主协程，其内部 `submit_to_dispatch`/`can_publish`/`_pace_after` 的 `db.commit()` 是同步写，撞上被占写锁就在主线程等 30s → 冻结整个事件循环 → 所有 job missed + API 全超时。修复：新增 `_run_share_cycle_in_thread()`，线程内用 `asyncio.run()` 驱动完整 `run_cycle`（含网络 await 与全部 commit）+ 独立 Session；`_job_share_center` 两段都走 `to_thread`，主线程全程零 SQLite 锁等待。
+- **取证澄清**：`build_share` 的 db 事务边界本身守得住（`client.create()` 网络 await 前已 commit），不是本次根因；真凶是上面两处。测试从"理想业务异常"改为"模拟写锁连 rollback/commit 都失败"的贴近真机场景。
+- 更新 `tests/test_v141_share_event_deadlock.py`：失败计数改内存态断言（不再写 payload）、锁异常下计数仍能累加到阈值并强制跳过、run_cycle 走线程驱动护栏。版本号四处一致升至 1.4.2。
+
+> 说明：本次仅根治分享中心这条死锁链（持锁源头）。开封府等未改名的文件，升级后由修复好的 `_job_rename_pending` 后台复查 job 自动续改；无需再靠重启+手动 force 续命。
+
+---
+
 ## v1.4.1 (2026-11-21)
 
 v1.4.0 真机验收后遗留问题的代码侧根治：光鸭 `code=127「操作过于频繁」`改名限流。死锁已确认解除（health/status 200、token 117 消失、事件 #6 消费完、镜像锁空闲、force 改名 15 成功），本版只处理限流与一处配置告警瑕疵，不动主链逻辑。

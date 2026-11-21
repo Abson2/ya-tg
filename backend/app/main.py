@@ -511,6 +511,24 @@ def _consume_resource_events_in_thread() -> None:
             logger.warning("[share_center] 消费资源事件周期异常：%s", exc)
 
 
+def _run_share_cycle_in_thread() -> None:
+    """v1.4.2 洞2根治：分享调度周期整体挪出事件循环线程。
+
+    2026-11-21 第四次复现：v1.4.0 只把「事件消费」挪进 to_thread，但 run_cycle
+    仍在主协程——它内部 submit_to_dispatch / can_publish / _pace_after 的 db.commit()
+    是同步写，撞上被占的写锁就在主线程等 30s，冻结整个 loop → 全 job missed + API 超时。
+    这里在独立线程用 asyncio.run() 跑完整 run_cycle（含 build_share 网络 await 与全部
+    commit），线程内自建 Session。主线程只等一个 to_thread，零 SQLite 锁等待。
+    """
+    from . import share_center as _sc
+    with SessionLocal() as db:
+        try:
+            asyncio.run(_sc.run_cycle(db, limit=20))
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center] 调度周期异常（线程内）", exc_info=True)
+
+
 async def _job_share_center() -> None:
     """四模块重构：分享中心调度周期（建分享→提交分发）。
 
@@ -518,8 +536,11 @@ async def _job_share_center() -> None:
     提交到分发中心。开关关闭仅作旧链排障用。全程独立 Session，异常自行吞掉并留
     应用日志，不影响其它定时任务。
 
-    P0 修复：同步 DB 段（事件消费）改 to_thread，绝不在事件循环线程等 SQLite 写锁；
-    async 段（run_cycle 含建分享网络 await）保持 await，网络等待不占写事务。
+    P0 修复（v1.4.0→v1.4.2）：两段都挪出事件循环线程——
+      1. 事件消费（纯同步 DB）走 _consume_resource_events_in_thread；
+      2. 分享调度周期（run_cycle 含同步 commit + 网络 await）走
+         _run_share_cycle_in_thread（线程内 asyncio.run drive）。
+    主线程全程零 SQLite 锁等待，任何 30s busy_timeout 都不再冻结全站 job/API。
     """
     from . import share_center as _sc
     # 先判断开关（轻量只读查询，留在事件循环线程）
@@ -533,13 +554,9 @@ async def _job_share_center() -> None:
             return
     # P0：同步事件消费挪出事件循环，锁等待不再冻结全站
     await asyncio.to_thread(_consume_resource_events_in_thread)
-    # async 段：建分享/提交含网络 await，保持在主协程
-    with SessionLocal() as db:
-        try:
-            await _sc.run_cycle(db, limit=20)
-        except Exception as exc:
-            db.rollback()
-            logger.warning("[share_center] 调度周期异常", exc_info=True)
+    # v1.4.2 洞2：分享调度周期（含同步 commit）也挪出事件循环，
+    # 避免主线程等待写锁冻结全站（第四次复现根因）
+    await asyncio.to_thread(_run_share_cycle_in_thread)
 
 
 @asynccontextmanager
@@ -624,13 +641,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=True)
 
 
-app = FastAPI(title="Ya-TG", version="1.4.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.4.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.2", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------

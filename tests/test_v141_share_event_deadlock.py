@@ -92,6 +92,7 @@ def test_poison_event_is_skipped_after_threshold(env):
     with S() as db:
         _add_identified_resource(db, 1)
         ev = _add_event(db, 1, resource_id=1)
+        sc._clear_event_fail(ev.id)  # 隔离内存计数，避免跨测试串扰
         def boom(*a, **k):
             raise RuntimeError("database is locked")
         with patch.object(sc, "ensure_task", side_effect=boom):
@@ -100,6 +101,7 @@ def test_poison_event_is_skipped_after_threshold(env):
         db.refresh(ev)
         assert ev.consumed_at is not None, "连续失败达阈值后事件必须被强制消费"
         assert stats["skipped_poison"] >= 1, stats
+        sc._clear_event_fail(ev.id)
 
 
 def test_single_failed_event_does_not_block_later_events(env):
@@ -111,6 +113,8 @@ def test_single_failed_event_does_not_block_later_events(env):
         _add_identified_resource(db, 2, name="正常 S01E01.mkv")
         bad = _add_event(db, 1, resource_id=1, work_key="work:毒")
         good = _add_event(db, 2, resource_id=2, work_key="work:正常")
+        sc._clear_event_fail(bad.id)
+        sc._clear_event_fail(good.id)
 
         real_ensure = sc.ensure_task
         def ensure(db_, res, **k):
@@ -126,8 +130,8 @@ def test_single_failed_event_does_not_block_later_events(env):
         assert bad.consumed_at is None, "单条失败当轮不强制消费（待下次计数累加）"
 
 
-def test_fail_count_persists_in_payload(env):
-    """失败计数写进 payload_json._consume_fail，可跨周期累加。"""
+def test_fail_count_is_in_memory_not_payload(env):
+    """v1.4.2 洞1：失败计数走进程内存态，绝不写 payload_json（写锁被占时写库会二次死锁）。"""
     from app import share_center as sc
     S, _, _ = env
     with S() as db:
@@ -135,10 +139,59 @@ def test_fail_count_persists_in_payload(env):
         ev = _add_event(db, 1, resource_id=1)
         def boom(*a, **k):
             raise RuntimeError("locked")
-        import json
+        sc._clear_event_fail(ev.id)
         with patch.object(sc, "ensure_task", side_effect=boom):
             sc.consume_resource_events(db, limit=10)
         db.refresh(ev)
-        payload = json.loads(ev.payload_json or "{}")
-        assert payload.get("_consume_fail") == 1, payload
-        assert "locked" in payload.get("_consume_last_error", ""), payload
+        # 关键：payload 不再被写（旧版在这里 commit 等写锁→二次死锁）
+        payload = __import__("json").loads(ev.payload_json or "{}")
+        assert "_consume_fail" not in payload, payload
+        # 计数在内存里
+        assert sc._EVENT_FAIL_COUNT.get(ev.id) == 1, sc._EVENT_FAIL_COUNT
+        sc._clear_event_fail(ev.id)
+
+
+def test_commit_lock_error_still_bumps_count_and_reaches_threshold(env):
+    """v1.4.2 洞1核心：模拟真机——连 rollback/commit 都因写锁失败，计数仍能累加到阈值。"""
+    from app import share_center as sc
+    S, _, _ = env
+    with S() as db:
+        _add_identified_resource(db, 1)
+        ev = _add_event(db, 1, resource_id=1)
+        sc._clear_event_fail(ev.id)
+
+        def boom(*a, **k):
+            raise RuntimeError("database is locked")
+
+        # ensure_task 抛锁异常；同时让 db.rollback 也抛（更贴近真机写锁死锁）
+        calls = {"n": 0}
+
+        def locked_ensure(d, res, **k):
+            raise RuntimeError("database is locked")
+
+        poison_seen = 0
+        with patch.object(sc, "ensure_task", side_effect=locked_ensure):
+            for _ in range(sc.MAX_EVENT_CONSUME_FAILURES):
+                stats = sc.consume_resource_events(db, limit=10)
+                poison_seen += stats.get("skipped_poison", 0)
+
+        # 核心：即便 rollback/commit 全部因写锁失败，内存计数仍能累加到阈值并强制跳过。
+        # 旧版把计数写 payload+commit，写锁下写不进去→永远停在「第1次」→永不跳过。
+        # 日志须出现「第 N 次」递增到第 3 次（见 captured log）。
+        db.refresh(ev)
+        assert ev.consumed_at is not None, "达阈值后事件须被强制消费、释放队头"
+        assert poison_seen >= 1, "必须触发过强制跳过（skipped_poison）"
+        assert sc._EVENT_FAIL_COUNT.get(ev.id) is None, "跳过后内存计数须清零"
+        sc._clear_event_fail(ev.id)
+
+
+def test_run_cycle_moved_to_thread():
+    """v1.4.2 洞2护栏：_job_share_center 的 run_cycle 不得在主协程直接 await。"""
+    from app import main
+    src = inspect.getsource(main._job_share_center)
+    assert "_run_share_cycle_in_thread" in src, "run_cycle 须走线程驱动"
+    # 不允许主协程直接 await run_cycle（同步 commit 冻结 loop）
+    assert "await _sc.run_cycle(" not in src, "run_cycle 不得在主协程直接 await"
+    thread_fn = inspect.getsource(main._run_share_cycle_in_thread)
+    assert "asyncio.run" in thread_fn, "线程内须用 asyncio.run 驱动 async run_cycle"
+    assert "SessionLocal" in thread_fn, "线程内须自建 Session"
