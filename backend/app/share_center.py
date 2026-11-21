@@ -324,6 +324,7 @@ async def build_share(db: Session, task: ShareTask) -> str:
     if not res:
         raise GuangYaError("分享任务关联的资源已不存在")
     task.status = ST_BUILDING
+    task.building_at = utcnow()  # v1.5.1：building 进入时间，超时自愈用
     task.attempts = int(task.attempts or 0) + 1
     db.commit()  # await 前落盘，不跨网络持写事务（项目红线）
 
@@ -556,6 +557,30 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
         return stats
     max_attempts = 8
     now = utcnow()
+    # v1.5.1 P0：building 僵尸自愈。build_share 先把 building 落盘（328行），
+    # 后续建分享异常 rollback 救不回已提交状态，而本函数候选只扫 planned/ready/failed，
+    # building 任务永久卡死（真机 task4 attempts=1354）。这里在取候选前把超时未完成的
+    # building 重置 planned，让它重进候选自愈。超时阈值可配，默认5分钟。
+    # 用条件 UPDATE 一次批量重置，不逐条 ORM；写失败不影响本轮其余流程。
+    try:
+        timeout_min = max(1, _int_cfg(db, "share_building_timeout_minutes") or 5)
+        cutoff = now - timedelta(minutes=timeout_min)
+        stale = db.scalars(select(ShareTask).where(
+            ShareTask.status == ST_BUILDING,
+            or_(ShareTask.building_at.is_(None), ShareTask.building_at <= cutoff))).all()
+        for st in stale:
+            st.status = ST_PLANNED
+            st.building_at = None
+            st.error = f"[building超时自愈] 卡 building 超过 {timeout_min} 分钟，已重置 planned"
+            st.scheduled_at = None
+        if stale:
+            db.commit()
+            stats["building_recovered"] = len(stale)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     # v1.2 发布节奏（§5.4）：相邻任务按配置错开 scheduled_at，避免一瞬间并发提交。
     # 0=不限（保持 v1.1 行为）；只对本次真正提交的任务顺延，不改门禁/退避逻辑。
     release_gap = _int_cfg(db, "share_release_interval_seconds")
@@ -634,6 +659,7 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
                 task.status = ST_READY
                 task.share_url = ""
                 task.next_retry_at = None
+                task.building_at = None  # v1.5.1：异常降级必清 building 中间态，防僵尸
                 db.commit()
             except Exception:
                 try:

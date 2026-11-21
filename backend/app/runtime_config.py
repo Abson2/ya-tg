@@ -126,6 +126,10 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 阶段六（分享中心全重做）全局急停：true=run_cycle 直接空转，不发任何新分享。
     # 保守默认 false；只拦「新提交」，不撤销已在途任务，也不动分发中心发送核心。
     "publish_paused": ("publish_paused", "false"),
+    # v1.5.1 P0：building 中间态超时自愈阈值（分钟）。build_share 先 commit building
+    # 落盘，网络/锁异常后 rollback 救不回已提交状态；候选查询又不扫 building → 永久僵尸。
+    # run_cycle 每轮把 building_at 早于 now-N 分钟的任务重置 planned 重进候选。默认5分钟。
+    "share_building_timeout_minutes": ("share_building_timeout_minutes", "5"),
     # 阶段五（链接校验与清理，用户决策1）：有效性=本地元数据+删除事件驱动，非光鸭实时状态。
     # link_inactive_confirm_count：连续失效信号达此次数才可能判 inactive（默认2）；
     # link_inactive_min_minutes：两次失效信号最小间隔分钟（默认30），防抖动误判；

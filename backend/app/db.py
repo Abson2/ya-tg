@@ -100,6 +100,8 @@ _COLUMNS = {
         "dedup_key": "TEXT",
         "queue_type": "TEXT DEFAULT 'fresh'",
         "submitted_at": "DATETIME",
+        # v1.5.1 P0：building 超时自愈时间戳（老库幂等补列）
+        "building_at": "DATETIME",
     },
     # v1.1：当前/历史分享记录表（真相源），表由 create_all 新建，老库补列兜底
     "share_records": {

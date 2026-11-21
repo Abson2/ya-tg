@@ -3987,6 +3987,13 @@ def retry(qid: int, db: Session = Depends(get_db)):
     if not q:
         raise HTTPException(404, "队列项不存在")
     q.status, q.attempts, q.error, q.next_retry_at = "pending", 0, "", None
+    # v1.5.1 P0：分享中心项(share_task_id>0)若 status_ext 为空/accepted/paused
+    # 等不可消费态，手动 retry 必须把它重新置回 submitted 才能进交接消费链——
+    # 否则真机 q82/83/84 retry 后 ext 仍空、永远不被 worker 领取（用户实测无效）。
+    if q.share_task_id:
+        q.status_ext = "submitted"
+        q.accept_worker = ""
+        q.accepted_at = None
     add_audit(db, "queue_retried", target_type="queue", target_id=str(qid))
     db.commit()
     return {"ok": True}

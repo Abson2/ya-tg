@@ -588,6 +588,10 @@ class ShareTask(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
+    # v1.5.1 P0：building 中间态超时自愈。build_share 先 commit building 落盘，
+    # 后续建分享异常 rollback 救不回已落盘状态 → 永久僵尸（候选查询不扫 building）。
+    # 记录进入 building 的时间，run_cycle 每轮把超时未完成的重置为 planned 重进候选。
+    building_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 三类资源队列（设计文档 §4.2）：stock(存量) / fresh(全新) / followup(追更)。
     # 与 kind 解耦：kind 描述动作，queue_type 描述队列归属与配额统计口径。
     queue_type: Mapped[str] = mapped_column(String(16), default="fresh", index=True)

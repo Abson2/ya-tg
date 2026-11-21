@@ -6,7 +6,7 @@ import re
 from datetime import timedelta
 
 import httpx
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, case
 from sqlalchemy.orm import Session
 
 from . import runtime_config, tmdb
@@ -455,16 +455,29 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                     pass
                 logger.exception("[publisher] 分享中心提交周期异常（主线程兜底）")
             # 重新读取 rows（run_cycle 可能刚新建/重置了队列项的 status_ext）
+            # v1.5.1 P0 队头解阻塞：原样取前 limit(20) 条时，status_ext 空的僵尸项
+            # （有 share_task_id 但从未被领取）占满名额，后面的新项永远排不到（真机
+            # 群聊40条pending只1条发出）。改为：
+            #   ① 取样窗口放大到 sample（默认200），但发送上限仍是 limit；
+            #   ② 按「可消费优先」排序——非分享中心项或已 accepted 的排前，僵尸排后；
+            #   ③ 过滤后只取前 limit 条真正可消费的，绝不一次多发触发 Telegram 风控。
+            sample = max(limit * 10, 200)
+            consumable = or_(
+                QueueItem.share_task_id == 0,
+                QueueItem.share_task_id.is_(None),
+                QueueItem.status_ext == _sc.ST_ACCEPTED,
+            )
             rows = list(db.scalars(
                 select(QueueItem).where(
                     or_(QueueItem.status == "pending", QueueItem.status == "retry"),
                     or_(QueueItem.next_retry_at.is_(None), QueueItem.next_retry_at <= now),
-                ).order_by(QueueItem.id).limit(limit)
+                ).order_by(case((consumable, 0), else_=1), QueueItem.id).limit(sample)
             ).all())
-            _sc.claim_tasks(db, worker="publisher", limit=limit)
+            _sc.claim_tasks(db, worker="publisher", limit=sample)
+            # claim_tasks 可能把本轮窗口内 submitted 项领成 accepted，刷新可消费判定：
             rows = [q for q in rows
                     if (q.share_task_id and q.status_ext == _sc.ST_ACCEPTED)
-                    or not q.share_task_id]
+                    or not q.share_task_id][:limit]
         # v0.9.11.1：一次性预构建「本轮涉及频道」的 sent 作品键映射，消除原逐条
         # O(N·M) 全表反查（每条 pending 都按 channel_id 扫全部 sent，再逐条
         # db.get(Resource) + 算键）。作品键 _work_group_key 只依赖 share_dir_id /
