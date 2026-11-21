@@ -720,6 +720,12 @@ def apply_suggestion(db: Session, suggestion_id: int, reviewer: str = "admin",
 
 @router.get("/overview")
 def api_overview(db: Session = Depends(get_db)):
+    """发布总览仪表盘数据。
+
+    全部字段来自 sc_* 真实表聚合：不读旧 ShareRecord/ShareTask，不使用截图示例值。
+    注意：link_state 仅由发布建链写入 active（unknown 为未建链默认值）；
+    suspicious/inactive/cleaned 属旧链接核验链路，v2 发布任务不写，故分布中可能缺席。
+    """
     ensure_defaults(db)
     counts = {}
     for model, key in ((SCLibraryVersion, "versions"), (SCPushList, "lists"),
@@ -730,13 +736,76 @@ def api_overview(db: Session = Depends(get_db)):
     status_rows = db.execute(
         select(SCPublishTask.status, func.count(SCPublishTask.id)).group_by(SCPublishTask.status)
     ).all()
+    status_counts = {str(k): int(v or 0) for k, v in status_rows}
+    link_rows = db.execute(
+        select(SCPublishTask.link_state, func.count(SCPublishTask.id)).group_by(SCPublishTask.link_state)
+    ).all()
+    link_state_counts = {str(k): int(v or 0) for k, v in link_rows}
+    kind_rows = db.execute(
+        select(SCPublishTask.kind, func.count(SCPublishTask.id)).group_by(SCPublishTask.kind)
+    ).all()
+    kind_counts = {str(k): int(v or 0) for k, v in kind_rows}
+
+    def _sum_status(*names: str) -> int:
+        return sum(status_counts.get(n, 0) for n in names)
+
+    # KPI 四卡：语义固定、来源可追溯
+    kpi = {
+        "pending_publish": _sum_status("planned", "ready"),
+        "active_shares": link_state_counts.get("active", 0),
+        "pending_link": link_state_counts.get("unknown", 0),
+        "in_flight_push": _sum_status("submitted", "accepted", "publishing", "building"),
+    }
+
+    # 发布调度：按真实 kind 分组，进度=已发布/该类任务总数
+    published_total = status_counts.get("published", 0)
+
+    def _schedule_row(kind: str, label: str) -> dict[str, Any]:
+        total = kind_counts.get(kind, 0)
+        done = db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.kind == kind, SCPublishTask.status == "published")) or 0
+        done = int(done or 0)
+        return {"kind": kind, "label": label, "total": total, "published": done,
+                "rate": round(done * 100 / total, 1) if total else 0.0}
+
+    schedule = {
+        "first": _schedule_row("first", "全新剧"),
+        "update": _schedule_row("update", "追更剧"),
+        "overall": {"kind": "overall", "label": "全部任务", "total": counts["tasks"],
+                    "published": published_total,
+                    "rate": round(published_total * 100 / counts["tasks"], 1)
+                    if counts["tasks"] else 0.0},
+    }
+    # 真实启用的时段窗口（供仪表盘展示配额区间；无窗口时前端显示"按计划窗口"）
+    windows = [
+        {"plan_version_id": w.plan_version_id, "start_hour": w.start_hour,
+         "end_hour": w.end_hour, "quota": w.quota}
+        for w in db.scalars(select(SCHourWindow).where(SCHourWindow.enabled.is_(True))
+                            .order_by(SCHourWindow.plan_version_id, SCHourWindow.start_hour)).all()
+    ]
+    # 最近发布动态：最近 8 条真实任务
+    recent_rows = db.scalars(
+        select(SCPublishTask).order_by(SCPublishTask.id.desc()).limit(8)).all()
+    recent_tasks = []
+    for row in recent_rows:
+        data = _model_dict(row)
+        recent_tasks.append({k: data.get(k) for k in (
+            "id", "work_key", "kind", "status", "link_state", "share_url",
+            "published_at", "updated_at", "error")})
+
     pacing = []
     for t in ("channel", "group", "private"):
         rule = resolve_pacing_rule(db, t)
+        base = db.scalar(select(SCPushPacingRule).where(
+            SCPushPacingRule.scope_key == f"global:{t}",
+            SCPushPacingRule.enabled.is_(True)))
         pacing.append({"target_type": t, "interval_seconds": rule["interval"],
-                       "min_seconds": rule["min"]})
+                       "min_seconds": rule["min"],
+                       "max_per_minute": int(base.max_per_minute or 0) if base else 0})
     return {"enabled": is_enabled(db), "paused": _is_paused(db), "counts": counts,
-            "status_counts": dict(status_rows), "pacing": pacing}
+            "status_counts": status_counts, "pacing": pacing, "kpi": kpi,
+            "link_state_counts": link_state_counts, "kind_counts": kind_counts,
+            "schedule": schedule, "windows": windows, "recent_tasks": recent_tasks}
 
 
 @router.post("/run")
