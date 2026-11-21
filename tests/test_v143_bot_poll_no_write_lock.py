@@ -175,10 +175,10 @@ def test_shutdown_flushes_poll_state():
     assert "flush_poll_state" in src, "优雅退出须 flush 内存态 offset/error"
 
 
-def test_version_is_143():
+def test_version_is_144():
     import json
     root = Path(__file__).resolve().parents[1]
     main_src = (root / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="1.4.3"' in main_src
-    assert "v1.4.3 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "1.4.3"
+    assert 'version="1.4.4"' in main_src
+    assert "v1.4.4 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
+    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "1.4.4"

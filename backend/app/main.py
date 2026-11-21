@@ -445,8 +445,9 @@ async def _job_rename_pending():
                     MirrorFile.rename_status == "failed"))) or 0
             if not pending:
                 return
-            out = await _safe_rename(db, r, only_pending=True, max_media=5,
-                                     max_files=10, max_seconds=20)
+            # v1.4.4 按部收敛：不再传 max_files=10 截断单集（那会让被选中的整部剧
+            # 只改 10 集）。每轮按 rule.max_works_per_run 选 N 部、部内全部改完。
+            out = await _safe_rename(db, r, only_pending=True, max_media=5)
             db.commit()
             if out.get("renamed") or out.get("waiting_visible"):
                 logger.info("[mirror] 待改名复查：改名 %s / 仍待可见 %s",
@@ -657,13 +658,13 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="1.4.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.4.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.4", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------

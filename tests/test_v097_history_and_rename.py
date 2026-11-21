@@ -164,16 +164,18 @@ def test_partial_visibility_renames_visible_rows(session):
     assert session.get(MirrorFile, f2.id).rename_status == "pending_visible"
 
 
-# ---- 3. 后台复查必须短、只看待办 ----
-def test_background_rename_job_uses_short_budget(session):
+# ---- 3. 后台复查只看待办；v1.4.4 起按部收敛，不再传单集/时间预算 ----
+def test_background_rename_job_uses_per_work_budget(session):
     _seed_rename(session, rename_status="")  # 后台复查需要启用规则 + 待改名文件
     with patch("app.main._safe_rename", new=AsyncMock(return_value={"renamed": 0})) as mock:
         _run(main._job_rename_pending())
     assert mock.await_count == 1
     kw = mock.await_args.kwargs
     assert kw["only_pending"] is True
-    assert kw["max_seconds"] <= 20
     assert kw["max_media"] <= 5
+    # v1.4.4：部内全改，不得再传 max_files/max_seconds 截断单集（那样整部剧只改前 N 集）
+    assert "max_files" not in kw, "不得按单集数截断，按 rule.max_works_per_run 选部"
+    assert "max_seconds" not in kw, "不得按时间截断部内单集"
 
 
 def test_frontend_exposes_legacy_and_zombie_hints():

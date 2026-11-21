@@ -1768,6 +1768,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                               force: bool = False, max_media: int = 100,
                               max_files: int | None = None,
                               max_seconds: float | None = None,
+                              max_works: int | None = None,
                               only_pending: bool = False) -> dict:
     """把 B 库已同步的单集 / 单电影文件按英文剧名改名（只换中文片名段）。
 
@@ -1781,8 +1782,14 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
       - v0.9.6.1：`rename_status='skipped_legacy'` 的历史行默认不回刷。用户口径：
         旧版只改文件夹、不改单集；新版单集英文名改名只作用于升级后新同步的文件。
         只有 force=True 才清掉标记、重新处理历史行。
-      - only_pending=True：后台复查专用，只看仍未改名的文件，并卡紧时长预算，
-        避免后台任务长期持有全局镜像锁导致「立即同步」报 409。
+      - only_pending=True：后台复查专用，只看仍未改名的文件。
+      - v1.4.4 按部收敛：预算单位是「部」（目录级），与复制阶段的
+        `max_works_per_run` 同口径。每轮最多处理 max_works 部作品，选中的每一部
+        其全部单集一次改完（部内不再按单集数 / 时间截断）——用户 2026-11-21 口径：
+        「单轮最多整理整部剧/电影（部）对复制、翻译都生效，附带的单文件全部处理完」。
+        改完的部不再 pending，下一轮自动选下一批，天然轮转、无需额外游标。
+        max_files / max_seconds 仅作向后兼容的防御参数保留：max_works 生效时部内
+        不触发单集截断；max_works<=0（配置未设）才退回旧的全局单集 / 时间预算。
     """
     # v1.4 B2：改名 idle 与复制 idle 解耦，管理页可配（默认 0.3，下限 0.2）。
     # 旧版直接复用 file_idle_seconds（默认 1.0），40 集纯等待就 39 秒。
@@ -1798,6 +1805,15 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     except (TypeError, ValueError):
         rename_concurrency = 3
     idle = rename_idle  # 函数体内所有 await asyncio.sleep(idle) 现指改名专用间隔
+    # v1.4.4 按部收敛：优先用显式 max_works，否则读 rule.max_works_per_run。
+    # >0 时按部选批、部内全改；<=0 时退回旧的单集/时间预算（向后兼容手动 force 全量）。
+    if max_works is None:
+        try:
+            max_works = int(getattr(rule, "max_works_per_run", 0) or 0)
+        except (TypeError, ValueError):
+            max_works = 0
+    max_works = max(0, int(max_works or 0))
+    per_work_mode = max_works > 0
     file_budget = int(max_files if max_files is not None else RENAME_MAX_FILES)
     time_budget = float(max_seconds if max_seconds is not None else RENAME_MAX_SECONDS)
     stats = {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
@@ -1813,7 +1829,9 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
              "remaining": 0, "truncated_reason": "", "attempts": 0,
              "skipped_legacy": 0,
              "untranslated_works": [], "idle_seconds": idle,
-             "file_budget": file_budget, "time_budget": time_budget}
+             "file_budget": file_budget, "time_budget": time_budget,
+             # v1.4.4：按部收敛回显
+             "max_works": max_works, "per_work_mode": per_work_mode}
     started_all = time.monotonic()
     attempts = 0
     consecutive_failures = 0
@@ -1832,12 +1850,26 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 or_(MirrorFile.rename_status.is_(None),
                     MirrorFile.rename_status.in_(["", "pending_visible", "failed"])))))
     medias = list(db.scalars(media_q).all())
-    for media in medias[:max_media]:
-        # v0.9.6.1：预算在「每部作品开始前」也要查。旧版只在内层逐文件查，
-        # 一部作品的 TMDB(6s)+AI(10s)+递归列目录 就能把后台锁拖到两分钟。
-        if stop_reason or time.monotonic() - started_all >= time_budget:
-            stop_reason = stop_reason or "time_budget"
-            break
+    # v1.4.4 按部收敛：每轮最多 max_works 部，改完的部不再 pending，下一轮自动
+    # 选下一批（天然轮转，无需游标，也不与复制阶段共用的 works_cursor 冲突）。
+    # 部内全改，不受单集 max_files / 时间预算截断。max_works<=0 时退回旧口径。
+    # per_work_mode 下部数完全由 max_works 决定（不再叠加 max_media 的防御截断）；
+    # 旧模式仍用 max_media 作全库防御上限。
+    selected = medias[:max_works] if per_work_mode else medias[:max_media]
+    if per_work_mode:
+        stats["selected_works"] = len(selected)
+    for media in selected:
+        # v1.4.4：按部模式下预算类（file_budget/time_budget）不再在这里阻断，
+        # 部内全改；但真实止损（连续失败熔断 rate_limited / 事务损坏 db_error）
+        # 仍须停止后续作品。旧版在这里无条件 `if stop_reason` 提前 break，叠加
+        # 内层单集预算 break，正是「准备满预算→阶段二全作废→0 改名」的断流根因。
+        if per_work_mode:
+            if stop_reason in ("rate_limited", "db_error"):
+                break
+        else:
+            if stop_reason or time.monotonic() - started_all >= time_budget:
+                stop_reason = stop_reason or "time_budget"
+                break
         # v1.3 借鉴 TgtoDrive v8.8.25「已入库的名称继续沿用、不重复解析」：
         # 名称沿用由 _resolve_english_title 的 english_title DB 缓存实现——缓存
         # 命中即零网络返回（force 才强制重解析）。这里**不**按 DB rename_status
@@ -1880,7 +1912,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
             stats["no_rows"] += 1
             continue
         # v0.9.6.1：再查一次预算，避免刚解析完英文名/列目录已超时还继续发改名请求。
-        if time.monotonic() - started_all >= time_budget:
+        # v1.4.4：按部模式下已选中的部不中途放弃，部内单集全部改完。
+        if not per_work_mode and time.monotonic() - started_all >= time_budget:
             stop_reason = "time_budget"
             break
         # v0.9.2：复制任务返回 done 后，B 库文件可见可能有秒级延迟。
@@ -1923,14 +1956,17 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         jobs: list[tuple[MirrorFile, str, str, str]] = []  # (row, fid, final, fname)
         for idx, row in enumerate(rows):
             fname = str(row.file_name or "")
-            # v0.8.9：预算与熔断。已达标跳过不消耗「尝试次数」，保证下轮能
-            # 快速跳过已改名的文件、把预算留给真正还没改的那部分。
-            if time.monotonic() - started_all >= time_budget:
-                stop_reason = "time_budget"
-                break
-            if attempts + len(jobs) >= file_budget:
-                stop_reason = "file_budget"
-                break
+            # v1.4.4：按部模式下部内全改——单集数 / 时间预算不在这里截断，
+            # 已选中的部所有可见单集全部收集进 jobs（用户口径「单文件全部处理完」）。
+            # 非按部模式（max_works<=0）保留旧的单集 / 时间预算。
+            if not per_work_mode:
+                if time.monotonic() - started_all >= time_budget:
+                    stop_reason = "time_budget"
+                    break
+                if attempts + len(jobs) >= file_budget:
+                    stop_reason = "file_budget"
+                    break
+            # 连续失败熔断是真实止损（真实失败/网盘异常），任何模式都保留。
             if consecutive_failures >= RENAME_MAX_CONSECUTIVE_FAILURES:
                 stop_reason = "rate_limited"
                 break
@@ -1996,9 +2032,16 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     break
 
         # 阶段二：按窗口并发发网络 + 主协程串行写库。
+        # v1.4.4 P0 断流修复：准备阶段因 file_budget / time_budget / rate_limited
+        # 提前 break 时会设 stop_reason，但此时 jobs 里已收集了待发任务。旧版这里
+        # `if stop_reason: break` 把这些 jobs 全部作废——单部 58 集、后台预算 10 时
+        # 准备到第 10 个就 break，执行阶段一个 rename_file 都不发，renamed 恒为 0。
+        # 修法：预算/限流类 stop_reason 不再阻断本轮已收集 jobs 的发送（发完才算停）；
+        # 只有 db_error（事务已坏、必须立即止损）才在这里中断。
+        # 预算仍然生效：发完 jobs 后外层作品循环因 stop_reason 停止，不会越界多改。
         first = True
         for start in range(0, len(jobs), rename_concurrency):
-            if stop_reason:
+            if stop_reason == "db_error":
                 break
             window = jobs[start:start + rename_concurrency]
             if not first:
@@ -2062,10 +2105,12 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     if requeue_rate_limited and not stop_reason:
         stats["rate_limit_retries_queued"] = len(requeue_rate_limited)
         for qstart in range(0, len(requeue_rate_limited), rename_concurrency):
-            if stop_reason or time.monotonic() - started_all >= time_budget:
+            # v1.4.4：按部模式下部内已全改，127 二次排队也不受单集/时间预算阻断。
+            if stop_reason or (not per_work_mode
+                               and time.monotonic() - started_all >= time_budget):
                 stop_reason = stop_reason or "time_budget"
                 break
-            if attempts >= file_budget:
+            if not per_work_mode and attempts >= file_budget:
                 stop_reason = "file_budget"
                 break
             qwin = requeue_rate_limited[qstart:qstart + rename_concurrency]

@@ -8,6 +8,26 @@
 
 ---
 
+## v1.4.4 (2026-11-21)
+
+**P0 改名按部收敛 + 断流根治**：v1.4.3 把五轮死锁彻底修好（容器 healthy、零 `database is locked`、零 job missed、零 127/160，事件 #10 已消费）、英文名解析完全正常（书剑/The Book and the Sword、开封府/The Legend of Kaifeng 均 tmdb 命中）。但暴露一个此前被死锁掩盖的 P0：开封府 58 集改名落盘恒为 0，与锁、限流、翻译都无关。
+
+- **根因（源码 mirror.py 两处叠加）**：
+  1. **断流**：阶段一（准备 jobs）遍历单集到 `attempts + len(jobs) >= file_budget` 时设 `stop_reason="file_budget"; break`；阶段二（发 `rename_file`）旧代码 `if stop_reason: break` 直接退出，把已收集 jobs 全部作废——一个网络请求都不发。后台复查 job 传 `max_files=10`，58 集剧永远只准备到 10 就断流 → `renamed=0`；手动 `max_files=100` 则 58 集全改完（真机 2026-11-21 11:03：10 → 0，100 → 58/failed=0/rate_limited=0）。
+  2. **预算单位错**：改名用「单集数」预算，与用户口径不符。
+- **用户口径（2026-11-21 拍板）**：前端「单轮最多整理整部剧 / 电影（部）」`max_works_per_run` 对**复制、翻译都生效**，按部的目录级收敛——每轮最多 N 部，选中的每部**所有单集文件全部改完**（部内不设单集数 / 时间上限，靠已有 127 退避 + 并发节奏兜风控）。用户选项确认：部内全改不设上限、每轮部数跟随 `max_works_per_run`（当前 10）。
+- **修复**（`mirror.py` / `main.py`）：
+  1. `rename_mirror_files` 新增 `max_works` 参数（不传则读 `rule.max_works_per_run`）。>0 时按部选批：每轮最多 `max_works` 部、部内全部单集一次改完；改完的部不再 pending，下一轮自动选下一批——天然轮转，不碰复制阶段共用的 `works_cursor`。
+  2. 按部模式下部内不再被 `max_files` / `time_budget` 逐文件截断；连续失败熔断（真实止损）保留；127 尾部二次排队也不再被单集预算阻断。
+  3. 断流修复：阶段二不再被「预算类」`stop_reason` 阻断，先把已收集 jobs 发完；只有 `db_error`（事务已坏）才立即中断。
+  4. 后台复查 job 去掉 `max_files=10` / `max_seconds=20` 的单集截断，改走按部预算。
+  5. `max_works<=0` 退回旧单集 / 时间预算（向后兼容手动 force 全量）。
+- 新增 `tests/test_v144_budget_drain_fix.py` 6 项：一部 20 集全改完、两部按 max_works 轮转续改、从 rule 读取部数、mode 0 兼容、`db_error` 立即中断护栏、版本一致。版本号四处一致升至 1.4.4。全量 pytest + 前端 build 通过。
+
+> 真机已由用户手动 `rename_mirror_files(max_files=100, only_pending=True)` 把开封府 58/58 改完止血；本版修复保证今后任何集数 > 旧预算的作品按部全量改完，不再卡 0。
+
+---
+
 ## v1.4.3 (2026-11-21)
 
 **P0 第五次死锁根治**：真机完整堆栈抓到真正的持锁源——不是 share_center（v1.4.2 确认已修好，事件 #10 已消费、书剑恩仇录 40 文件 done），而是 `_job_bot_poll` 每 10 秒无条件写 `app_config`。翻译本身完全正常（三家全部解析成功），卡的是「改名落盘」：bot_poll 的 `set_many` 与改名 job 的 58 次 `rename_status` 更新抢同一把 SQLite 写锁，双方互相饿死，容器持续 unhealthy。
