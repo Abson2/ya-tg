@@ -40,11 +40,18 @@ const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 const shareCenterTasks = ref([]), shareCenterStatus = ref({ enabled: false, counts: {}, queues: {}, share_records: {} })
 // 分享中心三类队列筛选（设计文档 §4.2）：all/stock/fresh/followup
 const shareQueueFilter = ref('all')
+const shareWorkKeySearch = ref('') // v1.2 §5.6 work_key 过滤
+const shareSchedule = ref({})       // 发布节奏配置
+const shareFollowups = ref([])      // 追更关系聚合
+const shareRecords = ref([])        // 分享记录（当前/历史）
 const shareStatusCounts = computed(() => shareCenterStatus.value.counts || {})
 const shareQueueCounts = computed(() => shareCenterStatus.value.queues || {})
 const shareFilteredTasks = computed(() => {
   const q = shareQueueFilter.value
-  return q === 'all' ? shareCenterTasks.value : (shareCenterTasks.value || []).filter(t => (t.queue_type || 'fresh') === q)
+  const kw = (shareWorkKeySearch.value || '').trim().toLowerCase()
+  let list = q === 'all' ? shareCenterTasks.value : (shareCenterTasks.value || []).filter(t => (t.queue_type || 'fresh') === q)
+  if (kw) list = (list || []).filter(t => (t.work_key || '').toLowerCase().includes(kw))
+  return list
 })
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
@@ -804,7 +811,8 @@ async function load() {
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
     'contributions?limit=50', 'media-requests?limit=50', 'logs/overview',
-    'share/tasks?limit=200', 'share/center/status']
+    'share/tasks?limit=200', 'share/center/status',
+    'share/schedule', 'share/followups', 'share/records?limit=100']
   const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
   const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   overview.value = v(0) || overview.value
@@ -851,6 +859,9 @@ async function load() {
   // 四模块重构：分享中心任务与状态（新接口失败不影响主界面）
   const st = v(22); if (st) shareCenterTasks.value = st.items || []
   const ss = v(23); if (ss) shareCenterStatus.value = ss
+  const sched = v(24); if (sched) shareSchedule.value = sched
+  const fu = v(25); if (fu) shareFollowups.value = fu.items || []
+  const recs = v(26); if (recs) shareRecords.value = recs.items || []
   // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
   try { await loadTgExtra() } catch (e) {}
   try { await loadPushStats() } catch (e) {}
@@ -1701,6 +1712,21 @@ async function shareCancelTask(id) {
   try { await ElMessageBox.confirm('取消该分享任务？将撤销未发送的推送队列项。', '确认', { type: 'warning' }); await api(`/share/tasks/${id}/cancel`, { method: 'POST' }); ElMessage.success('已取消'); await load() }
   catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
 }
+async function shareRebuildTask(id) {
+  try {
+    await ElMessageBox.confirm('重建该分享？将作废当前分享链接、清空重试次数，下一轮重新建链接并推送一次。', '重建分享', { type: 'warning' })
+    const d = await api(`/share/tasks/${id}/rebuild`, { method: 'POST' })
+    ElMessage.success(`已重建：作废记录 ${d.retired_records || 0} · 撤销队列 ${d.queue_revoked || 0}`)
+    await load()
+  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+}
+async function saveShareSchedule() {
+  try {
+    const d = await api('/share/schedule', { method: 'POST', body: JSON.stringify(shareSchedule.value) })
+    shareSchedule.value = d
+    ElMessage.success('发布节奏已保存')
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
 // v0.9.2：网页端扫码登录——光鸭 App 扫一扫，免开放平台应用凭证
 async function startWebqr() {
   try {
@@ -1891,7 +1917,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v1.1.0 · Asia/Shanghai</span>
+          <span>v1.2.0 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -2805,12 +2831,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           </div>
           <div class="panel" style="margin-bottom:16px">
             <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个有效分享；更新生成独立任务复用原链接；状态 planned→ready→submitted→accepted→published</span></div>
-            <el-radio-group v-model="shareQueueFilter" size="small" style="margin-bottom:12px">
-              <el-radio-button label="all">全部 {{ shareCenterTasks.length }}</el-radio-button>
-              <el-radio-button label="fresh">全新 {{ shareQueueCounts.fresh || 0 }}</el-radio-button>
-              <el-radio-button label="stock">存量 {{ shareQueueCounts.stock || 0 }}</el-radio-button>
-              <el-radio-button label="followup">追更 {{ shareQueueCounts.followup || 0 }}</el-radio-button>
-            </el-radio-group>
+            <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+              <el-radio-group v-model="shareQueueFilter" size="small">
+                <el-radio-button label="all">全部 {{ shareCenterTasks.length }}</el-radio-button>
+                <el-radio-button label="fresh">全新 {{ shareQueueCounts.fresh || 0 }}</el-radio-button>
+                <el-radio-button label="stock">存量 {{ shareQueueCounts.stock || 0 }}</el-radio-button>
+                <el-radio-button label="followup">追更 {{ shareQueueCounts.followup || 0 }}</el-radio-button>
+              </el-radio-group>
+              <el-input v-model="shareWorkKeySearch" size="small" clearable placeholder="按作品名/作品键搜索" style="width:220px"/>
+            </div>
             <el-table :data="shareFilteredTasks" stripe max-height="480">
               <el-table-column prop="id" label="ID" width="70"/>
               <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
@@ -2818,10 +2847,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="kind" label="类型" width="90"><template #default="s"><el-tag size="small" :type="s.row.kind === 'force' ? 'warning' : (s.row.kind === 'update' ? 'primary' : 'info')">{{ s.row.kind }}</el-tag></template></el-table-column>
               <el-table-column prop="status" label="状态" width="120"><template #default="s"><span class="status-tag">{{ s.row.status }}</span></template></el-table-column>
               <el-table-column prop="parent_task_id" label="追更自" width="90"><template #default="s">{{ s.row.parent_task_id || '—' }}</template></el-table-column>
+              <el-table-column label="推送目标" width="100"><template #default="s">{{ (JSON.parse(s.row.channel_targets || '[]') || []).length }}</template></el-table-column>
               <el-table-column prop="share_url" label="分享链接" min-width="180" show-overflow-tooltip/>
               <el-table-column prop="attempts" label="尝试" width="70"/>
               <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip/>
-              <el-table-column label="操作" width="90"><template #default="s"><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
+              <el-table-column label="操作" width="160"><template #default="s"><el-button size="small" type="warning" plain :disabled="['cancelled'].includes(s.row.status)" @click="shareRebuildTask(s.row.id)">重建</el-button><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
             </el-table>
             <div v-if="!shareFilteredTasks.length" class="empty">该队列暂无分享任务（识别入库后自动生成）</div>
           </div>
@@ -2829,6 +2859,44 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="panel-head"><h3>推送队列</h3><span class="hint">分发中心消费队列；失败项按指数退避自动重试，可手动重置</span></div>
             <el-table :data="queue" stripe max-height="640"><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="resource" label="资源" min-width="200"/><el-table-column prop="channel" label="频道"/><el-table-column prop="status" label="状态" width="100"><template #default="s"><span class="status-tag" :class="'st-'+s.row.status">{{ s.row.status }}</span></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="next_retry_at" label="下次重试"/><el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip/><el-table-column label="操作" width="90"><template #default="s"><el-button size="small" @click="retry(s.row.id)">重试</el-button></template></el-table-column></el-table>
             <div v-if="!queue.length" class="empty big">队列为空</div>
+          </div>
+          <!-- v1.2 分享管理（设计文档 §5.4/§5.7）：发布节奏 / 追更关系 / 分享记录 -->
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>发布节奏与配额</h3><span class="hint">相邻分享任务的释放间隔 + 三类队列当日配额；0 = 不限。保存后下一轮 run_cycle 生效</span></div>
+            <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+              <label class="hint">释放间隔(秒)<br><el-input-number v-model="shareSchedule.share_release_interval_seconds" :min="0" :max="3600" size="small"/></label>
+              <label class="hint">全新/日<br><el-input-number v-model="shareSchedule.fresh_daily_quota" :min="0" size="small"/></label>
+              <label class="hint">存量/日<br><el-input-number v-model="shareSchedule.stock_daily_quota" :min="0" size="small"/></label>
+              <label class="hint">追更/日<br><el-input-number v-model="shareSchedule.followup_daily_quota" :min="0" size="small"/></label>
+              <label class="hint">总分享/日<br><el-input-number v-model="shareSchedule.share_daily_limit" :min="0" size="small"/></label>
+              <label class="hint">总推送/日<br><el-input-number v-model="shareSchedule.push_daily_limit" :min="0" size="small"/></label>
+              <el-button size="small" type="primary" @click="saveShareSchedule">保存节奏配置</el-button>
+            </div>
+          </div>
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>追更管理</h3><span class="hint">按作品聚合：一部剧一个有效分享链接，更新复用链接但独立重推</span></div>
+            <el-table :data="shareFollowups" stripe max-height="360">
+              <el-table-column prop="work_key" label="作品" min-width="180" show-overflow-tooltip/>
+              <el-table-column prop="total_pushes" label="已推次数" width="100"/>
+              <el-table-column prop="update_count" label="更新次数" width="100"/>
+              <el-table-column prop="first_task_id" label="首次任务" width="100"/>
+              <el-table-column prop="current_share_url" label="当前分享链接" min-width="200" show-overflow-tooltip/>
+              <el-table-column prop="last_published_at" label="最近推送" width="170"/>
+            </el-table>
+            <div v-if="!shareFollowups.length" class="empty">暂无追更记录</div>
+          </div>
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-head"><h3>分享记录（当前 / 历史）</h3><span class="hint">share_records 是「作品→有效链接」真相源；历史记录作废后保留可追溯</span></div>
+            <el-table :data="shareRecords" stripe max-height="360">
+              <el-table-column prop="id" label="ID" width="70"/>
+              <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
+              <el-table-column label="当前" width="80"><template #default="s"><el-tag size="small" :type="s.row.current ? 'success' : 'info'">{{ s.row.current ? '有效' : '历史' }}</el-tag></template></el-table-column>
+              <el-table-column prop="share_status" label="状态" width="100"/>
+              <el-table-column prop="share_url" label="分享链接" min-width="200" show-overflow-tooltip/>
+              <el-table-column prop="failure_reason" label="作废原因" min-width="150" show-overflow-tooltip/>
+              <el-table-column prop="created_at" label="创建时间" width="170"/>
+            </el-table>
+            <div v-if="!shareRecords.length" class="empty">暂无分享记录</div>
           </div>
         </section>
 

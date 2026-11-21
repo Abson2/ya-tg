@@ -110,6 +110,13 @@ TASK_STATUS_MIN_INTERVAL = 0.2
 # 旧版用 100 且以 page*100>=total 判完整，实际每页不足 100 时会误判为
 # 「分页不完整」直接中止整轮，或漏掉文件层条目。
 LIST_PAGE_SIZE = 50
+# v1.2 需求①：单次 copy_file 的 fileIds 上限。光鸭网页端多选文件复制就是把
+# 所有选中条目的 fileId 塞进一个数组（前端 JS 契约 index.4998cfbcbd.js），
+# 但一次请求体不宜过大，按目录分组后每批最多 50 个文件，超出再分片。
+# 注意：光鸭 copy_file 不支持「复制整个目录」（无 copy_dir 接口、复制也不回传
+# 副本 fileId），所以「最大单元」在 API 能力内的落地＝同一目标目录下多文件
+# 一次批量提交，把「逐文件 N 次请求」降为「按目录 M 次请求」（M<<N）。
+COPY_BATCH_SIZE = 50
 # v0.8.4：只有 synced 才表示「文件确实到了 B 库」。这些状态必须重试，
 # 绝不能和 synced 一起塞进 existing 判 unchanged（否则永久卡死）。
 RETRYABLE_FILE_STATUS = {"pending", "copying", "failed", "unknown"}
@@ -1175,30 +1182,51 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             if stats.get("paused") or stats.get("cancelled"):
                 break
         else:
-            # 旧路径：逐文件复制，每次之间留 idle 秒；统一批量轮询
+            # v1.2 需求①：先扫描文件树（_walk_source/_b_file_candidates 已完成），
+            # 以 B 库目标目录为「最大单元」分组批量复制：同一 parent 下待复制的
+            # 多文件合并成一次 copy_file(fids[], parent)，把「逐文件 N 次请求
+            # + N 次 idle」降为「按目录 M 次请求 + M 次 idle」(M<<N)，显著提速。
+            # 光鸭 copy_file 契约只支持「多文件→同一 parent」，不支持复制整个目录，
+            # 故目录骨架仍由上面的 _ensure_child 逐层建好、副本 ID 由 backfill 回填。
+            buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
+            for row, source_fid, target_parent in copy_jobs:
+                buckets.setdefault(target_parent, []).append((row, source_fid))
+            stats["copy_batches"] = len(buckets)
             tasks: list[tuple[MirrorTask, list[MirrorFile]]] = []
-            for idx, (row, source_fid, target_parent) in enumerate(copy_jobs):
-                if idx:
-                    await asyncio.sleep(idle)
-                _beat()  # v0.9.21：逐文件复制推进打点
-                try:
-                    task_id = await api.copy_file([source_fid], target_parent)
-                except Exception as exc:
-                    msg = str(exc)[:300]
-                    row.status, row.error = "failed", msg
-                    stats["failed"] += 1
-                    stats["errors"].append(f"{title}/{row.file_name}：复制请求失败 {msg[:160]}")
-                    stats["file_errors"].append(f"{title}/{row.file_name}：{msg[:240]}")
-                    logger.warning("[mirror] copy_file 失败 %s/%s：%s", title, row.file_name, msg)
+            batch_no = 0
+            for target_parent, members in buckets.items():
+                # 单目录文件数超上限再分片，避免单次请求体过大
+                for start in range(0, len(members), COPY_BATCH_SIZE):
+                    chunk = members[start:start + COPY_BATCH_SIZE]
+                    if batch_no:
+                        await asyncio.sleep(idle)
+                    _beat()  # v0.9.21：每批复制推进打点
+                    fids = [fid for _row, fid in chunk]
+                    try:
+                        task_id = await api.copy_file(fids, target_parent)
+                    except Exception as exc:
+                        msg = str(exc)[:300]
+                        stats["failed"] += len(chunk)
+                        for row, _fid in chunk:
+                            row.status, row.error = "failed", msg
+                        stats["errors"].append(
+                            f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
+                        stats["file_errors"].extend(
+                            f"{title}/{row.file_name}：{msg[:240]}" for row, _fid in chunk)
+                        logger.warning("[mirror] 批量 copy_file 失败 %s/%s 文件：%s",
+                                       title, len(chunk), msg)
+                        db.commit()
+                        batch_no += 1
+                        continue
+                    task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
+                                      status="running")
+                    db.add(task)
                     db.commit()
-                    continue
-                task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
-                                  status="running")
-                db.add(task)
-                db.commit()
-                row.task_id = task_id
-                tasks.append((task, [row]))
-                stats["tasks"] += 1
+                    for row, _fid in chunk:
+                        row.task_id = task_id
+                    tasks.append((task, [row for row, _fid in chunk]))
+                    stats["tasks"] += 1
+                    batch_no += 1
             await _poll_tasks_batch(api, tasks, max_polls=max_polls, interval=poll_interval)
             for task, rows in tasks:
                 if task.status == "done":

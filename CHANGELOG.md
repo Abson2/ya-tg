@@ -8,6 +8,29 @@
 
 ---
 
+## v1.2.0 (2026-11-21)
+
+两项功能增强：① 镜像按 B 库目录「最大单元」批量复制提速；② 分享中心补全分享管理。全量 pytest **775 passed**、前端 build 通过。
+
+### ① 镜像最大单元批量复制
+- **先扫描文件树**：沿用 `_walk_source`（A 树）/ `_b_file_candidates`（B 树）扫描结果，先把整部作品的 B 库目录骨架逐层建好（`_ensure_child`），再进入复制阶段。
+- **按目标目录批量复制**：旧路径把同一 B 库目标父目录下的所有待复制文件合并成一次 `copy_file(fids[], parent)`，把「逐文件 N 次请求 + N 次 idle 等待」降为「按目录 M 次请求 + M 次 idle」(M≪N)，显著提速；单目录超 `COPY_BATCH_SIZE=50` 再分片。
+- **光鸭 API 边界**：`copy_file` 只支持「多文件→同一 parent」，不支持复制整个目录、也不返回副本文件 ID，故「最大单元」在 API 能力内落地为「按目录批量」，目录骨架由 create_dir 建、副本 ID 由 `backfill_target_file_ids` 按名+大小回填。
+- **已存在目录逐层补齐**：作品级 `_b_file_candidates` 只读核验 B 库实际文件，DB 标 synced 但 B 库缺失的自动重置重新复制（复用同一行、不新建、不删旧文件），已存在目录逐层复用不重复建。strict 模式因需逐任务确认暂停/恢复/跳过/取消，保持逐文件不变。
+- 统计新增 `stats["copy_batches"]`（本轮批量批次数）。
+
+### ② 分享中心分享管理（设计文档 §5.6/§5.7）
+- **任务列表增强**：`GET /api/share/tasks` 新增 `work_key` 模糊过滤，返回 `priority`/`channel_targets`（推送目标数）/`share_dir_id`/`share_scope`/`scheduled_at`；前端加作品搜索框与推送目标列。
+- **重建分享**：新增 `POST /api/share/tasks/{tid}/rebuild`，任务打回 planned、作废旧分享记录（历史保留）、清空链接/重试次数/错误、撤销未发送队列项，下一轮重新建链接并推送；前端任务表加「重建」按钮。
+- **发布节奏配置**：新增 `GET/POST /api/share/schedule`，可配 `share_release_interval_seconds`（相邻任务释放间隔）+ 三队列当日配额 + 总分享/推送上限；run_cycle 按间隔顺延 `scheduled_at` 实现「按节奏释放」，0=不限（v1.1 行为不变）。
+- **追更管理**：新增 `GET /api/share/followups`，按作品聚合「已推 N 次 / 更新 M 次 / 当前分享链接 / 最近推送」，前端加追更管理面板。
+- **分享记录管理**：新增 `GET /api/share/records`，`share_records` 真相源当前/历史记录列表（作废原因/核验时间），前端加分享记录面板。
+- 新增 `runtime_config` 键 `share_release_interval_seconds`（默认 0）。
+
+### 验证与状态
+- 全量 pytest **775 passed, 3 warnings**；新增 `tests/test_v120_bulk_copy_and_share_manage.py` 6 项（按目录批量合并、分片上限、rebuild 重建、追更聚合、节奏配置往返、work_key 过滤契约）；前端 build 通过。
+- 升级前备份 `./db` 与 `./logs`；回滚见 `ROLLBACK.md`（可切回 `IMAGE_TAG=v1.1.0`）。
+
 ## v1.1.0 (2026-11-20)
 
 按《四大模块重构开发设计与实施任务书》**100% 落地主链**：v1.0.0 只是「界面改名 + 影子登记 + 默认关闭」，本版推翻灰度模式，让分享中心真正接管发布主链，并修复真机 P0。用户已清空历史影视数据，本版不兼容旧灰度状态，升级后走全新机制。

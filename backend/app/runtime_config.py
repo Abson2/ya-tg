@@ -124,6 +124,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "stock_daily_quota": ("stock_daily_quota", "0"),
     "fresh_daily_quota": ("fresh_daily_quota", "0"),
     "followup_daily_quota": ("followup_daily_quota", "0"),
+    # v1.2 发布节奏（设计文档 §5.4/§10）：相邻分享任务的最小释放间隔秒数，0=不限。
+    # run_cycle 用它在同轮多个任务之间铺开 scheduled_at，避免瞬时并发推送。
+    "share_release_interval_seconds": ("share_release_interval_seconds", "0"),
 }
 
 

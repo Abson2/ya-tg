@@ -507,6 +507,9 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
     max_attempts = 8
     stats = {"built": 0, "submitted": 0, "skipped": 0, "failed": 0}
     now = utcnow()
+    # v1.2 发布节奏（§5.4）：相邻任务按配置错开 scheduled_at，避免一瞬间并发提交。
+    # 0=不限（保持 v1.1 行为）；只对本次真正提交的任务顺延，不改门禁/退避逻辑。
+    release_gap = _int_cfg(db, "share_release_interval_seconds")
     candidates = list(db.scalars(select(ShareTask).where(
         # ready 也要扫：force 任务在 ensure_task 时因资源已有 share_url 直接置 ready，
         # 若只扫 planned/failed 则这些 ready 任务永远不被提交，「立即推送」卡死。
@@ -522,7 +525,26 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
         if t.status == ST_FAILED and int(t.attempts or 0) >= max_attempts:
             continue
         due.append(t)
-    for task in due:
+
+    # v1.2 发布节奏：release_gap>0 时，每提交一条就把紧邻的下一条 scheduled_at
+    # 顺延一个间隔，形成「分享中心按 scheduled_at 释放」的节奏链；与分发中心
+    # 已有的 2s 发送节流叠加、不冲突。默认 0＝不施加节奏（v1.1 行为不变）。
+    paced = 0
+
+    def _pace_after(idx: int) -> None:
+        nonlocal paced
+        if release_gap <= 0:
+            return
+        paced += 1
+        future = due[idx + 1] if idx + 1 < len(due) else None
+        if future and future.status in (ST_PLANNED, ST_READY) and not future.scheduled_at:
+            future.scheduled_at = now + timedelta(seconds=release_gap * paced)
+        db.commit()
+
+    for idx, task in enumerate(due):
+        # 被节奏顺延到未来的任务等下一轮释放，不在本轮提交
+        if task.scheduled_at and (as_utc(task.scheduled_at) or now) > now:
+            continue
         try:
             if not task.share_url:
                 await build_share(db, task)
@@ -540,6 +562,7 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
                 n = submit_to_dispatch(db, task)
                 if n:
                     stats["submitted"] += n
+                    _pace_after(idx)
                 else:
                     stats["skipped"] += 1
         except Exception as exc:
@@ -562,6 +585,7 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
                     n = submit_to_dispatch(db, task)
                     if n:
                         stats["submitted"] = int(stats.get("submitted", 0)) + n
+                        _pace_after(idx)
                 else:
                     stats["skipped"] = int(stats.get("skipped", 0)) + 1
             except Exception:
@@ -620,3 +644,121 @@ def cancel_task(db: Session, task: ShareTask, *, cancel_queue: bool = True) -> i
             cancelled += 1
     db.commit()
     return cancelled
+
+
+# ============================================================================
+# v1.2 分享管理（设计文档 §5.6 / §5.7）：重建 / 节奏配置 / 追更关系 / 分享记录
+# ============================================================================
+
+def rebuild_task(db: Session, task: ShareTask) -> dict:
+    """重建分享（§5.6 POST /api/share/tasks/{id}/rebuild）。
+
+    把任务打回 planned 重新走「建分享→提交→推送」，不新建任务行（保留 dedup_key
+    与追更链），因此一部剧仍只有一个 first。作废当前 ShareRecord（历史保留），
+    清空链接/尝试次数/错误，撤销未发送队列项，下一轮 run_cycle 会重新建分享。
+    返回受影响统计。
+    """
+    prev_url = task.share_url or ""
+    retired = 0
+    try:
+        retired = retire_share_record(db, task.work_key, reason="manual_rebuild")
+    except Exception as exc:
+        logger.warning("[share_center] rebuild 作废分享记录失败 task#%s：%s", task.id, exc)
+    task.status = ST_PLANNED
+    task.share_id, task.share_url = "", ""
+    task.share_status = "not_created"
+    task.attempts, task.error = 0, ""
+    task.next_retry_at, task.scheduled_at = None, None
+    task.submitted_at, task.published_at = None, None
+    revoked = 0
+    for q in db.scalars(select(QueueItem).where(
+            QueueItem.share_task_id == task.id,
+            QueueItem.status.in_(["pending", "retry"]))).all():
+        q.status = "failed"
+        q.error = "分享任务已重建，旧队列项作废"
+        q.status_ext = ST_CANCELLED
+        revoked += 1
+    # 资源缓存也清空，避免旧前端/导出读回过期链接
+    res = db.get(Resource, task.resource_id)
+    if res:
+        res.share_id, res.share_url, res.share_status = "", "", "not_created"
+    db.add(AuditLog(action="share_rebuilt", target_type="share_task", target_id=str(task.id),
+                    detail=json_dumps({"work_key": task.work_key, "old_url": prev_url,
+                                       "retired": retired})))
+    db.commit()
+    return {"ok": True, "retired_records": retired, "queue_revoked": revoked}
+
+
+# 分享节奏/排序配置键（§5.4 发布排序与节奏；§10 已知优化项在 v1.2 落地）
+SCHEDULE_KEYS = ("share_release_interval_seconds", "share_daily_limit", "push_daily_limit",
+                 "stock_daily_quota", "fresh_daily_quota", "followup_daily_quota")
+
+
+def share_schedule_get(db: Session) -> dict:
+    """读取发布节奏配置（秒数/配额），供前端「发布节奏」面板展示。"""
+    cfg: dict[str, int] = {}
+    for key in SCHEDULE_KEYS:
+        try:
+            cfg[key] = max(0, int(runtime_config.get(db, key) or 0))
+        except (TypeError, ValueError):
+            cfg[key] = 0
+    return cfg
+
+
+def share_schedule_set(db: Session, values: dict) -> dict:
+    """写入发布节奏配置：只接受白名单键、非负整数，脏值忽略不抛错。"""
+    clean: dict[str, str] = {}
+    for key in SCHEDULE_KEYS:
+        if key not in values:
+            continue
+        try:
+            clean[key] = str(max(0, int(values[key])))
+        except (TypeError, ValueError):
+            continue
+    if clean:
+        runtime_config.set_many(db, clean)
+        db.commit()
+    return share_schedule_get(db)
+
+
+def followup_summary(db: Session) -> list[dict]:
+    """追更管理（§5.4/§5.7）：按作品聚合分享任务，展示「已推 N 次 / 更新 M 次」。"""
+    from sqlalchemy import case
+    rows = db.execute(select(
+        ShareTask.work_key,
+        func.count(ShareTask.id).label("total"),
+        func.sum(case((ShareTask.kind == "update", 1), else_=0)).label("updates"),
+        func.min(ShareTask.id).label("first_id"),
+        func.max(ShareTask.published_at).label("last_at"),
+    ).group_by(ShareTask.work_key).order_by(func.count(ShareTask.id).desc())).all()
+    out: list[dict] = []
+    for wk, total, updates, first_id, last_at in rows:
+        out.append({
+            "work_key": wk,
+            "total_pushes": int(total or 0),
+            "update_count": int(updates or 0),
+            "first_task_id": int(first_id or 0),
+            "last_published_at": last_at.isoformat() if last_at else "",
+            "current_share_url": (current_share(db, wk).share_url
+                                  if current_share(db, wk) else ""),
+        })
+    return out
+
+
+def share_records_list(db: Session, *, current_only: bool = False,
+                       limit: int = 200) -> list[dict]:
+    """分享记录管理（§5.2/§4.3 真相源）：当前与历史分享记录列表。"""
+    q = select(ShareRecord)
+    if current_only:
+        q = q.where(ShareRecord.current_flag == 1)
+    rows = db.scalars(q.order_by(ShareRecord.id.desc()).limit(min(limit, 500))).all()
+    return [{
+        "id": r.id, "work_key": r.work_key, "resource_type": r.resource_type,
+        "share_dir_id": r.share_dir_id, "share_id": r.share_id,
+        "share_url": r.share_url, "share_status": r.share_status,
+        "current": bool(r.current_flag),
+        "cancelled_at": r.cancelled_at.isoformat() if r.cancelled_at else "",
+        "failure_reason": r.failure_reason,
+        "last_verified_at": r.last_verified_at.isoformat() if r.last_verified_at else "",
+        "created_at": r.created_at.isoformat() if r.created_at else "",
+    } for r in rows]

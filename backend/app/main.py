@@ -601,13 +601,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=True)
 
 
-app = FastAPI(title="Ya-TG", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.2.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.1.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.2.0", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3979,12 +3979,15 @@ async def queue_run():
 # ============================================================================
 
 @app.get("/api/share/tasks", dependencies=ADMIN)
-def share_tasks_list(status: str = "", limit: int = 200, db: Session = Depends(get_db)):
-    """分享任务列表（前端「分享中心」页面）。"""
+def share_tasks_list(status: str = "", work_key: str = "", limit: int = 200,
+                     db: Session = Depends(get_db)):
+    """分享任务列表（前端「分享中心」页面）。§5.6：支持 status / work_key 过滤。"""
     from . import share_center
     q = select(share_center.ShareTask)
     if status:
         q = q.where(share_center.ShareTask.status == status)
+    if work_key:
+        q = q.where(share_center.ShareTask.work_key.contains(work_key))
     rows = list(db.scalars(q.order_by(share_center.ShareTask.id.desc()).limit(min(limit, 500))).all())
     return {"enabled": share_center.is_enabled(db), "items": [
         {"id": t.id, "work_key": t.work_key, "kind": t.kind, "status": t.status,
@@ -3992,6 +3995,10 @@ def share_tasks_list(status: str = "", limit: int = 200, db: Session = Depends(g
          "share_url": t.share_url, "share_id": t.share_id,
          "parent_task_id": t.parent_task_id, "parent_event_id": t.parent_event_id,
          "resource_id": t.resource_id, "attempts": t.attempts, "error": t.error,
+         "priority": t.priority,
+         "channel_targets": t.channel_targets or "[]",
+         "share_dir_id": t.share_dir_id, "share_scope": t.share_scope,
+         "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else "",
          "created_at": t.created_at.isoformat() if t.created_at else "",
          "published_at": t.published_at.isoformat() if t.published_at else ""}
         for t in rows]}
@@ -4007,6 +4014,48 @@ def share_task_cancel(tid: int, db: Session = Depends(get_db)):
     n = share_center.cancel_task(db, task)
     add_audit(db, "share_task_cancelled", target_type="share_task", target_id=str(tid))
     return {"ok": True, "queue_revoked": n}
+
+
+@app.post("/api/share/tasks/{tid}/rebuild", dependencies=ADMIN)
+def share_task_rebuild(tid: int, db: Session = Depends(get_db)):
+    """重建分享（§5.6）：任务打回 planned，作废旧分享，下一轮重新建链接并推送。"""
+    from . import share_center
+    task = db.get(share_center.ShareTask, tid)
+    if not task:
+        raise HTTPException(404, "分享任务不存在")
+    if task.status == share_center.ST_CANCELLED:
+        raise HTTPException(400, "已取消的任务请重新入库后再分享，不能直接重建")
+    return share_center.rebuild_task(db, task)
+
+
+@app.get("/api/share/schedule", dependencies=ADMIN)
+def share_schedule_get(db: Session = Depends(get_db)):
+    """发布节奏配置（§5.4）：释放间隔 + 各队列配额。"""
+    from . import share_center
+    return share_center.share_schedule_get(db)
+
+
+@app.post("/api/share/schedule", dependencies=ADMIN)
+def share_schedule_set(payload: dict, db: Session = Depends(get_db)):
+    """写入发布节奏配置；只接受白名单键的非负整数。"""
+    from . import share_center
+    return share_center.share_schedule_set(db, payload or {})
+
+
+@app.get("/api/share/records", dependencies=ADMIN)
+def share_records_list(current_only: bool = False, limit: int = 200,
+                       db: Session = Depends(get_db)):
+    """分享记录管理（§5.2/§4.3）：当前与历史分享链接真相源。"""
+    from . import share_center
+    return {"items": share_center.share_records_list(db, current_only=current_only,
+                                                      limit=limit)}
+
+
+@app.get("/api/share/followups", dependencies=ADMIN)
+def share_followups(db: Session = Depends(get_db)):
+    """追更管理（§5.4/§5.7）：按作品聚合「已推 N 次 / 更新 M 次」。"""
+    from . import share_center
+    return {"items": share_center.followup_summary(db)}
 
 
 @app.post("/api/share/run", dependencies=ADMIN)
