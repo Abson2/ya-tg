@@ -722,8 +722,9 @@ def apply_suggestion(db: Session, suggestion_id: int, reviewer: str = "admin",
 def api_overview(db: Session = Depends(get_db)):
     ensure_defaults(db)
     counts = {}
-    for model, key in ((SCPushList, "lists"), (SCPushListItem, "items"),
-                       (SCPublishTask, "tasks"), (SCUpdateWindow, "update_windows"),
+    for model, key in ((SCLibraryVersion, "versions"), (SCPushList, "lists"),
+                       (SCPushListItem, "items"), (SCPublishTask, "tasks"),
+                       (SCUpdateWindow, "update_windows"),
                        (SCAISuggestion, "ai_suggestions")):
         counts[key] = db.scalar(select(func.count(model.id))) or 0
     status_rows = db.execute(
@@ -734,7 +735,7 @@ def api_overview(db: Session = Depends(get_db)):
         rule = resolve_pacing_rule(db, t)
         pacing.append({"target_type": t, "interval_seconds": rule["interval"],
                        "min_seconds": rule["min"]})
-    return {"enabled": is_enabled(db), "counts": counts,
+    return {"enabled": is_enabled(db), "paused": _is_paused(db), "counts": counts,
             "status_counts": dict(status_rows), "pacing": pacing}
 
 
@@ -742,6 +743,25 @@ def api_overview(db: Session = Depends(get_db)):
 def api_run(db: Session = Depends(get_db)):
     import asyncio
     return asyncio.run(run_cycle(db, limit=50))
+
+
+def _is_paused(db: Session) -> bool:
+    return str(runtime_config.get(db, "publish_paused") or "false").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+@router.get("/pause")
+def api_pause_get(db: Session = Depends(get_db)):
+    """发布急停状态：与 dispatch_ready_tasks 读取同一 publish_paused 键。"""
+    return {"paused": _is_paused(db)}
+
+
+@router.post("/pause")
+def api_pause_set(body: Payload, db: Session = Depends(get_db)):
+    """发布急停开关：只拦新一轮建分享/提交，不触碰发送核心、不撤销在途任务。"""
+    paused = bool(body.payload.get("paused"))
+    runtime_config.set_many(db, {"publish_paused": "true" if paused else "false"})
+    return {"ok": True, "paused": paused}
 
 
 @router.get("/categories")

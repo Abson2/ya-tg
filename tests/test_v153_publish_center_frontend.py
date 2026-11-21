@@ -184,19 +184,21 @@ def test_share_run_uses_to_thread_with_independent_session():
     assert "rollback()" in helper_seg
 
 
-# ---------- 前端 5 页静态守卫 ----------
-def test_frontend_five_tabs_and_real_endpoints():
+# ---------- 前端分享中心全卡片化静态守卫（旧 5 页已移除，统一走 /api/sc/*） ----------
+def test_frontend_share_center_cards_and_real_endpoints():
     app = (ROOT / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
-    # 5 个子标签存在
-    for label in ("发布总览", "发布队列", "分享管理", "推送任务", "发布规则"):
-        assert label in app, f"缺子标签 {label}"
-    # 真实后端端点绑定（load() 用 keys 数组 api('/'+k)，故可能无前导斜杠）
-    for ep in ("share/publish-overview", "share/tasks", "share/records",
-               "share/rules"):
+    # 卡片化布局 + 规范业务模块标题（不再用 V2 等开发命名）
+    for label in ("调度总览", "发布清单", "作品分类", "发布计划",
+                  "时段窗口", "智能建议", "推送节奏", "发布任务"):
+        assert label in app, f"缺模块卡片 {label}"
+    assert "sc-board" in app and "sc-card" in app, "分享中心未卡片化"
+    # 旧 5 页分页组件与旧链端点均已移除
+    for gone in ("shareSubTab", "share/publish-overview", "share/followups",
+                 "share/records?", "share/link/review", "share/link/cleanup"):
+        assert gone not in app, f"旧模块仍残留 {gone}"
+    # 新体系真实端点绑定
+    for ep in ("/sc/overview", "/sc/pause", "/sc/push-lists", "/sc/tasks",
+               "/sc/pacing-rules", "/sc/ai/generate"):
         assert ep in app, f"缺真实端点 {ep}"
-    # 分发队列走 /api/queue 的既有 retry；链接生命周期端点绑定（核验/清理）
-    assert "share/link/review" in app and "share/link/cleanup" in app
-    # 急停开关绑定
-    assert "publish_paused" in app
     # nav key 兼容：原 key 保留
     assert "推送队列" in app

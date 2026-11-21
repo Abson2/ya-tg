@@ -195,10 +195,14 @@ def test_ai_local_fallback_and_review_boundary(env):
         assert version and version.config_json
 
 
-def test_frontend_v2_pages_use_real_api():
+def test_frontend_share_center_pages_use_real_api():
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    for token in ("V2总览", "推送清单", "分类管理", "周期计划", "小时排期", "AI调度", "V2任务"):
+    # 规范业务模块标题（卡片化），不再暴露 V2 等开发命名
+    for token in ("调度总览", "发布清单", "作品分类", "发布计划",
+                  "时段窗口", "智能建议", "推送节奏", "发布任务"):
         assert token in app, token
+    for dev_name in ("V2总览", "V2任务", "scV2", "跑一轮 v2"):
+        assert dev_name not in app, dev_name
     for token in ("/sc/overview", "/sc/run", "/sc/push-lists", "/sc/plans",
                   "/sc/hour-windows", "/sc/pacing-rules", "/sc/ai/generate", "/sc/tasks"):
         assert token in app, token
@@ -214,3 +218,30 @@ def test_publisher_wires_pacing_and_v2_result():
     shared = (ROOT / "backend/app/share_center.py").read_text(encoding="utf-8")
     assert 'push_reason", "") == "sc_v2"' in shared
     assert "SCPublishTask" in shared
+
+
+def test_pause_endpoint_shares_dispatch_key(env):
+    """分享中心卡片化后急停走 /sc/pause，读写与 dispatch 同一 publish_paused 键。"""
+    from app import runtime_config, share_center_v2 as sc2
+    S, _ = env
+    db = S()
+    assert sc2._is_paused(db) is False
+    sc2.api_pause_set(sc2.Payload(payload={"paused": True}), db)
+    assert sc2._is_paused(db) is True
+    assert runtime_config.get(db, "publish_paused") == "true"
+    # dispatch 读取的键被真正置位（同一键，不需旧链 /share/rules）
+    assert sc2.api_pause_get(db)["paused"] is True
+    sc2.api_pause_set(sc2.Payload(payload={"paused": False}), db)
+    assert sc2._is_paused(db) is False
+    db.close()
+
+
+def test_overview_counts_include_library_versions(env):
+    from app import share_center_v2 as sc2
+    S, _ = env
+    db = S()
+    sc2.ensure_defaults(db)
+    res = sc2.api_overview(db)
+    assert "versions" in res["counts"]
+    assert "paused" in res and "pacing" in res
+    db.close()
