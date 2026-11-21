@@ -792,6 +792,8 @@ class SCHourWindow(Base):
     plan_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_share_plan_versions.id"), index=True, default=0)
     start_hour: Mapped[int] = mapped_column(Integer, default=8)
     end_hour: Mapped[int] = mapped_column(Integer, default=24)
+    # 小时分类排期：该时段领取的主分类 category_key（空=不限分类，按全局轮转）
+    category_key: Mapped[str] = mapped_column(String(128), index=True, default="")
     quota: Mapped[int] = mapped_column(Integer, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

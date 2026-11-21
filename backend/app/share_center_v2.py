@@ -114,13 +114,25 @@ def ensure_defaults(db: Session) -> None:
         db.flush()
         changed = True
         has_window = db.scalar(select(SCHourWindow.id).where(
-            SCHourWindow.plan_version_id == version.id,
-            SCHourWindow.start_hour == 8, SCHourWindow.end_hour == 24))
+            SCHourWindow.plan_version_id == version.id))
         if not has_window:
-            db.add(SCHourWindow(plan_version_id=version.id, start_hour=8,
-                                end_hour=24, quota=0, enabled=True))
+            # v2.0.4：默认按 PRD 推荐模板建 16 个整点时段，每段绑定主分类。
+            # 老库已有 8-24 单窗口的保持不动（不重复建），由用户点「恢复模板」升级。
+            for start, cat in DEFAULT_HOUR_TEMPLATE:
+                db.add(SCHourWindow(plan_version_id=version.id, start_hour=start,
+                                    end_hour=start + 1, category_key=cat,
+                                    quota=0, enabled=True))
     if changed:
         db.commit()
+
+
+# v2.0.4：默认排期模板（08:00–24:00 共 16 个整点时段）。
+# category_key 默认留空 = 该时段不限分类（沿用全局分类轮转），不编造 PRD 截图里的
+# 示例分类（那是设计稿数字，真实分类 key 由资源 TMDB genres 派生，见 _primary_category）。
+# 管理员在前端为每个时段选择真实 SCCategory 后才绑定并驱动调度。
+DEFAULT_HOUR_TEMPLATE: list[tuple[int, str]] = [
+    (h, "") for h in range(8, 24)
+]
 
 
 def _primary_category(resource: Resource) -> tuple[str, str]:
@@ -254,15 +266,25 @@ def _active_version(db: Session) -> SCSharePlanVersion | None:
     )
 
 
-def _current_hour_allowed(db: Session, version: SCSharePlanVersion) -> bool:
+def _current_hour_window(db: Session, version: SCSharePlanVersion) -> SCHourWindow | None:
+    """当前小时命中的启用窗口（Asia/Shanghai）。多条重叠取第一条。"""
     hour = datetime.now(timezone(timedelta(hours=8))).hour
+    return db.scalar(
+        select(SCHourWindow).where(SCHourWindow.plan_version_id == version.id,
+                                   SCHourWindow.enabled.is_(True),
+                                   SCHourWindow.start_hour <= hour,
+                                   SCHourWindow.end_hour > hour)
+    )
+
+
+def _current_hour_allowed(db: Session, version: SCSharePlanVersion) -> bool:
     windows = list(db.scalars(
         select(SCHourWindow).where(SCHourWindow.plan_version_id == version.id,
                                    SCHourWindow.enabled.is_(True))
     ).all())
     if not windows:
         return True
-    return any(w.start_hour <= hour < w.end_hour for w in windows)
+    return _current_hour_window(db, version) is not None
 
 
 def plan_engine(db: Session) -> dict[str, int]:
@@ -282,6 +304,13 @@ def plan_engine(db: Session) -> dict[str, int]:
         select(SCCategory).where(SCCategory.enabled.is_(True))
         .order_by(SCCategory.priority.desc(), SCCategory.id)
     ).all())[:category_limit]
+    # v2.0.4：小时分类排期真正驱动调度——当前时段绑定了真实分类时，只为该分类生成任务。
+    # 绑定 key 不在启用分类字典中（如分类被停用）时退回全局轮转，不产出空清单。
+    hour_window = _current_hour_window(db, version)
+    if hour_window and hour_window.category_key:
+        scoped = [c for c in categories if c.category_key == hour_window.category_key]
+        if scoped:
+            categories = scoped
 
     list_key = f"plan:{version.id}:{uuid.uuid4().hex[:12]}"
     push_list = SCPushList(list_key=list_key, name=f"计划版本 {version.version_no}",
@@ -745,6 +774,22 @@ def api_overview(db: Session = Depends(get_db)):
         select(SCPublishTask.kind, func.count(SCPublishTask.id)).group_by(SCPublishTask.kind)
     ).all()
     kind_counts = {str(k): int(v or 0) for k, v in kind_rows}
+    # 推送清单三视图计数（按 kind × status 交叉，真实派生，不写死）
+    kind_status_rows = db.execute(
+        select(SCPublishTask.kind, SCPublishTask.status, func.count(SCPublishTask.id))
+        .group_by(SCPublishTask.kind, SCPublishTask.status)
+    ).all()
+    kind_status = {(str(k), str(s)): int(n or 0) for k, s, n in kind_status_rows}
+
+    def _ks(kinds: tuple[str, ...], statuses: tuple[str, ...]) -> int:
+        return sum(v for (k, s), v in kind_status.items() if k in kinds and s in statuses)
+
+    unfinished = ("planned", "ready", "building", "submitted", "accepted", "publishing", "failed")
+    push_list_counts = {
+        "pending_first": _ks(("first",), unfinished),
+        "pending_update": _ks(("update",), unfinished),
+        "published_first": _ks(("first",), ("published",)),
+    }
 
     def _sum_status(*names: str) -> int:
         return sum(status_counts.get(n, 0) for n in names)
@@ -802,10 +847,13 @@ def api_overview(db: Session = Depends(get_db)):
         pacing.append({"target_type": t, "interval_seconds": rule["interval"],
                        "min_seconds": rule["min"],
                        "max_per_minute": int(base.max_per_minute or 0) if base else 0})
+    active_version = _active_version(db)
     return {"enabled": is_enabled(db), "paused": _is_paused(db), "counts": counts,
             "status_counts": status_counts, "pacing": pacing, "kpi": kpi,
             "link_state_counts": link_state_counts, "kind_counts": kind_counts,
-            "schedule": schedule, "windows": windows, "recent_tasks": recent_tasks}
+            "schedule": schedule, "windows": windows, "recent_tasks": recent_tasks,
+            "push_list_counts": push_list_counts,
+            "active_version_id": active_version.id if active_version else 0}
 
 
 @router.post("/run")
@@ -962,10 +1010,30 @@ def api_upsert_hour_window(body: Payload, db: Session = Depends(get_db)):
     if not row:
         row = SCHourWindow(plan_version_id=version_id, start_hour=start, end_hour=end)
         db.add(row)
+    # v2.0.4：小时分类排期——绑定该时段主分类（空=不限分类，沿用全局轮转）
+    row.category_key = str(p.get("category_key") or "").strip()
     row.quota = int(p.get("quota") or 0)
     row.enabled = bool(p.get("enabled", True))
     db.commit()
     return {"ok": True, "item": _model_dict(row)}
+
+
+@router.post("/hour-windows/reset-template")
+def api_reset_hour_template(body: Payload, db: Session = Depends(get_db)):
+    """恢复默认 08:00–24:00 共 16 段整点模板（分类留空=按计划轮转）。幂等：先删该版本旧窗口。"""
+    version_id = int((body.payload or {}).get("plan_version_id") or 0)
+    if not version_id or not db.get(SCSharePlanVersion, version_id):
+        return {"ok": False, "reason": "计划版本不存在，请先选择有效版本"}
+    for old in db.scalars(select(SCHourWindow).where(
+            SCHourWindow.plan_version_id == version_id)).all():
+        db.delete(old)
+    db.flush()
+    for start, cat in DEFAULT_HOUR_TEMPLATE:
+        db.add(SCHourWindow(plan_version_id=version_id, start_hour=start,
+                            end_hour=start + 1, category_key=cat,
+                            quota=0, enabled=True))
+    db.commit()
+    return {"ok": True, "version_id": version_id, "segments": len(DEFAULT_HOUR_TEMPLATE)}
 
 
 @router.get("/cursors")

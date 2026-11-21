@@ -130,6 +130,10 @@ _COLUMNS = {
         "idem_key": "TEXT DEFAULT ''",
         "consumed_at": "DATETIME",
     },
+    # v2.0.4：分享中心小时分类排期——每个时段的主分类归属（老库 ALTER 补列）
+    "sc_hour_windows": {
+        "category_key": "TEXT DEFAULT ''",
+    },
     "auth_tokens": {
         "device_id": "TEXT DEFAULT ''",
     },

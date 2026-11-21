@@ -1,4 +1,4 @@
-"""v2.0.3 发布总览仪表盘验收：真实数据聚合 + 全交互控制台。
+"""分享中心发布总览/控制台验收：真实数据聚合 + 全交互（v2.0.3 引入，v2.0.4 扩展 tab 布局与小时分类排期）。
 
 覆盖：
   1. /sc/overview 返回 kpi / link_state_counts / kind_counts / schedule /
@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 BACKEND = Path(__file__).resolve().parents[1] / "backend"
@@ -93,9 +93,17 @@ def test_overview_empty_db_has_no_fabricated_numbers(env):
 
 def test_frontend_dashboard_interactions_use_real_endpoints():
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    # 左侧子导航 + 仪表盘结构
-    for token in ("sc-sidebar", "scSubNavs", "发布总览", "发布队列", "分享管理",
+    # 顶部 tab（4 个，无系统设置）+ 仪表盘结构
+    for token in ("sc-tabbar", "sc-tab", "scSubNavs", "发布总览", "分享管理",
                   "推送任务", "发布规则", "sc-kpi-grid", "sc-health-grid", "sc-progress"):
+        assert token in app, token
+    assert "系统设置" not in app, "系统设置空 tab 应移除"
+    assert "sc-sidebar" not in app, "左侧子导航应改为顶部 tab"
+    # 推送清单三视图 + 运作流程 + 四级计划 + 小时分类排期
+    for token in ("sc-pushlist-grid", "待首次分享", "更新待推送", "已完成首次推送",
+                  "sc-flow", "统一推送清单", "统一调度引擎", "Telegram 推送及结果回写",
+                  "sc-plan-flow", "月度计划", "周度计划", "每日计划", "小时计划",
+                  "小时分类排期", "sc-hour-row", "scSaveAllHourRows", "scSaveHourRow"):
         assert token in app, token
     # KPI 点击筛选 + 任务详情抽屉 + 批量 + 各模块保存均有真实端点
     for token in ("scFilterQueue", "scOpenTaskDetail", "scBatchTask",
@@ -103,7 +111,8 @@ def test_frontend_dashboard_interactions_use_real_endpoints():
                   "scCreatePlanVersion", "scActivateVersion", "scRestoreWindowTemplate"):
         assert token in app, token
     for ep in ("/sc/overview", "/sc/categories", "/sc/categories/reassign",
-               "/sc/plans", "/sc/hour-windows", "/sc/tasks/${id}", "/sc/push-lists"):
+               "/sc/plans", "/sc/hour-windows/reset-template",
+               "/sc/tasks/${id}", "/sc/push-lists"):
         assert ep in app, ep
     # 无 V2 开发命名、无截图示例写死数字（45%/60% 是 CSS 通用样式，不在此列）
     for bad in ("scV2", "V2总览", "V2任务", "1,286", "1286", "待发布</small><b>128"):
@@ -115,3 +124,57 @@ def test_overview_source_disclosed_not_pretend_full_link_states():
     src = (ROOT / "backend/app/share_center_v2.py").read_text(encoding="utf-8")
     assert "link_state_counts" in src
     assert "发布任务 link_state" in (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
+
+
+def test_push_list_counts_are_real_derived(env):
+    from app import share_center_v2 as sc2
+    from app.models import SCPublishTask
+    S, _ = env
+    with S() as db:
+        sc2.ensure_defaults(db)
+        db.add_all([
+            SCPublishTask(work_key="work:a", kind="first", status="planned"),
+            SCPublishTask(work_key="work:b", kind="first", status="published"),
+            SCPublishTask(work_key="work:c", kind="update", status="failed"),
+            SCPublishTask(work_key="work:d", kind="update", status="published"),
+        ])
+        db.commit()
+        ov = sc2.api_overview(db)
+        c = ov["push_list_counts"]
+        assert c["pending_first"] == 1
+        assert c["pending_update"] == 1
+        assert c["published_first"] == 1
+
+
+def test_hour_window_persists_category_and_reset_template(env):
+    from app import share_center_v2 as sc2
+    from app.models import SCHourWindow
+    S, _ = env
+    with S() as db:
+        sc2.ensure_defaults(db)
+        vid = sc2._active_version(db).id
+        # 首建默认 16 段整点模板（新库）
+        rows = db.scalars(select(SCHourWindow).where(
+            SCHourWindow.plan_version_id == vid)).all()
+        assert len(rows) == 16
+        assert all(r.category_key == "" for r in rows)  # 默认不限分类，不编造示例
+        # 单行保存分类绑定（真实写库）
+        d = sc2.api_upsert_hour_window(sc2.Payload(payload={
+            "plan_version_id": vid, "start_hour": 19, "end_hour": 20,
+            "category_key": "genre:动作", "quota": 3, "enabled": True}), db)
+        assert d["ok"] is True
+        r = db.scalar(select(SCHourWindow).where(
+            SCHourWindow.plan_version_id == vid, SCHourWindow.start_hour == 19))
+        assert r.category_key == "genre:动作" and r.quota == 3
+        # 恢复模板：清空分类绑定，重建 16 段
+        d2 = sc2.api_reset_hour_template(sc2.Payload(payload={"plan_version_id": vid}), db)
+        assert d2["ok"] is True and d2["segments"] == 16
+        rows2 = db.scalars(select(SCHourWindow).where(
+            SCHourWindow.plan_version_id == vid)).all()
+        assert len(rows2) == 16 and all(x.category_key == "" for x in rows2)
+
+
+def test_db_migration_has_sc_hour_windows_category():
+    db_src = (ROOT / "backend/app/db.py").read_text(encoding="utf-8")
+    assert '"sc_hour_windows"' in db_src
+    assert '"category_key": "TEXT DEFAULT \'\'"' in db_src

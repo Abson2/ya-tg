@@ -39,19 +39,22 @@ const reviews = ref([]), queue = ref([]), templates = ref([]), audit = ref([])
 // 四模块重构：分享中心任务列表与状态（独立命名，避免与光鸭 shareStatus 冲突）
 // 分享中心：统一走全新数据体系（发布概览/清单/分类/计划/游标/任务/智能建议/推送节奏）
 // 所有状态来自后端 /api/sc/*，前端不承载计划、不启定时器、不读旧链表。
-const scOverview = ref({ counts: {}, status_counts: {}, link_state_counts: {}, kind_counts: {}, kpi: {}, schedule: {}, windows: [], recent_tasks: [], pacing: [], paused: false, enabled: true })
+const scOverview = ref({ counts: {}, status_counts: {}, link_state_counts: {}, kind_counts: {}, kpi: {}, schedule: {}, windows: [], recent_tasks: [], push_list_counts: {}, active_version_id: 0, pacing: [], paused: false, enabled: true })
 const scTasks = ref([]), scLists = ref([]), scListItems = ref([])
 const scCategories = ref([]), scPlans = ref({ items: [], versions: [] })
 const scCursors = ref([]), scAI = ref([]), scWindows = ref([])
-const scWindowForm = ref({ plan_version_id: 0, start_hour: 8, end_hour: 24, quota: 0, enabled: true })
 const scPacingForm = ref({ scope_key: 'global:group', target_type: 'group', default_interval_seconds: 4, min_interval_seconds: 3, max_per_minute: 0, jitter_seconds: 0 })
 const scActiveList = ref(null) // 当前展开明细的清单（卡片内交互）
 // 发布总览：左侧子导航 + KPI 点击筛选 + 任务详情（全部基于 /api/sc/* 真实数据）
 const scSubNav = ref('发布总览')
+// 顶部 tab：发布总览 → 发布规则 → 推送任务（合并原发布队列）→ 分享管理
 const scSubNavs = [
-  { key: '发布总览', ico: '◈' }, { key: '发布队列', ico: '▤' }, { key: '分享管理', ico: '▦' },
-  { key: '推送任务', ico: '▷' }, { key: '发布规则', ico: '◷' }
+  { key: '发布总览', ico: '◈' }, { key: '发布规则', ico: '◷' },
+  { key: '推送任务', ico: '▷' }, { key: '分享管理', ico: '▦' }
 ]
+// 小时分类排期：每行一条 sc_hour_windows 记录，分类下拉来自真实 SCCategory
+const scHourRows = ref([])
+const scHourSaving = ref(false)
 const scTaskStatusFilter = ref(''), scLinkFilter = ref(''), scSelectedTasks = ref([])
 const scDetailVisible = ref(false), scDetailTask = ref(null), scDetailExecutions = ref([])
 const scCatForm = ref({ category_key: '', name: '', media_type: '', priority: 0 })
@@ -1734,7 +1737,12 @@ async function loadSc() {
     const group = (pc.items || []).find(x => x.scope_key === 'global:group')
     if (group) scPacingForm.value = { ...scPacingForm.value, ...group }
   }
-  const hw = val(8); if (hw) scWindows.value = hw.items || []
+  const hw = val(8); if (hw) {
+    scWindows.value = hw.items || []
+    const activeVid = ov?.active_version_id || 0
+    const rows = activeVid ? (hw.items || []).filter(x => x.plan_version_id === activeVid) : (hw.items || [])
+    scHourRows.value = rows.map(x => ({ ...x })).sort((a, b) => a.start_hour - b.start_hour)
+  }
 }
 async function scRun() {
   try {
@@ -1758,13 +1766,6 @@ async function scOpenList(row) {
   scActiveList.value = row
   try { const d = await api(`/sc/push-lists/${row.id}/items?limit=200`); scListItems.value = d.items || [] }
   catch (e) { ElMessage.error(String(e?.message || e)) }
-}
-async function scSaveWindow() {
-  try {
-    await api('/sc/hour-windows', { method: 'POST', body: JSON.stringify({ payload: scWindowForm.value }) })
-    ElMessage.success('时段窗口已保存')
-    await loadSc()
-  } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
 async function scSavePacing() {
   try {
@@ -1791,7 +1792,7 @@ async function scTaskAction(id, action) {
 }
 // KPI / 链接健康点击 → 切到发布队列并按真实状态/链接态筛选
 function scFilterQueue(status, linkState) {
-  scSubNav.value = '发布队列'
+  scSubNav.value = '推送任务'
   scTaskStatusFilter.value = status || ''
   scLinkFilter.value = linkState || ''
 }
@@ -1863,10 +1864,36 @@ async function scActivateVersion(id) {
 }
 async function scRestoreWindowTemplate() {
   try {
-    const d = await api('/sc/hour-windows', { method: 'POST', body: JSON.stringify({ payload: { plan_version_id: scWindowForm.value.plan_version_id, start_hour: 8, end_hour: 24, quota: 0, enabled: true } }) })
+    await ElMessageBox.confirm('恢复默认 08:00–24:00 共 16 段整点模板？当前各时段的分类绑定将清空（改为按计划轮转）。', '恢复默认模板', { type: 'warning' })
+    const d = await api('/sc/hour-windows/reset-template', { method: 'POST', body: JSON.stringify({ payload: { plan_version_id: scOverview.value.active_version_id } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '恢复失败'); return }
-    ElMessage.success('已恢复默认窗口 08:00–24:00（配额不限）'); await loadSc()
+    ElMessage.success(`已恢复默认模板 ${d.segments} 段`); await loadSc()
+  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+}
+async function scSaveHourRow(row) {
+  try {
+    const d = await api('/sc/hour-windows', { method: 'POST', body: JSON.stringify({ payload: {
+      plan_version_id: row.plan_version_id, start_hour: row.start_hour, end_hour: row.end_hour,
+      category_key: row.category_key || '', quota: row.quota || 0, enabled: !!row.enabled } }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '保存失败'); return }
+    ElMessage.success(`${row.start_hour}:00 时段已保存`)
+    await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+async function scSaveAllHourRows() {
+  if (!scHourRows.value.length) { ElMessage.warning('暂无时段可保存'); return }
+  scHourSaving.value = true
+  try {
+    for (const row of scHourRows.value) {
+      const d = await api('/sc/hour-windows', { method: 'POST', body: JSON.stringify({ payload: {
+        plan_version_id: row.plan_version_id, start_hour: row.start_hour, end_hour: row.end_hour,
+        category_key: row.category_key || '', quota: row.quota || 0, enabled: !!row.enabled } }) })
+      if (!d.ok) throw new Error(d.reason || '保存失败')
+    }
+    ElMessage.success(`已保存 ${scHourRows.value.length} 个时段`)
+    await loadSc()
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+  finally { scHourSaving.value = false }
 }
 function isBoolOn(v) { return ['1', 'true', 'yes', 'on'].includes(String(v ?? '').toLowerCase()) }
 // v0.9.2：网页端扫码登录——光鸭 App 扫一扫，免开放平台应用凭证
@@ -2059,7 +2086,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.0.3 · Asia/Shanghai</span>
+          <span>v2.0.4 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -2973,16 +3000,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
         <section v-else-if="tab === '推送队列'" class="fade">
           <div class="sc-shell">
-            <!-- 左侧子导航 -->
-            <aside class="sc-sidebar">
-              <div class="sc-side-brand"><span class="sc-brand-mark">▶</span><b>分享中心</b></div>
-              <button v-for="n in scSubNavs" :key="n.key" :class="['sc-side-item', { active: scSubNav === n.key }]" @click="scSubNav = n.key">
-                <span class="sc-side-ico">{{ n.ico }}</span>{{ n.key }}
+            <!-- 顶部 tab（发布总览 → 发布规则 → 推送任务 → 分享管理） -->
+            <div class="sc-tabbar">
+              <button v-for="n in scSubNavs" :key="n.key" :class="['sc-tab', { active: scSubNav === n.key }]" @click="scSubNav = n.key">
+                <span class="sc-tab-ico">{{ n.ico }}</span>{{ n.key }}
               </button>
-              <div class="sc-side-foot"><span>⚙</span> 系统设置</div>
-            </aside>
+            </div>
 
-            <!-- 右侧工作区 -->
+            <!-- 工作区 -->
             <div class="sc-workspace">
               <div class="sc-topbar">
                 <div><h2>{{ scSubNav }}</h2>
@@ -3016,7 +3041,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <!-- 调度总览：按真实 kind 分组的完成进度 -->
                   <div class="sc-card sc-sched-card">
                     <div class="sc-card-head"><span class="sc-ico">◈</span><div><h3>调度总览</h3><p>发布进度来自发布任务真实状态；配额与放行区间来自启用的时段窗口</p></div>
-                      <button class="sc-link-btn" @click="scSubNav = '发布队列'">查看队列 ›</button></div>
+                      <button class="sc-link-btn" @click="scSubNav = '推送任务'">查看队列 ›</button></div>
                     <div class="sc-sched-grid">
                       <div class="sc-sched" v-for="(row, key) in (scOverview.schedule || {})" :key="key">
                         <div class="sc-sched-top"><span :class="['sc-sched-ico', key]">{{ key === 'first' ? '▶' : (key === 'update' ? '⟳' : '⚑') }}</span>
@@ -3033,7 +3058,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <div class="sc-dash-two">
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>最近发布动态</h3><p>最近 8 条发布任务真实记录，点击详情查看执行链</p></div>
-                        <button class="sc-link-btn" @click="scSubNav = '发布队列'">查看全部 ›</button></div>
+                        <button class="sc-link-btn" @click="scSubNav = '推送任务'">查看全部 ›</button></div>
                       <el-table :data="scOverview.recent_tasks || []" stripe size="small" max-height="300">
                         <el-table-column prop="work_key" label="影视名称" min-width="150" show-overflow-tooltip/>
                         <el-table-column label="队别" width="80"><template #default="s"><span class="sc-mini-tag">{{ s.row.kind === 'first' ? '全新' : '追更' }}</span></template></el-table-column>
@@ -3053,6 +3078,50 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <button class="sc-health sc-health-gray" @click="scFilterQueue('', 'unknown')"><span>⊕</span><small>待建链</small><b>{{ scOverview.link_state_counts?.unknown || 0 }}</b></button>
                       </div>
                       <p class="hint sc-source-note">来源：发布任务 link_state。疑似/失效/清理态属链接核验链路，v2 发布任务当前仅写 active / unknown，显示为 0 即真实结果。</p>
+                    </div>
+                  </div>
+
+                  <!-- 推送清单三视图（真实来自 sc_publish_tasks 按 kind×status 聚合） -->
+                  <div class="sc-card">
+                    <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>推送清单</h3><p>统一资源归属；三视图共用同一资源 ID 与分享关系，计数由发布任务真实派生</p></div>
+                      <button class="sc-link-btn" @click="scSubNav = '分享管理'">管理清单 ›</button></div>
+                    <div class="sc-pushlist-grid">
+                      <div class="sc-pl-card sc-pl-green">
+                        <b>{{ scOverview.push_list_counts?.pending_first || 0 }}</b><small>待首次分享</small>
+                        <div class="sc-pl-view"><span>首次分享清单</span><em>按计划轮转</em></div>
+                        <p>尚未完成首次分享的合格影视，按 TMDB 分类归属</p>
+                        <button class="sc-link-btn" @click="scFilterQueue('pending')">查看 ›</button>
+                      </div>
+                      <div class="sc-pl-card sc-pl-blue">
+                        <b>{{ scOverview.push_list_counts?.pending_update || 0 }}</b><small>更新待推送</small>
+                        <div class="sc-pl-view"><span>更新推送清单</span><em>变化触发</em></div>
+                        <p>已有有效分享且发生真实资源变化的影视</p>
+                        <button class="sc-link-btn" @click="scFilterQueue('inflight')">查看 ›</button>
+                      </div>
+                      <div class="sc-pl-card sc-pl-violet">
+                        <b>{{ scOverview.push_list_counts?.published_first || 0 }}</b><small>已完成首次推送</small>
+                        <div class="sc-pl-view"><span>已发布清单</span><em>历史记录</em></div>
+                        <p>已完成首次分享与推送，保留资源与分享关联</p>
+                        <button class="sc-link-btn" @click="scFilterQueue('', 'active')">查看 ›</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 各模块运作流程（架构说明，非示例数字；节点对应真实 sc_* 模块） -->
+                  <div class="sc-card">
+                    <div class="sc-card-head"><span class="sc-ico">⟿</span><div><h3>各模块运作流程</h3><p>资源事实 → 清单 → 计划 → 调度引擎 → 分享/推送 → 结果回写，全链路由后端驱动</p></div></div>
+                    <div class="sc-flow">
+                      <div class="sc-flow-node sc-flow-a"><b>资源库 + A/B 映射 + TMDB 识别</b><small>真实资源 · 目录映射 · TMDB 元数据 · 资源变化</small></div>
+                      <div class="sc-flow-arrow">↓</div>
+                      <div class="sc-flow-node sc-flow-b"><b>统一推送清单</b><em>唯一资源归属</em><small>分类 · 排序 · 排期 · 推送状态 · 版本 · 轮转位置</small></div>
+                      <div class="sc-flow-arrow">↓</div>
+                      <div class="sc-flow-pair"><div class="sc-flow-node"><b>自定义时间计划</b><small>小时 / 每日 / 每周 / 每月</small></div><div class="sc-flow-node"><b>OpenAI 智能调度</b><small>每周轻量分析 · 优化顺序（选配）</small></div></div>
+                      <div class="sc-flow-arrow">↓</div>
+                      <div class="sc-flow-node sc-flow-c"><b>统一调度引擎</b><small>检查分类 · 时段 · 配额 · 重复 · 资源变化 · 分享状态</small></div>
+                      <div class="sc-flow-arrow">↓</div>
+                      <div class="sc-flow-pair"><div class="sc-flow-node"><b>首次分享</b><small>整部电影 / 整部剧目录</small></div><div class="sc-flow-node"><b>更新推送</b><small>原链接复用 · 变化触发</small></div></div>
+                      <div class="sc-flow-arrow">↓</div>
+                      <div class="sc-flow-node"><b>Telegram 推送及结果回写</b><small>记录成功 · 失败 · 版本 · 下次轮转位置</small></div>
                     </div>
                   </div>
 
@@ -3150,29 +3219,42 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div v-if="!scCursors.length" class="empty">暂无游标</div>
             </div>
 
-            <!-- 模块：时段窗口 -->
+            <!-- 模块：四级计划流程 -->
             <div class="sc-card" v-show="scSubNav === '发布规则'">
-              <div class="sc-card-head"><span class="sc-ico">◔</span><div><h3>时段窗口</h3><p>每天放行的小时区间与配额；0 ≤ 起 &lt; 止 ≤ 24，配额 0 = 不限</p></div>
-                <el-button size="small" plain @click="scRestoreWindowTemplate">恢复模板</el-button></div>
-              <div class="sc-form-row">
-                <label class="hint">计划版本ID<br><el-input-number v-model="scWindowForm.plan_version_id" :min="0" size="small"/></label>
-                <label class="hint">起<br><el-input-number v-model="scWindowForm.start_hour" :min="0" :max="23" size="small"/></label>
-                <label class="hint">止<br><el-input-number v-model="scWindowForm.end_hour" :min="1" :max="24" size="small"/></label>
-                <label class="hint">配额<br><el-input-number v-model="scWindowForm.quota" :min="0" size="small"/></label>
-                <el-button size="small" type="primary" @click="scSaveWindow">保存窗口</el-button>
+              <div class="sc-card-head"><span class="sc-ico">▦</span><div><h3>四级计划</h3><p>月控总量 → 周控配额与顺序 → 日控当天任务 → 小时控实际执行；统一引擎，不拆多套队列</p></div></div>
+              <div class="sc-plan-flow">
+                <div class="sc-plan-step"><b>月度计划 · 控制总释放量</b><small>本月计划发布多少部、各类占比、存量释放</small></div>
+                <div class="sc-plan-arrow">↓</div>
+                <div class="sc-plan-step"><b>周度计划 · 控制分类配额和顺序</b><small>每周调整分类权重、每日目标与 AI 推荐顺序</small></div>
+                <div class="sc-plan-arrow">↓</div>
+                <div class="sc-plan-step"><b>每日计划 · 控制当天发布任务</b><small>从推送清单确定当天各类可领取数量</small></div>
+                <div class="sc-plan-arrow">↓</div>
+                <div class="sc-plan-step"><b>小时计划 · 控制实际执行</b><small>08:00–24:00 按小时选分类、间隔、数量、窗口</small></div>
               </div>
-              <el-table :data="scWindows" stripe max-height="300" size="small">
-                <el-table-column prop="plan_version_id" label="版本" width="80"/>
-                <el-table-column prop="start_hour" label="起" width="70"/>
-                <el-table-column prop="end_hour" label="止" width="70"/>
-                <el-table-column prop="quota" label="配额" width="80"/>
-                <el-table-column prop="enabled" label="启用" width="80"><template #default="s">{{ s.row.enabled ? '是' : '否' }}</template></el-table-column>
-              </el-table>
-              <div v-if="!scWindows.length" class="empty">暂无时段窗口</div>
             </div>
 
-            <!-- 模块：智能建议 -->
-            <div class="sc-card" v-show="scSubNav === '推送任务'">
+            <!-- 模块：小时分类排期（16 段，真实持久化到 sc_hour_windows） -->
+            <div class="sc-card sc-hour-card" v-show="scSubNav === '发布规则'">
+              <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>小时分类排期</h3><p>时段窗口每日 08:00–24:00 共 {{ scHourRows.length || 16 }} 段；每段选真实分类绑定，留空=按计划轮转；保存后由调度引擎执行</p></div>
+                <el-button size="small" plain @click="scRestoreWindowTemplate">恢复模板</el-button>
+                <el-button size="small" type="primary" :loading="scHourSaving" @click="scSaveAllHourRows">保存全部</el-button></div>
+              <div class="sc-hour-list">
+                <div class="sc-hour-row" v-for="row in scHourRows" :key="row.start_hour + '-' + row.end_hour">
+                  <span class="sc-hour-time">{{ String(row.start_hour).padStart(2,'0') }}:00–{{ String(row.end_hour).padStart(2,'0') }}:00</span>
+                  <el-select v-model="row.category_key" size="small" clearable placeholder="按计划轮转（不限分类）" style="flex:1">
+                    <el-option v-for="c in scCategories" :key="c.category_key" :label="c.name || c.category_key" :value="c.category_key"/>
+                  </el-select>
+                  <el-input-number v-model="row.quota" :min="0" size="small" controls-position="right" style="width:92px" title="每小时上限，0=不限"/>
+                  <el-switch v-model="row.enabled" size="small" title="启用该时段"/>
+                  <el-button size="small" link type="primary" @click="scSaveHourRow(row)">保存</el-button>
+                </div>
+                <div v-if="!scHourRows.length" class="empty">暂无时段，点击「恢复模板」生成 08:00–24:00 共 16 段</div>
+              </div>
+              <p class="hint sc-source-note">下拉选项来自真实分类字典（作品分类）；class 名称为空即该时段不限制分类，沿用全局轮转。配额 0 = 不限。</p>
+            </div>
+
+            <!-- 模块：智能建议（分享管理：AI 建议应用） -->
+            <div class="sc-card" v-show="scSubNav === '分享管理'">
               <div class="sc-card-head"><span class="sc-ico">✦</span><div><h3>智能建议</h3><p>每周生成优化建议；只出建议不直接推送，默认进审核队列</p></div>
                 <el-button size="small" type="primary" plain @click="scGenerateAI">生成建议</el-button></div>
               <el-table :data="scAI" stripe max-height="340" size="small">
@@ -3207,8 +3289,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </div>
             </div>
 
-            <!-- 模块：发布任务 -->
-            <div class="sc-card" v-show="scSubNav === '发布队列'">
+            <!-- 模块：发布任务（推送任务 tab = 原发布队列合并） -->
+            <div class="sc-card" v-show="scSubNav === '推送任务'">
               <div class="sc-card-head"><span class="sc-ico">▷</span><div><h3>发布任务</h3><p>任务详情与重试 / 取消；支持从 KPI / 链接健康筛选跳转，消息发送核心不改动</p></div></div>
               <div class="sc-form-row">
                 <label class="hint">状态筛选<br>
@@ -3747,16 +3829,42 @@ button{font-family:inherit}
 .push-badge{position:absolute;top:34px;right:10px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;background:#4b7bec;z-index:4}
 .link-badge{position:absolute;bottom:26px;right:8px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;background:#e5526b;z-index:4}
 /* 分享中心：左侧子导航 + 仪表盘工作台 */
-.sc-shell{display:grid;grid-template-columns:190px minmax(0,1fr);gap:18px;align-items:start}
-.sc-sidebar{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:14px 12px;box-shadow:var(--yg-shadow);position:sticky;top:82px}
-.sc-side-brand{display:flex;align-items:center;gap:10px;padding:6px 10px 16px;font-size:15px}
-.sc-brand-mark{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--yg-primary-2),var(--yg-primary));color:#fff;display:grid;place-items:center;font-size:13px}
-.sc-side-item{width:100%;border:0;background:transparent;text-align:left;padding:11px 12px;border-radius:11px;display:flex;align-items:center;gap:11px;color:var(--yg-muted);font-size:13px;font-weight:650;cursor:pointer;margin-bottom:3px;transition:.18s}
-.sc-side-item:hover{background:var(--yg-bg);color:var(--yg-ink)}
-.sc-side-item.active{background:linear-gradient(135deg,#eef0ff,#f4f0ff);color:var(--yg-primary)}
-.sc-side-ico{width:20px;text-align:center;font-size:15px}
-.sc-side-foot{margin-top:14px;padding:12px 12px 4px;border-top:1px solid var(--yg-line);color:var(--yg-muted);font-size:12px;display:flex;gap:10px;align-items:center}
+.sc-shell{display:flex;flex-direction:column;gap:16px}
+.sc-tabbar{display:flex;gap:8px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:6px;box-shadow:var(--yg-shadow);overflow-x:auto}
+.sc-tab{border:0;background:transparent;white-space:nowrap;padding:11px 20px;border-radius:10px;display:flex;align-items:center;gap:9px;color:var(--yg-muted);font-size:13px;font-weight:700;cursor:pointer;transition:.18s}
+.sc-tab:hover{background:var(--yg-bg);color:var(--yg-ink)}
+.sc-tab.active{background:linear-gradient(135deg,#eef0ff,#f4f0ff);color:var(--yg-primary);box-shadow:0 2px 8px rgba(91,91,214,.12)}
+.sc-tab-ico{font-size:15px}
 .sc-workspace{min-width:0}
+/* 推送清单三视图 */
+.sc-pushlist-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.sc-pl-card{border-radius:var(--yg-radius-sm);padding:18px;position:relative}
+.sc-pl-green{background:#eef8f2}.sc-pl-blue{background:#eef2ff}.sc-pl-violet{background:#f2effc}
+.sc-pl-card>b{display:block;font-size:30px;font-weight:790;line-height:1;font-variant-numeric:tabular-nums}
+.sc-pl-card>small{display:block;color:var(--yg-muted);font-size:11px;margin-top:5px}
+.sc-pl-view{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:14px 0 8px}
+.sc-pl-view span{font-size:13px;font-weight:750}
+.sc-pl-view em{font-style:normal;font-size:10px;background:rgba(255,255,255,.75);border-radius:8px;padding:3px 8px;color:var(--yg-primary)}
+.sc-pl-card p{font-size:10px;color:var(--yg-muted);line-height:1.6;margin:0 0 8px}
+/* 运作流程 */
+.sc-flow{display:flex;flex-direction:column;align-items:center;gap:2px}
+.sc-flow-node{width:100%;max-width:640px;text-align:center;border:1px solid var(--yg-line);border-radius:12px;padding:14px 18px;background:var(--yg-surface)}
+.sc-flow-node b{display:block;font-size:13px;margin-bottom:5px}
+.sc-flow-node small{display:block;color:var(--yg-muted);font-size:11px}
+.sc-flow-node em{display:inline-block;font-style:normal;font-size:10px;background:#e7f8f0;color:#159a6b;border-radius:8px;padding:2px 8px;margin-bottom:6px}
+.sc-flow-a{background:#f1f0fd;border-color:#e4e1fb}.sc-flow-b{background:#eef8f2;border-color:#dcefe4}.sc-flow-c{background:#f1f0fd;border-color:#e4e1fb}
+.sc-flow-pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;width:100%}
+.sc-flow-arrow{color:var(--yg-primary);font-size:16px;line-height:1.4;font-weight:700}
+/* 四级计划 */
+.sc-plan-flow{display:flex;flex-direction:column;align-items:center;gap:2px}
+.sc-plan-step{width:100%;border:1px solid var(--yg-line);border-radius:12px;padding:12px 16px;background:var(--yg-bg)}
+.sc-plan-step b{display:block;font-size:13px;margin-bottom:4px}
+.sc-plan-step small{display:block;color:var(--yg-muted);font-size:11px}
+.sc-plan-arrow{color:var(--yg-primary);font-size:15px;line-height:1.3;font-weight:700}
+/* 小时分类排期 */
+.sc-hour-list{display:flex;flex-direction:column;gap:7px}
+.sc-hour-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--yg-line);border-radius:10px;background:var(--yg-bg)}
+.sc-hour-time{width:104px;flex:none;font-size:11px;font-weight:750;color:var(--yg-ink);font-variant-numeric:tabular-nums}
 .sc-topbar{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--yg-line)}
 .sc-topbar h2{margin:0 0 5px;font-size:23px;letter-spacing:-.4px;font-weight:750}
 .sc-topbar p{margin:0;color:var(--yg-muted);font-size:12px}
@@ -3807,7 +3915,7 @@ button{font-family:inherit}
 .sc-detail-kv span{display:block;color:var(--yg-muted);font-size:10px;margin-bottom:5px}
 .sc-detail-kv b{display:block;font-size:12px;font-weight:700}
 @media(max-width:1200px){.sc-kpi-grid{grid-template-columns:repeat(2,1fr)}.sc-dash-two{grid-template-columns:1fr}}
-@media(max-width:900px){.sc-shell{grid-template-columns:1fr}.sc-sidebar{position:static;display:flex;flex-wrap:wrap;gap:6px}.sc-side-brand,.sc-side-foot{width:100%}.sc-side-item{width:auto}.sc-sched-grid{grid-template-columns:1fr}.sc-mini-counts .sc-stat-row{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:900px){.sc-tab{padding:10px 12px;font-size:12px}.sc-pushlist-grid{grid-template-columns:1fr}.sc-flow-pair{grid-template-columns:1fr}.sc-sched-grid{grid-template-columns:1fr}.sc-mini-counts .sc-stat-row{grid-template-columns:repeat(3,1fr)}}
 /* 分享中心：全卡片化工作台 */
 .sc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
 .sc-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;box-shadow:var(--yg-shadow);min-width:0;overflow:hidden;transition:.22s}
