@@ -16,7 +16,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from . import runtime_config
@@ -354,10 +354,9 @@ async def build_share(db: Session, task: ShareTask) -> str:
         if title and suffix not in title:
             title = f"{title}{suffix}"
     client = GuangYaShareClient(db)
-    result = await client.create(target_id, title, settings.share_duration)
-    data = result.get("data") or {}
-    share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
-    share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
+    # 阶段四：统一走光鸭建分享解析适配器（与 publisher/main 口径一致）
+    from .guangya import create_share_parsed
+    share_id, share_url = await create_share_parsed(client, target_id, title, settings.share_duration)
     if not share_url:
         task.status = ST_FAILED
         task.error = "分享接口返回成功但未找到 shareUrl"
@@ -446,24 +445,53 @@ def submit_to_dispatch(db: Session, task: ShareTask) -> int:
 def claim_tasks(db: Session, worker: str, limit: int = 20) -> list[int]:
     """分发中心原子领取：submitted → accepted（强制项4）。
 
-    逐条条件 UPDATE（WHERE status_ext=submitted），返回真正领到的 share_task_id。
-    单进程仍由 publisher._queue_lock 二次保险；多进程靠条件更新互斥。
+    阶段四真原子改造：旧版先 select 再逐条改属性最后 commit（select-then-modify），
+    单进程靠 publisher._queue_lock 能过，但多进程两个 worker 同时 select 会拿到同一批、
+    重复领取。新版用**条件 UPDATE 抢占**：
+      1. select 候选 id（只读，无锁）；
+      2. 一条 `UPDATE push_queue SET status_ext=accepted, worker=?, at=?
+         WHERE id IN (...) AND status_ext=submitted AND status IN (pending,retry)`，
+         SQLite 单写者保证这条语句原子——两个 worker 并发时只有一个的 rowcount>0；
+      3. 只更新真正抢到的行的 ShareTask 状态；rowcount=0 的候选直接跳过。
+    返回真正领到的 share_task_id（可能少于 limit）。
     """
-    claimed: list[int] = []
     rows = db.scalars(select(QueueItem).where(
         QueueItem.status_ext == ST_SUBMITTED,
         QueueItem.status.in_(["pending", "retry"])).order_by(QueueItem.id).limit(limit)).all()
+    if not rows:
+        return []
+    candidate_ids = [q.id for q in rows]
+    by_id = {q.id: q for q in rows}
     now = utcnow()
-    for q in rows:
-        q.status_ext = ST_ACCEPTED
-        q.accept_worker = worker
-        q.accepted_at = now
+    # 条件 UPDATE 抢占：只有仍是 submitted 的行才被本 worker 拿下（真原子）。
+    # accept_worker=worker 作为「归属标记」——下面据此精确回查哪些行是本 worker 抢到的
+    # （rowcount 只给总数，无法区分候选集部分重叠时具体哪些行被别人先抢走）。
+    db.execute(
+        update(QueueItem)
+        .where(QueueItem.id.in_(candidate_ids),
+               QueueItem.status_ext == ST_SUBMITTED,
+               QueueItem.status.in_(["pending", "retry"]))
+        .values(status_ext=ST_ACCEPTED, accept_worker=worker, accepted_at=now))
+    # 回查归属：同一事务内，只有被打上本 worker 标记的行才是真正领到的
+    won_ids = set(db.scalars(select(QueueItem.id).where(
+        QueueItem.id.in_(candidate_ids),
+        QueueItem.status_ext == ST_ACCEPTED,
+        QueueItem.accept_worker == worker)).all())
+    claimed: list[int] = []
+    for qid in candidate_ids:
+        if qid not in won_ids:
+            continue  # 被别的 worker 先抢走，跳过
+        q = by_id[qid]
+        q.status_ext = ST_ACCEPTED  # 同步 ORM 内存态（条件 UPDATE 绕过 ORM）
         task = db.get(ShareTask, q.share_task_id) if q.share_task_id else None
         if task and task.status == ST_SUBMITTED:
             task.status = ST_ACCEPTED
-        claimed.append(q.share_task_id or q.id)
+        claimed.append(q.share_task_id or qid)
     if claimed:
         db.commit()
+    else:
+        # 一行都没抢到：回滚本次只读事务，不改动任何东西
+        db.rollback()
     return claimed
 
 

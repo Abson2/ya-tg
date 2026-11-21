@@ -172,6 +172,18 @@
 **回滚**：`publish_engine_enabled` 开关；旧三套建分享逻辑保留到验收后删除。
 **风险**：`[P0]` 收敛时误伤发送核心 → 引擎只封装「建/更新/删分享 + 任务状态」，绝不触碰 publisher 发送函数（审计第 7 节红线）。
 
+#### 阶段四实际落地记录（2026-11-21，代码完成待真机验收）
+
+二次取证后按「真缺口才改、已具备只验证、高风险不折腾」收敛范围：
+
+1. **9 态收口 → 保持现状**：9 态已定义齐全；`ST_PUBLISHING` 虽在 Python 侧不作为流转态，但 `main.py:2267` 对账删除把它当活跃态过滤，`[事实]` 并非死状态，**不删不改**（删除会放宽对账删除范围，反而有风险）。用测试固化 9 态完整性。
+2. **跨季一剧一链接 → 已具备，测试固化不重写**：`[事实]` `work_group_key`（utils.py:197-224）对 `Season 1/2` 取剧名母目录、`build_share` 有 `current_share` + `share_dir_id` 双重复用（share_center.py:312-341）、`ShareRecord` 部分唯一索引保证一剧一条 current。决策 3 已由现有代码满足，新增测试 `test_cross_season_*` 固化语义，不改实现。
+3. **统一发布引擎 → 收敛返回解析，不建 PublishEngine**：`[事实]` 三套建分享（publisher/share_center/main）真正的重复是「各自手写光鸭返回的 share_id/share_url 解析、字段口径不一」。抽 `GuangYaShareClient.parse_share_result()`（字段名并集含 link 兜底）+ 模块级 `create_share_parsed(client,...)`（guangya.py，对只实现 create() 的 client 优雅回退，兼容测试替身/旧实现），三处改调它——**只换解析，不动 publisher 发送逻辑、不动任务状态机**，符合决策 4「发送核心绝不动」。未另建 PublishEngine（收益低、动共享核心风险高）。
+4. **`claim_tasks` 真原子（本次核心修复）**：`[事实]` 旧版 select-then-modify（先 select rows 再逐条改属性 commit），多进程两 worker 可领同一批。改为**条件 UPDATE 抢占**：`UPDATE push_queue SET status_ext=accepted, accept_worker=?, at=? WHERE id IN(...) AND status_ext=submitted AND status IN(pending,retry)`，再按 `accept_worker==worker` 回查精确归属（rowcount 只给总数、候选部分重叠时无法区分具体行，故用 worker 标记回查）。单进程零回归、多进程互斥。
+5. **can_publish 接 link_state → 留阶段五**：link_state 字段阶段五才建，阶段四不接，避免半成品门禁。
+
+**验收结果**：新增 `tests/test_v147_share_lifecycle.py` 11 项全过（原子领取含部分重叠、解析字段兼容、跨季同键+复用链接、9态完整）；现有 claim_tasks 8 项零回归；全量 pytest 见发版记录。未升版本未发版。
+
 ### 阶段五：链接校验与清理（决策 1 落地，不虚构接口）
 
 **目标**：在不虚构光鸭接口的前提下，建立「有效性判定 → 失效复查 → 清理」的完整可追溯流程。

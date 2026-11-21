@@ -26,7 +26,8 @@ from . import (admin_session, ai_assist, async_scan_state, bot_listener,
                mirror, mirror_batch, runtime_config, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
-from .guangya import GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles, WebFileError
+from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
+                      WebFileError, create_share_parsed)
 from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, DiscoveredChat,
                      DistributionEvent, MediaRequest, MessageTemplate, MirrorDir, MirrorFile,
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
@@ -2859,10 +2860,9 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
                 title = x.media_title or x.name or ""
                 if is_series and x.season:
                     title = f"{title} 第{int(x.season)}季"
-                result = await GuangYaShareClient(db).create(target_id, title, p.duration)
-                data = result.get("data") or {}
-                share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
-                share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
+                # 阶段四：统一走光鸭建分享解析适配器（三处散点口径收敛）
+                share_id, share_url = await create_share_parsed(
+                    GuangYaShareClient(db), target_id, title, p.duration)
                 targets = list(db.scalars(select(Resource).where(Resource.share_dir_id == dir_id)).all()) if is_series else [x]
                 for item in (targets or [x]):
                     item.share_id, item.share_url = share_id, share_url
@@ -2913,10 +2913,9 @@ async def create_share(rid: int, duration: int = 0, db: Session = Depends(get_db
                 db.commit()
                 return {"ok": True, "share_id": x.share_id, "share_url": x.share_url,
                         "scope": scope, "reused": True}
-        result = await GuangYaShareClient(db).create(target_id, title, duration)
-        data = result.get("data") or {}
-        share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
-        share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or "")
+        # 阶段四：统一走光鸭建分享解析适配器（三处散点口径收敛）
+        share_id, share_url = await create_share_parsed(
+            GuangYaShareClient(db), target_id, title, duration)
         # 同步给同目录所有单集，一处分享整剧可见
         targets = list(db.scalars(select(Resource).where(Resource.share_dir_id == dir_id)).all()) if is_series else [x]
         targets = targets or [x]

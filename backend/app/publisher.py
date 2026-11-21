@@ -62,10 +62,9 @@ async def ensure_share(db: Session, res: Resource) -> str:
     title = res.media_title or res.name or ""
     if scope == "series_dir" and res.season:
         title = f"{title} 第{int(res.season)}季" if title else f"第{int(res.season)}季"
-    result = await client.create(target_id, title, settings.share_duration)
-    data = result.get("data") or {}
-    share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
-    share_url = str(data.get("shareUrl") or data.get("share_url") or data.get("url") or data.get("link") or "")
+    # 阶段四：统一走光鸭建分享解析适配器（三处散点字段口径收敛，发送逻辑不变）
+    from .guangya import create_share_parsed
+    share_id, share_url = await create_share_parsed(client, target_id, title, settings.share_duration)
     res.share_id = share_id or res.share_id
     res.share_url = share_url
     res.share_status = "active" if share_url else "failed"

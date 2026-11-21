@@ -595,6 +595,26 @@ class GuangYaShareClient:
                 "shareType": 0, "maxRestoreCount": 0, "trafficLimit": "0"}
         return await self.post("share_file", body)
 
+    @staticmethod
+    def parse_share_result(result: dict) -> tuple[str, str]:
+        """统一解析光鸭建分享返回 → (share_id, share_url)。
+
+        阶段四：收敛三套建分享散点（publisher/share_center/main）里各自手写、字段口径
+        不一致的返回解析。取并集兼容所有已知字段名（含 link），空 url 返回空串由调用方
+        决定降级/报错。不启用提取码（create 显式 enableShareCode=False）。
+        """
+        data = (result or {}).get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        share_id = str(data.get("shareId") or data.get("share_id") or data.get("id") or "")
+        share_url = str(data.get("shareUrl") or data.get("share_url")
+                        or data.get("url") or data.get("link") or "")
+        return share_id, share_url
+
+    async def create_parsed(self, file_id, title, duration) -> tuple[str, str]:
+        """建分享 + 统一解析，返回 (share_id, share_url)。三处建分享的统一入口。"""
+        return self.parse_share_result(await self.create(file_id, title, duration))
+
     async def update(self, share_id, title, duration):
         body = {"id": str(share_id), "title": title, "validateDuration": int(duration),
                 "shareType": 0, "downloadType": 1, "enableShareCode": False,
@@ -612,3 +632,16 @@ class GuangYaShareClient:
             return data if isinstance(data, dict) else {"raw": data}
         except Exception:
             return {"raw": r.text[:500]}
+
+
+async def create_share_parsed(client, file_id, title, duration) -> tuple[str, str]:
+    """阶段四统一建分享入口：兼容真实 client 与只实现 create() 的测试替身。
+
+    真实 GuangYaShareClient 有 create_parsed（内部仍是 create + parse）；
+    测试/第三方 client 可能只实现 create()——此处回退为 create + 本地 parse，
+    保证统一解析口径的同时不破坏任何 mock。
+    """
+    if hasattr(client, "create_parsed"):
+        return await client.create_parsed(file_id, title, duration)
+    return GuangYaShareClient.parse_share_result(
+        await client.create(file_id, title, duration))
