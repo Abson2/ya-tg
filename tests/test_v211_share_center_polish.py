@@ -84,16 +84,20 @@ def test_default_schedule_by_media_type(env):
     with S() as db:
         movie = sc2._default_schedule_for("movie")
         tv = sc2._default_schedule_for("tv")
-        # 时段沿用 8-24（与计划版本小时窗口一致，避免上线后 8-10 点被掐断），
-        # 分档差异体现在速率上限：电视量大、电影量小。
-        assert movie == (8, 24, 3, 20), "电影档：3 条每时 / 20 条每日"
-        assert tv == (8, 24, 5, 30), "电视档：5 条每时 / 30 条每日"
+        # v2.1.2：时段默认由**偏好分配**决定（高峰独占段或全天窗口），
+        # 未传窗口时兜底为全天 0-24；分档差异体现在速率上限：
+        # 电视量大、电影量小。
+        assert movie == (0, 24, 3, 20), "电影档：3 条每时 / 20 条每日（不限时段）"
+        assert tv == (0, 24, 5, 30), "电视档：5 条每时 / 30 条每日（不限时段）"
         for value in (movie, tv):
             ws, we, hl, dl = value
             assert we > ws, "时段必须为正长度"
             assert hl > 0 and dl > 0, "每小时/每日上限不得为 0（0 = 不限）"
         # 未知媒体类型按电影档兜底，不返回 0/0
         assert sc2._default_schedule_for("") == movie
+        # 传入高峰独占段时，时段跟随窗口走，上限仍按媒体类型分档
+        assert sc2._default_schedule_for("movie", (20, 22)) == (20, 22, 3, 20)
+        assert sc2._default_schedule_for("tv", (18, 20)) == (18, 20, 5, 30)
         # 全部 27 个官方分类都能取到非零默认档
         catalog = sc2._tmdb_genre_catalog()
         assert len(catalog) == 27
@@ -103,7 +107,7 @@ def test_default_schedule_by_media_type(env):
 
 
 def test_ensure_schedules_backfills_untouched_rows(env):
-    """存量 8-24 + 0/0 行回填默认建议值；用户改过的行不被覆盖。"""
+    """从未配置过的行回填默认建议值；用户改过的行不被覆盖。"""
     from app import share_center_v2 as sc2
     from app.models import SCCategorySchedule
     S, _ = env
@@ -116,41 +120,77 @@ def test_ensure_schedules_backfills_untouched_rows(env):
         movie_key = "genre:剧情"          # movie 档
         custom_key = "genre:科幻"         # 用户自定义过的分类
 
-        # 模拟真机存量：初始 8-24 + 0/0（从未配置过）
+        # 模拟真机存量：初始 8-24 + 0/0（从未配置过，window_auto 为默认真）
         db.add(SCCategorySchedule(plan_version_id=version.id, category_key=tv_key,
                                   window_start=8, window_end=24,
                                   hourly_limit=0, daily_limit=0, enabled=False))
         db.add(SCCategorySchedule(plan_version_id=version.id, category_key=movie_key,
                                   window_start=8, window_end=24,
                                   hourly_limit=0, daily_limit=0, enabled=False))
-        # 用户已经配置过的行：时段与上限都不是默认值
-        db.add(SCCategorySchedule(plan_version_id=version.id, category_key=custom_key,
-                                  window_start=20, window_end=22,
-                                  hourly_limit=2, daily_limit=9, enabled=True))
         db.commit()
 
+        # 用户已经配置过的行：走**真实用户保存路径**（api_upsert_category_schedule），
+        # 该路径会把 window_auto 置 0 —— 这才是「用户手工设定过」的权威标记。
+        # v2.1.2：不能用 db.add 直插来模拟用户改过的行：window_auto 列默认 1，
+        # 直插出来的行会被误判成「系统托管」，从而被高峰分配覆盖时段。
+        res = sc2.api_upsert_category_schedule(sc2.Payload(payload={
+            "plan_version_id": version.id, "category_key": custom_key,
+            "window_start": 20, "window_end": 22,
+            "hourly_limit": 2, "daily_limit": 9, "enabled": True,
+        }), db)
+        assert res["ok"] is True
+
+        windows = sc2._preference_windows(db)
         rows = sc2._ensure_schedules(db, version.id)
         by_key = {r.category_key: r for r in rows}
 
         tv_row = by_key[tv_key]
-        assert (tv_row.window_start, tv_row.window_end) == (8, 24)
+        tv_ws, tv_we = windows.get(tv_key, sc2.FULL_DAY_WINDOW)
+        assert (tv_row.window_start, tv_row.window_end) == (tv_ws, tv_we)
         assert (tv_row.hourly_limit, tv_row.daily_limit) == (5, 30)
         assert tv_row.enabled is True, "回填后该分类的排期必须真正生效"
 
         movie_row = by_key[movie_key]
-        assert (movie_row.window_start, movie_row.window_end) == (8, 24)
+        mv_ws, mv_we = windows.get(movie_key, sc2.FULL_DAY_WINDOW)
+        assert (movie_row.window_start, movie_row.window_end) == (mv_ws, mv_we)
         assert (movie_row.hourly_limit, movie_row.daily_limit) == (3, 20)
 
         custom_row = by_key[custom_key]
         assert (custom_row.window_start, custom_row.window_end) == (20, 22)
         assert (custom_row.hourly_limit, custom_row.daily_limit) == (2, 9), \
             "用户改过的行不得被默认建议值覆盖"
+        assert custom_row.window_auto is False, "用户手工保存的行必须脱离系统托管"
 
         # 新建行（此前不存在）直接带默认值并默认启用
-        new_row = by_key["genre:恐怖"]
-        assert new_row.window_start == 8 and new_row.window_end == 24
+        new_key = "genre:恐怖"
+        new_row = by_key[new_key]
+        new_ws, new_we = windows.get(new_key, sc2.FULL_DAY_WINDOW)
+        assert (new_row.window_start, new_row.window_end) == (new_ws, new_we)
         assert new_row.hourly_limit == 3 and new_row.daily_limit == 20
         assert new_row.enabled is True, "新建排期行默认启用，避免流程跑不通"
+
+
+def test_ensure_schedules_keeps_legacy_manual_window(env):
+    """老库迁移场景：window_auto 因 ALTER 补列默认成 1，用户手工时段仍不得被覆盖。"""
+    from app import share_center_v2 as sc2
+    from app.models import SCCategorySchedule
+    S, _ = env
+    with S() as db:
+        sc2.ensure_defaults(db)
+        version = sc2._active_version(db)
+        key = "genre:科幻"
+        # 老库形态：window_auto=1（ALTER DEFAULT），但上限是用户自己配的 2/9，
+        # 时段也是用户手工设的 21-23（不属于任何系统分配过的窗口形态）。
+        db.add(SCCategorySchedule(plan_version_id=version.id, category_key=key,
+                                  window_start=21, window_end=23,
+                                  hourly_limit=2, daily_limit=9, enabled=True,
+                                  window_auto=True))
+        db.commit()
+        rows = sc2._ensure_schedules(db, version.id)
+        row = next(r for r in rows if r.category_key == key)
+        assert (row.window_start, row.window_end) == (21, 23), \
+            "用户手工时段不得被系统高峰分配覆盖"
+        assert (row.hourly_limit, row.daily_limit) == (2, 9)
 
 
 def test_apply_defaults_endpoint(env):
@@ -176,10 +216,13 @@ def test_apply_defaults_endpoint(env):
         assert res["applied"] >= 1
         assert res["total"] == 27
 
+        windows = sc2._preference_windows(db)
         untouched = db.scalar(select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id,
             SCCategorySchedule.category_key == untouched_key))
-        assert (untouched.window_start, untouched.window_end) == (8, 24)
+        # v2.1.2：时段取**偏好分配**给出的窗口（前 12 名独占高峰段，其余全天 0-24）。
+        u_ws, u_we = windows.get(untouched_key, sc2.FULL_DAY_WINDOW)
+        assert (untouched.window_start, untouched.window_end) == (u_ws, u_we)
         assert (untouched.hourly_limit, untouched.daily_limit) == (5, 30)
         assert untouched.enabled is True, "一键应用必须同时启用该行"
 
@@ -198,7 +241,8 @@ def test_apply_defaults_endpoint(env):
         custom2 = db.scalar(select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id,
             SCCategorySchedule.category_key == custom_key))
-        assert (custom2.window_start, custom2.window_end) == (8, 24)
+        c_ws, c_we = windows.get(custom_key, sc2.FULL_DAY_WINDOW)
+        assert (custom2.window_start, custom2.window_end) == (c_ws, c_we)
         assert (custom2.hourly_limit, custom2.daily_limit) == (3, 20)
         assert custom2.enabled is True
 
@@ -219,7 +263,9 @@ def test_reset_default_endpoint_single_row(env):
         res = sc2.api_reset_category_schedule_default(sc2.Payload(payload={"id": row.id}), db)
         assert res["ok"] is True
         item = res["item"]
-        assert (item["window_start"], item["window_end"]) == (8, 24)
+        # v2.1.2：恢复默认的时段取偏好分配窗口，不是写死的 8-24。
+        r_ws, r_we = sc2._preference_windows(db).get(row.category_key, sc2.FULL_DAY_WINDOW)
+        assert (item["window_start"], item["window_end"]) == (r_ws, r_we)
         assert (item["hourly_limit"], item["daily_limit"]) == (5, 30)
         assert item["ai_adopted"] is False, "恢复默认应清除 AI 采纳标记"
 
@@ -231,7 +277,8 @@ def test_reset_default_endpoint_single_row(env):
         db.commit()
         res2 = sc2.api_reset_category_schedule_default(
             sc2.Payload(payload={"id": movie_row.id}), db)
-        assert (res2["item"]["window_start"], res2["item"]["window_end"]) == (8, 24)
+        m_ws, m_we = sc2._preference_windows(db).get(movie_row.category_key, sc2.FULL_DAY_WINDOW)
+        assert (res2["item"]["window_start"], res2["item"]["window_end"]) == (m_ws, m_we)
         assert (res2["item"]["hourly_limit"], res2["item"]["daily_limit"]) == (3, 20)
 
 
@@ -601,8 +648,13 @@ def test_frontend_schedule_defaults_controls():
     assert "一键应用默认建议" in app
     assert "内置默认建议值" in app
     # 默认档位文案必须写明电视/电影两档
-    assert "8:00–24:00" in app and "5 条每时" in app and "30 条每日" in app
+    assert "5 条每时" in app and "30 条每日" in app
     assert "3 条每时" in app and "20 条每日" in app
+    # v2.1.2：默认时段不再是写死的 8-24，改由偏好分配给出高峰独占段
+    assert "8:00–24:00" not in app, "写死的 8:00–24:00 时段文案必须清掉"
+    assert "peak_segments" in app and "full_day_window" in app
+    assert "批量采纳 AI 建议" in app
+    assert "/sc/category-schedules/adopt-ai-all" in app
 
 
 def test_frontend_no_backend_code_terms_in_share_center():

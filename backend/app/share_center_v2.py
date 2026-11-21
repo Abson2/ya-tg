@@ -58,6 +58,22 @@ DEFAULT_MAX_PER_MINUTE = {"channel": 30, "private": 30, "group": 20}
 DEFAULT_JITTER_SECONDS = {"channel": 0.0, "private": 0.0, "group": 1.0}
 ACTIVE_TASK_STATUS = {"planned", "building", "ready", "submitted", "accepted", "publishing"}
 TERMINAL_TASK_STATUS = {"published", "failed", "cancelled"}
+# v2.1.2：归档态（清理后置位）。**不物理删除行**——任务与分享记录是推送历史与
+# 链接生命周期的真相源，删除会连带毁掉执行记录与统计口径。归档后：
+#   任务   → status='cleaned'
+#   分享   → link_state='cleaned'
+# 默认列表均排除归档态（可用 include_archived=true 查回），保证「清理」=
+# 「从管理视图里移除」，而不是「抹掉历史」。
+CLEANED_TASK_STATUS = "cleaned"
+CLEANED_LINK_STATE = "cleaned"
+# 永久性失败文案特征（真实来自 _RepResolver.resolve 与 dispatch 的错误分支）：
+# 这些失败重试也不会成功——资源没了就是没了，属于「无效任务/无效链接」。
+PERMANENT_ERROR_MARKERS = (
+    "作品资源已从资源库移除",
+    "资源版本快照缺少资源 id",
+    "代表资源不存在",
+    "清单项或资源版本不存在",
+)
 
 # v2.0.5：TMDB 官方 genre 全集为影视分类唯一权威（源 tmdb.py::TMDB_GENRES，27 项）。
 # 设计稿原写「连续剧/院线电影/综艺」，但那不是 TMDB 官方 genre 概念；按用户决策改为
@@ -74,6 +90,42 @@ def _tmdb_genre_catalog() -> list[dict[str, Any]]:
                     "media_type": "tv" if gid in tv_ids else "movie",
                     "source": "tmdb"})
     return out
+
+
+def _category_display_name(category_key: str) -> str:
+    """把分类键翻译成**界面上可读的中文名**（不暴露后端 key 形态）。
+
+    - 命中 TMDB 官方 genre → 官方中文名（如 `genre:动作` → 「动作」）；
+    - `genre:unknown` → 「未分类」（资源未识别出 TMDB 类型时的兜底桶）；
+    - 其它不在官方字典里的键 → 「未分类」，**不回显 key 本身**。
+    """
+    key = str(category_key or "").strip()
+    if not key:
+        return "未分类"
+    for cat in _tmdb_genre_catalog():
+        if cat["category_key"] == key:
+            return str(cat["name"])
+    if key == "genre:unknown":
+        return "未分类"
+    # 归一化后的中文名仍可能是有效 TMDB 分类（字典按 normalize 生成，此处兜底匹配）
+    tail = key.split(":", 1)[-1]
+    for cat in _tmdb_genre_catalog():
+        if utils.normalize_work_name(str(cat["name"])) == tail:
+            return str(cat["name"])
+    return "未分类"
+
+
+def _category_safe_name(category_key: str, names: dict[str, str]) -> str:
+    """分类展示名：优先用户自定义名，但**拒绝回显后端 key 形态**。
+
+    字典行的 name 可能仍是历史懒生成留下的 `genre:xxx`（与 category_key 相同），
+    这类值直接渲染会把内部 key 暴露到界面，一律替换为可读中文名。
+    """
+    key = str(category_key or "").strip()
+    raw = str(names.get(key) or "").strip()
+    if raw and raw != key and not raw.startswith("genre:"):
+        return raw
+    return _category_display_name(key)
 
 
 # 分类排期默认窗口（每分类一行）。
@@ -237,21 +289,140 @@ DEFAULT_HOUR_TEMPLATE: list[tuple[int, str]] = [
 ]
 # 时段段长（小时）。v2.1.1：固定 2 小时一段，全天 12 段。
 HOUR_SEGMENT_HOURS = 2
-# 白天 / 夜间的分界小时（上海时区）。偏好高的分类排在白天段，偏好低的排在夜间段。
-# 选 8 点为界：影视消费高峰在 8 点后，8 点前留给偏好低的分类（错峰，不空转）。
-DAY_START_HOUR = 8
-NIGHT_END_HOUR = 8
-# 白天段 08:00–24:00（8 段）、夜间段 00:00–08:00（4 段），
-# 两段**恰好铺满 0-24 全天 12 段且互不重叠**：
-#   偏好高的分类 → 白天段（覆盖 8 点后的全部活跃时段，含 22-24 黄金档）；
-#   偏好低的分类 → 夜间段（凌晨到清晨，长尾内容错峰投放）。
-DAY_WINDOW = (DAY_START_HOUR, 24)
-NIGHT_WINDOW = (0, NIGHT_END_HOUR)
+# v2.1.2：高峰优先的时段顺序（**固定默认**，不随真实数据变化）。
+# 用户口径：「观看用户多的倾向分类排在观影高峰时段」「每两个小时对应一个分类，
+# 不要只分白天、夜间，太宽泛了」——因此由「昼夜两档」升级为「12 段高峰序列」。
+# 顺序依据通用观影作息：20-22 黄金档 → 18-20 晚高峰 → 22-24 深夜档 →
+# 12-14 午休档 → 傍晚 → 下午 → 上午 → 早间 → 凌晨依次递减。
+# 这 12 段恰好覆盖 0-24 全天且互不重叠。
+PEAK_SEGMENT_ORDER: list[tuple[int, int]] = [
+    (20, 22), (18, 20), (22, 24), (12, 14),
+    (16, 18), (14, 16), (10, 12), (8, 10),
+    (0, 2), (2, 4), (4, 6), (6, 8),
+]
+# v2.1.2：第 13 名及以后保持**全天窗口**（不限时段），保证长尾分类仍有产出，
+# 不因「前 12 名独占时段」把其余分类挤到完全推不出去。
+FULL_DAY_WINDOW = (0, 24)
+# v2.1.2：**系统曾经分配过**的窗口形态全集（判定「这行的时段是系统给的，还是用户手改的」）。
+# 含 v2.1.1 的昼夜两档（8-24 / 0-8）、v2.1.2 的 12 段高峰与全天窗口。
+# 老库 ALTER 补 window_auto 列时 DEFAULT 1，用户手工改过时段但上限仍 0/0 的行
+# 也会拿到 window_auto=1——用这张表做「系统窗口形态」白名单，避免误覆盖用户手工时段。
+SYSTEM_ASSIGNED_WINDOWS: frozenset[tuple[int, int]] = frozenset(
+    set(PEAK_SEGMENT_ORDER)
+    | {FULL_DAY_WINDOW, (8, 24), (0, 8)}
+)
 
 
 def _hour_segments() -> list[tuple[int, int]]:
     """全天 2 小时一段的 (起, 止) 列表，共 12 段。"""
     return [(h, h + HOUR_SEGMENT_HOURS) for h in range(0, 24, HOUR_SEGMENT_HOURS)]
+
+
+def _looks_like_title(value: str) -> bool:
+    """判断字符串像作品名而不是文件名（带视频扩展名的按文件名处理）。"""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    for ext in (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
+                ".rmvb", ".webm", ".mpg", ".mpeg", ".srt", ".ass", ".nfo"):
+        if low.endswith(ext):
+            return False
+    return True
+
+
+def _work_titles(db: Session, work_keys) -> dict[str, str]:
+    """批量把作品聚合键翻译成**可读标题**（不暴露内部键形态）。
+
+    聚合键是内部实现（展示、分享、推送三处共用），**不得**直接渲染到界面上。
+
+    解析顺序（越靠前越准确）：
+      ① `SCLibraryVersion.metadata_json.title` —— 资源库版本表里登记的真实作品名
+         （识别成功时是 TMDB 中文名），按 work_key 精确命中；
+      ② `work:<归一化作品名>` 直接剥前缀 —— 归一化会去掉空格与大小写，
+         中文名无损，英文名会退化成 `thelastofus`，故仅作兜底；
+      ③ `tmdb:<媒体类型>:<tmdb_id>` / `file:<file_id>` 回查资源库取真实作品名
+         （media_title → share_dir_name → name 依次回退）。
+    """
+    out: dict[str, str] = {}
+    keys: list[str] = []
+    for raw in work_keys or []:
+        key = str(raw or "")
+        if not key or key in out:
+            continue
+        out[key] = ""
+        keys.append(key)
+
+    # ① 资源库版本表登记的真实标题（同一 work_key 取最新版本）
+    if keys:
+        rows = db.execute(
+            select(SCLibraryVersion.work_key, SCLibraryVersion.version_no,
+                   SCLibraryVersion.metadata_json)
+            .where(SCLibraryVersion.work_key.in_(keys))
+            .order_by(SCLibraryVersion.version_no.desc())).all()
+        seen: set[str] = set()
+        for wk, _ver, meta_json in rows:
+            if wk in seen:
+                continue
+            seen.add(wk)
+            meta = _jload(meta_json, {})
+            if not isinstance(meta, dict):
+                continue
+            cand = str(meta.get("title") or "").strip()
+            if not _looks_like_title(cand):
+                cand = str(meta.get("share_dir_name") or "").strip()
+                if not _looks_like_title(cand):
+                    continue
+            out[wk] = cand
+
+    # ② work: 前缀直接剥
+    tmdb_ids: set[int] = set()
+    file_ids: set[str] = set()
+    for key in keys:
+        if out[key]:
+            continue
+        if key.startswith("work:"):
+            name = key[5:].strip()
+            if name:
+                out[key] = name
+        elif key.startswith("tmdb:"):
+            parts = key.split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                tmdb_ids.add(int(parts[2]))
+        elif key.startswith("file:"):
+            file_ids.add(key[5:])
+
+    # ③ tmdb:/file: 回查资源库
+    if tmdb_ids:
+        for res in db.scalars(select(Resource).where(
+                Resource.tmdb_id.in_(tmdb_ids))).all():
+            title = (str(res.media_title or "").strip()
+                     or str(res.share_dir_name or "").strip()
+                     or str(res.name or "").strip())
+            if not title:
+                continue
+            mt = str(res.media_type or "")
+            # 注意：这些键在上面的初始化里已被置成 ""，不能用 setdefault（空串不是缺省），
+            # 否则 tmdb: 形态永远解析不出标题。
+            for cand in (f"tmdb:{mt}:{res.tmdb_id}", f"tmdb:{res.tmdb_id}"):
+                if cand in out and not out[cand]:
+                    out[cand] = title
+    if file_ids:
+        for res in db.scalars(select(Resource).where(
+                Resource.file_id.in_(file_ids))).all():
+            title = (str(res.media_title or "").strip()
+                     or str(res.share_dir_name or "").strip()
+                     or str(res.name or "").strip())
+            if title:
+                key = f"file:{res.file_id}"
+                if key in out and not out[key]:
+                    out[key] = title
+
+    # 兜底：仍解析不出的键，至少给出「作品」这种中性占位，不暴露键形态
+    for key in keys:
+        if not out[key]:
+            out[key] = "未知作品" if not key.startswith("work:") else (key[5:] or "未知作品")
+    return out
 
 
 def _primary_category(resource: Resource) -> tuple[str, str]:
@@ -283,7 +454,8 @@ def _ensure_category(db: Session, category_key: str, media_type: str, name: str 
                 row.media_type = media_type
             db.flush()
         return
-    db.add(SCCategory(category_key=category_key, name=name or category_key,
+    db.add(SCCategory(category_key=category_key,
+                      name=name or _category_display_name(category_key),
                       source="tmdb", media_type=media_type, enabled=True, priority=0))
     db.flush()
 
@@ -1214,7 +1386,7 @@ def _aggregate_category_ratio(db: Session) -> dict[str, Any]:
     for key, n in rows:
         count = int(n or 0)
         items.append({"category_key": str(key or ""),
-                      "name": names.get(str(key or ""), str(key or "未分类")),
+                      "name": _category_safe_name(str(key or ""), names),
                       "count": count,
                       "ratio": round(count * 100 / total, 1) if total else 0.0})
     items.sort(key=lambda x: x["count"], reverse=True)
@@ -1254,9 +1426,13 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
         if statuses:
             q = q.where(SCPublishTask.status.in_(statuses))
         rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(limit)).all()
-        return [{k: v for k, v in _model_dict(r).items() if k in (
+        out = [{k: v for k, v in _model_dict(r).items() if k in (
             "id", "work_key", "kind", "status", "link_state", "share_url",
             "error", "attempts", "created_at", "published_at", "updated_at")} for r in rows]
+        titles = _work_titles(db, [r.get("work_key") for r in out])
+        for row in out:
+            row["title"] = titles.get(str(row.get("work_key") or ""), "")
+        return out
 
     return {"history": rows_for({"published"}),
             "queue": rows_for(ACTIVE_TASK_STATUS),
@@ -1274,10 +1450,15 @@ def _aggregate_share_stats(db: Session) -> dict[str, Any]:
       invalid   —— 任务已 failed 或链接被判失效
       history   —— 已 published 的记录数（历史归档）
     """
-    total = int(db.scalar(select(func.count(SCPushListItem.id))) or 0)
+    total = int(db.scalar(select(func.count(SCPushListItem.id)).join(
+        SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id).where(
+        SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != "",
+        SCPublishTask.link_state != CLEANED_LINK_STATE)) or 0)
     rows = db.execute(
         select(SCPublishTask.link_state, SCPublishTask.status, func.count(SCPublishTask.id))
         .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != "",
+               SCPublishTask.link_state != CLEANED_LINK_STATE)
         .group_by(SCPublishTask.link_state, SCPublishTask.status)
     ).all()
     active = pending = invalid = history = 0
@@ -1350,59 +1531,65 @@ def _category_preference(db: Session) -> list[dict[str, Any]]:
     return items
 
 
-def _assign_day_night_windows(prefs: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
-    """按偏好把分类分配到白天 / 夜间时段窗口（每 2 小时一段）。
+def _assign_peak_windows(prefs: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """按偏好排名把分类分配到**高峰独占时段**（每 2 小时一段，共 12 段）。
 
-    规则（用户口径）：
-      - 偏好高的分类 → 白天段 08:00–24:00（DAY_WINDOW）；
-      - 偏好低的分类 → 夜间段 00:00–08:00（NIGHT_WINDOW）。
+    用户口径（v2.1.2）：「举例 12 个分类，均匀地分布到 24 个小时里面，每两个小时
+    对应一个分类，观看用户多的倾向分类排在观影高峰时段，不要只分白天、夜间，
+    太宽泛了」——因此由「昼夜两档」升级为「12 段高峰序列」。
 
-    两段恰好铺满 0-24 全天 12 段且互不重叠，夜里也有产出、不会空转。
+    规则：
+      - 偏好排名第 1 名的分类占用**最高峰时段**（20:00–22:00 黄金档），
+        第 2 名次高峰（18:00–20:00），依次映射到 PEAK_SEGMENT_ORDER；
+      - 前 12 名**互不重叠**，恰好铺满 0–24 全天 12 段；
+      - 第 13 名及以后保持**全天窗口** 0–24（不限时段），
+        保证长尾分类仍能产出，不因前 12 名独占时段而完全推不出去。
 
-    分界按**中位数**：偏好排名前一半进白天、后一半进夜间。
-    用中位数而不是写死条数，是为了让分类数量变化时不需要改代码，
-    且不因「某分类分数异常高」把其余全挤进夜间。
+    高峰顺序是**固定默认**（不随真实数据波动），观影作息是稳定的行业规律，
+    真实推送量只决定「谁排前面」，不决定「什么时候是高峰」。
     """
     if not prefs:
         return {}
-    n = len(prefs)
-    day_count = (n + 1) // 2
     out: dict[str, tuple[int, int]] = {}
     for idx, item in enumerate(prefs):
-        out[item["category_key"]] = DAY_WINDOW if idx < day_count else NIGHT_WINDOW
+        key = item["category_key"]
+        if idx < len(PEAK_SEGMENT_ORDER):
+            out[key] = PEAK_SEGMENT_ORDER[idx]
+        else:
+            out[key] = FULL_DAY_WINDOW
     return out
 
 
 @router.get("/preference")
 def api_preference(db: Session = Depends(get_db)):
-    """分类偏好排名（真实派生）+ 按偏好应分配的白天/夜间时段窗口。
+    """分类偏好排名（真实派生）+ 按偏好应分配的高峰独占时段。
 
-    前端用于展示「偏好高的排白天、偏好低的排夜间」的分配依据，
-    并提供一键按偏好重新分配时段。
+    前端用于展示「偏好高的分类排高峰时段」的分配依据，并提供一键按偏好重排时段。
     """
     prefs = _category_preference(db)
-    windows = _assign_day_night_windows(prefs)
+    windows = _assign_peak_windows(prefs)
     items = []
-    for item in prefs:
-        ws, we = windows.get(item["category_key"], DAY_WINDOW)
+    for idx, item in enumerate(prefs):
+        ws, we = windows.get(item["category_key"], FULL_DAY_WINDOW)
         data = dict(item)
         data["window_start"] = ws
         data["window_end"] = we
-        data["period"] = "day" if ws == DAY_WINDOW[0] else "night"
+        data["period"] = "peak" if (ws, we) != FULL_DAY_WINDOW else "full_day"
+        # 高峰序号：第几名的分类占用第几个高峰段（0 = 全天不限时段）
+        data["peak_rank"] = idx + 1 if data["period"] == "peak" else 0
         data["cross_midnight"] = ws > we
         items.append(data)
     return {"items": items,
             "segments": _hour_segments(),
-            "day_start_hour": DAY_START_HOUR,
+            "peak_segments": [list(s) for s in PEAK_SEGMENT_ORDER],
+            "full_day_window": list(FULL_DAY_WINDOW),
             "segment_hours": HOUR_SEGMENT_HOURS,
-            "day_window": list(DAY_WINDOW),
-            "night_window": list(NIGHT_WINDOW),
             "source": "分类字典人工优先级（主）+ 该分类已成功推送任务数（次）"}
 
 
 @router.post("/preference/assign")
 def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
-    """一键按用户偏好把分类排期重新分配到白天 / 夜间时段。
+    """一键按用户偏好把分类排期重排到高峰独占时段。
 
     只改**时段**（window_start/window_end），不动用户已设的每小时/每日上限，
     也不覆盖用户手工改过的时段——除非显式传 force=true。
@@ -1419,14 +1606,14 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
     prefs = _category_preference(db)
     if not prefs:
         return {"ok": False, "reason": "分类字典为空，无法按偏好分配"}
-    windows = _assign_day_night_windows(prefs)
+    windows = _assign_peak_windows(prefs)
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id)).all()}
     changed = 0
     skipped = 0
     for item in prefs:
-        ws, we = windows.get(item["category_key"], DAY_WINDOW)
+        ws, we = windows.get(item["category_key"], FULL_DAY_WINDOW)
         row = rows.get(item["category_key"])
         if row is None:
             db.add(SCCategorySchedule(
@@ -1589,7 +1776,8 @@ def api_overview(db: Session = Depends(get_db), period: str = "day"):
 
 
 @router.get("/share-records")
-def api_share_records(db: Session = Depends(get_db), limit: int = 200):
+def api_share_records(db: Session = Depends(get_db), limit: int = 200,
+                      include_archived: bool = False):
     """分享管理记录列表（v2.1.1）。
 
     真实来源：sc_push_list_items JOIN sc_publish_tasks，
@@ -1597,19 +1785,20 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200):
     share_code（分享码，从 share_url 尾段解析）、share_title（作品标题，真实可读名）、
     last_checked_at（最后校验时间）、last_pushed_at（最近推送时间）。
     没有分享链接的记录不返回——分享管理管的是**已建链**的分享。
+    v2.1.2：已归档（清理）的链接默认不返回，可用 include_archived=true 查回。
     """
-    rows = db.execute(
-        select(SCPushListItem, SCPublishTask)
-        .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
-        .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != "")
-        .order_by(SCPublishTask.id.desc()).limit(min(limit, 500))).all()
+    q = (select(SCPushListItem, SCPublishTask)
+         .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+         .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != ""))
+    if not include_archived:
+        q = q.where(SCPublishTask.link_state != CLEANED_LINK_STATE)
+    rows = db.execute(q.order_by(SCPublishTask.id.desc()).limit(min(limit, 500))).all()
     names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
+    titles = _work_titles(db, [item.work_key for item, _ in rows])
     items = []
     for item, task in rows:
         data = _model_dict(task)
-        title = str(item.work_key or "")
-        if title.startswith("work:"):
-            title = title[5:]
+        title = titles.get(str(item.work_key or ""), "")
         items.append({
             "id": task.id,
             "list_item_id": item.id,
@@ -1617,7 +1806,7 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200):
             "share_title": title,
             "kind": data.get("kind") or "first",
             "category_key": item.category_key,
-            "category_name": names.get(item.category_key, item.category_key),
+            "category_name": _category_safe_name(item.category_key, names),
             "share_url": data.get("share_url") or "",
             "share_code": _share_code_from_url(data.get("share_url") or ""),
             "link_state": data.get("link_state") or "unknown",
@@ -1834,12 +2023,20 @@ def api_cursors(version_id: int = 0, db: Session = Depends(get_db)):
 
 
 @router.get("/tasks")
-def api_tasks(status: str = "", limit: int = 200, db: Session = Depends(get_db)):
+def api_tasks(status: str = "", limit: int = 200,
+              include_archived: bool = False, db: Session = Depends(get_db)):
     q = select(SCPublishTask)
     if status:
         q = q.where(SCPublishTask.status == status)
+    if not include_archived:
+        # v2.1.2：已归档（清理）的任务默认不出现在列表里，可用 include_archived=true 查回。
+        q = q.where(SCPublishTask.status != CLEANED_TASK_STATUS)
     rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(min(limit, 1000))).all()
-    return {"items": [_model_dict(r) for r in rows]}
+    items = [_model_dict(r) for r in rows]
+    titles = _work_titles(db, [r.get("work_key") for r in items])
+    for row in items:
+        row["title"] = titles.get(str(row.get("work_key") or ""), "")
+    return {"items": items}
 
 
 @router.get("/tasks/{task_id}")
@@ -1849,7 +2046,10 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
         return {"ok": False, "reason": "任务不存在"}
     executions = db.scalars(select(SCPublishExecution).where(
         SCPublishExecution.task_id == task_id).order_by(SCPublishExecution.id)).all()
-    return {"item": _model_dict(task), "executions": [_model_dict(x) for x in executions]}
+    item = _model_dict(task)
+    titles = _work_titles(db, [item.get("work_key")])
+    item["title"] = titles.get(str(item.get("work_key") or ""), "")
+    return {"item": item, "executions": [_model_dict(x) for x in executions]}
 
 
 @router.post("/tasks/{task_id}/retry")
@@ -1876,6 +2076,148 @@ def api_task_cancel(task_id: int, db: Session = Depends(get_db)):
     task.lease_expires_at = None
     db.commit()
     return {"ok": True, "status": task.status}
+
+
+def _live_work_keys(db: Session) -> set[str]:
+    """当前资源库中**真实存在**的作品聚合键集合（实时扫描派生）。
+
+    用于判断一条历史任务/分享链接背后的作品是否已从资源库移除——
+    这是「无效」判定的唯一事实依据，不依赖任何人工标记或示例值。
+    """
+    keys: set[str] = set()
+    for res in db.scalars(select(Resource)).all():
+        keys.add(utils.work_group_key(res))
+    return keys
+
+
+def _is_permanent_error(error: str) -> bool:
+    """错误文案是否表明**重试也不会成功**（资源已不存在一类）。"""
+    text = str(error or "")
+    return any(marker in text for marker in PERMANENT_ERROR_MARKERS)
+
+
+@router.post("/tasks/cleanup")
+def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
+    """清理无效推送任务：归档（status=cleaned），**不物理删除行**。
+
+    「无效」判据（全部实时派生，不编造）：
+      ① 任务已被用户取消（cancelled）——调度器不再捡起它；
+      ② 任务失败，且失败原因表明**资源已从资源库移除**
+         （重试也永远不会成功）；
+      ③ 任务失败，且它背后的作品在当前资源库已查无此物。
+
+    归档后默认列表不再展示（`include_archived=true` 可查回），
+    历史行与执行记录保留，不影响推送历史与统计口径。
+    """
+    p = body.payload or {}
+    only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
+    live = _live_work_keys(db)
+    q = select(SCPublishTask).where(
+        SCPublishTask.status.in_({"failed", "cancelled"}))
+    if only_ids:
+        q = q.where(SCPublishTask.id.in_(only_ids))
+    rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
+    cleaned = 0
+    skipped = 0
+    details = []
+    for task in rows:
+        reason = ""
+        if str(task.status or "") == "cancelled":
+            reason = "已取消"
+        elif _is_permanent_error(task.error):
+            reason = "资源已从资源库移除"
+        elif str(task.work_key or "") not in live:
+            reason = "作品已不在资源库"
+        if not reason:
+            skipped += 1
+            continue
+        task.status = CLEANED_TASK_STATUS
+        task.error = f"已清理：{reason}"
+        task.lease_owner = ""
+        task.lease_expires_at = None
+        task.updated_at = utcnow()
+        cleaned += 1
+        details.append({"id": task.id, "reason": reason})
+    db.commit()
+    return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
+
+
+@router.post("/share-records/cleanup")
+def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
+    """清理无效分享链接：归档（link_state=cleaned），**不物理删除行**。
+
+    「无效」判据（全部实时派生，不编造）：
+      ① 链接状态已被本地元数据状态机判为失效
+         （suspicious / inactive）；
+      ② 作品已从资源库移除——链接指向的目录已不存在，链接必然打不开；
+      ③ 任务失败且失败原因表明资源已移除。
+
+    只归档本地记录：**不删 B 库资源、不删远端分享、不删历史行**
+    （与 share_link.cleanup_link 的既有语义一致）。
+    """
+    p = body.payload or {}
+    only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
+    live = _live_work_keys(db)
+    q = (select(SCPushListItem, SCPublishTask)
+         .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+         .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != ""))
+    if only_ids:
+        q = q.where(SCPublishTask.id.in_(only_ids))
+    rows = db.execute(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
+    cleaned = 0
+    skipped = 0
+    details = []
+    for item, task in rows:
+        state = str(task.link_state or "unknown")
+        reason = ""
+        if state in ("suspicious", "inactive"):
+            reason = "链接已判失效"
+        elif _is_permanent_error(task.error):
+            reason = "资源已从资源库移除"
+        elif str(task.work_key or item.work_key or "") not in live:
+            reason = "作品已不在资源库"
+        if not reason:
+            skipped += 1
+            continue
+        task.link_state = CLEANED_LINK_STATE
+        task.updated_at = utcnow()
+        cleaned += 1
+        details.append({"id": task.id, "reason": reason})
+    db.commit()
+    return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
+
+
+@router.post("/category-schedules/adopt-ai-all")
+def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
+    """批量采纳 AI 建议时段：对**有真实历史**的分类一次性写入建议窗口。
+
+    建议时段来自 `_ai_suggest_window`（按该分类已发布任务的小时分布派生），
+    无历史发布数据的分类返回 (0,0)，这类行**跳过**而不是编造时段。
+    """
+    p = body.payload or {}
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "无活动计划版本"}
+    # v2.1.2：先补齐排期行（幂等），否则首次点击时表里没行，等于什么都没采纳。
+    _ensure_schedules(db, version.id)
+    rows = db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version.id)).all()
+    adopted = 0
+    skipped = 0
+    for row in rows:
+        ai_start, ai_end = _ai_suggest_window(db, row.category_key)
+        if not ai_start:
+            skipped += 1
+            continue
+        row.window_start, row.window_end = ai_start, ai_end
+        row.ai_window_start, row.ai_window_end = ai_start, ai_end
+        row.ai_adopted = True
+        # 采纳 AI 建议是用户手工动作 → 该行不再被「按偏好分配时段」覆盖。
+        row.window_auto = False
+        row.updated_at = utcnow()
+        adopted += 1
+    db.commit()
+    return {"ok": True, "adopted": adopted, "skipped": skipped, "total": len(rows)}
 
 
 @router.get("/pacing-rules")
@@ -1997,32 +2339,59 @@ def _default_schedule_for(media_type: str,
     （0 = 不限，等于没有限流规则），否则整个排期机制形同虚设。
     分档依据是真实 media_type，不是设计稿示例数字。
 
-    v2.1.1（用户口径：按偏好高的分类排白天、偏好低的排夜间）：
-    时段默认由**偏好分配**决定（window 参数传入白天/夜间窗口），
+    v2.1.2（用户口径：前 12 名独占高峰 2 小时段，其余保持全天窗口）：
+    时段默认由**偏好分配**决定（window 参数传入高峰独占段或全天窗口），
     只有媒体类型决定速率上限。这样「一键应用默认建议」与
     「按偏好分配时段」两套动作口径一致，不会互相覆盖。
+    未传 window 时兜底为全天窗口 0-24（不限时段，不掐断产出）。
     """
     hl, dl = _default_limits_for(media_type)
-    ws, we = window if window else (DEFAULT_SCHEDULE_WINDOW_MOVIE[0], DEFAULT_SCHEDULE_WINDOW_MOVIE[1])
+    ws, we = window if window else FULL_DAY_WINDOW
     return ws, we, hl, dl
 
 
 def _preference_windows(db: Session) -> dict[str, tuple[int, int]]:
-    """当前偏好排名对应的白天/夜间时段窗口（分类 key → (起, 止)）。"""
-    return _assign_day_night_windows(_category_preference(db))
+    """当前偏好排名对应的高峰独占时段窗口（分类 key → (起, 止)）。"""
+    return _assign_peak_windows(_category_preference(db))
 
 
 def _is_untouched_schedule(row: SCCategorySchedule) -> bool:
     """判断一行分类排期是否「从未被用户配置过」。
 
-    指纹 = 上限全 0（不限）+ 时段仍是初始 8-24。这是 v2.0.5 建表时写入的默认值，
-    用户在页面上保存过就会带上真实时段/上限（哪怕填的是 0），指纹随之失效。
+    v2.1.2：指纹不再写死「时段 8-24」——时段默认值已改为按偏好分配的高峰段
+    （前 12 名各占一个 2 小时段），写死 8-24 会漏判 v2.1.1 留下的 0-8 夜间行。
+
+    新指纹 = **上限全 0** + **window_auto 为真** + **时段是系统曾用过的窗口形态**：
+      - 用户在页面保存过任何一行，`api_upsert_category_schedule` 会置 window_auto=False
+        并带上真实上限，指纹随之失效；
+      - 系统托管行（window_auto=True）一旦被回填过默认上限，上限非 0，指纹失效，
+        此时只刷新时段归属、不动上限；
+      - 老库（v2.0.5 时代）ALTER 补 window_auto 列时 DEFAULT 1，
+        用户手工改过时段但上限仍是 0/0 的行也会拿到 window_auto=1——
+        加上「时段必须是系统窗口形态」这道闸，避免把用户手工时段覆盖掉。
     用途：只对「未配置过」的行回填默认建议值，不覆盖用户已改过的行。
     """
-    return (int(row.hourly_limit or 0) == 0
-            and int(row.daily_limit or 0) == 0
-            and int(row.window_start or 0) == 8
-            and int(row.window_end or 0) == 24)
+    if not bool(row.window_auto):
+        return False
+    if int(row.hourly_limit or 0) != 0 or int(row.daily_limit or 0) != 0:
+        return False
+    return (int(row.window_start or 0), int(row.window_end or 0)) in SYSTEM_ASSIGNED_WINDOWS
+
+
+def _is_system_managed_schedule(row: SCCategorySchedule, media_type: str) -> bool:
+    """判断一行的时段是否仍**归系统托管**（可被偏好分配刷新）。
+
+    v2.1.2：光看 window_auto 不够——
+      - window_auto 列是 v2.1.1 才加的，老库 ALTER 补列时 DEFAULT 1，
+        **v2.1.0 时代用户手工改过的行也会拿到 window_auto=1**；
+      - 因此追加一道「上限指纹」：系统回填过的行，上限恰好是媒体类型默认档
+        （电视 5/30、电影 3/20）；用户自己配过上限的行不是这个值。
+    两个条件同时成立才视为系统托管，否则一律按「用户手工设定」保护，不刷新时段。
+    """
+    if not bool(row.window_auto):
+        return False
+    hl, dl = _default_limits_for(media_type)
+    return (int(row.hourly_limit or 0), int(row.daily_limit or 0)) == (hl, dl)
 
 
 def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
@@ -2032,13 +2401,15 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
       ① 新建行直接写入按媒体类型分档的默认时段与上限，并默认启用——
          之前 enabled=False + 0/0，等于新建后调度完全不受排期约束，
          用户勾选启用才生效但参数仍是「不限」，配置形同虚设。
-      ② **存量行回填**：已存在的行若是「全零上限 + 默认 8-24 时段」，
-         说明从未被用户配置过（未配置 = 空白），回填默认建议值**并启用**，
+      ② **存量行回填**：已存在的行若是「从未被用户配置过」，回填默认建议值**并启用**，
          让排期规则开箱即用；用户已改过的行保持原样，不覆盖。
 
-    v2.1.1（用户口径：按偏好高的分类排白天、偏好低的排夜间）：
-      ③ 时段不再写死 8-24，而是取**偏好分配**给出的白天/夜间窗口，
-         新建行一落库就落在正确的时段档位上。
+    v2.1.2（用户口径：前 12 名独占高峰 2 小时段，其余保持全天窗口）：
+      ③ 时段不再写死 8-24，而是取**偏好分配**给出的高峰独占段，
+         新建行一落库就落在正确的时段上；
+      ④ 系统托管行（window_auto=True）的时段归属随偏好分配刷新——
+         上限已由系统回填的，只改时段不动上限；上限全 0 的（从未配置过）
+         连同默认上限一起回填。
     """
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
@@ -2047,7 +2418,7 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
     changed = False
     for cat in _tmdb_genre_catalog():
         key = cat["category_key"]
-        win = windows.get(key, DAY_WINDOW)
+        win = windows.get(key, FULL_DAY_WINDOW)
         ws, we, hl, dl = _default_schedule_for(cat.get("media_type") or "", win)
         existing = rows.get(key)
         if existing is None:
@@ -2062,18 +2433,27 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
         # 即使用户恰好保存了 0/0 上限 + 8-24 时段，也属于「已配置」，不该被改写。
         if not bool(existing.window_auto):
             continue
-        # 存量行回填：从未配置过（上限全 0 且时段仍是初始 8-24）才回填默认建议值。
-        if not _is_untouched_schedule(existing):
+        # 从未配置过（上限全 0）：连同默认上限与时段一起回填。
+        if _is_untouched_schedule(existing):
+            if (int(existing.hourly_limit or 0) != hl
+                    or int(existing.daily_limit or 0) != dl
+                    or int(existing.window_start or 0) != ws
+                    or int(existing.window_end or 0) != we
+                    or not existing.enabled):
+                existing.window_start, existing.window_end = ws, we
+                existing.hourly_limit, existing.daily_limit = hl, dl
+                existing.enabled = True
+                existing.window_auto = True
+                existing.updated_at = utcnow()
+                changed = True
             continue
-        if (int(existing.hourly_limit or 0) != hl
-                or int(existing.daily_limit or 0) != dl
-                or int(existing.window_start or 0) != ws
-                or int(existing.window_end or 0) != we
-                or not existing.enabled):
+        # 系统托管且上限已回填：只刷新时段归属（高峰独占段），不动用户可见的上限。
+        # v2.1.2：必须同时满足「上限仍是系统默认档」——否则视为用户手工设定，保护不动。
+        if not _is_system_managed_schedule(existing, cat.get("media_type") or ""):
+            continue
+        if (int(existing.window_start or 0) != ws
+                or int(existing.window_end or 0) != we):
             existing.window_start, existing.window_end = ws, we
-            existing.hourly_limit, existing.daily_limit = hl, dl
-            existing.enabled = True
-            existing.window_auto = True
             existing.updated_at = utcnow()
             changed = True
     if added or changed:
@@ -2133,7 +2513,7 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
     for row in rows:
         cat = next((c for c in _tmdb_genre_catalog()
                     if c["category_key"] == row.category_key), None)
-        win = windows.get(row.category_key, DAY_WINDOW)
+        win = windows.get(row.category_key, FULL_DAY_WINDOW)
         ws, we, hl, dl = _default_schedule_for((cat or {}).get("media_type") or "", win)
         if not force and row.category_key not in untouched_keys:
             continue
@@ -2169,8 +2549,8 @@ def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get
     cat = next((c for c in _tmdb_genre_catalog()
                 if c["category_key"] == row.category_key), None)
     media_type = cat.get("media_type") if cat else ""
-    # v2.1.1：时段取偏好分配（白天/夜间），与「按偏好分配时段」口径一致。
-    win = _preference_windows(db).get(row.category_key, DAY_WINDOW)
+    # v2.1.2：时段取偏好分配（高峰独占段），与「按偏好分配时段」口径一致。
+    win = _preference_windows(db).get(row.category_key, FULL_DAY_WINDOW)
     ws, we, hl, dl = _default_schedule_for(media_type, win)
     row.window_start, row.window_end = ws, we
     row.hourly_limit, row.daily_limit = hl, dl
@@ -2195,7 +2575,7 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
     items = []
     for r in rows:
         d = _model_dict(r)
-        d["name"] = names.get(r.category_key, cat_map.get(r.category_key, {}).get("name", r.category_key))
+        d["name"] = _category_safe_name(r.category_key, names)
         d["tmdb_genre_id"] = cat_map.get(r.category_key, {}).get("tmdb_genre_id", 0)
         ai_start, ai_end = _ai_suggest_window(db, r.category_key)
         if not r.ai_adopted:
