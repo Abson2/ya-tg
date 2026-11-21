@@ -16,3 +16,7 @@ logs/*
 # 需要分享接口结构时，用 scripts/har_extract.py 生成脱敏摘要。
 *.har
 *.har.gz
+
+# 源码包是发版产物，只作为 Release asset 发布，禁止入库。
+# 历史版本已从仓库移除（v1.5.1 曾用 git add -A 误提交 9 个 zip）。
+Ya-TG-*.zip

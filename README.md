@@ -169,3 +169,18 @@ docker compose ps          # 状态为 Up (healthy) 即成功
 版本历史与逐版变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 指定版本 / 回滚：在 `.env` 设 `IMAGE_TAG=v1.3.0` 后 `docker compose pull && docker compose up -d`；所有版本见 [Releases](https://github.com/Abson2/ya-tg/releases)。
+
+### 历史归档（过程文档）
+
+以下是历次重构的审计报告与设计文档，仅作历史追溯参考，不代表当前实现；当前行为以 README 与 CHANGELOG 为准。
+
+- [源码审计报告](docs/archive/AUDIT_REPORT.md)
+- [功能保护红线](docs/archive/FEATURE_PRESERVATION.md)
+- [整改计划](docs/archive/REFACTOR_PLAN.md)
+- [四模块重构审计](docs/archive/FOUR_MODULE_REFACTOR_AUDIT.md) / [设计](docs/archive/FOUR_MODULE_REFACTOR_DESIGN.md)
+- [资源库与分享中心重构审计](docs/archive/RESOURCE_SHARE_REDESIGN_AUDIT.md) / [方案](docs/archive/RESOURCE_SHARE_REDESIGN_PLAN.md)
+- [分享中心重构审计](docs/archive/SHARE_CENTER_REDESIGN_AUDIT.md) / [二阶段设计](docs/archive/SHARE_CENTER_REDESIGN_PHASE2_DESIGN.md)
+- [严格顺序引擎设计](docs/archive/STRICT_SEQUENCE_DESIGN.md)
+- [批量复制与改名提速方案](docs/archive/STRICT_BULK_AND_RENAME_FAST_PLAN.md)
+- [镜像同步 1.1 设计](docs/archive/MIRROR_1.1_DESIGN.md)
+- [性能报告](docs/archive/PERFORMANCE_REPORT.md) / [优化变更记录](docs/archive/CHANGELOG_OPTIMIZATION.md)
