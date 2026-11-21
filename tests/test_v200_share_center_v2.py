@@ -134,6 +134,7 @@ def test_plan_engine_creates_list_items_tasks_and_cursors(env):
     from app import share_center_v2 as sc2
     from app.models import (SCCategoryCursor, SCPublishTask, SCPushList,
                             SCPushListItem, SCPushPacingRule)
+    from conftest import ensure_full_day_hour_window
     S, _ = env
     with S() as db:
         sc2.ensure_defaults(db)
@@ -141,6 +142,9 @@ def test_plan_engine_creates_list_items_tasks_and_cursors(env):
         _resource(db)
         sc2.sync_library_versions(db)
         _channel(db, "-1001")
+        # 排期窗口默认 8-24，夜间（真实墙钟）整轮不排期——补一条整日窗口，
+        # 让本用例断言与运行时刻无关（生产行为不变）。
+        ensure_full_day_hour_window(db, sc2._active_version(db).id)
         result = sc2.plan_engine(db)
         assert result["lists"] == 1
         assert result["items"] >= 1
@@ -149,7 +153,18 @@ def test_plan_engine_creates_list_items_tasks_and_cursors(env):
         assert db.scalar(select(SCPushListItem))
         assert db.scalar(select(SCPublishTask))
         cursors = db.scalars(select(SCCategoryCursor)).all()
-        assert cursors and all(c.last_library_version_id > 0 for c in cursors)
+        assert cursors
+        # v2.1.1：plan_engine 现在按分类真实过滤作品（JOIN sc_work_categories），
+        # 只有**该分类名下确实有作品**的分类才会推进游标。
+        # 旧实现每个分类都抢同一批作品（导致「分类占比 100% 剧情」），
+        # 游标因此全被推进——那正是 bug 而非契约。此处断言真正的语义：
+        # 至少有一个游标推进，且推进的分类确实拥有该作品。
+        advanced = [c for c in cursors if c.last_library_version_id > 0]
+        assert advanced, "有作品的分类必须推进游标"
+        # 测试资源的 genres 是英文 "Drama" → 归类 key 为 genre:drama。
+        # 断言推进游标的分类必须是该作品真实归属的分类（而不是所有分类）。
+        assert all(c.category_key == "genre:drama" for c in advanced), \
+            "只应推进真实拥有作品的分类"
 
 
 def test_pacing_defaults_and_official_minimum(env):
@@ -197,14 +212,23 @@ def test_ai_local_fallback_and_review_boundary(env):
 
 def test_frontend_share_center_pages_use_real_api():
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    # 规范业务模块标题（卡片化），不再暴露 V2 等开发命名
-    for token in ("调度总览", "发布清单", "作品分类", "发布计划",
-                  "时段窗口", "智能建议", "推送节奏", "发布任务"):
+    import re
+    card_titles = set(re.findall(r"<h3>([^<]+)</h3>", app))
+    # v2.1.1：分享中心收敛为 4 页设计稿，模块卡片以设计稿为准。
+    for token in ("发布总览", "发布规则", "推送任务", "分享管理",
+                  "推送趋势", "分类推送占比", "本周热门候选",
+                  "分类-时间排期配置", "周期计划管理"):
         assert token in app, token
+    # 超设计稿范围的卡片标题已整块删除（不是隐藏）——按标题精确比对，
+    # 避免误伤「智能建议：新增 N 条」这类操作提示语。
+    for gone in ("调度总览", "发布清单", "作品分类", "发布计划",
+                 "时段窗口", "智能建议", "推送节奏"):
+        assert gone not in card_titles, gone
     for dev_name in ("V2总览", "V2任务", "scV2", "跑一轮 v2"):
         assert dev_name not in app, dev_name
     for token in ("/sc/overview", "/sc/run", "/sc/push-lists", "/sc/plans",
-                  "/sc/hour-windows", "/sc/pacing-rules", "/sc/ai/generate", "/sc/tasks"):
+                  "/sc/hour-windows", "/sc/pacing-rules", "/sc/ai/generate", "/sc/tasks",
+                  "/sc/share-records"):
         assert token in app, token
     assert "localStorage.setItem('scPlan" not in app
     assert "setInterval(() => api('/sc/run'" not in app

@@ -115,11 +115,12 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tg_group_link": ("tg_group_link", ""),
     # v0.9.10：推送消息正文里的机器人跳转文字链接（指向推送 Bot 本身），留空则不显示
     "tg_bot_link": ("tg_bot_link", ""),
-    # 四模块重构：分享中心主链开关。v1.1 起默认 true=分享中心真正接管主链
-    # （建分享→提交→原子领取→只读链接发送→回执）；设 false 可临时回退旧链排障。
+    # 分享中心总开关：true=分享中心接管主链（建分享→提交→原子领取→只读链接发送→回执）。
+    # v2.1.1 用户口径「前后端仅用一套最新重构后的分享中心」：本键成为**唯一**总开关，
+    # 原 share_center_v2_enabled 已并入本键（读它作为兼容回退），对外不再区分版本。
     "share_center_enabled": ("share_center_enabled", "true"),
-    # 分享中心 v2（全新数据体系）：true=使用 sc_* 新表与四级计划引擎；
-    # 用户口径：旧库数据不用管，新模块上线后全部使用新数据。
+    # 兼容保留：旧版本写入的 v2 开关键。读取时以 share_center_enabled 为准，
+    # 此键仅作回退兜底，新代码不再单独使用它做分支判断。
     "share_center_v2_enabled": ("share_center_v2_enabled", "true"),
     # AI 调度建议默认只进审核队列；显式打开后才允许自动应用，且永远不直接推送。
     "sc_ai_auto_apply": ("sc_ai_auto_apply", "false"),

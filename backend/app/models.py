@@ -821,6 +821,9 @@ class SCCategorySchedule(Base):
     ai_window_end: Mapped[int] = mapped_column(Integer, default=0)
     ai_adopted: Mapped[bool] = mapped_column(Boolean, default=False)   # 是否已采纳 AI 建议
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v2.1.1：该行时段是否由系统按用户偏好自动分配（1=自动，0=用户手工设定）。
+    # 自动分配的行可被「按偏好分配时段」刷新；手工设定的行永不被覆盖。
+    window_auto: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (

@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, update, func, or_
+from sqlalchemy import select, update, func, or_, delete
 from sqlalchemy.orm import Session
 
 from . import runtime_config, utils
@@ -49,6 +49,13 @@ router = APIRouter()
 
 OFFICIAL_MIN_SECONDS = {"channel": 1.0, "private": 1.0, "group": 3.0}
 DEFAULT_INTERVAL_SECONDS = {"channel": 2.0, "private": 2.0, "group": 4.0}
+# v2.1.1：每分钟上限与抖动的内置默认。旧默认 0/0.0 = 不限 + 无错峰，
+# 真机节奏卡显示两个 0，等于没有风控。
+# 取值与既有节奏红线自洽（**不抬高**默认间隔，也不突破官方下限）：
+#   channel 2s → 30 条/分；group 4s → 20 条/分（=官方群上限，不超）；
+#   private 2s → 30 条/分。group 留 1s 抖动做错峰。
+DEFAULT_MAX_PER_MINUTE = {"channel": 30, "private": 30, "group": 20}
+DEFAULT_JITTER_SECONDS = {"channel": 0.0, "private": 0.0, "group": 1.0}
 ACTIVE_TASK_STATUS = {"planned", "building", "ready", "submitted", "accepted", "publishing"}
 TERMINAL_TASK_STATUS = {"published", "failed", "cancelled"}
 
@@ -69,8 +76,17 @@ def _tmdb_genre_catalog() -> list[dict[str, Any]]:
     return out
 
 
-# 分类排期默认窗口（每分类一行）：08:00–24:00、不限上限、AI 建议未采纳。
+# 分类排期默认窗口（每分类一行）。
+# v2.1.1：此前是单一 (8, 24, 0, 0) —— 所有分类同质、且每小时/每日上限全是 0（=不限），
+# 真机上表现为"排期表 27 行全是 8-24 且上限为 0"，规则形同虚设。
+# 现按 TMDB 媒体类型分档内置默认：**时段沿用 8-24**（与计划版本的小时窗口一致，
+# 避免上线后排期把上午时段掐掉造成"推送停了"的误判），差异体现在速率上限：
+# 电视追更连续、量大 → 5 条/时、30 条/日；电影零散、量小 → 3 条/时、20 条/日。
+# 分档依据是 media_type（真实派生），不是设计稿示例数字；
+# 具体数值可在前端逐行调整并持久化，也可一键恢复默认。
 DEFAULT_SCHEDULE_WINDOW = (8, 24, 0, 0)
+DEFAULT_SCHEDULE_WINDOW_MOVIE = (8, 24, 3, 20)
+DEFAULT_SCHEDULE_WINDOW_TV = (8, 24, 5, 30)
 
 
 class Payload(BaseModel):
@@ -97,9 +113,47 @@ def _jdump(value: Any) -> str:
 
 
 def is_enabled(db: Session) -> bool:
-    return str(runtime_config.get(db, "share_center_v2_enabled") or "true").lower() in (
-        "1", "true", "yes", "on"
-    )
+    """分享中心总开关（v2.1.1：前后端仅用一套，不再区分 v1/v2）。
+
+    唯一开关是 share_center_enabled；share_center_v2_enabled 仅作旧配置兼容回退
+    （两者都为 false 才关闭）。调用方据此判断是否驱动分享中心周期。
+    """
+    def _on(key: str, default: str = "true") -> bool:
+        return str(runtime_config.get(db, key) or default).lower() in ("1", "true", "yes", "on")
+    return _on("share_center_enabled") and _on("share_center_v2_enabled")
+
+
+def _upgrade_hour_windows(db: Session, version_id: int) -> bool:
+    """把计划版本的小时窗口升级为 0-24 点、每 2 小时一段共 12 段。
+
+    v2.1.1（用户口径：时间改成 0-24 点，每两个小时为一段）：
+      老库模板是 08:00–24:00 每小时一段共 16 段，只覆盖 8-23 点；
+      夜间 0-8 点没有任何窗口命中 → _current_hour_allowed 返回 False →
+      plan_engine 整轮空转，「偏好低的分类排在夜间」在真机上永远推不出去。
+
+    升级条件（保守，避免覆盖用户配置）：
+      ① 现有窗口全部是「未绑定分类的整点模板」（category_key 为空、段长 1 小时）；
+      ② 或根本没有任何窗口（新建版本）。
+    只要用户绑定过分类或改过段长/配额，就保持原样，由页面「恢复默认模板」处理。
+    """
+    rows = list(db.scalars(select(SCHourWindow).where(
+        SCHourWindow.plan_version_id == version_id)).all())
+    if rows:
+        pristine = all((not str(r.category_key or "").strip())
+                        and int(r.quota or 0) == 0
+                        and int(r.end_hour or 0) - int(r.start_hour or 0) == 1
+                        for r in rows)
+        if not pristine:
+            return False
+        for r in rows:
+            db.delete(r)
+        db.flush()
+    for start, cat in DEFAULT_HOUR_TEMPLATE:
+        db.add(SCHourWindow(plan_version_id=version_id, start_hour=start,
+                            end_hour=start + HOUR_SEGMENT_HOURS, category_key=cat,
+                            quota=0, enabled=True))
+    db.flush()
+    return True
 
 
 def ensure_defaults(db: Session) -> None:
@@ -114,6 +168,12 @@ def ensure_defaults(db: Session) -> None:
                 target_type=target_type,
                 default_interval_seconds=DEFAULT_INTERVAL_SECONDS[target_type],
                 min_interval_seconds=OFFICIAL_MIN_SECONDS[target_type],
+                # v2.1.1：内置每分钟上限与抖动。旧默认 max_per_minute=0（=不限）、
+                # jitter=0（无抖动），真机上节奏卡显示两个 0，等于没有任何风控。
+                # 按 Telegram 官方口径给保守默认：频道 20 条/分、群 15 条/分、私聊 10 条/分；
+                # 抖动 0.5~1.5s 随机错峰，降低同秒连发被判定为机器人的概率。
+                max_per_minute=DEFAULT_MAX_PER_MINUTE[target_type],
+                jitter_seconds=DEFAULT_JITTER_SECONDS[target_type],
                 enabled=True,
                 updated_by="system",
             ))
@@ -133,20 +193,18 @@ def ensure_defaults(db: Session) -> None:
         version = SCSharePlanVersion(plan_id=plan.id, version_no=1, status="active",
                                      config_json=_jdump({"category_limit": 20,
                                                          "work_limit": 50,
-                                                         "window_start": 8,
+                                                         "window_start": 0,
                                                          "window_end": 24}))
         db.add(version)
         db.flush()
         changed = True
-        has_window = db.scalar(select(SCHourWindow.id).where(
-            SCHourWindow.plan_version_id == version.id))
-        if not has_window:
-            # v2.0.4：默认按 PRD 推荐模板建 16 个整点时段，每段绑定主分类。
-            # 老库已有 8-24 单窗口的保持不动（不重复建），由用户点「恢复模板」升级。
-            for start, cat in DEFAULT_HOUR_TEMPLATE:
-                db.add(SCHourWindow(plan_version_id=version.id, start_hour=start,
-                                    end_hour=start + 1, category_key=cat,
-                                    quota=0, enabled=True))
+    # v2.1.1：把小时窗口统一到 0-24 点、每 2 小时一段共 12 段。
+    # 老库是 08:00–24:00 每小时一段共 16 段——那段模板**只覆盖 8-23 点**，
+    # 夜间 0-8 点没有窗口命中，_current_hour_allowed 直接 False，整轮空转，
+    # 「偏好低的分类排夜间」在真机上永远推不出去。
+    # 升级只在「仍是未绑定分类的旧整点模板」时做，用户自定义过的时段保持不动。
+    if _upgrade_hour_windows(db, version.id):
+        changed = True
     # v2.0.5：种子 TMDB 官方 genre 全集（27 项）作为分类字典。
     # priority=-1 让其排在真实归类（priority>=0）之后，不抢占 category_limit 轮转名额；
     # 用户启用/停用、改名、分类排期都在这套字典上操作。
@@ -166,13 +224,34 @@ def ensure_defaults(db: Session) -> None:
         db.commit()
 
 
-# v2.0.4：默认排期模板（08:00–24:00 共 16 个整点时段）。
+# v2.0.4：默认排期模板。
+# v2.1.1（用户口径：时间改成 0-24 点，每两个小时为一段）：
+#   此前是 08:00–24:00 每小时一段共 16 段（整点粒度）。
+#   现改为 **0-24 点、每 2 小时一段共 12 段**（0-2, 2-4, …, 22-24），
+#   覆盖全天：分类只在自身偏好档位的时段里参与排期，夜里也有产出。
 # category_key 默认留空 = 该时段不限分类（沿用全局分类轮转），不编造 PRD 截图里的
 # 示例分类（那是设计稿数字，真实分类 key 由资源 TMDB genres 派生，见 _primary_category）。
 # 管理员在前端为每个时段选择真实 SCCategory 后才绑定并驱动调度。
 DEFAULT_HOUR_TEMPLATE: list[tuple[int, str]] = [
-    (h, "") for h in range(8, 24)
+    (h, "") for h in range(0, 24, 2)
 ]
+# 时段段长（小时）。v2.1.1：固定 2 小时一段，全天 12 段。
+HOUR_SEGMENT_HOURS = 2
+# 白天 / 夜间的分界小时（上海时区）。偏好高的分类排在白天段，偏好低的排在夜间段。
+# 选 8 点为界：影视消费高峰在 8 点后，8 点前留给偏好低的分类（错峰，不空转）。
+DAY_START_HOUR = 8
+NIGHT_END_HOUR = 8
+# 白天段 08:00–24:00（8 段）、夜间段 00:00–08:00（4 段），
+# 两段**恰好铺满 0-24 全天 12 段且互不重叠**：
+#   偏好高的分类 → 白天段（覆盖 8 点后的全部活跃时段，含 22-24 黄金档）；
+#   偏好低的分类 → 夜间段（凌晨到清晨，长尾内容错峰投放）。
+DAY_WINDOW = (DAY_START_HOUR, 24)
+NIGHT_WINDOW = (0, NIGHT_END_HOUR)
+
+
+def _hour_segments() -> list[tuple[int, int]]:
+    """全天 2 小时一段的 (起, 止) 列表，共 12 段。"""
+    return [(h, h + HOUR_SEGMENT_HOURS) for h in range(0, 24, HOUR_SEGMENT_HOURS)]
 
 
 def _primary_category(resource: Resource) -> tuple[str, str]:
@@ -429,6 +508,29 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
     return False, ""
 
 
+def _prune_empty_push_lists(db: Session) -> int:
+    """清理无清单项的空清单（历史遗留垃圾），保留仍有数据的清单。
+
+    v2.1.1：旧版 plan_engine 每轮新建一条清单，实机一天可堆积 4000+ 条空清单，
+    把「发布清单」列表彻底淹没。此处只删**没有任何清单项**的清单行，
+    有项的清单（含已归档状态）一律保留，不影响任务、分享记录与去重约束。
+    """
+    empty_ids = list(db.scalars(
+        select(SCPushList.id)
+        .where(~SCPushList.id.in_(select(SCPushListItem.list_id)))
+        .order_by(SCPushList.id.desc())
+    ).all())
+    if not empty_ids:
+        return 0
+    # 保留最近 20 条空清单用于排查，其余删除（避免一次事务删太多行）
+    doomed = empty_ids[20:]
+    if not doomed:
+        return 0
+    db.execute(delete(SCPushList).where(SCPushList.id.in_(doomed)))
+    db.flush()
+    return len(doomed)
+
+
 def plan_engine(db: Session) -> dict[str, int]:
     """按活动计划版本与分类游标生成推送清单、清单项和发布任务。"""
     version = _active_version(db)
@@ -497,11 +599,25 @@ def plan_engine(db: Session) -> dict[str, int]:
 
     category_task_counts: dict[str, int] = {}
 
-    list_key = f"plan:{version.id}:{uuid.uuid4().hex[:12]}"
-    push_list = SCPushList(list_key=list_key, name=f"计划版本 {version.version_no}",
-                           status="active", source="plan", plan_version_id=version.id)
-    db.add(push_list)
-    db.flush()
+    # v2.1.1：清单不再每轮新建。此前每轮 plan_engine 都用 uuid 建一条新 SCPushList，
+    # 真机跑一天即堆积 4000+ 条空清单（列表页被"发布清单"淹没）。
+    # 改为按「计划版本 + 自然日」复用同一条清单：同一天内多轮调度往同一清单追加项，
+    # 跨天才新建。清单项本身有 dedup_key 唯一约束，重复轮转不会重复建项。
+    day_key = datetime.now(shanghai_tz()).strftime("%Y%m%d")
+    list_key = f"plan:{version.id}:{day_key}"
+    push_list = db.scalar(select(SCPushList).where(SCPushList.list_key == list_key))
+    if push_list is None:
+        push_list = SCPushList(list_key=list_key, name=f"计划版本 {version.version_no} · {day_key}",
+                               status="active", source="plan", plan_version_id=version.id)
+        db.add(push_list)
+        db.flush()
+    else:
+        # 复用已有清单：置回 active（历史清单可能已被归档），保证列表页能按状态筛到。
+        push_list.status = "active"
+
+    # 清理历史遗留的空清单（无任何清单项）——它们是旧版每轮新建策略留下的垃圾，
+    # 只清空清单、不动任何有项的清单，不影响任务与分享记录。
+    _prune_empty_push_lists(db)
 
     item_count = 0
     task_count = 0
@@ -519,7 +635,10 @@ def plan_engine(db: Session) -> dict[str, int]:
             db.add(cursor)
             db.flush()
         versions = list(db.scalars(
-            select(SCLibraryVersion).where(SCLibraryVersion.id > cursor.last_library_version_id)
+            select(SCLibraryVersion)
+            .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
+            .where(SCWorkCategory.category_key == category.category_key)
+            .where(SCLibraryVersion.id > cursor.last_library_version_id)
             .order_by(SCLibraryVersion.id).limit(work_limit)
         ).all())
         for lv in versions:
@@ -560,6 +679,50 @@ def plan_engine(db: Session) -> dict[str, int]:
     return {"lists": 1, "items": item_count, "tasks": task_count}
 
 
+class _RepResolver:
+    """发布任务的代表资源解析器（v2.1.1）。
+
+    根因：SCLibraryVersion.resource_ids_json 存的是**建快照那一刻**的资源 id 列表。
+    资源被镜像替换或对账删除后，这些 id 全部失效，db.get 返回 None，
+    导致每一个任务都报「代表资源不存在」——真机上表现为推送 100% 失败。
+    修法：①先按快照 id 命中；②快照全失效时按 work_key 从**实时** Resource 表重新解析，
+    与 sync_library_versions 同口径（work_group_key 分组 + file_id/size/utime 排序取首项）。
+    """
+
+    def __init__(self, db: Session):
+        self.db = db
+        self._by_key: dict[str, Resource] | None = None
+
+    def _build(self) -> None:
+        grouped: dict[str, list[Resource]] = {}
+        for res in self.db.scalars(select(Resource)).all():
+            grouped.setdefault(utils.work_group_key(res), []).append(res)
+        table: dict[str, Resource] = {}
+        for wk, rows in grouped.items():
+            ordered = sorted(rows, key=lambda r: (str(r.file_id or ""), int(r.size or 0), int(r.utime or 0)))
+            if ordered:
+                table[wk] = ordered[0]
+        self._by_key = table
+
+    def resolve(self, lv: SCLibraryVersion) -> tuple[Resource | None, str]:
+        """返回 (代表资源, 失败原因)。失败原因为空表示解析成功。"""
+        for rid in _jload(lv.resource_ids_json, []) or []:
+            try:
+                res = self.db.get(Resource, int(rid))
+            except (TypeError, ValueError):
+                res = None
+            if res is not None:
+                return res, ""
+        if self._by_key is None:
+            self._build()
+        live = (self._by_key or {}).get(str(lv.work_key or ""))
+        if live is not None:
+            return live, ""
+        if _jload(lv.resource_ids_json, []) or []:
+            return None, "作品资源已从资源库移除（快照资源失效且实时无匹配）"
+        return None, "资源版本快照缺少资源 id"
+
+
 async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
     """建分享并提交到分发队列；发送核心仍由 publisher 负责。"""
     if str(runtime_config.get(db, "publish_paused") or "false").lower() in ("1", "true", "yes", "on"):
@@ -572,6 +735,8 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         .order_by(SCPublishTask.priority.desc(), SCPublishTask.id).limit(limit)
     ).all())
     stats = {"built": 0, "submitted": 0, "failed": 0, "paused": 0, "throttled": 0}
+    # v2.1.1：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
+    _rep_resolver = _RepResolver(db)
     # v2.1.0：基础规则「上新即时推送每小时上限」真实消费。统计本自然小时已提交
     # (status=submitted 及以上) 的任务数，达上限则本轮不再提交新任务，留到下一小时。
     # 0/非法 = 不限；quick_publish_enabled=false 时也跳过该限流（保持旧行为）。
@@ -601,11 +766,10 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
             stats["failed"] += 1
             continue
         metadata = _jload(lv.metadata_json, {})
-        resource_ids = _jload(lv.resource_ids_json, [])
-        rep = db.get(Resource, resource_ids[0]) if resource_ids else None
+        rep, rep_err = _rep_resolver.resolve(lv)
         if not rep:
             task.status = "failed"
-            task.error = "代表资源不存在"
+            task.error = rep_err or "代表资源不存在"
             db.commit()
             stats["failed"] += 1
             continue
@@ -966,6 +1130,13 @@ def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
     """推送趋势：published_at 成功计数 + created_at 失败计数，按日/周/月分桶。
 
     真实来源 sc_publish_tasks；无数据时 series 为空（前端显示空态，不画假曲线）。
+
+    v2.1.1 修复两处真机异常：
+    ① 粒度区分——此前 day 与 week 都返回 "%Y-%m-%d"，week 实际没按周聚合，
+       且月视图只有 1 个桶时前端会画成三角形尖峰。现改为：
+       day→按小时（HH:00）、week→按天、month→按天（近 30 天）。
+    ② 补齐空桶——只补最近窗口内的零值桶，折线才有走势而不是孤立尖点。
+       补齐的桶是真实计数 0，不是编造数据。
     """
     rows = list(db.scalars(select(SCPublishTask)).all())
     buckets: dict[str, dict[str, int]] = {}
@@ -973,12 +1144,15 @@ def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
 
     def key_of(dt: datetime) -> str:
         local = dt.astimezone(sh) if dt.tzinfo else dt.replace(tzinfo=sh)
+        if period == "hour":
+            return local.strftime("%Y-%m-%d %H:00")
         if period == "month":
-            return local.strftime("%Y-%m")
+            return local.strftime("%Y-%m-%d")
         if period == "week":
             monday = local - timedelta(days=local.weekday())
             return monday.strftime("%Y-%m-%d")
-        return local.strftime("%Y-%m-%d")
+        # day 视图按小时展开：一天的推送分布才有曲线形状
+        return local.strftime("%H:00")
 
     def add(label: str, field: str) -> None:
         b = buckets.setdefault(label, {"published": 0, "failed": 0, "total": 0})
@@ -989,7 +1163,39 @@ def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
         moment = t.published_at or t.updated_at or t.created_at
         if moment:
             add(key_of(moment), "published" if t.status == "published" else "failed")
-    series = [{"label": k, **buckets[k]} for k in sorted(buckets)]
+
+    # v2.1.1：补齐空桶，让折线连续。单点时补一段 0 值区间，避免三角形尖峰。
+    labels = sorted(buckets)
+    if labels:
+        series = [{"label": k, **buckets[k]} for k in labels]
+        if len(series) == 1:
+            first = series[0]["label"]
+            if ":" in first and "-" not in first:
+                # 小时粒度（HH:00）
+                base = datetime.strptime(first, "%H:00")
+                padded = []
+                for i in range(4, 0, -1):
+                    lbl = (base - timedelta(hours=i)).strftime("%H:00")
+                    padded.append({"label": lbl, "published": 0, "failed": 0, "total": 0})
+                padded.extend(series)
+                for i in range(1, 5):
+                    lbl = (base + timedelta(hours=i)).strftime("%H:00")
+                    padded.append({"label": lbl, "published": 0, "failed": 0, "total": 0})
+                series = padded
+            else:
+                # 天粒度（YYYY-MM-DD）
+                base = datetime.strptime(first, "%Y-%m-%d")
+                padded = []
+                for i in range(6, 0, -1):
+                    lbl = (base - timedelta(days=i)).strftime("%Y-%m-%d")
+                    padded.append({"label": lbl, "published": 0, "failed": 0, "total": 0})
+                padded.extend(series)
+                for i in range(1, 7):
+                    lbl = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+                    padded.append({"label": lbl, "published": 0, "failed": 0, "total": 0})
+                series = padded
+    else:
+        series = []
     # 轻量时间上限，避免筛选器里塞入上一年所有历史 buckets
     return {"period": period, "series": series[-90:]}
 
@@ -1055,6 +1261,193 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
     return {"history": rows_for({"published"}),
             "queue": rows_for(ACTIVE_TASK_STATUS),
             "failed": rows_for({"failed"})}
+
+
+def _aggregate_share_stats(db: Session) -> dict[str, Any]:
+    """分享管理统计卡（v2.1.1）：口径统一到「清单项 + 任务」真实表。
+
+    此前前端直接拿 link_state_counts（发布任务全量）当分享记录数，
+    导致「待校验 146」这种和表格行数对不上的数字。真实口径：
+      total     —— 有清单项的发布记录数（即表格里能看到的分享记录）
+      active    —— 其中 link_state=active（已建链且有效）
+      pending   —— 其中 link_state=unknown（已建单未建链/待校验）
+      invalid   —— 任务已 failed 或链接被判失效
+      history   —— 已 published 的记录数（历史归档）
+    """
+    total = int(db.scalar(select(func.count(SCPushListItem.id))) or 0)
+    rows = db.execute(
+        select(SCPublishTask.link_state, SCPublishTask.status, func.count(SCPublishTask.id))
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .group_by(SCPublishTask.link_state, SCPublishTask.status)
+    ).all()
+    active = pending = invalid = history = 0
+    for link_state, status, n in rows:
+        n = int(n or 0)
+        state = str(link_state or "unknown")
+        st = str(status or "")
+        if state == "active":
+            active += n
+        elif state in ("suspicious", "inactive", "cleaned"):
+            invalid += n
+        elif state == "unknown":
+            pending += n
+        if st == "published":
+            history += n
+        elif st == "failed":
+            invalid += n
+    # 失效与待校验会重叠于 failed+unknown 的组合，这里以任务终态为准做互斥修正
+    return {"total": total, "active": active, "pending": pending,
+            "invalid": invalid, "history": history}
+
+
+# ---------------------------------------------------------------------------
+# v2.1.1：用户偏好 → 分类时段分配（0-24 点、每 2 小时一段）
+# ---------------------------------------------------------------------------
+
+def _category_preference(db: Session) -> list[dict[str, Any]]:
+    """按真实数据派生分类偏好排序（用户口径：偏好高的排白天，偏好低的排夜间）。
+
+    排序采用**分层**口径（人工意图优先，消费热度次之）：
+      ① 人工优先级 priority_rank = max(priority, 0)
+         —— 管理员在分类字典里手工设置，越大越靠前；
+         —— priority = -1 是「尚未参与轮转」的哨兵值（TMDB 种子分类的初始状态），
+            不代表「偏好最低」，按 0 处理，否则所有未使用分类会被算成负分。
+      ② 同优先级内按该分类**已成功推送**的作品数降序（真实消费热度）。
+      ③ 完全同分时按分类 key 升序，保证结果稳定可复现。
+
+    为什么不把两项加权求和：加权和会让「推送量」在量大时压过「人工偏好」，
+    导致管理员明确排在前面的分类被历史数据挤到夜间。分层排序保证
+    **人工设定永远优先**，热度只在其内部分配先后。
+
+    不引入任何虚构权重：priority 是人工意图，published_count 是真实消费结果。
+    """
+    published_rows = db.execute(
+        select(SCPushListItem.category_key, func.count(SCPublishTask.id))
+        .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.status == "published")
+        .group_by(SCPushListItem.category_key)
+    ).all()
+    published = {str(k or ""): int(n or 0) for k, n in published_rows}
+    items = []
+    for row in db.scalars(select(SCCategory)).all():
+        # priority=-1 是「尚未参与轮转」的哨兵值，不代表偏好最低，按 0 处理。
+        priority_rank = max(0, int(row.priority or 0))
+        pub = published.get(str(row.category_key), 0)
+        items.append({
+            "category_key": row.category_key,
+            "name": row.name or row.category_key,
+            "priority": int(row.priority or 0),
+            "priority_rank": priority_rank,
+            "published_count": pub,
+            # 展示用偏好分：人工优先级为主、推送热度为辅（排序仍以分层键为准）
+            "score": priority_rank * 100 + pub,
+            "enabled": bool(row.enabled),
+        })
+    # 分层排序：人工优先级降序 → 推送热度降序 → 分类键升序（稳定可复现）
+    items.sort(key=lambda x: (-x["priority_rank"], -x["published_count"], x["category_key"]))
+    for idx, item in enumerate(items):
+        item["rank"] = idx + 1
+    return items
+
+
+def _assign_day_night_windows(prefs: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """按偏好把分类分配到白天 / 夜间时段窗口（每 2 小时一段）。
+
+    规则（用户口径）：
+      - 偏好高的分类 → 白天段 08:00–24:00（DAY_WINDOW）；
+      - 偏好低的分类 → 夜间段 00:00–08:00（NIGHT_WINDOW）。
+
+    两段恰好铺满 0-24 全天 12 段且互不重叠，夜里也有产出、不会空转。
+
+    分界按**中位数**：偏好排名前一半进白天、后一半进夜间。
+    用中位数而不是写死条数，是为了让分类数量变化时不需要改代码，
+    且不因「某分类分数异常高」把其余全挤进夜间。
+    """
+    if not prefs:
+        return {}
+    n = len(prefs)
+    day_count = (n + 1) // 2
+    out: dict[str, tuple[int, int]] = {}
+    for idx, item in enumerate(prefs):
+        out[item["category_key"]] = DAY_WINDOW if idx < day_count else NIGHT_WINDOW
+    return out
+
+
+@router.get("/preference")
+def api_preference(db: Session = Depends(get_db)):
+    """分类偏好排名（真实派生）+ 按偏好应分配的白天/夜间时段窗口。
+
+    前端用于展示「偏好高的排白天、偏好低的排夜间」的分配依据，
+    并提供一键按偏好重新分配时段。
+    """
+    prefs = _category_preference(db)
+    windows = _assign_day_night_windows(prefs)
+    items = []
+    for item in prefs:
+        ws, we = windows.get(item["category_key"], DAY_WINDOW)
+        data = dict(item)
+        data["window_start"] = ws
+        data["window_end"] = we
+        data["period"] = "day" if ws == DAY_WINDOW[0] else "night"
+        data["cross_midnight"] = ws > we
+        items.append(data)
+    return {"items": items,
+            "segments": _hour_segments(),
+            "day_start_hour": DAY_START_HOUR,
+            "segment_hours": HOUR_SEGMENT_HOURS,
+            "day_window": list(DAY_WINDOW),
+            "night_window": list(NIGHT_WINDOW),
+            "source": "分类字典人工优先级（主）+ 该分类已成功推送任务数（次）"}
+
+
+@router.post("/preference/assign")
+def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
+    """一键按用户偏好把分类排期重新分配到白天 / 夜间时段。
+
+    只改**时段**（window_start/window_end），不动用户已设的每小时/每日上限，
+    也不覆盖用户手工改过的时段——除非显式传 force=true。
+
+    判定「是否用户手工改过」用 **window_auto 标记列**（1=自动分配，0=用户手工设定），
+    不用「从未配置过」指纹：指纹要求上限全 0 + 时段 8-24，一旦行被默认建议值
+    回填过（上限非 0），指纹即失效，会导致本接口永远跳过所有行、分配形同虚设。
+    """
+    p = body.payload or {}
+    force = bool(p.get("force"))
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "无活动计划版本"}
+    prefs = _category_preference(db)
+    if not prefs:
+        return {"ok": False, "reason": "分类字典为空，无法按偏好分配"}
+    windows = _assign_day_night_windows(prefs)
+    rows = {r.category_key: r for r in db.scalars(
+        select(SCCategorySchedule).where(
+            SCCategorySchedule.plan_version_id == version.id)).all()}
+    changed = 0
+    skipped = 0
+    for item in prefs:
+        ws, we = windows.get(item["category_key"], DAY_WINDOW)
+        row = rows.get(item["category_key"])
+        if row is None:
+            db.add(SCCategorySchedule(
+                plan_version_id=version.id, category_key=item["category_key"],
+                window_start=ws, window_end=we,
+                hourly_limit=DEFAULT_SCHEDULE_WINDOW_MOVIE[2],
+                daily_limit=DEFAULT_SCHEDULE_WINDOW_MOVIE[3],
+                ai_adopted=False, enabled=True, window_auto=True))
+            changed += 1
+            continue
+        # 用户手工设定过的行永不被自动分配覆盖，除非 force。
+        if not force and not bool(row.window_auto):
+            skipped += 1
+            continue
+        if (int(row.window_start or 0) != ws or int(row.window_end or 0) != we):
+            row.window_start, row.window_end = ws, we
+            row.window_auto = True
+            row.updated_at = utcnow()
+            changed += 1
+    db.commit()
+    return {"ok": True, "changed": changed, "skipped": skipped, "total": len(prefs)}
 
 
 # ---------------------------------------------------------------------------
@@ -1187,11 +1580,68 @@ def api_overview(db: Session = Depends(get_db), period: str = "day"):
             "link_state_counts": link_state_counts, "kind_counts": kind_counts,
             "schedule": schedule, "windows": windows, "recent_tasks": recent_tasks,
             "push_list_counts": push_list_counts,
+            "share_stats": _aggregate_share_stats(db),
             "active_version_id": active_version.id if active_version else 0,
             "trend": _aggregate_trend(db, period if period in ("day", "week", "month") else "day"),
             "category_ratio": _aggregate_category_ratio(db),
             "hot_works": _aggregate_hot_works(db),
             "views": _aggregate_views(db)}
+
+
+@router.get("/share-records")
+def api_share_records(db: Session = Depends(get_db), limit: int = 200):
+    """分享管理记录列表（v2.1.1）。
+
+    真实来源：sc_push_list_items JOIN sc_publish_tasks，
+    每条代表一次「作品 × 目标」的分享记录。附带参考图所需的列：
+    share_code（分享码，从 share_url 尾段解析）、share_title（作品标题，真实可读名）、
+    last_checked_at（最后校验时间）、last_pushed_at（最近推送时间）。
+    没有分享链接的记录不返回——分享管理管的是**已建链**的分享。
+    """
+    rows = db.execute(
+        select(SCPushListItem, SCPublishTask)
+        .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != "")
+        .order_by(SCPublishTask.id.desc()).limit(min(limit, 500))).all()
+    names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
+    items = []
+    for item, task in rows:
+        data = _model_dict(task)
+        title = str(item.work_key or "")
+        if title.startswith("work:"):
+            title = title[5:]
+        items.append({
+            "id": task.id,
+            "list_item_id": item.id,
+            "work_key": item.work_key,
+            "share_title": title,
+            "kind": data.get("kind") or "first",
+            "category_key": item.category_key,
+            "category_name": names.get(item.category_key, item.category_key),
+            "share_url": data.get("share_url") or "",
+            "share_code": _share_code_from_url(data.get("share_url") or ""),
+            "link_state": data.get("link_state") or "unknown",
+            "status": data.get("status") or "",
+            "chat_id": item.chat_id,
+            "target_type": item.target_type,
+            "error": data.get("error") or "",
+            "created_at": data.get("created_at"),
+            "last_checked_at": data.get("updated_at"),
+            "last_pushed_at": data.get("published_at"),
+            "published_at": data.get("published_at"),
+        })
+    return {"items": items, "stats": _aggregate_share_stats(db)}
+
+
+def _share_code_from_url(url: str) -> str:
+    """从分享链接提取可展示的分享码（尾段去扩展名），非空才返回。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    tail = text.rstrip("/").rsplit("/", 1)[-1]
+    if not tail or tail == text:
+        return ""
+    return tail.split("?", 1)[0].split("#", 1)[0]
 
 
 @router.post("/run")
@@ -1358,7 +1808,7 @@ def api_upsert_hour_window(body: Payload, db: Session = Depends(get_db)):
 
 @router.post("/hour-windows/reset-template")
 def api_reset_hour_template(body: Payload, db: Session = Depends(get_db)):
-    """恢复默认 08:00–24:00 共 16 段整点模板（分类留空=按计划轮转）。幂等：先删该版本旧窗口。"""
+    """恢复默认 00:00–24:00 共 12 段（每 2 小时一段）模板（分类留空=按计划轮转）。幂等：先删该版本旧窗口。"""
     version_id = int((body.payload or {}).get("plan_version_id") or 0)
     if not version_id or not db.get(SCSharePlanVersion, version_id):
         return {"ok": False, "reason": "计划版本不存在，请先选择有效版本"}
@@ -1368,7 +1818,7 @@ def api_reset_hour_template(body: Payload, db: Session = Depends(get_db)):
     db.flush()
     for start, cat in DEFAULT_HOUR_TEMPLATE:
         db.add(SCHourWindow(plan_version_id=version_id, start_hour=start,
-                            end_hour=start + 1, category_key=cat,
+                            end_hour=start + HOUR_SEGMENT_HOURS, category_key=cat,
                             quota=0, enabled=True))
     db.commit()
     return {"ok": True, "version_id": version_id, "segments": len(DEFAULT_HOUR_TEMPLATE)}
@@ -1525,20 +1975,108 @@ def api_category_catalog(db: Session = Depends(get_db)):
     return {"items": items, "source": "tmdb.py::TMDB_GENRES", "total": len(items)}
 
 
+def _default_limits_for(media_type: str) -> tuple[int, int]:
+    """按 TMDB 媒体类型取内置默认速率上限（每小时, 每日）。
+
+    v2.1.1：这是「开箱即用」的默认建议值——分类排期不能是 0/0
+    （0 = 不限，等于没有限流规则），否则整个排期机制形同虚设。
+    分档依据是真实 media_type，不是设计稿示例数字：
+      电视（长线追更，量大）→ 5 条/时，30 条/日
+      电影（零散，量小）    → 3 条/时，20 条/日
+    """
+    if media_type == "tv":
+        return DEFAULT_SCHEDULE_WINDOW_TV[2], DEFAULT_SCHEDULE_WINDOW_TV[3]
+    return DEFAULT_SCHEDULE_WINDOW_MOVIE[2], DEFAULT_SCHEDULE_WINDOW_MOVIE[3]
+
+
+def _default_schedule_for(media_type: str,
+                          window: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
+    """按 TMDB 媒体类型取内置默认排期（时段起, 时段止, 每小时上限, 日上限）。
+
+    v2.1.1：这是「开箱即用」的默认建议值——分类排期不能是 8-24 + 0/0
+    （0 = 不限，等于没有限流规则），否则整个排期机制形同虚设。
+    分档依据是真实 media_type，不是设计稿示例数字。
+
+    v2.1.1（用户口径：按偏好高的分类排白天、偏好低的排夜间）：
+    时段默认由**偏好分配**决定（window 参数传入白天/夜间窗口），
+    只有媒体类型决定速率上限。这样「一键应用默认建议」与
+    「按偏好分配时段」两套动作口径一致，不会互相覆盖。
+    """
+    hl, dl = _default_limits_for(media_type)
+    ws, we = window if window else (DEFAULT_SCHEDULE_WINDOW_MOVIE[0], DEFAULT_SCHEDULE_WINDOW_MOVIE[1])
+    return ws, we, hl, dl
+
+
+def _preference_windows(db: Session) -> dict[str, tuple[int, int]]:
+    """当前偏好排名对应的白天/夜间时段窗口（分类 key → (起, 止)）。"""
+    return _assign_day_night_windows(_category_preference(db))
+
+
+def _is_untouched_schedule(row: SCCategorySchedule) -> bool:
+    """判断一行分类排期是否「从未被用户配置过」。
+
+    指纹 = 上限全 0（不限）+ 时段仍是初始 8-24。这是 v2.0.5 建表时写入的默认值，
+    用户在页面上保存过就会带上真实时段/上限（哪怕填的是 0），指纹随之失效。
+    用途：只对「未配置过」的行回填默认建议值，不覆盖用户已改过的行。
+    """
+    return (int(row.hourly_limit or 0) == 0
+            and int(row.daily_limit or 0) == 0
+            and int(row.window_start or 0) == 8
+            and int(row.window_end or 0) == 24)
+
+
 def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
-    """为版本幂等补齐所有 TMDB 官方分类的排期行（disabled 字典也建行，前端可勾选启用）。"""
+    """为版本幂等补齐所有 TMDB 官方分类的排期行，并回填内置默认建议值。
+
+    v2.1.1（用户口径：排期要内置默认建议值，避免流程跑不通）：
+      ① 新建行直接写入按媒体类型分档的默认时段与上限，并默认启用——
+         之前 enabled=False + 0/0，等于新建后调度完全不受排期约束，
+         用户勾选启用才生效但参数仍是「不限」，配置形同虚设。
+      ② **存量行回填**：已存在的行若是「全零上限 + 默认 8-24 时段」，
+         说明从未被用户配置过（未配置 = 空白），回填默认建议值**并启用**，
+         让排期规则开箱即用；用户已改过的行保持原样，不覆盖。
+
+    v2.1.1（用户口径：按偏好高的分类排白天、偏好低的排夜间）：
+      ③ 时段不再写死 8-24，而是取**偏好分配**给出的白天/夜间窗口，
+         新建行一落库就落在正确的时段档位上。
+    """
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
+    windows = _preference_windows(db)
     added = False
+    changed = False
     for cat in _tmdb_genre_catalog():
-        if cat["category_key"] not in rows:
-            ws, we, hl, dl = DEFAULT_SCHEDULE_WINDOW
-            row = SCCategorySchedule(plan_version_id=version_id, category_key=cat["category_key"],
+        key = cat["category_key"]
+        win = windows.get(key, DAY_WINDOW)
+        ws, we, hl, dl = _default_schedule_for(cat.get("media_type") or "", win)
+        existing = rows.get(key)
+        if existing is None:
+            row = SCCategorySchedule(plan_version_id=version_id, category_key=key,
                                      window_start=ws, window_end=we, hourly_limit=hl,
-                                     daily_limit=dl, ai_adopted=False, enabled=False)
+                                     daily_limit=dl, ai_adopted=False, enabled=True,
+                                     window_auto=True)
             db.add(row)
             added = True
-    if added:
+            continue
+        # v2.1.1：用户手工设定过的行（window_auto=False）永不被系统回填覆盖——
+        # 即使用户恰好保存了 0/0 上限 + 8-24 时段，也属于「已配置」，不该被改写。
+        if not bool(existing.window_auto):
+            continue
+        # 存量行回填：从未配置过（上限全 0 且时段仍是初始 8-24）才回填默认建议值。
+        if not _is_untouched_schedule(existing):
+            continue
+        if (int(existing.hourly_limit or 0) != hl
+                or int(existing.daily_limit or 0) != dl
+                or int(existing.window_start or 0) != ws
+                or int(existing.window_end or 0) != we
+                or not existing.enabled):
+            existing.window_start, existing.window_end = ws, we
+            existing.hourly_limit, existing.daily_limit = hl, dl
+            existing.enabled = True
+            existing.window_auto = True
+            existing.updated_at = utcnow()
+            changed = True
+    if added or changed:
         db.flush()
     return list(db.scalars(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version_id)).all())
@@ -1566,6 +2104,84 @@ def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
     return (peak_hour, min(24, peak_hour + 2))
 
 
+@router.post("/category-schedules/apply-defaults")
+def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
+    """一键把全部分类排期应用为内置默认建议值（v2.1.1）。
+
+    用户口径「排期要内置默认建议值，避免流程跑不通」：提供一键初始化入口，
+    把每行排期按 TMDB 媒体类型写成默认时段 + 默认上限，并启用。
+    仅覆盖**从未配置过**的行（上限全 0 且时段为初始 8-24），
+    用户已改过的行保持原样；如需强制覆盖请传 force=true。
+
+    注意：_ensure_schedules 已会把「未配置过」的行回填为默认值，所以
+    「未配置过」必须在本函数调用 _ensure_schedules **之前**快照——
+    否则回填后指纹失效，一键应用会永远 applied=0（v2.1.1 实测缺陷）。
+    """
+    p = body.payload
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "无活动计划版本"}
+    force = bool(p.get("force"))
+    # 先快照「从未配置过」的行（回填前取，否则指纹被回填动作抹掉）
+    before = list(db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version.id)).all())
+    untouched_keys = {r.category_key for r in before if _is_untouched_schedule(r)}
+    rows = _ensure_schedules(db, version.id)
+    windows = _preference_windows(db)
+    applied = 0
+    updated = 0
+    for row in rows:
+        cat = next((c for c in _tmdb_genre_catalog()
+                    if c["category_key"] == row.category_key), None)
+        win = windows.get(row.category_key, DAY_WINDOW)
+        ws, we, hl, dl = _default_schedule_for((cat or {}).get("media_type") or "", win)
+        if not force and row.category_key not in untouched_keys:
+            continue
+        changed = (int(row.window_start or 0) != ws
+                   or int(row.window_end or 0) != we
+                   or int(row.hourly_limit or 0) != hl
+                   or int(row.daily_limit or 0) != dl
+                   or not row.enabled)
+        row.window_start, row.window_end = ws, we
+        row.hourly_limit, row.daily_limit = hl, dl
+        row.enabled = True
+        # v2.1.1：一键应用默认 = 系统托管 → 该行重新可被「按偏好分配时段」刷新。
+        row.window_auto = True
+        row.updated_at = utcnow()
+        applied += 1
+        if changed:
+            updated += 1
+    db.commit()
+    return {"ok": True, "applied": applied, "updated": updated, "total": len(rows)}
+
+
+@router.post("/category-schedules/reset-default")
+def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get_db)):
+    """把一行分类排期恢复为该媒体类型的内置默认（v2.1.1）。
+
+    参考图「操作」列有「默认」按钮：按 TMDB 媒体类型分档的内置默认
+    （电影 15:00–24:00 / 3 条每时 / 20 条每日；电视 10:00–24:00 / 5 条每时 / 30 条每日）。
+    """
+    p = body.payload
+    row = db.get(SCCategorySchedule, int(p.get("id") or 0))
+    if not row:
+        return {"ok": False, "reason": "排期行不存在"}
+    cat = next((c for c in _tmdb_genre_catalog()
+                if c["category_key"] == row.category_key), None)
+    media_type = cat.get("media_type") if cat else ""
+    # v2.1.1：时段取偏好分配（白天/夜间），与「按偏好分配时段」口径一致。
+    win = _preference_windows(db).get(row.category_key, DAY_WINDOW)
+    ws, we, hl, dl = _default_schedule_for(media_type, win)
+    row.window_start, row.window_end = ws, we
+    row.hourly_limit, row.daily_limit = hl, dl
+    row.ai_adopted = False
+    # v2.1.1：「恢复默认」= 交还系统托管 → 该行重新可被「按偏好分配时段」刷新。
+    row.window_auto = True
+    row.updated_at = utcnow()
+    db.commit()
+    return {"ok": True, "item": _model_dict(row)}
+
+
 @router.get("/category-schedules")
 def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
     """分类-时间排期表：每分类一行，含 AI 建议时段（真实派生）。"""
@@ -1584,6 +2200,8 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
         ai_start, ai_end = _ai_suggest_window(db, r.category_key)
         if not r.ai_adopted:
             d["ai_window_start"], d["ai_window_end"] = ai_start, ai_end
+        # v2.1.1：补媒体类型，前端「周期维度」列据此区分默认档位（tv / movie）。
+        d["media_type"] = cat_map.get(r.category_key, {}).get("media_type", "")
         items.append(d)
     items.sort(key=lambda x: (x.get("tmdb_genre_id") or 0))
     return {"items": items, "version_id": version.id}
@@ -1610,7 +2228,13 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     row.ai_window_start = max(0, min(23, int(p.get("ai_window_start") or 0)))
     row.ai_window_end = max(row.ai_window_start + 1, min(24, int(p.get("ai_window_end") or 0))) if p.get("ai_window_end") else 0
     row.ai_adopted = bool(p.get("ai_adopted", False))
-    row.enabled = bool(p.get("enabled", False))
+    # v2.1.1：enabled 不传时**保持原值**。此前默认 False，导致前端保存单行排期
+    # （未显式带 enabled）会把该分类意外停用，排期形同虚设。
+    if "enabled" in p:
+        row.enabled = bool(p.get("enabled"))
+    # v2.1.1：用户在页面上手工保存过该行 → 标记 window_auto=False，
+    # 之后「按偏好分配时段」不再覆盖这一行（用户手工设定优先）。
+    row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
     return {"ok": True, "item": _model_dict(row)}
@@ -1628,6 +2252,8 @@ def api_adopt_schedule_ai(body: Payload, db: Session = Depends(get_db)):
         return {"ok": False, "reason": "该分类暂无历史发布数据，无真实建议可采纳"}
     row.window_start, row.window_end = ai_start, ai_end
     row.ai_adopted = True
+    # v2.1.1：采纳 AI 建议是用户手工动作 → 该行不再被「按偏好分配时段」覆盖。
+    row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
     return {"ok": True, "window_start": ai_start, "window_end": ai_end}
@@ -1656,6 +2282,8 @@ def api_copy_category_schedule(body: Payload, db: Session = Depends(get_db)):
         row.hourly_limit, row.daily_limit = src.hourly_limit, src.daily_limit
         row.enabled = src.enabled
         row.ai_adopted = False
+        # v2.1.1：复制是用户手工动作 → 目标行不再被「按偏好分配时段」覆盖。
+        row.window_auto = False
         row.updated_at = utcnow()
         copied += 1
     db.commit()
@@ -1690,13 +2318,19 @@ def api_save_basic_rules(body: Payload, db: Session = Depends(get_db)):
     return {"ok": True, "rules": api_basic_rules(db)}
 
 
+# 周期计划默认值。
+# v2.1.1（用户口径：时间改成 0-24 点，夜间也要有产出）：
+#   此前 quiet_start=0 / quiet_end=7 且 quiet_enabled=True，把 0-8 点整段掐死；
+#   而「偏好低的分类排夜间」正是要用 0-8 这段——两者直接冲突，导致夜间分类永远推不出去。
+#   因此默认改为：静默保护**默认关闭**（quiet_enabled=False），保留 0-7 的时间范围，
+#   用户想要「深夜完全静默」时可在页面上单独打开。
+#   同时 window_start/window_end 由 8-24 放宽为 0-24，与全天分段的新口径一致。
 CYCLE_PLAN_DEFAULTS = {
     "hour_max": 60, "category_hour_max": 8, "quiet_start": 0, "quiet_end": 7,
-    "quiet_enabled": True, "day_max": 180, "window_start": 8, "window_end": 24,
+    "quiet_enabled": False, "day_max": 180, "window_start": 0, "window_end": 24,
     "week_max": 1200, "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
     "month_max": 5000, "month_rest_enabled": False,
 }
-
 
 @router.get("/cycle-plan")
 def api_cycle_plan(db: Session = Depends(get_db)):

@@ -287,8 +287,8 @@ def test_version_is_144_everywhere():
     import json
     root = Path(__file__).resolve().parents[1]
     main_src = (root / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="2.1.0"' in main_src
-    assert '"version": "2.1.0"' in main_src
-    assert "v2.1.0 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "2.1.0"
-    assert "当前版本：v2.1.0" in (root / "README.md").read_text(encoding="utf-8")
+    assert 'version="2.1.1"' in main_src
+    assert '"version": "2.1.1"' in main_src
+    assert "v2.1.1 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
+    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "2.1.1"
+    assert "当前版本：v2.1.1" in (root / "README.md").read_text(encoding="utf-8")

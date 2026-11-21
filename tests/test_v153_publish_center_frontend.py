@@ -185,13 +185,25 @@ def test_share_cycle_helper_uses_independent_session():
     assert "asyncio.to_thread" in job_seg and "_run_share_cycle_in_thread" in job_seg
 
 
-# ---------- 前端分享中心全卡片化静态守卫（旧 5 页已移除，统一走 /api/sc/*） ----------
+# ---------- 前端分享中心按 4 张设计稿收敛后的静态守卫 ----------
 def test_frontend_share_center_cards_and_real_endpoints():
     app = (ROOT / "frontend" / "src" / "App.vue").read_text(encoding="utf-8")
-    # 卡片化布局 + 规范业务模块标题（不再用 V2 等开发命名）
-    for label in ("调度总览", "发布清单", "作品分类", "发布计划",
-                  "时段窗口", "智能建议", "推送节奏", "发布任务"):
+    # v2.1.1：分享中心收敛为 4 页（发布总览 / 发布规则 / 推送任务 / 分享管理），
+    # 每页只保留设计稿范围内的模块卡片，超范围的整块删除——不是隐藏。
+    import re
+    card_titles = set(re.findall(r"<h3>([^<]+)</h3>", app))
+    for label in ("发布总览", "发布规则", "推送任务", "分享管理",
+                  "推送趋势", "分类推送占比", "本周热门候选",
+                  "推送历史", "推送队列", "推送失败",
+                  "分类-时间排期配置", "周期计划管理"):
         assert label in app, f"缺模块卡片 {label}"
+    # 超设计稿范围的卡片标题不得存在。
+    # 用精确的卡片标题集合比对，避免误伤「智能建议：新增 N 条」这类操作提示语。
+    for gone in ("调度总览", "发布清单", "作品分类", "发布计划",
+                 "时段窗口", "智能建议", "推送节奏"):
+        assert gone not in card_titles, f"超设计稿范围的模块卡片仍残留 {gone}"
+    for gone in ("sc-pushlist-grid", "sc-sched-card", "sc-mini-counts"):
+        assert gone not in app, f"超设计稿范围的模块仍残留 {gone}"
     assert "sc-board" in app and "sc-card" in app, "分享中心未卡片化"
     # 旧 5 页分页组件与旧链端点均已移除
     for gone in ("shareSubTab", "share/publish-overview", "share/followups",
@@ -199,7 +211,7 @@ def test_frontend_share_center_cards_and_real_endpoints():
         assert gone not in app, f"旧模块仍残留 {gone}"
     # 新体系真实端点绑定
     for ep in ("/sc/overview", "/sc/pause", "/sc/push-lists", "/sc/tasks",
-               "/sc/pacing-rules", "/sc/ai/generate"):
+               "/sc/pacing-rules", "/sc/ai/generate", "/sc/share-records"):
         assert ep in app, f"缺真实端点 {ep}"
     # nav key 兼容：原 key 保留
     assert "推送队列" in app

@@ -45,9 +45,15 @@ ACTIVE_STATUS = {ST_READY, ST_SUBMITTED, ST_ACCEPTED, ST_PUBLISHING}
 
 
 def is_enabled(db: Session) -> bool:
-    """灰度开关（设计文档 §8）：默认关闭=走旧链，零回归；开启=新链交接生效。
+    """旧链周期是否可驱动（v2.1.1：前后端仅用一套分享中心）。
 
-    存在 app_config，键 share_center_enabled=true/1/yes 视为开启。
+    本模块在 v2.1.1 起**不再是独立的分享中心**，只作为内部工具库被调用：
+    share_url_for_queue_item / ensure_share / claim_tasks / 状态常量 /
+    shadow_register / retire_share_record。分享中心的数据体系与调度引擎
+    统一由 share_center_v2（sc_* 新表）承担。
+
+    因此旧链**永远不独立驱动 run_cycle**——它只有在分享中心总开关关闭时
+    才作为排障兜底被调用（见 publisher._process_queue_impl 的分流）。
     """
     try:
         v = str(runtime_config.get(db, "share_center_enabled") or "").strip().lower()

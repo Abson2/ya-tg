@@ -465,13 +465,13 @@ async def _process_queue_impl(limit: int = 20) -> dict:
         #      不受交接确认约束。数据已清空的新部署下几乎全是①，③只是稳健兜底。
         from . import share_center as _sc
         from . import share_center_v2 as _sc2
+        # v2.1.1 用户口径「前后端仅用一套最新重构后的分享中心」：
+        # 新体系（sc_* 新表 + 四级计划引擎）是唯一驱动方。旧链不再作为
+        # 可切换的"另一套分享中心"——它只在总开关关闭时作为排障兜底，
+        # 正常运行时绝不与新体系并行，避免双写 push_queue。
         sc_enabled = _sc.is_enabled(db)
         v2_enabled = _sc2.is_enabled(db)
-        # v2.1.0：分流层收敛为单一生产者。v2 开启时只驱动 v2 cycle——旧链的
-        # consume_resource_events + run_cycle 绝不并行，否则两条链同时写 push_queue
-        # 会用 (resource_id,channel_id) 唯一键复用同一行、互相覆盖 push_reason/
-        # share_task_id/event_id，造成状态错乱与重复建分享。v2 关闭时才走旧链。
-        active_sc = "v2" if v2_enabled else ("legacy" if sc_enabled else "off")
+        active_sc = "v2" if v2_enabled else ("off" if not sc_enabled else "legacy")
         if active_sc != "off":
             # 先驱动本轮分流周期，不依赖独立 5s job 的时序：
             # 「立即处理队列」/手动 queue/run 必须也能把 planned 任务推到 submitted，

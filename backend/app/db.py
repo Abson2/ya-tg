@@ -146,6 +146,8 @@ _COLUMNS = {
         "ai_window_end": "INTEGER DEFAULT 0",
         "ai_adopted": "BOOLEAN DEFAULT 0",
         "enabled": "BOOLEAN DEFAULT 1",
+        # v2.1.1：时段是否由系统按用户偏好自动分配（1=自动，可被刷新；0=用户手工设定）
+        "window_auto": "BOOLEAN DEFAULT 1",
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
     },

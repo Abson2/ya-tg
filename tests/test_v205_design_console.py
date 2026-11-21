@@ -162,6 +162,7 @@ def test_basic_rules_and_cycle_plan_persist(env):
 def test_quiet_hours_really_blocks_plan_engine(env):
     from app import share_center_v2 as sc2
     from app.models import Channel, Resource
+    from conftest import ensure_full_day_hour_window
     S, _ = env
     with S() as db:
         sc2.ensure_defaults(db)
@@ -169,6 +170,9 @@ def test_quiet_hours_really_blocks_plan_engine(env):
         db.add(Resource(file_id="f1", name="r", media_title="w", identify_status="identified"))
         db.commit()
         version = sc2._active_version(db)
+        # 排期窗口默认 8-24，夜间整轮不排期——补整日窗口，
+        # 让「静默保护生效」这一断言与运行时刻无关。
+        ensure_full_day_hour_window(db, version.id)
         cfg = {"hour_max": 0, "quiet_enabled": True,
                "quiet_start": 0, "quiet_end": 24}  # 全时段静默
         version.config_json = sc2._jdump({"cycle_plan": cfg})
