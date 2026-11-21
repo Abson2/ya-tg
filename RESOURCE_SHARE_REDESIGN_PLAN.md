@@ -116,6 +116,24 @@
 **回滚**：保留 `_enqueue_after_identify` 旧路径函数，用 `resource_decoupled_enabled` 开关切换；出问题关开关回到同步链路。
 **风险**：`[P0]` 双写期 Resource 缓存与 ShareRecord 状态不一致 → 以 ShareRecord 为准 + 刷新函数兜底；回归测试覆盖 5 处触发点。
 
+#### 阶段二实际落地记录（2026-11-21，代码完成待真机验收）
+
+`[事实]` 实施前对源码做二次取证，**推翻了上面"字面切断 5 处硬耦合"的做法**——直接删 `_enqueue_after_identify` 会造成全项目零推送，原因：
+
+1. `[事实]` `consume_resource_events` 消费事件时调 `ensure_task(db, res, kind="first")` **不带 channel_targets**（`share_center.py:659`）；而 channel_targets 此前只由旧链 `_enqueue_ready → shadow_register(db, x, channel_ids=[...])` 写进 ShareTask（`:74-75`）。
+2. `[推断]+推理链` 若切断旧链、只靠事件：`ensure_task` 拿到空 targets → `submit_to_dispatch` 读 `task.channel_targets=[]` 返回 0 → 不写 QueueItem → 零推送。这正是用户决策 4「避免推送异常」要防的事故。
+
+**实际采用「切决策不切链路 + 灰度开关」**（可逆、零回归）：
+1. 新增 `compute_resource_channel_targets(db, x)`（`main.py`）：纯计算、复用 `push_routes/match_push_routes/规则匹配/_ensure_route_channel`，返回 `[{channel_id,...}]`，**不写 QueueItem**。
+2. 新增 `_identify_emit_only(db, x)`：只发资源事件，payload 携带 `channel_targets` + `decoupled=True`；若同类事件已存在且无 targets 则刷新其 payload（防开关切换后断推）。
+3. 改 `consume_resource_events`：从 payload 读 `channel_targets` 传给 `ensure_task`；无 targets 的存量事件保持旧行为（兼容）。
+4. 新增统一分发 `_after_identify_dispatch(db, x)`：按 `resource_decoupled_enabled`（**默认 false**）选择新链/旧链；且要求 `share_center_enabled=true` 才切新链，避免切到无消费者事件导致漏推。5 个识别入口统一改调它，旧链函数原样保留。
+5. A 库原名回溯：`MirrorFile.file_name` 恒为 A 原名（本地查表，零网络），通过 `target_file_id==x.file_id` 关联；`identify_with_a_source_fallback()` 首次识别失败时用 A 原名重试一次。
+6. 识别缓存：`_IDENTIFY_CACHE` 进程内 dict（key=name+path_hint），只缓存成功结果，失败/存疑不缓存；force/手动 identify 不走本包装函数，天然重新解析。测试 conftest 加 autouse fixture 每用例清理（防跨用例串扰，v085 两用例曾因此假失败后已修）。
+
+**验收结果**：新增 `tests/test_v145_resource_decouple.py` 13 项全过；全量 pytest 通过（见发版记录）；未改前端；未升版本号、未发版（按计划阶段七统一发版）。
+**关键护栏**：默认开关关闭 = 旧链零回归；解耦能力已就绪但默认不启用，符合保守默认值决策（决策 5）。真机需验证「开关开启后新链推送等价」才具备开启条件。
+
 ### 阶段三：事件体系补齐（任务 #139）
 
 **目标**：让「逐集/逐文件变化」可追溯、重启不丢事件、幂等；补镜像事件消费端。

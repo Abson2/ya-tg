@@ -656,7 +656,23 @@ def consume_resource_events(db: Session, limit: int = 100) -> dict:
                 if not res or res.identify_status != "identified":
                     stats["skipped"] += 1
                 else:
-                    _, created = ensure_task(db, res, kind="first")
+                    # 阶段二（资源库解耦）：解耦事件 payload 携带 channel_targets，
+                    # 消费端据此建带目标的 ShareTask，run_cycle→submit_to_dispatch 才能
+                    # 写入 QueueItem 完成推送。无 targets 的非解耦事件保持旧行为（兼容存量）。
+                    payload = {}
+                    try:
+                        payload = json.loads(ev.payload_json or "{}")
+                    except Exception:
+                        payload = {}
+                    targets = payload.get("channel_targets") if isinstance(payload, dict) else None
+                    if isinstance(targets, list) and targets:
+                        # channel_targets 两种形态兼容：解耦事件 [{channel_id,...}]；
+                        # shadow_register 旧态 [{channel_id:int}] 也是同一结构，直接用。
+                        clean = [t for t in targets
+                                 if isinstance(t, dict) and int(t.get("channel_id") or 0) > 0]
+                        _, created = ensure_task(db, res, kind="first", channel_targets=clean)
+                    else:
+                        _, created = ensure_task(db, res, kind="first")
                     stats["tasks_created"] += 1 if created else 0
             _ev.mark_consumed(db, ev)
             _clear_event_fail(ev.id)  # v1.4.2：成功即清计数，防止陈旧计数误伤下次失败

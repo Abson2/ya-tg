@@ -2124,7 +2124,7 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     ).order_by(Resource.id.desc()).limit(min(limit, 500))).all())
     for x in pending:
         try:
-            r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+            r = await identify_with_a_source_fallback(x.name, x, db)
             if r.get("ok") and r.get("best"):
                 _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
                                       note=r.get("reason") or "", hint=r.get("hint"))
@@ -2135,7 +2135,7 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
                 # autoflush=False：同批次识别后立刻查队列去重，必须 flush
                 db.flush()
                 if publish_after_identify:
-                    n_added = _enqueue_after_identify(db, x, diag=diag)
+                    n_added = _after_identify_dispatch(db, x, diag=diag)
                     stats["queued"] += n_added
                     if n_added and wkey:
                         stats["queued_work_keys"].add(wkey)
@@ -2337,7 +2337,7 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
             ev.queue_id = q.id
             stats["queued"] += 1
         else:
-            _enqueue_after_identify(db, rep)
+            _after_identify_dispatch(db, rep)
             db.flush()
             q = db.scalar(select(QueueItem).where(
                 QueueItem.resource_id.in_(ids)).order_by(QueueItem.id.desc()).limit(1))
@@ -3118,6 +3118,175 @@ def _ensure_route_channel(db: Session, route: dict):
     return ch
 
 
+# 阶段二：识别结果进程内缓存（纯内存，零 DB 写，避免高频识别打爆 TMDB）。
+# key=(规范化 name, path_hint)；只缓存成功命中的结果，失败/存疑不缓存以便下次重试。
+# 进程重启后自然失效（TMDB 元数据稳定，可接受）；force/手动 identify 不经本包装函数，
+# 因此 force 永远重新解析，符合「force 才重解析」红线。
+_IDENTIFY_CACHE: dict[tuple[str, str], dict] = {}
+_IDENTIFY_CACHE_MAX = 2000
+
+
+def _identify_cache_get(key: tuple[str, str]) -> dict | None:
+    hit = _IDENTIFY_CACHE.get(key)
+    return dict(hit) if hit is not None else None
+
+
+def _identify_cache_put(key: tuple[str, str], value: dict) -> None:
+    if len(_IDENTIFY_CACHE) >= _IDENTIFY_CACHE_MAX:
+        # 简单有界清理：丢弃最早插入的 1/4（dict 保序），避免无界增长
+        for k in list(_IDENTIFY_CACHE.keys())[:_IDENTIFY_CACHE_MAX // 4]:
+            _IDENTIFY_CACHE.pop(k, None)
+    _IDENTIFY_CACHE[key] = dict(value)
+
+
+async def identify_with_a_source_fallback(name: str, x: Resource, db: Session) -> dict:
+    """阶段二：识别结果缓存 + A 库原名重试（纯本地线索，零额外依赖）。
+
+    保持 tmdb.identify 的返回契约不变（ok/best/status/reason/...）。
+    失败/存疑不缓存；A 原名仅首次未命中时重试一次，同样失败则返回首次结果。
+    """
+    key = (str(name or "").strip().lower(), str(x.path_hint or "").strip())
+    cached = _identify_cache_get(key)
+    if cached is not None:
+        return cached
+    first = await tmdb.identify(name, db, path_hint=x.path_hint or "", use_ai=True)
+    if first and first.get("ok") and first.get("best"):
+        _identify_cache_put(key, first)
+        return first
+    a_name = a_source_name_hint(db, x)
+    if not a_name or a_name == name:
+        return first
+    retry = await tmdb.identify(a_name, db, path_hint=x.path_hint or "", use_ai=True)
+    if retry and retry.get("ok") and retry.get("best"):
+        retry = dict(retry)
+        retry["reason"] = (str(retry.get("reason") or "") + " · A库原名回溯命中").strip(" ·")
+        _identify_cache_put(key, retry)
+        return retry
+    return first
+
+
+def a_source_name_hint(db: Session, x: Resource) -> str:
+    """阶段二（资源库解耦）：从本地 MirrorFile.file_name 取 A 库原名作为识别线索。
+
+    MirrorFile.file_name 永远是 A 库原名（改名不覆盖，见 models.py:389），因此无需
+    访问 A 库、无需网络——纯本地查表。B 库 fileId 通过 target_file_id 关联。
+    当 B 库改过名/目录线索失效导致识别失败时，用 A 原名重试可显著提升识别率。
+    查不到返回空串，调用方据此决定是否重试。
+    """
+    try:
+        row = db.scalar(select(MirrorFile.file_name).where(
+            MirrorFile.target_file_id == str(x.file_id or "")).limit(1))
+        return str(row or "").strip()
+    except Exception as exc:
+        logger.warning("[resource-decouple] A库原名回溯失败 file_id=%s：%s",
+                       x.file_id, exc)
+        return ""
+
+
+def compute_resource_channel_targets(db: Session, x: Resource) -> list[dict]:
+    """阶段二（资源库解耦）：算出某个已识别资源应推送到的频道目标快照。
+
+    [解耦设计] 把「决定推给谁」从 _enqueue_after_identify 里抽成纯计算函数：
+    只按现有路由表（push_routes/match_push_routes/规则匹配）算出目标 channel_id，
+    并现场补建缺失的路由 Channel（_ensure_route_channel，与旧链等价），但**不写
+    QueueItem、不建 ShareTask**。结果写进资源事件的 payload.channel_targets，供
+    分享中心 consume_resource_events 独立接管推送，无需回调资源库的入队函数。
+
+    返回值：[{"channel_id": int, "kind": str, "chat_id": str}]，可能为空（无目标）。
+    语义必须与旧链 _enqueue_after_identify 完全一致，否则切换开关会漏推/错推：
+      - 路由表非空：只走匹配到的路由（不再叠加 Rule）；
+      - 路由表为空：走启用的 Rule（按 directory_id/keyword 过滤）。
+    现场补建的 Channel 会 flush 落库（autoflush=False），保证随后 submit 能按 id 取到。
+    """
+    targets: list[dict] = []
+    try:
+        routes = bot_listener.push_routes(db)
+        if routes:
+            matched = bot_listener.match_push_routes(
+                db, x, root_ids=bot_listener.scan_root_ids(db))
+            for route in matched:
+                ch = _ensure_route_channel(db, route)
+                if ch:
+                    targets.append({"channel_id": ch.id,
+                                    "kind": str(route.get("kind") or "channel"),
+                                    "chat_id": str(route.get("chat_id") or "")})
+            return targets
+        rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))).all())
+        for rule in rules:
+            if rule.directory_id and rule.directory_id != x.parent_id:
+                continue
+            if rule.keyword and rule.keyword.lower() not in (x.name or "").lower():
+                continue
+            ch = db.get(Channel, rule.channel_id)
+            bot = db.get(Bot, ch.bot_id) if ch else None
+            if not ch or not ch.enabled or not bot or not bot.enabled:
+                continue
+            targets.append({"channel_id": ch.id, "kind": "channel", "chat_id": ch.chat_id or ""})
+        return targets
+    except Exception as exc:
+        # 路由计算失败不阻断识别主链；返回空目标，由调用方决定是否回退旧链兜底。
+        logger.warning("[resource-decouple] 计算频道目标失败 work_key=%s：%s",
+                       work_group_key(x), exc)
+        return []
+
+
+def _identify_emit_only(db: Session, x: Resource, diag: dict | None = None) -> int:
+    """阶段二（解耦开关开启时）识别入口的替代动作：只发资源事件，不直接入队/建分享。
+
+    与 _enqueue_after_identify 的关键区别：本函数**不写 QueueItem**，推送决策完全交给
+    分享中心 consume_resource_events → ensure_task → submit_to_dispatch 新链。为保证新链
+    能独立算出推送目标，事件 payload 携带 channel_targets（由 compute_resource_channel_targets
+    按与旧链完全一致的路由/规则逻辑算出）。
+
+    返回 int（算出的目标数），语义对齐 _enqueue_after_identify 的返回值，调用方统计无需改。
+    灰度开关关闭时识别入口仍走 _enqueue_after_identify，本函数不会被调用。
+    """
+    if x.identify_status != "identified" or not (x.poster_path or "").strip():
+        return 0
+    targets = compute_resource_channel_targets(db, x)
+    try:
+        from . import events, share_center
+        from .models import ShareTask
+        wk = work_group_key(x)
+        ever_cancelled = db.scalar(select(ShareTask.id).where(
+            ShareTask.work_key == wk, ShareTask.kind == "first",
+            ShareTask.status == share_center.ST_CANCELLED).limit(1))
+        etype = events.RESOURCE_RESTORED if ever_cancelled else events.RESOURCE_NEW
+        payload = {"share_dir_id": x.share_dir_id or "",
+                   "media_type": x.media_type or "",
+                   "channel_targets": targets,
+                   "decoupled": True}
+        ev = events.emit_resource_event(db, event_type=etype, work_key=wk,
+                                        resource_id=x.id, payload=payload)
+        # 同一资源同一类型已存在未消费事件时 emit 返回旧事件（幂等）；
+        # 用 targets 刷新其 payload，避免「开关切换后旧事件无 targets」导致断推。
+        if ev is not None and not json.loads(ev.payload_json or "{}").get("channel_targets"):
+            ev.payload_json = json.dumps(payload, ensure_ascii=False)
+            db.commit()
+        return len(targets)
+    except Exception as exc:
+        logger.warning("[resource-decouple] 只发事件失败 work_key=%s：%s",
+                       work_group_key(x), exc)
+        return 0
+
+
+def _after_identify_dispatch(db: Session, x: Resource, diag: dict | None = None) -> int:
+    """识别入口统一分发：按 resource_decoupled_enabled 灰度开关选新链/旧链。
+
+    所有识别入口（扫描后识别、手动 identify、auto_identify、identify_all、更新事件兜底）
+    都走这里，保证「一处开关、全局一致」。默认走旧链，零回归；开关开启且分享中心
+    主链启用时才走「只发事件」新链，避免在 share_center_enabled=false 时切到无消费者的
+    事件导致漏推。返回 int 语义与两条链一致。
+    """
+    decoupled = str(runtime_config.get(db, "resource_decoupled_enabled") or "false").lower() in (
+        "1", "true", "yes", "on")
+    share_on = str(runtime_config.get(db, "share_center_enabled") or "true").lower() in (
+        "1", "true", "yes", "on")
+    if decoupled and share_on:
+        return _identify_emit_only(db, x, diag=diag)
+    return _enqueue_after_identify(db, x, diag=diag)
+
+
 def _enqueue_after_identify(db: Session, x: Resource, diag: dict | None = None) -> int:
     """v0.6.5：识别成功且拿到 TMDB 海报后才入队推送。
 
@@ -3315,7 +3484,7 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
         d = await tmdb.detail(p.tmdb_id, p.media_type, db)
         _apply_identification(x, d, source="manual", note=p.note or "手动匹配",
                               hint=parse_media_name(x.name, x.path_hint or ""))
-        queued = _enqueue_after_identify(db, x)  # v0.6.5：识别成功且有海报才推送
+        queued = _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
         add_audit(db, "resource_identified", target_type="resource", target_id=str(rid),
                   detail=json_dumps({"tmdb_id": p.tmdb_id, "media_type": p.media_type,
                                      "title": x.media_title, "source": "manual", "queued": queued}))
@@ -3346,10 +3515,10 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+        r = await identify_with_a_source_fallback(x.name, x, db)
         if r["ok"] and r.get("best"):
             _apply_identification(x, r["best"], source=r["source"], note=r["reason"], hint=r["hint"])
-            queued = _enqueue_after_identify(db, x)  # v0.6.5
+            queued = _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
             add_audit(db, "resource_auto_identified", target_type="resource", target_id=str(rid),
                       detail=json_dumps({"tmdb_id": x.tmdb_id, "media_type": x.media_type,
                                          "source": r["source"], "reason": r["reason"], "queued": queued}))
@@ -3387,7 +3556,7 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
             if r["ok"] and r.get("best"):
                 _apply_identification(x, r["best"], source=r["source"],
                                       note=r["reason"], hint=r["hint"])
-                queued += _enqueue_after_identify(db, x)  # v0.6.5：识别成功且有海报才推
+                queued += _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
                 done += 1
             else:
                 x.identify_status = r["status"]

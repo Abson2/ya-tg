@@ -118,6 +118,11 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 四模块重构：分享中心主链开关。v1.1 起默认 true=分享中心真正接管主链
     # （建分享→提交→原子领取→只读链接发送→回执）；设 false 可临时回退旧链排障。
     "share_center_enabled": ("share_center_enabled", "true"),
+    # 阶段二（资源库解耦）灰度开关：true=识别入口只发资源事件（携带 channel_targets），
+    # 推送决策完全由分享中心 consume_resource_events→submit_to_dispatch 新链接管；
+    # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。
+    # 开启前须确保新链全量测试通过，且 share_center_enabled=true。
+    "resource_decoupled_enabled": ("resource_decoupled_enabled", "false"),
     # 发布配额（设计文档 §4.6）：三队列每小时/每日上限，后台可配，0=不限。
     "share_daily_limit": ("share_daily_limit", "0"),
     "push_daily_limit": ("push_daily_limit", "0"),
