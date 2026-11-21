@@ -4499,6 +4499,15 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
                     QueueItem.resource_id == x.id, QueueItem.status == "pending")).all():
                 q.share_task_id = force_task.id
                 q.push_reason = "force"
+                # v1.5.1 P0：手动强推入队项必须立刻置为可消费的 submitted——
+                # 否则 share_task_id 有值但 status_ext='' 的项会被 publisher 的
+                # 交接闸门过滤（有 share_task_id 且非 accepted → 永不发送）。
+                # 真机「资源库手动推送推不出去」即此因：点推送排队成功，但项卡在空 ext。
+                # force 是手动强制动作（预置 share_url 可为空=无链接推送），
+                # 交接置 submitted 后由 worker 原子领取，不依赖 force 任务本轮 run_cycle。
+                q.status_ext = "submitted"
+                q.accept_worker = ""
+                q.accepted_at = None
     except Exception:
         pass
     db.commit()

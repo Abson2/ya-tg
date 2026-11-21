@@ -146,6 +146,12 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # v1.2 发布节奏（设计文档 §5.4/§10）：相邻分享任务的最小释放间隔秒数，0=不限。
     # run_cycle 用它在同轮多个任务之间铺开 scheduled_at，避免瞬时并发推送。
     "share_release_interval_seconds": ("share_release_interval_seconds", "0"),
+    # v1.5.1 P0 第七次：TG 发送循环单条网络耗时。旧版硬编码 timeout=20s，
+    # sendPhoto 失败再回退 sendMessage 一次（+20s），单条最坏 40s；逐条串行 +
+    # 全局 _queue_lock 把一轮拖到数分钟，队列看似停摆。改为可配置：HTTP 超时默认
+    # 8s，整条 _send_telegram 硬上限默认 12s（wait_for 截断回退），仍退避重试。
+    "telegram_http_timeout_seconds": ("telegram_http_timeout_seconds", "8"),
+    "telegram_send_hard_limit_seconds": ("telegram_send_hard_limit_seconds", "12"),
     # v1.4 改名提速：改名 idle 与复制 idle 解耦（下限 0.2）。
     # v1.4.1：默认从 0.3 上调到 0.5（≈6 req/s 配合并发3），给光鸭风控留余量；
     # 并发度仍保持 3（不消极降到 1），限流靠 127 专用指数退避+自动重试根治。

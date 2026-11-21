@@ -331,8 +331,14 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
     if keyboard_rows:
         payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
     retry_after = None
+    # v1.5.1 P0 第七次：超时可配置（默认8s，旧硬编码20s），避免单条慢请求拖垮整轮。
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        http_timeout = max(1, min(60, int(runtime_config.get(
+            db, "telegram_http_timeout_seconds") or 8)))
+    except (TypeError, ValueError):
+        http_timeout = 8
+    try:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
             r = await client.post(f"{base}/bot{token}/{method}", json=payload)
     except httpx.TimeoutException:
         return False, "", (f"连接 Telegram 超时（{base}）。若在国内网络，请在「分发规则」页"
@@ -360,7 +366,7 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
             if payload.get("reply_markup"):
                 fallback["reply_markup"] = payload["reply_markup"]
             try:
-                async with httpx.AsyncClient(timeout=20) as client:
+                async with httpx.AsyncClient(timeout=http_timeout) as client:
                     r2 = await client.post(f"{base}/bot{token}/sendMessage", json=fallback)
                 d2 = r2.json()
             except Exception:
@@ -568,8 +574,22 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                 q.error = share_error
             # v0.9.10：ensure_share 内部已 commit；发 TG 前再确保无悬挂写事务。
             db.commit()
-            ok, message_id, error, retry_after = await _send_telegram(
-                db, q, res, channel, bot)
+            # v1.5.1 P0 第七次：给单条发送加硬上限，杜绝「慢请求+sendPhoto回退」
+            # 把一轮拖到数分钟。超时按可重试失败计退避，不破坏逐条保序与去重。
+            try:
+                hard_limit = max(3, min(120, int(runtime_config.get(
+                    db, "telegram_send_hard_limit_seconds") or 12)))
+            except (TypeError, ValueError):
+                hard_limit = 12
+            try:
+                ok, message_id, error, retry_after = await asyncio.wait_for(
+                    _send_telegram(db, q, res, channel, bot), timeout=hard_limit)
+            except asyncio.TimeoutError:
+                ok, message_id, error, retry_after = (
+                    False, "", f"Telegram 发送超过硬上限 {hard_limit}s（网络慢），本条退避重试", None)
+            except Exception as exc:
+                ok, message_id, error, retry_after = (
+                    False, "", f"Telegram 发送异常：{str(exc)[:300]}", None)
             if ok:
                 q.status = "sent"
                 q.telegram_message_id = message_id
