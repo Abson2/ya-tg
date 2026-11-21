@@ -41,7 +41,10 @@ def test_process_queue_is_mutex():
     finally:
         publisher._process_queue_impl = orig
 
-    assert second.get("skipped") is True
+    # v1.5.2：锁冲突标志从 bool skipped 改为 queue_busy——skipped 必须留给
+    # 手动推送端点的字符串数组契约，否则前端展开 bool 抛 TypeError。
+    assert second.get("queue_busy") is True
+    assert "skipped" not in second
     assert second["sent"] == 0
     assert first["sent"] == 1
     assert calls[0] == 1  # 慢实现只被调用一次

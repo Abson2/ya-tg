@@ -1495,7 +1495,14 @@ async function publishResource(row) {
   try {
     const d = await api(`/resources/${row.id}/publish`, { method: 'POST' })
     const base = `已入队 ${d.queued || 0} 条，发送 ${d.sent || 0} 条，失败 ${d.failed || 0} 条`
-    const reasons = [...(d.skipped || []), ...(d.detail || []).map(x => x.error)]
+    // v1.5.2 P0 兜底：skipped 历史上被后端契约覆盖成 bool（锁冲突那轮），
+    // 直接展开会抛 TypeError: 'bool' object is not iterable。这里强制数组归一化，
+    // 并把 detail[].error 一并收进来——后端已把锁冲突 reason 并进 detail，
+    // 前端据此显示「另一次队列处理进行中」正常提示，而不是 JS 异常。
+    const reasons = [
+      ...(Array.isArray(d.skipped) ? d.skipped : []),
+      ...(Array.isArray(d.detail) ? d.detail : []).map(x => x && x.error).filter(Boolean)
+    ]
     if (reasons.length) {
       ElMessage({ type: 'warning', message: `${base}｜${reasons[0]}`, duration: 6000, showClose: true })
     } else {
@@ -1965,7 +1972,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v1.5.1 · Asia/Shanghai</span>
+          <span>v1.5.2 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

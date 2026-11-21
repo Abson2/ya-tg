@@ -649,7 +649,12 @@ _queue_lock = asyncio.Lock()
 
 async def process_queue(limit: int = 20) -> dict:
     if _queue_lock.locked():
+        # v1.5.2 P0：绝不能用 "skipped" 作锁冲突标志——手动推送端点
+        # main.publish_resource 会把 result 展开进响应，而它与本地 skipped=[]
+        # （字符串数组）同名。bool True 覆盖数组后前端 [...d.skipped] 抛
+        # TypeError: 'bool' object is not iterable（真机「道士下山」手动推送报错）。
+        # 改用独立语义键 queue_busy，由调用方决定如何回显。
         return {"sent": 0, "failed": 0, "shares_created": 0,
-                "skipped": True, "reason": "另一次队列处理进行中，本轮跳过"}
+                "queue_busy": True, "reason": "另一次队列处理进行中，本轮跳过"}
     async with _queue_lock:
         return await _process_queue_impl(limit=limit)

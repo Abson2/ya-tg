@@ -673,13 +673,13 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="1.5.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.5.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.5.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.5.2", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -4519,7 +4519,18 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         QueueItem.resource_id == x.id).order_by(QueueItem.id.desc()).limit(max(added, 1))).all())
     detail = [{"channel_id": q.channel_id, "status": q.status,
                "error": str(q.error or "")[:300]} for q in recent if q.error]
-    return {"ok": True, "queued": added, "detail": detail, "skipped": skipped, **result}
+    # v1.5.2 P0：process_queue 的 result 绝不能覆盖本端点的 skipped（字符串数组）
+    # 契约。旧写法把 skipped 写在 **result 展开之前，result 带同名键时后者覆盖前者
+    # ——真机锁冲突那轮 result["skipped"]=True(bool)，前端
+    # `[...(d.skipped||[])]` 展开布尔抛 TypeError，手动推送直接报错。
+    # 处理：先展开 result 再写自身字段；pop 掉内部 skipped 标志（内部统计不该
+    # 污染给前端的数组契约）；锁冲突 reason 并进 detail 作为普通提示回显。
+    payload = dict(result)
+    reason = str(payload.pop("reason", "") or "")
+    payload.pop("skipped", None)
+    if reason:
+        detail = [*detail, {"channel_id": 0, "status": "skipped", "error": reason}]
+    return {**payload, "ok": True, "queued": added, "detail": detail, "skipped": skipped}
 
 
 @app.put("/api/bots/{bid}", dependencies=ADMIN)

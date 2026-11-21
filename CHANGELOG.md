@@ -8,6 +8,20 @@
 
 ---
 
+## v1.5.2 (2026-11-21)
+
+**手动推送 "skipped is not iterable" 契约覆盖 P0 修复**：真机点「道士下山」资源库手动推送报 JS `TypeError: (f.skipped || []) is not iterable`。这是后端返回契约被内部标志覆盖的 bug，与资源本身无关。触发条件：手动推送时恰好有另一轮队列处理持有 `_queue_lock`（定时 worker 或上次推送未结束）——队列越堵越易触发。全量 pytest **899 passed**，前端 build 通过。回滚 `IMAGE_TAG=v1.5.1`。
+
+- **根因**：`main.publish_resource` 初始化 `skipped=[]`（字符串数组，前端要展开），末尾 `return {..., "skipped": skipped, **result}` 把 `result` 放在最后展开；`publisher.process_queue` 锁冲突分支返回 `{"skipped": True}`（bool），同名键覆盖数组 → 前端 `[...(d.skipped||[])]` 展开布尔抛 TypeError。
+- **后端根治（`publisher.py`）**：锁冲突标志从 `skipped` 改为独立语义键 `queue_busy`，并带可读 `reason`，不再污染端点数组契约。
+- **后端契约（`main.py`）**：先 `payload = dict(result)` 展开，再 `pop("skipped")` 摘掉内部标志、`pop("reason")` 提取原因并并进 `detail` 作为普通提示，最后才写自身 `ok/queued/detail/skipped`——`skipped` 恒为数组。
+- **前端兜底（`App.vue`）**：`skipped` / `detail` 均做 `Array.isArray` 归一化 + `.filter(Boolean)`，锁冲突显示「另一次队列处理进行中」正常提示而非 JS 异常；即使后端将来又往 result 塞 skipped 也不会崩。
+- **测试**：新增 `test_v158_skipped_contract` 4 项（真实占锁调用返回 queue_busy 无 skipped、main 契约顺序、模拟覆盖后 skipped 仍数组、前端归一化守卫）；历史 `test_v102_queue_lock` 断言适配新键名，互斥语义保留。
+
+> 说明：本版只修契约 bug，不动存量队列数据。真机当前队列仍有 building 僵尸、ext='' 老项与 accepted 未 sent 积压，是锁冲突高频触发的根；契约修复后手动推送不再报错，但队列消费健康度需另行观察/处理。
+
+---
+
 ## v1.5.1 (2026-11-21)
 
 **v1.5.0 真机试跑 P0 修复（三项）**：v1.5.0 上线后真机连续暴露全局推送停摆、TG 发送循环卡死、缺集不自动补三类 P0。本版逐项根治，均为保守修复，不改发送核心、不改镜像 full/half 模式语义、不动默认开关。全量 pytest **895 passed**，前端 build 通过。回滚 `IMAGE_TAG=v1.5.0`。
