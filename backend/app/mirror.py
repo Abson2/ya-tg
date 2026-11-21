@@ -301,6 +301,160 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
     return batch, new_cursor, wrapped
 
 
+# ============================================================================
+# 镜像1.1（2026-11-21）：单轮开始的 A树/B树/映射清单三方对比预扫描（查漏补缺）。
+# 需求 a/b/c/d 见 MIRROR_1.1_DESIGN.md。设计红线：
+#   - complete=False（A 树不完整）跳过 c/b 判定，绝不误删；
+#   - 默认只清清单+统计、不删 B 库（真删靠 mirror_delete_b_on_a_missing 开关）；
+#   - 零跨 await 持写事务：网络 await 前先 commit；
+#   - 性能护栏 max_prepass_media 限制单轮核对部数。
+# ============================================================================
+
+def _build_a_facts(nodes: dict, works: list) -> tuple[set[str], dict[str, str], set[str]]:
+    """从 A 全树构建事实集（纯内存零网络）：文件ID集、{fileId:指纹}、作品键集。"""
+    a_file_ids: set[str] = set()
+    a_source_fps: dict[str, str] = {}
+    for node in nodes.values():
+        for item in node.get("files") or []:
+            fid = str(item.get("fileId") or "")
+            if not fid:
+                continue
+            a_file_ids.add(fid)
+            a_source_fps[fid] = _fingerprint(item)
+    a_work_keys = {work_key_of(w) for w, _ in works}
+    return a_file_ids, a_source_fps, a_work_keys
+
+
+def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool = True) -> int:
+    """清一部作品的无效映射清单（C 类默认动作）：重置 MirrorFile 字段，不物理删行。
+
+    复用 prune_stale_mappings 的"重置 pending"语义（mirror.py:2216-2224），
+    让这些行不参与后续核对；mark_retired 时把 MirrorMedia.status 标 failed 留痕。
+    返回清理的文件行数。不删 B 库文件、不删 DB 行（物理删走手动端点）。
+    """
+    n = 0
+    for row in db.scalars(select(MirrorFile).where(
+            MirrorFile.media_id == media.id,
+            MirrorFile.status != "pending")).all():
+        row.status = "pending"
+        row.target_file_id = ""
+        row.target_name = ""
+        row.rename_status = ""
+        row.rename_error = ""
+        row.task_id = ""
+        n += 1
+    if mark_retired:
+        media.status = "failed"
+    db.commit()
+    return n
+
+
+async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
+                                      works: list, api: GuangYaWebFiles, stats: dict,
+                                      *, complete: bool) -> list[str]:
+    """镜像1.1：单轮开始三方对比，输出需优先重处理的作品键（B 类）。
+
+    a) 单文件变化：只统计，补齐交给主循环 1194-1256，不计剧部数；
+    b) 整部在 B 缺失（A 还在）：只识别+返回优先重处理键；重置/补复制/计数
+       一律交给主循环 v0.8.7（1323-1339）——预扫描提前清 pending 会让主循环
+       synced_rows 变空、missing_in_b 丢失，且误伤 name_mismatch 保护场景；
+    c) A 库已无该作品：默认清清单+统计；开关开且 complete 时真删 B 库文件；
+    d) 无变化：不动作。
+
+    任何判定都要求 complete=True（A 树完整），否则跳过 c/b。全程无跨 await 写事务。
+    返回 reprocess_keys（B 类作品键列表，供 sync_rule 重排 works 优先处理）。
+    """
+    prepass = {"enabled": True, "complete": complete,
+               "c_deleted_a": 0, "c_b_files_removed": 0, "c_mapping_cleared": 0,
+               "b_invalid_reprocess": 0, "a_single_file_fix": 0, "d_unchanged": 0,
+               "skipped": 0}
+    stats["prepass"] = prepass
+    reprocess_keys: list[str] = []
+    try:
+        enabled = str(runtime_config.get(db, "mirror_prepass_enabled") or "true").lower() in (
+            "1", "true", "yes", "on")
+        if not enabled:
+            prepass["enabled"] = False
+            return reprocess_keys
+        try:
+            max_media = max(0, int(runtime_config.get(db, "mirror_prepass_max_media") or 50))
+        except (TypeError, ValueError):
+            max_media = 50
+
+        a_file_ids, a_source_fps, a_work_keys = _build_a_facts(nodes, works)
+        medias = list(db.scalars(select(MirrorMedia).where(
+            MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id)).all()[:max_media])
+
+        for media in medias:
+            wk = str(media.work_key or "")
+            # 镜像1.1：兼容 legacy 无前缀 work_key。C 类判定与 B 类重排都依赖与
+            # work_key_of() 同口径的 "work:" 前缀，否则会把 A 还在的作品误判为已删。
+            if wk and not wk.startswith("work:"):
+                wk = "work:" + wk
+            rows = list(db.scalars(select(MirrorFile).where(
+                MirrorFile.media_id == media.id)).all())
+            if not rows:
+                continue
+            src_ids = {str(r.source_file_id or "") for r in rows if r.source_file_id}
+            in_a = src_ids & a_file_ids
+
+            # C 类：A 库已无该作品（所有源文件都不在 A 树，且作品键也不在工作集）
+            if complete and not in_a and wk not in a_work_keys:
+                prepass["c_deleted_a"] += 1
+                do_delete = str(runtime_config.get(
+                    db, "mirror_delete_b_on_a_missing") or "false").lower() in (
+                        "1", "true", "yes", "on")
+                # 必须在清清单前捕获 b_ids：_clear_media_mappings 会清空 ORM 行的
+                # target_file_id，rows 与其共享 identity map，事后取不到。
+                b_ids: list[str] = []
+                if do_delete:
+                    b_ids = [str(r.target_file_id) for r in rows
+                             if r.target_file_id and str(r.target_file_id).strip()]
+                # 先清清单（不跨 await），再可选真删 B 库（网络 await 前已 commit）
+                prepass["c_mapping_cleared"] += _clear_media_mappings(db, media)
+                if do_delete and b_ids:
+                    try:
+                        await api.delete_files(b_ids)
+                        prepass["c_b_files_removed"] += len(b_ids)
+                    except Exception as exc:
+                        logger.warning("[mirror1.1] C类删B库失败 wk=%s：%s", wk, exc)
+                continue
+
+            # 作品 A 库还在 → 判断是否整部在 B 缺失（B 类）或单文件变化（A 类）
+            if not complete:
+                prepass["skipped"] += 1
+                continue
+            changed_fp = sum(1 for r in rows if r.source_file_id in a_source_fps
+                             and a_source_fps[r.source_file_id] != str(r.fingerprint or ""))
+            # 只在「该作品本轮会被选」的范围内做 B 库核对，控制接口开销
+            candidates, verified = await api_b_candidates_safe(api, media)
+            if not verified:
+                prepass["skipped"] += 1
+                continue
+            visible = {str(v) for v in candidates.values()}
+            if not visible:
+                # B 库整部为空 + A 库还有 → B 类：失效。只登记优先重处理键，
+                # 不在这里重置 MirrorFile——重置/补复制/计数由主循环 v0.8.7
+                # 统一完成，避免 synced_rows 被提前清空导致 missing_in_b 丢失。
+                prepass["b_invalid_reprocess"] += 1
+                reprocess_keys.append(wk)
+            elif changed_fp or len(in_a) < len(src_ids):
+                # A 有更新 或 A 源文件数 > 已同步源文件集合 → A 类单文件补齐（不计部数）
+                prepass["a_single_file_fix"] += 1
+            else:
+                prepass["d_unchanged"] += 1
+        return reprocess_keys
+    except Exception as exc:
+        logger.warning("[mirror1.1] 三方对比预扫描异常（不阻断同步）：%s", exc)
+        stats.setdefault("prepass", prepass)["error"] = str(exc)[:200]
+        return []
+
+
+async def api_b_candidates_safe(api: GuangYaWebFiles, media: MirrorMedia) -> tuple[dict, bool]:
+    """镜像1.1：复用现有 _b_file_candidates 的 B 目录核对（含 verified 语义）。"""
+    return await _b_file_candidates(api, media)
+
+
 def _relative_dir_names(node: dict, work: dict, nodes: dict) -> list[str]:
     """从影视主目录到文件所在目录之间的子目录名（Season 1 等），B 库同名映射。"""
     names: list[str] = []
@@ -1063,6 +1217,24 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         return fid, None, effective
 
     works = _discover_works(nodes, root)
+    # 镜像1.1：单轮开始三方对比预扫描（A树/B树/映射清单查漏补缺）。
+    # 返回的 reprocess_keys（B类整部失效）重排到 works 前部，优先进入本批重处理；
+    # A类单文件补齐仍交给主循环、不计剧部数；C类默认只清清单不删B库。
+    # 预扫描失败只记录不阻断同步；complete=False 时内部自动跳过 c/b 判定。
+    try:
+        reprocess_keys = await reconcile_mappings_prepass(
+            db, rule, nodes, works, api, stats, complete=complete)
+        if reprocess_keys:
+            rank = {k: i for i, k in enumerate(reprocess_keys)}
+            # works 元素是 (node, cats) 元组，work_key_of 要吃 node（w[0]），
+            # 不能直接吃元组——否则 .get() 报 'tuple' object has no attribute 'get'。
+            works = sorted(
+                works,
+                key=lambda pair: (0 if work_key_of(pair[0]) in rank else 1,
+                                  rank.get(work_key_of(pair[0]), 0)))
+            stats["prepass"]["reprocess_prioritized"] = len(reprocess_keys)
+    except Exception as exc:
+        logger.warning("[mirror1.1] 预扫描挂钩异常（不阻断同步）：%s", exc)
     # v0.9.0：按单轮上限 + 轮转游标切批。max_works<=0 时退化为旧行为（全量，
     # 仍受 max_media 防御上限约束）；>0 时本批最多 max_works 部，剩余下轮继续。
     if max_works > 0:
