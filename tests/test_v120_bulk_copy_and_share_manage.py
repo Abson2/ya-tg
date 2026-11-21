@@ -199,9 +199,9 @@ def test_schedule_config_roundtrip(env):
         assert cfg2["fresh_daily_quota"] == 10
 
 
-def test_tasks_list_supports_work_key_filter():
-    """API 契约：GET /api/share/tasks 接受 work_key 查询参数。"""
-    import inspect
-    from app.main import share_tasks_list
-    sig = inspect.signature(share_tasks_list)
-    assert "work_key" in sig.parameters, "分享任务列表需支持 work_key 过滤"
+def test_old_share_tasks_route_removed_new_sc_tasks_active():
+    """旧 /api/share/tasks handler 已随分享中心卡片化移除，任务列表统一走 /api/sc/tasks。"""
+    from app import main as m
+    assert not hasattr(m, "share_tasks_list"), "旧分享任务 handler 应已删除"
+    from app.share_center_v2 import api_tasks
+    assert api_tasks is not None, "新体系任务列表端点应存在"

@@ -695,7 +695,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.0.1", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.0.2", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -703,7 +703,7 @@ app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.0.1", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.0.2", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -4265,187 +4265,6 @@ async def _send_test_message(token: str, chat_id: str, bot_name: str,
 async def queue_run():
     """立即处理一次队列（默认 worker 每 30 秒一轮），配置完可马上验证。"""
     return await process_queue(limit=50)
-
-
-# ============================================================================
-# 四模块重构：分享中心 API（阶段D 前端对接）
-# ============================================================================
-
-@app.get("/api/share/tasks", dependencies=ADMIN)
-def share_tasks_list(status: str = "", work_key: str = "", limit: int = 200,
-                     db: Session = Depends(get_db)):
-    """分享任务列表（前端「分享中心」页面）。§5.6：支持 status / work_key 过滤。"""
-    from . import share_center
-    q = select(share_center.ShareTask)
-    if status:
-        q = q.where(share_center.ShareTask.status == status)
-    if work_key:
-        q = q.where(share_center.ShareTask.work_key.contains(work_key))
-    rows = list(db.scalars(q.order_by(share_center.ShareTask.id.desc()).limit(min(limit, 500))).all())
-    return {"enabled": share_center.is_enabled(db), "items": [
-        {"id": t.id, "work_key": t.work_key, "kind": t.kind, "status": t.status,
-         "queue_type": t.queue_type or "fresh",
-         "share_url": t.share_url, "share_id": t.share_id,
-         "parent_task_id": t.parent_task_id, "parent_event_id": t.parent_event_id,
-         "resource_id": t.resource_id, "attempts": t.attempts, "error": t.error,
-         "priority": t.priority,
-         "channel_targets": t.channel_targets or "[]",
-         "share_dir_id": t.share_dir_id, "share_scope": t.share_scope,
-         "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else "",
-         "created_at": t.created_at.isoformat() if t.created_at else "",
-         "published_at": t.published_at.isoformat() if t.published_at else ""}
-        for t in rows]}
-
-
-@app.post("/api/share/tasks/{tid}/cancel", dependencies=ADMIN)
-def share_task_cancel(tid: int, db: Session = Depends(get_db)):
-    """取消分享任务（撤销未发送的交接队列项）。"""
-    from . import share_center
-    task = db.get(share_center.ShareTask, tid)
-    if not task:
-        raise HTTPException(404, "分享任务不存在")
-    n = share_center.cancel_task(db, task)
-    add_audit(db, "share_task_cancelled", target_type="share_task", target_id=str(tid))
-    return {"ok": True, "queue_revoked": n}
-
-
-@app.post("/api/share/tasks/{tid}/rebuild", dependencies=ADMIN)
-def share_task_rebuild(tid: int, db: Session = Depends(get_db)):
-    """重建分享（§5.6）：任务打回 planned，作废旧分享，下一轮重新建链接并推送。"""
-    from . import share_center
-    task = db.get(share_center.ShareTask, tid)
-    if not task:
-        raise HTTPException(404, "分享任务不存在")
-    if task.status == share_center.ST_CANCELLED:
-        raise HTTPException(400, "已取消的任务请重新入库后再分享，不能直接重建")
-    return share_center.rebuild_task(db, task)
-
-
-@app.get("/api/share/schedule", dependencies=ADMIN)
-def share_schedule_get(db: Session = Depends(get_db)):
-    """发布节奏配置（§5.4）：释放间隔 + 各队列配额。"""
-    from . import share_center
-    return share_center.share_schedule_get(db)
-
-
-@app.post("/api/share/schedule", dependencies=ADMIN)
-def share_schedule_set(payload: dict, db: Session = Depends(get_db)):
-    """写入发布节奏配置；只接受白名单键的非负整数。"""
-    from . import share_center
-    return share_center.share_schedule_set(db, payload or {})
-
-
-@app.get("/api/share/records", dependencies=ADMIN)
-def share_records_list(current_only: bool = False, limit: int = 200,
-                       db: Session = Depends(get_db)):
-    """分享记录管理（§5.2/§4.3）：当前与历史分享链接真相源。"""
-    from . import share_center
-    return {"items": share_center.share_records_list(db, current_only=current_only,
-                                                      limit=limit)}
-
-
-@app.get("/api/share/link/{work_key:path}", dependencies=ADMIN)
-def share_link_get(work_key: str, db: Session = Depends(get_db)):
-    """阶段五：只读查询某作品当前分享链接的有效性状态（本地推断，非光鸭实时）。"""
-    from . import share_link
-    return share_link.link_summary(db, work_key)
-
-
-@app.post("/api/share/link/review", dependencies=ADMIN)
-def share_link_review(payload: dict, db: Session = Depends(get_db)):
-    """阶段五：人工核验入队（manual_review），不自动改 inactive。"""
-    from . import share_link
-    wk = str((payload or {}).get("work_key") or "").strip()
-    if not wk:
-        raise HTTPException(400, "缺少 work_key")
-    r = share_link.mark_manual_review(db, wk, note=str((payload or {}).get("note") or ""))
-    db.commit()
-    add_audit(db, "share_link_review", target_type="share", target_id=wk,
-              detail=json_dumps({"work_key": wk}))
-    db.commit()
-    return {"ok": bool(r.get("changed")), **r}
-
-
-@app.post("/api/share/link/cleanup", dependencies=ADMIN)
-def share_link_cleanup(payload: dict, db: Session = Depends(get_db)):
-    """阶段五：手动清理失效链接（置 cleaned + current_flag=0 归档）。
-
-    绝不删 B 库资源、不删历史记录、不碰队列/分发；二次确认由前端保证。
-    auto_cleanup_enabled 默认关，本端点只做手动触发，不做任何自动清理。
-    """
-    from . import share_link
-    wk = str((payload or {}).get("work_key") or "").strip()
-    if not wk:
-        raise HTTPException(400, "缺少 work_key")
-    r = share_link.cleanup_link(db, wk, operator=str((payload or {}).get("operator") or "manual"))
-    db.commit()
-    add_audit(db, "share_link_cleanup", target_type="share", target_id=wk,
-              detail=json_dumps({"work_key": wk, "result": r}))
-    db.commit()
-    return {"ok": bool(r.get("changed")), **r}
-
-
-@app.get("/api/share/followups", dependencies=ADMIN)
-def share_followups(db: Session = Depends(get_db)):
-    """追更管理（§5.4/§5.7）：按作品聚合「已推 N 次 / 更新 M 次」。"""
-    from . import share_center
-    return {"items": share_center.followup_summary(db)}
-
-
-@app.post("/api/share/run", dependencies=ADMIN)
-async def share_run():
-    """手动跑一轮分享中心调度（建分享→提交分发）。
-
-    阶段六第六次死锁同源修复：复用 _run_share_cycle_in_thread（线程内独立 Session），
-    避免前端「跑一轮」按钮在主协程撞写锁冻结 event loop。
-    """
-    return await asyncio.to_thread(_run_share_cycle_in_thread, 20)
-
-
-@app.get("/api/share/publish-overview", dependencies=ADMIN)
-def share_publish_overview(db: Session = Depends(get_db)):
-    """阶段六发布总览：急停 / 今日配额进度 / 待处理事件 / 链接有效性分布（只读）。"""
-    from . import share_center
-    return share_center.publish_overview(db)
-
-
-@app.get("/api/share/rules", dependencies=ADMIN)
-def share_rules_get(db: Session = Depends(get_db)):
-    """阶段六发布规则只读：保守默认值 + 开关。"""
-    from . import share_center
-    return share_center.publish_rules_get(db)
-
-
-@app.post("/api/share/rules", dependencies=ADMIN)
-def share_rules_set(payload: dict, db: Session = Depends(get_db)):
-    """阶段六发布规则写入：白名单键、热更新。"""
-    from . import share_center
-    result = share_center.publish_rules_set(db, payload or {})
-    add_audit(db, "publish_rules_changed", detail=json_dumps({"rules": payload or {}}))
-    db.commit()
-    return result
-
-
-@app.get("/api/share/center/status", dependencies=ADMIN)
-def share_center_status(db: Session = Depends(get_db)):
-    """分享中心状态：开关 + 各状态计数（前端任务中心聚合用）。
-
-    注意：路径不能是 /api/share/status（那是光鸭分享会话状态端点，先注册优先匹配）。
-    """
-    from . import share_center as _sc
-    from sqlalchemy import func as _fn
-    from .models import ShareRecord
-    rows = db.execute(select(_sc.ShareTask.status, _fn.count()).group_by(_sc.ShareTask.status)).all()
-    qrows = db.execute(select(_sc.ShareTask.queue_type, _fn.count()).group_by(_sc.ShareTask.queue_type)).all()
-    current_shares = db.scalar(select(_fn.count()).select_from(ShareRecord).where(
-        ShareRecord.current_flag == 1)) or 0
-    history_shares = db.scalar(select(_fn.count()).select_from(ShareRecord)) or 0
-    return {
-        "enabled": _sc.is_enabled(db),
-        "counts": {str(s): int(n) for s, n in rows},
-        "queues": {str(q or "fresh"): int(n) for q, n in qrows},
-        "share_records": {"current": int(current_shares), "total": int(history_shares)},
-    }
 
 
 @app.post("/api/resources/{rid}/publish", dependencies=ADMIN)

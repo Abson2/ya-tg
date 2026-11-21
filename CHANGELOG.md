@@ -8,6 +8,14 @@
 
 ---
 
+## v2.0.2 (2026-11-21)
+
+**移除旧分享中心 HTTP 路径**：v2.0.1 只移除了前端旧模块调用，后端 15 个旧 `/api/share/*` 端点仍登记在路由表。本版把这些已零调用的旧路径从路由层彻底删除，分享中心只剩 `/api/sc/*` 一套路径。回滚 `IMAGE_TAG=v2.0.1`。
+
+- **删除的旧路径**：`/api/share/tasks`、`/tasks/{tid}/cancel|rebuild`、`/schedule`(GET/POST)、`/records`、`/link/{work_key}`、`/link/review`、`/link/cleanup`、`/followups`、`/run`、`/publish-overview`、`/rules`(GET/POST)、`/center/status` 共 15 个。
+- **保留项**：`/api/share/status`（光鸭分享会话状态，前端「光鸭授权」页在用，与分享中心无关）；`share_center.py` / `share_link.py` 模块内部函数（发送核心队列 worker、资源事件消费、B库删除联动、手动推送 force 注册仍依赖，路径删除不影响这些内部调用）；`/api/sc/pause` 急停端点（v2.0.1 已提供）。
+- **测试**：test_v106 改为锁定旧路径 404 + 新路径 200 + 光鸭 status 保留；test_v120/task 契约改为新体系端点；test_v153 死锁守卫转为直接守 `_run_share_cycle_in_thread` helper 与调度器。全量 pytest 通过。
+
 ## v2.0.1 (2026-11-21)
 
 **分享中心旧模块移除 + 全卡片化改造**：v2.0.0 把新体系以追加分页方式挂在旧链 5 页之后，旧模块未真正移除、标题仍带 V2 开发命名。本版把整个分享中心重做为全卡片化工作台，彻底移除旧 5 页及其脚本状态与旧链端点调用，模块标题统一为规范业务名；只保留新 `sc_*` 数据体系，发送核心不变。回滚 `IMAGE_TAG=v2.0.0`。

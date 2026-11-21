@@ -164,17 +164,14 @@ def test_share_records_list_has_link_state(env):
         assert "cleaned_at" in row and "clean_state" in row
 
 
-# ---------- share_run 线程化静态守卫 ----------
-def test_share_run_uses_to_thread_with_independent_session():
+# ---------- 分享调度线程化静态守卫（share_run 旧端点已删，死锁红线由调度器 helper 守住） ----------
+def test_share_cycle_helper_uses_independent_session():
     main_src = (ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
-    marker = "async def share_run("
-    i = main_src.index(marker)
-    seg = main_src[i:i + 320]
-    assert "asyncio.to_thread" in seg, "share_run 必须 to_thread 防写锁冻结"
-    assert "_run_share_cycle_in_thread" in seg
+    # 旧 share_run 端点已随旧路径删除
+    assert "async def share_run(" not in main_src
     # 全局守卫：不得有主协程裸 await run_cycle（publisher 已有同款守卫）
     assert "await _sc.run_cycle(db" not in main_src
-    # helper 只能定义一次（重复定义会覆盖 _job_share_center 的调用），且独立 Session
+    # 调度器 helper 只能定义一次（重复定义会覆盖 _job_share_center 的调用），且独立 Session
     assert main_src.count("def _run_share_cycle_in_thread(") == 1
     helper = "def _run_share_cycle_in_thread("
     j = main_src.index(helper)
@@ -182,6 +179,10 @@ def test_share_run_uses_to_thread_with_independent_session():
     assert "SessionLocal()" in helper_seg
     assert "asyncio.run" in helper_seg
     assert "rollback()" in helper_seg
+    # 调度器 _job_share_center 必须经 to_thread 调 helper
+    k = main_src.index("async def _job_share_center(")
+    job_seg = main_src[k:k + 1600]
+    assert "asyncio.to_thread" in job_seg and "_run_share_cycle_in_thread" in job_seg
 
 
 # ---------- 前端分享中心全卡片化静态守卫（旧 5 页已移除，统一走 /api/sc/*） ----------
