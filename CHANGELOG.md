@@ -8,6 +8,19 @@
 
 ---
 
+## v2.1.0 (2026-11-21)
+
+**分享中心分流层收敛为单一生产者 + 四板块规则全量消费 + 改名硬门禁**：v2.0.5 已把四页 UI 按设计稿重做并对接真实数据，但存在两处根子问题——一是 publisher 无论 v2 开关与否都额外驱动旧链 `run_cycle`，新旧两条链同时写 `push_queue` 有双推/状态覆盖风险；二是 v2 发布规则（`SCCategorySchedule`、周期计划、更新检测窗口、即时推送上限、链接失效联动）大量只落库未真正消费。本版按用户四项决策（推倒重写分流层 / 全量打通规则 / 改名改硬门禁 / 加诊断端点）落地。回滚 `IMAGE_TAG=v2.0.5`。
+
+- **单一分流层，切断双推**：`publisher._process_queue_impl` 改为 v2/legacy/off 三态互斥——v2 开启时只驱动新增的 `_run_share_center_v2_in_thread`（sync→plan→dispatch 一轮，独立线程 + 独立 Session，延续第六次死锁防护），旧链 `consume_resource_events + run_cycle` 绝不再并行；仅 v2 关闭时才回退旧链。杜绝两条链同时按 `(resource_id,channel_id)` 复用同一 `push_queue` 行互相覆盖 `push_reason/share_task_id/event_id`。
+- **v2 规则全量真实消费**：`SCCategorySchedule` 真正驱动 `plan_engine`（分类时段窗口过滤 + 分类级 hourly/daily 限流）；周期计划 `day_max/week_max/month_max` 配额与周/月休止窗口真实夹逼；`sc_update_detect_minutes` 作为更新窗口长度（默认 10 分钟）；`sc_quick_publish_hourly_limit` 作为即时推送每小时提交上限；resource 的 `removed/deleted` 事件联动 `share_link` 标记 suspicious 并二次确认转 inactive、回写共享记录退役。此前这些键只落库不生效。
+- **改名硬门禁（用户决策）**：手动 `mirror_run` 与定时 `_scheduled_mirror` 统一口径——改名任一文件失败或整体异常即视为本轮单任务未完成，`rename_gate_blocked=True`，跳过「入库→识别→推送」，杜绝英文名没改对就先推群/频道；复制照常落库，等人工处理或下一轮重试。翻译粒度保持作品级（英文名解析后拼单集文件名，不逐集翻译）。
+- **只读诊断端点 `GET /api/sc/diagnostics`**：暴露当前生效链路（v2/legacy/off）、关键开关、规则生效状态与段间积压计数（resource_events 待消费、发布任务按状态、push_queue 待发、计划版本状态），纯 SELECT 不改配置不触发周期，用于核实四板块门禁是否真按配置执行。
+- **前端严禁照搬流程图**：按用户明确反馈删除 v2.0.5 中把流程图直接做成页面组件的三处元素——分享总览顶部 `sc-pipeline` 资源→识别→TG 流程条、"各模块运作流程"纵向流程图、"四级计划"月→周→日→小时流程图；保留全部真实数据展示与交互（六 KPI / 趋势 / 占比 / 热门榜 / 三表 / 推送清单三视图 / 基础规则 / 分类时间排期 / 分享管理 / 推送任务）。参考图只取展示、按钮、窗口、表格列与排版，示例数字与虚构分类一律不照搬。
+- **测试与门禁**：新增 test_v210（6 项）锁定单一生产者、事件链接失效、排期消费、更新窗口读基础规则、诊断端点只读、改名硬门禁静态守卫；同步更新 4 个过时断言到新契约（test_flow 改验 Resource.share_url 真相源、test_v086/v089 改名失败改验门禁拦截、test_v203 反向锁定流程图已移除）。全量 pytest 928 passed，前端 build 通过。
+
+---
+
 ## v2.0.5 (2026-11-21)
 
 **分享中心四页按设计稿重做，全部对接真实数据（非壳）**：v2.0.4 的 tab 控制台结构已对，但四页内容与设计稿差距大，且设计稿里「连续剧/院线电影/综艺」并非 TMDB 官方分类、「热度 98.2」无真实数据源。本版按用户两项决策落地——分类口径改用 TMDB 官方 genre 全集（27 项），无源数据一律改真实数据榜，不伪造校验态。所有趋势、占比、热门榜、排期、规则、计划、任务详情均来自 `/api/sc/*` 真实聚合，`sc_category_schedules` 新表持久化。回滚 `IMAGE_TAG=v2.0.4`。

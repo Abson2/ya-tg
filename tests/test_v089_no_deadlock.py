@@ -362,6 +362,7 @@ def test_known_tid_unknown_type_queries_both(db):
 
 
 def test_rename_failure_does_not_block_post_sync_pipeline(db):
+    """v2.1.0 改名硬门禁：复制照常完成，改名失败则跳过后置入库识别推送。"""
     _rule, _media, _row = _seed(db)
     pipeline = AsyncMock(return_value={"files": 1, "identify": {"identified": 1},
                                        "queued": 1, "changes_pending": 0})
@@ -372,5 +373,6 @@ def test_rename_failure_does_not_block_post_sync_pipeline(db):
          patch("app.main._mirror_post_sync_pipeline", new=pipeline):
         out = _run(main.mirror_run(post_identify=True, db=db))
     assert out["rename"]["errors"], out
-    assert pipeline.await_count == 1
-    assert out["pipeline"]["files"] == 1
+    assert out.get("rename_gate_blocked") is True
+    assert pipeline.await_count == 0
+    assert "pipeline" not in out

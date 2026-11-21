@@ -360,7 +360,11 @@ def test_run_respects_switch_and_status_exposes_state(db):
 
 
 def test_rename_exception_never_blocks_sync_pipeline(db):
-    """改名是可选优化：整体异常不得阻断已完成的复制与后续入库 / 推送。"""
+    """v2.1.0 改名硬门禁：整体异常不阻断已完成的复制，但阻断后续入库 / 推送。
+
+    用户决策（2026-11）：改名失败即视为单轮镜像任务未完成，英文名没改对前绝不
+    先推给群 / 频道。复制照常落库；rename_gate_blocked=True 时跳过 post 管线。
+    """
     rule, media, row = _seed(db)
     with patch("app.main.mirror.sync_rule", new=AsyncMock(return_value={"media": 1})), \
          patch("app.main.mirror.backfill_target_file_ids", new=AsyncMock(return_value=0)), \
@@ -371,12 +375,15 @@ def test_rename_exception_never_blocks_sync_pipeline(db):
         out = _run(main.mirror_run(post_identify=True, db=db))
     assert out["rename_enabled"] is True
     assert out["rename"]["errors"] and "列 B 库超时" in out["rename"]["errors"][0]
-    assert out["pipeline_enabled"] is True and pipe.await_count == 1
-    assert out["pipeline"]["files"] == 3
+    # 复制已完成、管线意图开启，但改名硬门禁拦截：不进 post 管线
+    assert out["pipeline_enabled"] is True
+    assert out.get("rename_gate_blocked") is True
+    assert pipe.await_count == 0
+    assert "pipeline" not in out
 
 
 def test_scheduled_rename_exception_never_blocks_pipeline(db):
-    """定时镜像同样不能被改名异常打断（v0.8.5 的自动链路必须继续跑）。"""
+    """v2.1.0 定时镜像改名硬门禁：与手动路径同口径，改名失败跳过入库推送。"""
     rule, media, row = _seed(db, rename_files=True)
     rule.enabled = True
     rule.auto_identify = True
@@ -389,7 +396,7 @@ def test_scheduled_rename_exception_never_blocks_pipeline(db):
                new=AsyncMock(return_value={"files": 2, "identify": {"identified": 1},
                                            "queued": 1, "changes_pending": 0})) as pipe:
         _run(main._scheduled_mirror())
-    assert pipe.await_count == 1
+    assert pipe.await_count == 0
 
 
 def test_version_and_ui_contract():

@@ -86,15 +86,15 @@ def test_scan_to_share_to_push_flow():
         assert queued == 2
         result = asyncio.run(process_queue())
         assert result["sent"] == 2
-        # v1.1 新链：建分享在分享中心 run_cycle 完成（process_queue 内部已驱动一轮），
-        # publisher 的 shares_created 只统计旧链兜底路径，新链下可为 0。验证真相源即可。
-        from app.models import ShareTask, ShareRecord
+        # v2.1.0 单一分流层：publisher 在 v2 开启时只驱动 v2 分流层，旧链 run_cycle
+        # 不再并行写 ShareRecord（双推已切断）。分享真相源是 Resource.share_url ——
+        # 队列消费时 ensure_share 真实调用光鸭建链并回写，验证每条资源都有分享链接。
         db2 = SessionLocal()
         try:
-            assert db2.scalar(select(func.count(ShareTask.id))) == 2
-            assert db2.scalar(select(func.count(ShareRecord.id))) == 2
-            assert all((t.share_url or "").startswith("https://share.test/")
-                       for t in db2.scalars(select(ShareTask)).all())
+            rows = db2.scalars(select(Resource)).all()
+            assert len(rows) == 2
+            assert all((r.share_url or "").startswith("https://share.test/") for r in rows), \
+                [r.share_url for r in rows]
         finally:
             db2.close()
 

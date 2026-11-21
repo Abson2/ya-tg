@@ -267,8 +267,18 @@ def sync_library_versions(db: Session) -> dict[str, int]:
             "works": len(grouped)}
 
 
-def merge_update_windows(db: Session, window_seconds: int = 600) -> dict[str, int]:
-    """把 10 分钟内同一作品的资源事件合并为一个更新窗口。"""
+def merge_update_windows(db: Session, window_seconds: int = 0) -> dict[str, int]:
+    """把 N 分钟内同一作品的资源事件合并为一个更新窗口。
+
+    v2.1.0：窗口秒数真实消费基础规则 sc_update_detect_minutes（默认 10 分钟），
+    此前该键只落库不生效。显式传 window_seconds>0 时以传值为准（测试/内部调用）。
+    """
+    if window_seconds <= 0:
+        try:
+            detect_min = int(runtime_config.get(db, "sc_update_detect_minutes") or 10)
+        except (TypeError, ValueError):
+            detect_min = 10
+        window_seconds = max(1, detect_min) * 60
     now = utcnow()
     events = list(db.scalars(
         select(ResourceEvent).where(ResourceEvent.consumed_at.is_(None)).order_by(ResourceEvent.id)
@@ -279,6 +289,29 @@ def merge_update_windows(db: Session, window_seconds: int = 600) -> dict[str, in
         if not work_key:
             ev.consumed_at = now
             continue
+        # v2.1.0 分流层收敛：B 库删除/移出事件在 v2 模式下也要触发链接失效联动。
+        # 旧链 consume_resource_events 被切断后，removed/deleted 只能在这里处理，
+        # 否则「B库删→链接失效」断链。share_link 是纯本地元数据状态机、无网络无队列，
+        # 复用它不违反「v2 不读旧 ShareTask/ShareRecord」红线——ShareRecord 是分享链接
+        # 生命周期表，不是旧推送任务表。异常吞掉不阻断窗口合并。
+        if ev.type in ("removed", "deleted"):
+            try:
+                from . import share_link as _sl
+                r1 = _sl.mark_suspicious(db, work_key,
+                                         reason=f"{ev.type}:resource_removed_event")
+                r2 = _sl.confirm_inactive_if_due(db, work_key)
+                if r2.get("changed"):
+                    try:
+                        from . import share_center as _sc
+                        _sc.retire_share_record(db, work_key,
+                                                reason="link_inactive_confirmed")
+                    except Exception:
+                        pass
+                    ev.consumed_at = now
+                    merged += 1
+                    continue
+            except Exception:
+                pass
         window = db.scalar(
             select(SCUpdateWindow).where(SCUpdateWindow.work_key == work_key,
                                          SCUpdateWindow.status == "open")
@@ -334,6 +367,68 @@ def _current_hour_allowed(db: Session, version: SCSharePlanVersion) -> bool:
     return _current_hour_window(db, version) is not None
 
 
+def _category_today_count(db: Session, category_key: str) -> int:
+    """某分类当日已创建任务数（分类排期 daily_limit 用）。上海自然日。"""
+    now_sh = datetime.now(shanghai_tz())
+    day_start = datetime(now_sh.year, now_sh.month, now_sh.day,
+                         tzinfo=shanghai_tz()).astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    return int(db.scalar(
+        select(func.count(SCPublishTask.id))
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPushListItem.category_key == category_key,
+               SCPublishTask.created_at >= day_start,
+               SCPublishTask.created_at < day_end)
+    ) or 0)
+
+
+def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
+    """周期计划日/周/月配额与休止窗口门禁（v2.1.0 真实消费，此前只落库）。
+
+    统计口径：当日/周/月已提交的任务数（submitted_at 或 created_at 落库时间），
+    0 = 不限。休止窗口命中时直接拦截（周末/月末指定小时后停普通排期），
+    quiet 已在调用方处理。返回 (是否拦截, 原因)。
+    """
+    now_sh = datetime.now(shanghai_tz())
+    # 周度休止：如「周六 20:00 后暂停普通排期」
+    if cycle.get("week_rest_enabled"):
+        rest_day = int(cycle.get("week_rest_day") or 6)  # 0=周一 ... 6=周日
+        rest_hour = int(cycle.get("week_rest_hour") or 20)
+        if now_sh.weekday() == rest_day and now_sh.hour >= rest_hour:
+            return True, "weekly_rest"
+    # 月度休止
+    if cycle.get("month_rest_enabled"):
+        month_end = (now_sh + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        if now_sh.date() == month_end.date():
+            return True, "monthly_rest"
+
+    def period_start(dt: datetime, kind: str) -> datetime:
+        if kind == "day":
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        if kind == "week":
+            return (dt - timedelta(days=dt.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    checks = (("day_max", "day"), ("week_max", "week"), ("month_max", "month"))
+    for key, kind in checks:
+        cap = int(cycle.get(key) or 0)
+        if cap <= 0:
+            continue
+        start = period_start(now_sh, kind).astimezone(timezone.utc)
+        if kind == "day":
+            end = start + timedelta(days=1)
+        elif kind == "week":
+            end = start + timedelta(days=7)
+        else:
+            end = (period_start(now_sh, kind) + timedelta(days=32)).replace(day=1).astimezone(timezone.utc)
+        used = db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.created_at >= start, SCPublishTask.created_at < end)) or 0
+        if int(used) >= cap:
+            return True, f"{kind}_quota"
+    return False, ""
+
+
 def plan_engine(db: Session) -> dict[str, int]:
     """按活动计划版本与分类游标生成推送清单、清单项和发布任务。"""
     version = _active_version(db)
@@ -349,6 +444,10 @@ def plan_engine(db: Session) -> dict[str, int]:
         in_quiet = (q_start <= sh_hour < q_end) if q_end > q_start else (sh_hour >= q_start or sh_hour < q_end)
         if in_quiet:
             return {"lists": 0, "items": 0, "tasks": 0, "quiet": 1}
+    # v2.1.0 分流层全量消费：周期计划日/周/月配额与休止窗口真实拦截（此前只落库）。
+    quota_gate, quota_reason = _cycle_quota_gate(db, cycle)
+    if quota_gate:
+        return {"lists": 0, "items": 0, "tasks": 0, "quota": quota_reason}
     category_limit = max(1, int(cfg.get("category_limit") or 20))
     work_limit = max(1, int(cfg.get("work_limit") or 50))
     # v2.0.5：周期计划的小时上限真实夹逼单轮任务数（0=不限）
@@ -369,6 +468,34 @@ def plan_engine(db: Session) -> dict[str, int]:
         scoped = [c for c in categories if c.category_key == hour_window.category_key]
         if scoped:
             categories = scoped
+    # v2.1.0：SCCategorySchedule 分类-时间排期真实生效——每分类按自己的窗口时段与
+    # hourly/daily 上限过滤。此前整表只落库不被消费，前端配的排期不产生调度效果。
+    # 某分类未启用排期行/配了窗口但当前小时不在窗口内 → 跳过该分类；上限 0 = 不限。
+    sh_hour = datetime.now(shanghai_tz()).hour
+    sched_map = {s.category_key: s for s in db.scalars(
+        select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version.id,
+                                         SCCategorySchedule.enabled.is_(True))).all()}
+    def _sched_allows(key: str, per_category_count: int) -> bool:
+        s = sched_map.get(key)
+        if not s:
+            return True  # 未配置排期行的分类保持原轮转行为（兼容存量）
+        ws, we = int(s.window_start or 0), int(s.window_end or 0)
+        if we > ws:
+            in_win = ws <= sh_hour < we
+        elif we < ws:
+            in_win = sh_hour >= ws or sh_hour < we  # 跨午夜
+        else:
+            in_win = True
+        if not in_win:
+            return False
+        hl, dl = int(s.hourly_limit or 0), int(s.daily_limit or 0)
+        if hl and per_category_count >= hl:
+            return False
+        if dl and _category_today_count(db, key) >= dl:
+            return False
+        return True
+
+    category_task_counts: dict[str, int] = {}
 
     list_key = f"plan:{version.id}:{uuid.uuid4().hex[:12]}"
     push_list = SCPushList(list_key=list_key, name=f"计划版本 {version.version_no}",
@@ -379,6 +506,9 @@ def plan_engine(db: Session) -> dict[str, int]:
     item_count = 0
     task_count = 0
     for category in categories:
+        # v2.1.0：分类排期限流——当前小时不在该分类排期窗口、或已达每小时上限则跳过。
+        if not _sched_allows(category.category_key, category_task_counts.get(category.category_key, 0)):
+            continue
         cursor = db.scalar(
             select(SCCategoryCursor).where(SCCategoryCursor.plan_version_id == version.id,
                                                   SCCategoryCursor.category_key == category.category_key)
@@ -416,6 +546,8 @@ def plan_engine(db: Session) -> dict[str, int]:
                 )
                 db.add(task)
                 task_count += 1
+                category_task_counts[category.category_key] = category_task_counts.get(
+                    category.category_key, 0) + 1
             cursor.last_library_version_id = lv.id
             cursor.last_work_key = lv.work_key
             cursor.last_success_at = utcnow()
@@ -439,8 +571,27 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         .where(or_(SCPublishTask.next_retry_at.is_(None), SCPublishTask.next_retry_at <= now))
         .order_by(SCPublishTask.priority.desc(), SCPublishTask.id).limit(limit)
     ).all())
-    stats = {"built": 0, "submitted": 0, "failed": 0, "paused": 0}
+    stats = {"built": 0, "submitted": 0, "failed": 0, "paused": 0, "throttled": 0}
+    # v2.1.0：基础规则「上新即时推送每小时上限」真实消费。统计本自然小时已提交
+    # (status=submitted 及以上) 的任务数，达上限则本轮不再提交新任务，留到下一小时。
+    # 0/非法 = 不限；quick_publish_enabled=false 时也跳过该限流（保持旧行为）。
+    hourly_cap = 0
+    try:
+        if str(runtime_config.get(db, "sc_quick_publish_enabled") or "true").lower() in (
+                "1", "true", "yes", "on"):
+            hourly_cap = max(0, int(runtime_config.get(db, "sc_quick_publish_hourly_limit") or 0))
+    except (TypeError, ValueError):
+        hourly_cap = 0
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    submitted_this_hour = 0
+    if hourly_cap:
+        submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
+            SCPublishTask.scheduled_at >= hour_start)) or 0)
     for task in tasks:
+        if hourly_cap and submitted_this_hour >= hourly_cap:
+            stats["throttled"] += 1
+            break
         item = db.get(SCPushListItem, task.list_item_id)
         lv = db.get(SCLibraryVersion, item.library_version_id) if item else None
         if not item or not lv:
@@ -519,6 +670,7 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
                                   response_json=_jdump({"queue_channel_id": channel.id})))
         db.commit()
         stats["submitted"] += 1
+        submitted_this_hour += 1
     return stats
 
 
@@ -1586,3 +1738,64 @@ def _model_dict(row) -> dict[str, Any]:
             value = value.isoformat()
         data[column.name] = value
     return data
+
+
+@router.get("/diagnostics")
+def api_diagnostics(db: Session = Depends(get_db)):
+    """只读链路诊断（v2.1.0）：暴露四个板块的关键开关、生效链路与段间状态。
+
+    只读，不改任何配置、不触发任何周期。用于核实「资源库→分享中心→分发中心」
+    当前到底走哪条链、规则是否生效、各段有无积压。前端「分享总览」可显示。
+    """
+    from . import share_center as _sc
+
+    def _on(val: Any) -> bool:
+        return str(val or "false").lower() in ("1", "true", "yes", "on")
+
+    v2_on = _on(is_enabled(db))
+    old_on = _on(_sc.is_enabled(db)) and not v2_on
+    active_chain = "v2" if v2_on else ("legacy" if old_on else "off")
+    version = _active_version(db)
+    cycle = ({**CYCLE_PLAN_DEFAULTS, **((_jload(version.config_json, {}).get("cycle_plan") or {}) if version else {})})
+    task_status: dict[str, int] = {}
+    for (st,) in db.execute(select(SCPublishTask.status).group_by(SCPublishTask.status)).all():
+        task_status[st] = int(db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.status == st)) or 0)
+    pending_events = int(db.scalar(select(func.count(ResourceEvent.id)).where(
+        ResourceEvent.consumed_at.is_(None))) or 0)
+    queue_pending = int(db.scalar(select(func.count(QueueItem.id)).where(
+        QueueItem.status.in_(("pending", "retry")))) or 0)
+    link_counts: dict[str, int] = {}
+    for st, n in db.execute(select(SCSharePlanVersion.status, func.count(SCSharePlanVersion.id))
+                            .group_by(SCSharePlanVersion.status)).all():
+        link_counts[st] = int(n or 0)
+    return {
+        "active_chain": active_chain,
+        "switches": {
+            "share_center_v2_enabled": v2_on,
+            "share_center_legacy_enabled": old_on,
+            "publish_paused": _on(runtime_config.get(db, "publish_paused")),
+            "resource_decoupled_enabled": _on(runtime_config.get(db, "resource_decoupled_enabled")),
+        },
+        "rules_in_effect": {
+            "quiet_enabled": bool(cycle.get("quiet_enabled")),
+            "hour_max": int(cycle.get("hour_max") or 0),
+            "day_max": int(cycle.get("day_max") or 0),
+            "week_max": int(cycle.get("week_max") or 0),
+            "month_max": int(cycle.get("month_max") or 0),
+            "category_schedules_enabled": int(db.scalar(select(func.count(SCCategorySchedule.id)).where(
+                SCCategorySchedule.enabled.is_(True))) or 0),
+            "quick_publish_enabled": _on(runtime_config.get(db, "sc_quick_publish_enabled")),
+            "quick_publish_hourly_limit": runtime_config.get(db, "sc_quick_publish_hourly_limit"),
+            "update_detect_minutes": runtime_config.get(db, "sc_update_detect_minutes"),
+        },
+        "segments": {
+            "resource_events_pending": pending_events,
+            "sc_publish_tasks_by_status": task_status,
+            "push_queue_pending": queue_pending,
+            "plan_versions_by_status": link_counts,
+            "active_version_id": int(version.id) if version else 0,
+        },
+        "note": "链路判定：v2_on 时 publisher 只驱动 v2 分流层（旧链双推已切断）；"
+                "resource_decoupled_enabled 控制资源识别后走事件新链还是旧链入队。",
+    }

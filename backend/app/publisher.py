@@ -387,6 +387,27 @@ def _work_group_key(res: Resource) -> str:
     return f"file:{res.id}"
 
 
+def _run_share_center_v2_in_thread(limit: int = 20) -> None:
+    """v2.1.0 分流层唯一生产者：在独立线程跑 v2 的 sync→plan→dispatch 一轮。
+
+    v2 模式下的资源事件消费（含 removed/deleted 链接失效联动）由 v2.run_cycle 内的
+    merge_update_windows 承担；本 helper 与 _run_share_center_in_thread 互斥调用，
+    杜绝新旧两条链同时向 push_queue 写造成 push_reason/share_task_id 互相覆盖。
+    同样走 to_thread + 线程内独立 Session（第六次死锁同源防护）。
+    """
+    from . import share_center_v2 as _sc2
+    with SessionLocal() as sdb:
+        try:
+            _sc2.ensure_defaults(sdb)
+            asyncio.run(_sc2.run_cycle(sdb, limit=max(limit, 20)))
+        except Exception as exc:
+            try:
+                sdb.rollback()
+            except Exception:
+                pass
+            logger.warning("[publisher] v2 分享中心周期异常（线程内已隔离）", exc_info=True)
+
+
 def _run_share_center_in_thread(limit: int = 20) -> None:
     """P0 第六次死锁根治：分享中心的事件消费 + run_cycle 整体挪出事件循环线程。
 
@@ -443,17 +464,26 @@ async def _process_queue_impl(limit: int = 20) -> dict:
         #      直接入队的项）照常处理走 ensure_share 旧路径，避免漏发——这些项不属分享中心，
         #      不受交接确认约束。数据已清空的新部署下几乎全是①，③只是稳健兜底。
         from . import share_center as _sc
+        from . import share_center_v2 as _sc2
         sc_enabled = _sc.is_enabled(db)
-        if sc_enabled:
-            # 先消费资源事件 + 自己驱动一轮建分享/提交，不依赖独立 5s job 的时序：
+        v2_enabled = _sc2.is_enabled(db)
+        # v2.1.0：分流层收敛为单一生产者。v2 开启时只驱动 v2 cycle——旧链的
+        # consume_resource_events + run_cycle 绝不并行，否则两条链同时写 push_queue
+        # 会用 (resource_id,channel_id) 唯一键复用同一行、互相覆盖 push_reason/
+        # share_task_id/event_id，造成状态错乱与重复建分享。v2 关闭时才走旧链。
+        active_sc = "v2" if v2_enabled else ("legacy" if sc_enabled else "off")
+        if active_sc != "off":
+            # 先驱动本轮分流周期，不依赖独立 5s job 的时序：
             # 「立即处理队列」/手动 queue/run 必须也能把 planned 任务推到 submitted，
             # 否则入队项 status_ext 为空会一直卡住不被本函数消费（真机漏发风险）。
             try:
                 # P0 第六次死锁根治：事件消费 + run_cycle 含同步 commit，必须挪出
                 # 事件循环线程（线程内自建 Session），否则撞写锁会冻结全站并让
-                # _queue_lock 永不释放（队列停滞但容器 healthy）。详见
-                # _run_share_center_in_thread 注释。
-                await asyncio.to_thread(_run_share_center_in_thread, max(limit, 20))
+                # _queue_lock 永不释放（队列停滞但容器 healthy）。
+                if v2_enabled:
+                    await asyncio.to_thread(_run_share_center_v2_in_thread, max(limit, 20))
+                else:
+                    await asyncio.to_thread(_run_share_center_in_thread, max(limit, 20))
             except Exception as exc:
                 try:
                     db.rollback()

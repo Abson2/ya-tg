@@ -2230,7 +2230,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.0.5 · Asia/Shanghai</span>
+          <span>v2.1.0 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3166,13 +3166,6 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <!-- 子页：发布总览（仪表盘，全部来自 /sc/overview 真实数据） -->
               <template v-if="scSubNav === '发布总览'">
                 <div class="sc-dash">
-                  <!-- 顶部流程条：资源→TMDB识别→生成清单→TG推送（对应设计稿，节点为真实模块） -->
-                  <div class="sc-pipeline">
-                    <span class="sc-pipe-node">资源库映射 · TMDB 识别</span><span class="sc-pipe-arrow">→</span>
-                    <span class="sc-pipe-node active">TMDB 识别 · 生成推送清单</span><span class="sc-pipe-arrow">→</span>
-                    <span class="sc-pipe-node">TG 频道 / 群组推送</span>
-                  </div>
-
                   <!-- 六 KPI 卡：全部来自 /sc/overview kpi 真实聚合；点击跳转筛选 -->
                   <div class="sc-kpi-grid sc-kpi-six">
                     <button class="sc-kpi sc-kpi-blue" @click="scFilterQueue('pending')">
@@ -3320,24 +3313,6 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <p>已完成首次分享与推送，保留资源与分享关联</p>
                         <button class="sc-link-btn" @click="scFilterQueue('', 'active')">查看 ›</button>
                       </div>
-                    </div>
-                  </div>
-
-                  <!-- 各模块运作流程（架构说明，非示例数字；节点对应真实 sc_* 模块） -->
-                  <div class="sc-card">
-                    <div class="sc-card-head"><span class="sc-ico">⟿</span><div><h3>各模块运作流程</h3><p>资源事实 → 清单 → 计划 → 调度引擎 → 分享/推送 → 结果回写，全链路由后端驱动</p></div></div>
-                    <div class="sc-flow">
-                      <div class="sc-flow-node sc-flow-a"><b>资源库 + A/B 映射 + TMDB 识别</b><small>真实资源 · 目录映射 · TMDB 元数据 · 资源变化</small></div>
-                      <div class="sc-flow-arrow">↓</div>
-                      <div class="sc-flow-node sc-flow-b"><b>统一推送清单</b><em>唯一资源归属</em><small>分类 · 排序 · 排期 · 推送状态 · 版本 · 轮转位置</small></div>
-                      <div class="sc-flow-arrow">↓</div>
-                      <div class="sc-flow-pair"><div class="sc-flow-node"><b>自定义时间计划</b><small>小时 / 每日 / 每周 / 每月</small></div><div class="sc-flow-node"><b>OpenAI 智能调度</b><small>每周轻量分析 · 优化顺序（选配）</small></div></div>
-                      <div class="sc-flow-arrow">↓</div>
-                      <div class="sc-flow-node sc-flow-c"><b>统一调度引擎</b><small>检查分类 · 时段 · 配额 · 重复 · 资源变化 · 分享状态</small></div>
-                      <div class="sc-flow-arrow">↓</div>
-                      <div class="sc-flow-pair"><div class="sc-flow-node"><b>首次分享</b><small>整部电影 / 整部剧目录</small></div><div class="sc-flow-node"><b>更新推送</b><small>原链接复用 · 变化触发</small></div></div>
-                      <div class="sc-flow-arrow">↓</div>
-                      <div class="sc-flow-node"><b>Telegram 推送及结果回写</b><small>记录成功 · 失败 · 版本 · 下次轮转位置</small></div>
                     </div>
                   </div>
 
@@ -3492,20 +3467,6 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-table-column prop="status" label="状态" width="88"/>
               </el-table>
               <div v-if="!scCursors.length" class="empty">暂无游标</div>
-            </div>
-
-            <!-- 模块：四级计划流程 -->
-            <div class="sc-card" v-show="scSubNav === '发布规则'">
-              <div class="sc-card-head"><span class="sc-ico">▦</span><div><h3>四级计划</h3><p>月控总量 → 周控配额与顺序 → 日控当天任务 → 小时控实际执行；统一引擎，不拆多套队列</p></div></div>
-              <div class="sc-plan-flow">
-                <div class="sc-plan-step"><b>月度计划 · 控制总释放量</b><small>本月计划发布多少部、各类占比、存量释放</small></div>
-                <div class="sc-plan-arrow">↓</div>
-                <div class="sc-plan-step"><b>周度计划 · 控制分类配额和顺序</b><small>每周调整分类权重、每日目标与 AI 推荐顺序</small></div>
-                <div class="sc-plan-arrow">↓</div>
-                <div class="sc-plan-step"><b>每日计划 · 控制当天发布任务</b><small>从推送清单确定当天各类可领取数量</small></div>
-                <div class="sc-plan-arrow">↓</div>
-                <div class="sc-plan-step"><b>小时计划 · 控制实际执行</b><small>08:00–24:00 按小时选分类、间隔、数量、窗口</small></div>
-              </div>
             </div>
 
             <!-- 设计稿发布规则：基础规则 / 分类时间排期 两个子 tab -->
@@ -4203,21 +4164,6 @@ button{font-family:inherit}
 .sc-pl-view span{font-size:13px;font-weight:750}
 .sc-pl-view em{font-style:normal;font-size:10px;background:rgba(255,255,255,.75);border-radius:8px;padding:3px 8px;color:var(--yg-primary)}
 .sc-pl-card p{font-size:10px;color:var(--yg-muted);line-height:1.6;margin:0 0 8px}
-/* 运作流程 */
-.sc-flow{display:flex;flex-direction:column;align-items:center;gap:2px}
-.sc-flow-node{width:100%;max-width:640px;text-align:center;border:1px solid var(--yg-line);border-radius:12px;padding:14px 18px;background:var(--yg-surface)}
-.sc-flow-node b{display:block;font-size:13px;margin-bottom:5px}
-.sc-flow-node small{display:block;color:var(--yg-muted);font-size:11px}
-.sc-flow-node em{display:inline-block;font-style:normal;font-size:10px;background:#e7f8f0;color:#159a6b;border-radius:8px;padding:2px 8px;margin-bottom:6px}
-.sc-flow-a{background:#f1f0fd;border-color:#e4e1fb}.sc-flow-b{background:#eef8f2;border-color:#dcefe4}.sc-flow-c{background:#f1f0fd;border-color:#e4e1fb}
-.sc-flow-pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;width:100%}
-.sc-flow-arrow{color:var(--yg-primary);font-size:16px;line-height:1.4;font-weight:700}
-/* 四级计划 */
-.sc-plan-flow{display:flex;flex-direction:column;align-items:center;gap:2px}
-.sc-plan-step{width:100%;border:1px solid var(--yg-line);border-radius:12px;padding:12px 16px;background:var(--yg-bg)}
-.sc-plan-step b{display:block;font-size:13px;margin-bottom:4px}
-.sc-plan-step small{display:block;color:var(--yg-muted);font-size:11px}
-.sc-plan-arrow{color:var(--yg-primary);font-size:15px;line-height:1.3;font-weight:700}
 /* 小时分类排期 */
 .sc-hour-list{display:flex;flex-direction:column;gap:7px}
 .sc-hour-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--yg-line);border-radius:10px;background:var(--yg-bg)}
@@ -4272,10 +4218,6 @@ button{font-family:inherit}
 .sc-detail-kv span{display:block;color:var(--yg-muted);font-size:10px;margin-bottom:5px}
 .sc-detail-kv b{display:block;font-size:12px;font-weight:700}
 /* v2.0.5 设计稿：发布总览 */
-.sc-pipeline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
-.sc-pipe-node{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:20px;padding:7px 15px;font-size:12px;color:var(--yg-muted)}
-.sc-pipe-node.active{background:var(--yg-primary);color:#fff;border-color:var(--yg-primary)}
-.sc-pipe-arrow{color:var(--yg-primary);font-weight:700}
 .sc-kpi-six{grid-template-columns:repeat(6,minmax(0,1fr))}
 .sc-kpi-six .sc-kpi{padding:14px;gap:9px}
 .sc-kpi-six .sc-kpi-ico{width:38px;height:38px;font-size:17px}
@@ -4327,7 +4269,7 @@ button{font-family:inherit}
 .sc-share-aside .sc-card,.sc-task-aside .sc-card{position:sticky;top:12px}
 .el-table .sc-row-active{background:var(--yg-primary-2)!important;opacity:.6}
 @media(max-width:1200px){.sc-kpi-grid{grid-template-columns:repeat(2,1fr)}.sc-dash-two{grid-template-columns:1fr}.sc-kpi-six{grid-template-columns:repeat(3,1fr)}.sc-dash-three{grid-template-columns:1fr}.sc-share-layout,.sc-task-layout{grid-template-columns:1fr}}
-@media(max-width:900px){.sc-tab{padding:10px 12px;font-size:12px}.sc-pushlist-grid{grid-template-columns:1fr}.sc-flow-pair{grid-template-columns:1fr}.sc-sched-grid{grid-template-columns:1fr}.sc-mini-counts .sc-stat-row{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:900px){.sc-tab{padding:10px 12px;font-size:12px}.sc-pushlist-grid{grid-template-columns:1fr}.sc-sched-grid{grid-template-columns:1fr}.sc-mini-counts .sc-stat-row{grid-template-columns:repeat(3,1fr)}}
 /* 分享中心：全卡片化工作台 */
 .sc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
 .sc-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;box-shadow:var(--yg-shadow);min-width:0;overflow:hidden;transition:.22s}

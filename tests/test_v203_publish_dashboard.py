@@ -99,12 +99,16 @@ def test_frontend_dashboard_interactions_use_real_endpoints():
         assert token in app, token
     assert "系统设置" not in app, "系统设置空 tab 应移除"
     assert "sc-sidebar" not in app, "左侧子导航应改为顶部 tab"
-    # 推送清单三视图 + 运作流程 + 四级计划 + 小时分类排期
+    # 推送清单三视图 + 小时分类排期（真实数据/真实交互，保留）
     for token in ("sc-pushlist-grid", "待首次分享", "更新待推送", "已完成首次推送",
-                  "sc-flow", "统一推送清单", "统一调度引擎", "Telegram 推送及结果回写",
-                  "sc-plan-flow", "月度计划", "周度计划", "每日计划", "小时计划",
                   "小时分类排期", "sc-hour-row", "scSaveAllHourRows", "scSaveHourRow"):
         assert token in app, token
+    # v2.1.0 用户明确要求：严禁把「流程图」照搬成页面组件。
+    # 设计稿顶部的资源→识别→TG 流程示意、各模块运作流程、四级计划流程均不得做成 UI 节点。
+    for token in ("sc-pipeline", "sc-pipe-node", "sc-flow", "sc-flow-node",
+                  "sc-plan-flow", "各模块运作流程", "统一推送清单", "统一调度引擎",
+                  "Telegram 推送及结果回写", "月度计划 · 控制总释放量"):
+        assert token not in app, token
     # KPI 点击筛选 + 任务详情抽屉 + 批量 + 各模块保存均有真实端点
     for token in ("scFilterQueue", "scOpenTaskDetail", "scBatchTask",
                   "scSaveCategory", "scReassignCategories", "scCreatePlan",

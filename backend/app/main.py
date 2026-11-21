@@ -695,7 +695,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.0.5", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -703,7 +703,7 @@ app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.0.5", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.0", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1214,9 +1214,18 @@ async def _scheduled_mirror() -> None:
                     # v0.8.6：改名必须赶在「扫描入库」之前，否则 Resource 记的是旧中文名。
                     # 只改 B 库单集/单电影文件名，A 库与 B 库目录名都不动。
                     # v0.8.9：TMDB 查不到英文名会快速直译兜底，不阻断下面的入库/推送。
+                    # v2.1.0 改名硬门禁（与手动 mirror_run 同一口径）：改名任一文件失败
+                    # 或整体异常 → 本轮不进入库识别推送，杜绝英文名没改对就先推群/频道。
+                    rename_failed = False
                     if bool(getattr(r, "rename_files", True)):
-                        await _safe_rename(db, r)
-                    if bool(getattr(r, "auto_identify", True)):
+                        rn = await _safe_rename(db, r)
+                        rename_failed = bool((rn or {}).get("errors")) or int((rn or {}).get("failed") or 0) > 0
+                        if rename_failed:
+                            logger.warning("[mirror] 定时镜像改名硬门禁：改名失败，跳过入库识别推送")
+                            r.last_message = (str(r.last_message or "")
+                                              + " · 改名硬门禁拦截（定时）：改名失败，已跳过入库识别推送")
+                            db.commit()
+                    if bool(getattr(r, "auto_identify", True)) and not rename_failed:
                         p = await _mirror_post_sync_pipeline(db, r)
                         # v0.9.10：定时同步也写本轮任务快照（复制量定时路径不细究，记 0）
                         ident = p.get("identify") or {}
@@ -1440,7 +1449,19 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
                 r.last_message = ((r.last_message or "")
                                   + " · 首个改名错误：" + str(rename_errors[0])[:300])
         stats["pipeline_enabled"] = do_pipeline
-        if do_pipeline:
+        # v2.1.0 改名硬门禁（用户决策：改名失败阻断后续入库识别推送）：
+        # 改名任一文件失败或整体异常 → 本轮不进后置管线，等人工处理/下一轮重试，
+        # 杜绝「英文名没改对就先推给群/频道」。仅 rename_files 开启时才校验。
+        rename_failed = False
+        if stats["rename_enabled"]:
+            rn = stats.get("rename") or {}
+            rename_failed = bool(rn.get("errors")) or int(rn.get("failed") or 0) > 0
+            stats["rename_gate_blocked"] = rename_failed
+        if rename_failed:
+            logger.warning("[mirror] 改名硬门禁：本轮改名存在失败，跳过入库识别推送")
+            r.last_message = ((r.last_message or "")
+                              + " · 改名硬门禁拦截：改名失败，已跳过入库识别推送")
+        if do_pipeline and not rename_failed:
             # 改名完成 → 写「入库识别中」阶段帧
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="identify", running=True,
                                      copied=int(stats.get("done", 0) or 0),
