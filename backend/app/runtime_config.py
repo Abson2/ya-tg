@@ -123,6 +123,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。
     # 开启前须确保新链全量测试通过，且 share_center_enabled=true。
     "resource_decoupled_enabled": ("resource_decoupled_enabled", "false"),
+    # 阶段五（链接校验与清理，用户决策1）：有效性=本地元数据+删除事件驱动，非光鸭实时状态。
+    # link_inactive_confirm_count：连续失效信号达此次数才可能判 inactive（默认2）；
+    # link_inactive_min_minutes：两次失效信号最小间隔分钟（默认30），防抖动误判；
+    # auto_cleanup_enabled：自动清理默认关，只提供手动清理端点。
+    "link_inactive_confirm_count": ("link_inactive_confirm_count", "2"),
+    "link_inactive_min_minutes": ("link_inactive_min_minutes", "30"),
+    "auto_cleanup_enabled": ("auto_cleanup_enabled", "false"),
     # 发布配额（设计文档 §4.6）：三队列每小时/每日上限，后台可配，0=不限。
     "share_daily_limit": ("share_daily_limit", "0"),
     "push_daily_limit": ("push_daily_limit", "0"),

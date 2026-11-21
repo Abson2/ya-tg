@@ -183,6 +183,11 @@ def can_publish(db: Session, task: ShareTask) -> tuple[bool, str]:
         cur = current_share(db, task.work_key)
         if not cur or not cur.share_url or cur.share_status != "active":
             return False, "追更资源无有效原分享链接"
+        # 阶段五：失效/已清理/作废的链接不再复用（inactive/cleaned/retired），
+        # 让追更改走"重建新分享"，避免把失效链接继续推给用户。
+        from . import share_link as _sl
+        if str(cur.link_state or _sl.LINK_ACTIVE) in _sl.NON_REUSABLE_LINK_STATES:
+            return False, f"追更原链接已失效（{cur.link_state}），需重建分享"
     # 配额门禁：分队列按当日已提交数统计
     qtype = task.queue_type or "fresh"
     quota_key = {"stock": "stock_daily_quota", "fresh": "fresh_daily_quota",
@@ -689,10 +694,21 @@ def consume_resource_events(db: Session, limit: int = 100) -> dict:
              "skipped": 0, "skipped_poison": 0, "failed_once": 0}
     for ev in _ev.pending_resource_events(db, limit=limit):
         try:
-            if ev.type == _ev.RESOURCE_REMOVED:
+            if ev.type in (_ev.RESOURCE_REMOVED, _ev.RESOURCE_DELETED):
+                # 阶段五：删除事件 = 失效信号（本地元数据+事件驱动，非光鸭实时状态）。
+                # 第一次→suspicious；累计2次且间隔≥30min→inactive+归档 current_flag=0。
+                # 网络异常不进这里（只有已确认的删除事件才调），防误判。
                 try:
-                    stats["records_retired"] += retire_share_record(
-                        db, ev.work_key, reason="resource_removed_event")
+                    from . import share_link as _sl
+                    r1 = _sl.mark_suspicious(db, ev.work_key,
+                                             reason=f"{ev.type}:resource_removed_event")
+                    r2 = _sl.confirm_inactive_if_due(db, ev.work_key)
+                    if r2.get("changed"):
+                        # inactive 后归档当前记录（保留历史行，不删 B 库）
+                        stats["records_retired"] += retire_share_record(
+                            db, ev.work_key, reason="link_inactive_confirmed")
+                    if r1.get("changed") or r2.get("changed"):
+                        stats["link_marked"] = stats.get("link_marked", 0) + 1
                 except Exception:
                     pass
             elif ev.type in (_ev.RESOURCE_NEW, _ev.RESOURCE_RESTORED):

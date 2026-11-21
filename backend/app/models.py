@@ -616,6 +616,12 @@ class ShareRecord(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_reason: Mapped[str] = mapped_column(Text, default="")
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 阶段五（链接校验与清理）：有效性由本地元数据+事件驱动判定，非光鸭实时状态。
+    link_state: Mapped[str] = mapped_column(String(24), default="active", index=True)  # 8态见 share_link.py
+    verified_result: Mapped[str] = mapped_column(Text, default="")  # 最近一次判定依据（事件/人工）
+    verify_fail_count: Mapped[int] = mapped_column(Integer, default=0)  # 连续失效信号次数
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    clean_state: Mapped[str] = mapped_column(String(24), default="")  # 清理结果/方式
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     # 部分唯一索引：同一 work_key 只允许一条 current_flag=1；历史(current_flag=0)可保留多条。
     __table_args__ = (

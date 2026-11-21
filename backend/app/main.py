@@ -4296,6 +4296,47 @@ def share_records_list(current_only: bool = False, limit: int = 200,
                                                       limit=limit)}
 
 
+@app.get("/api/share/link/{work_key:path}", dependencies=ADMIN)
+def share_link_get(work_key: str, db: Session = Depends(get_db)):
+    """阶段五：只读查询某作品当前分享链接的有效性状态（本地推断，非光鸭实时）。"""
+    from . import share_link
+    return share_link.link_summary(db, work_key)
+
+
+@app.post("/api/share/link/review", dependencies=ADMIN)
+def share_link_review(payload: dict, db: Session = Depends(get_db)):
+    """阶段五：人工核验入队（manual_review），不自动改 inactive。"""
+    from . import share_link
+    wk = str((payload or {}).get("work_key") or "").strip()
+    if not wk:
+        raise HTTPException(400, "缺少 work_key")
+    r = share_link.mark_manual_review(db, wk, note=str((payload or {}).get("note") or ""))
+    db.commit()
+    add_audit(db, "share_link_review", target_type="share", target_id=wk,
+              detail=json_dumps({"work_key": wk}))
+    db.commit()
+    return {"ok": bool(r.get("changed")), **r}
+
+
+@app.post("/api/share/link/cleanup", dependencies=ADMIN)
+def share_link_cleanup(payload: dict, db: Session = Depends(get_db)):
+    """阶段五：手动清理失效链接（置 cleaned + current_flag=0 归档）。
+
+    绝不删 B 库资源、不删历史记录、不碰队列/分发；二次确认由前端保证。
+    auto_cleanup_enabled 默认关，本端点只做手动触发，不做任何自动清理。
+    """
+    from . import share_link
+    wk = str((payload or {}).get("work_key") or "").strip()
+    if not wk:
+        raise HTTPException(400, "缺少 work_key")
+    r = share_link.cleanup_link(db, wk, operator=str((payload or {}).get("operator") or "manual"))
+    db.commit()
+    add_audit(db, "share_link_cleanup", target_type="share", target_id=wk,
+              detail=json_dumps({"work_key": wk, "result": r}))
+    db.commit()
+    return {"ok": bool(r.get("changed")), **r}
+
+
 @app.get("/api/share/followups", dependencies=ADMIN)
 def share_followups(db: Session = Depends(get_db)):
     """追更管理（§5.4/§5.7）：按作品聚合「已推 N 次 / 更新 M 次」。"""

@@ -111,6 +111,12 @@ _COLUMNS = {
         "cancelled_at": "DATETIME",
         "failure_reason": "TEXT DEFAULT ''",
         "last_verified_at": "DATETIME",
+        # 阶段五：链接有效性判定与清理（幂等增列）
+        "link_state": "TEXT DEFAULT 'active'",
+        "verified_result": "TEXT DEFAULT ''",
+        "verify_fail_count": "INTEGER DEFAULT 0",
+        "cleaned_at": "DATETIME",
+        "clean_state": "TEXT DEFAULT ''",
         "created_at": "DATETIME",
     },
     # 四模块重构 v1.1：模块间事件表（表本身由 create_all 新建，这里给极老库补列兜底）
