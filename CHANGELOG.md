@@ -8,6 +8,24 @@
 
 ---
 
+## v1.5.0 (2026-11-21)
+
+**资源库 / 分享中心重构阶段二~六全落地 + 镜像同步 1.1 + 三处死锁根治**：按《Ya-TG 资源库优化与分享中心重新设计开发建议书》推进，遵循「资源库唯一管理入口、分享中心唯一发布入口、分发与互动中心唯一发送入口、B 库为实际存在状态最终依据」。全程不改发送核心（`_send_telegram` / `_build_message` / `process_queue`），默认全部保守值（自动发布 / 自动清理 / 资源解耦均关）。版本号四处一致升至 1.5.0；全量 pytest **878 passed**，前端 build 通过。回滚 `IMAGE_TAG=v1.4.4`。
+
+- **阶段二 资源库解耦（切决策不切链路）**：识别入口只发资源事件（payload 携带 `channel_targets`），推送决策交分享中心新链；灰度开关 `resource_decoupled_enabled` 默认 false，旧链保留可回滚。`Resource.share_*` 收敛为只读缓存，A 库原名回溯 + 识别缓存。
+- **阶段三 事件体系补齐**：镜像事件不转资源事件（id 无可靠映射，强转=虚构），只归档；`emit_resource_event` 加 fingerprint 扩幂等键，补 5 类事件常量。
+- **阶段四 分享中心生命周期**：`claim_tasks` 改条件 UPDATE 真原子 + worker 回查（多进程互斥）；建分享解析收敛 `create_share_parsed`；跨季 S01/S02 一剧一链接语义由测试固化，9 态任务状态机保持。
+- **阶段五 链接校验与清理（决策 1）**：有效性权威 = 本地元数据 + B 库删除事件驱动，**不虚构光鸭分享状态接口**。新增 `share_link.py` 8 态状态机（unknown/active/suspicious/inactive/retired/replaced/cleaned/manual_review）；删除事件 → suspicious，`verify_fail_count>=2` 且两次间隔 ≥30min → inactive；清理只置 cleaned + `current_flag=0` 归档，绝不删 B 库 / 历史 / 队列。`can_publish` 接 link_state 门禁，失效链接不再复用。ShareRecord 幂等增列 `link_state/verified_result/verify_fail_count/cleaned_at/clean_state`。默认 `auto_cleanup_enabled=false`。
+- **阶段六 分享中心前端 5 页全重做**：发布总览 / 发布队列 / 分享管理 / 推送任务 / 发布规则，`el-tabs` 内层切换、nav key 保留兼容。新增真实急停 `publish_paused`（默认关，只拦新一轮建分享、不撤销在途、不碰发送核心）、`GET /api/share/publish-overview`（配额进度/待处理事件/链接分布）、`GET/POST /api/share/rules`（保守默认值白名单热更新）；分享管理列表补 link_state，核验 / 清理按钮直连阶段五真实端点（清理二次确认）；资源卡加「已推」「链接{state}」角标（本地推断，不虚构光鸭状态）。所有按钮走真实后端，无空壳。
+- **镜像同步 1.1 查漏补缺**：单轮开始跑 `reconcile_mappings_prepass()` 做 A 树 / B 树 / 映射清单三方对比。a 单文件变化只统计补复制不计部数；b 整部在 B 缺失只登记 `reprocess_keys` 重排进本批、不预重置（补复制与计数交既有主循环，避免破坏 name_mismatch 保护）；c A 库已删按镜像模式处理；d 无变化轮转。新增 `mirror_prepass_enabled`(true) / `mirror_prepass_max_media`(50)。
+- **镜像模式（默认全镜像）**：C 类 A 已删由 `mirror_mode` 决定（旧键 `mirror_delete_b_on_a_missing` 移除）。`full` 全镜像 = 预扫描自动删 B 库对应文件 + 清清单；`half` 半镜像 = B 文件与映射清单都保留。**边界始终是 A 库只读**。前端镜像设置页下拉，经 `/api/mirror/config` 读写。
+- **第六次死锁根治（P0）**：容器 healthy 但 `queue_worker` 的 `process_queue` 卡死、群聊队列积压（唐伯虎 q46 未推）。真凶：`publisher._process_queue_impl` 主协程直接 `await _sc.run_cycle(db)`，内部同步 `db.commit()` 撞写锁 → 主线程等 30s 冻结 event loop → `_queue_lock` / APScheduler job 不释放。修复：publisher 走 `to_thread` + 独立 Session；`share_center.run_cycle` 异常分支先 rollback 再写（防 PendingRollbackError 连锁）；`POST /api/share/run` 同源漏网点复用线程化 helper。加静态守卫测试（禁裸 `await _sc.run_cycle(db`）防再漏。
+- **测试**：新增 `test_v151_queue_lock_fix` / `test_v152_link_lifecycle`（9 项）/ `test_v153_publish_center_frontend`（10 项）等；镜像 1.1 / 阶段五 / 阶段六各阶段独立回归零失败。
+
+> 发版门禁：自动发布 / 自动清理 / 资源解耦默认关闭状态下先发版；真机跑稳后由用户逐项放开。请先真机验证识别→事件→分享→推送全链、跨季一剧一链、B 库删文件→链接失效、清理不动 B 库、镜像 full/half、以及第六次死锁后队列不再停滞与唐伯虎 q46 发出。
+
+---
+
 ## v1.4.4 (2026-11-21)
 
 **P0 改名按部收敛 + 断流根治**：v1.4.3 把五轮死锁彻底修好（容器 healthy、零 `database is locked`、零 job missed、零 127/160，事件 #10 已消费）、英文名解析完全正常（书剑/The Book and the Sword、开封府/The Legend of Kaifeng 均 tmdb 命中）。但暴露一个此前被死锁掩盖的 P0：开封府 58 集改名落盘恒为 0，与锁、限流、翻译都无关。
