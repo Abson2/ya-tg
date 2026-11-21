@@ -57,10 +57,12 @@ class StrictAPI:
 
     async def copy_file(self, file_ids, parent_id):
         self.copies += 1
-        self.events.append(("copy", file_ids[0], self.copies))
-        self.b_files.append({"fileId": f"BF{self.copies}", "resType": 1,
-                             "fileName": "copied.mkv", "fileSize": 100,
-                             "utime": 1, "parentId": parent_id})
+        # v1.4：strict 目录级批量，一次 copy_file 带同目录全部 fileId（旧版每次 1 个）
+        self.events.append(("copy", list(file_ids), self.copies))
+        for fid in file_ids:
+            self.b_files.append({"fileId": f"BF{self.copies}_{fid}", "resType": 1,
+                                 "fileName": f"{fid}.mkv", "fileSize": 100,
+                                 "utime": 1, "parentId": parent_id})
         return f"TASK{self.copies}"
 
     async def get_task_status(self, task_id):
@@ -103,14 +105,13 @@ def test_strict_sequence_copy_after_confirm(env):
         stats = asyncio.run(mirror.sync_rule(db, rule, strict=True,
                                              max_polls=5, poll_interval=0.0))
     assert stats["done"] == 2, stats
-    # 事件序列：copy#1 → poll-pending#1 → poll-done#1 → copy#2 ...
+    # v1.4 目录级批量：同目录 2 文件合并为 1 次 copy_file，确认后才算完成。
     copies = [(i, e) for i, e in enumerate(events) if e[0] == "copy"]
-    assert len(copies) == 2
-    first_copy_idx = copies[0][0]
-    # 第二个 copy 之前必须出现第一个任务的 poll-done
-    between = events[first_copy_idx + 1: copies[1][0]]
-    assert any(e[0] == "poll-done" and e[1] == "TASK1" for e in between), events
-    # 任务序列落库
+    assert len(copies) == 1, "同目录两文件应一次批量提交"
+    assert set(copies[0][1][1]) == {"F1", "F2"}, events  # 一次带两个 fileId
+    # 批量提交后必须 poll 到 done 才落终态
+    assert any(e[0] == "poll-done" and e[1] == "TASK1" for e in events), events
+    # 任务序列落库：每个文件仍占一个 sequence（顺序记录粒度不变）
     tasks = list(db.scalars(select(models.MirrorTask).order_by(models.MirrorTask.sequence_id)).all())
     assert len(tasks) == 2
     assert [t.sequence_id for t in tasks] == [1, 2]
@@ -125,7 +126,8 @@ def test_strict_sequence_files_in_natural_order(env):
     with patch("app.mirror.GuangYaWebFiles", _api_factory(events, pending_times=0)):
         asyncio.run(mirror.sync_rule(db, rule, strict=True, max_polls=5, poll_interval=0.0))
     copies = [e[1] for e in events if e[0] == "copy"]
-    assert copies == ["F1", "F2"]  # S01E01 在 S01E02 前
+    # v1.4：同目录一次批量，fileId 保持自然序 F1→F2
+    assert len(copies) == 1 and copies[0] == ["F1", "F2"], events
 
 
 def test_strict_sequence_pause_at_task_boundary(env):
@@ -133,27 +135,21 @@ def test_strict_sequence_pause_at_task_boundary(env):
     events = []
     api_factory = _api_factory(events, pending_times=0)
 
-    original_control = mirror_batch.consume_control
+    # v1.4 目录级批量：同目录只有 1 个桶边界。首边界派发并消费 pause → 整桶不复制。
+    def control_pause(d, r):
+        r.control_action = ""
+        d.commit()
+        return "pause"
 
-    def control_then_pause(d, r):
-        action = original_control(d, r)
-        # 第一个任务边界后派发 pause（第二个任务边界消费）
-        if not hasattr(control_then_pause, "fired"):
-            control_then_pause.fired = True
-            r.control_action = "pause"
-            d.commit()
-            return action
-        return action
-
-    with patch("app.mirror.mirror_batch.consume_control", control_then_pause), \
+    with patch("app.mirror.mirror_batch.consume_control", side_effect=control_pause), \
          patch("app.mirror.GuangYaWebFiles", api_factory):
         stats = asyncio.run(mirror.sync_rule(db, rule, strict=True,
                                              max_polls=5, poll_interval=0.0))
     assert stats.get("paused") is True
     assert rule.batch_status == "paused"
-    # pause 在第二个任务边界生效：只 copy 了 1 个文件
+    # pause 在首个（唯一）桶边界生效：不复制任何文件
     copies = [e for e in events if e[0] == "copy"]
-    assert len(copies) == 1, events
+    assert len(copies) == 0, events
 
 
 def test_strict_sequence_skip_and_cancel(env):
@@ -173,9 +169,10 @@ def test_strict_sequence_skip_and_cancel(env):
          patch("app.mirror.GuangYaWebFiles", _api_factory(events, pending_times=0)):
         stats = asyncio.run(mirror.sync_rule(db, rule, strict=True,
                                              max_polls=5, poll_interval=0.0))
+    # v1.4：skip 是目录级——首（唯一）桶整桶跳过，不复制任何文件
     copies = [e[1] for e in events if e[0] == "copy"]
-    assert copies == ["F2"], events  # F1 被跳过
-    assert stats["skipped"] >= 1
+    assert len(copies) == 0, events
+    assert stats["skipped"] >= 2, stats  # 整桶 2 文件都标 skipped
 
 
 def test_strict_sequence_cancel_stops_all(env):

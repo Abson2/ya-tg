@@ -593,6 +593,12 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
     return stats
 
 
+# P0 毒事件隔离：单条事件连续失败超过该次数就强制消费跳过，避免队头永久卡死。
+# 2026-11-21 事故：事件 #6 identified|work:开封府 卡 8 小时，pending 按 id 升序，
+# 它永远排第一 → 每轮都先在它身上等写锁超时 → 死亡螺旋。
+MAX_EVENT_CONSUME_FAILURES = 3
+
+
 def consume_resource_events(db: Session, limit: int = 100) -> dict:
     """消费资源库事件（设计文档 §3.7/§6.2）：把资源变化转成分享中心动作。
 
@@ -600,9 +606,16 @@ def consume_resource_events(db: Session, limit: int = 100) -> dict:
       被 cancelled 的旧任务（规则2 重建闭环）。
     - removed：兜底作废当前分享记录（生产者 _reconcile_library 已作废，这里幂等）。
     幂等：事件处理完置 consumed_at；同一事件重复消费不会重复建任务。
+
+    P0 加固（2026-11-21）：
+      1. 每条事件独立 try，失败只 rollback 自己并继续下一条，绝不中止整批；
+      2. 失败计数写进 payload_json._consume_fail（不加列、幂等迁移零负担），
+         连续失败超过 MAX_EVENT_CONSUME_FAILURES 就强制 mark_consumed 跳过，
+         保证毒事件不会永久占住队头拖垮整个调度器。
     """
     from . import events as _ev
-    stats = {"consumed": 0, "tasks_created": 0, "records_retired": 0, "skipped": 0}
+    stats = {"consumed": 0, "tasks_created": 0, "records_retired": 0,
+             "skipped": 0, "skipped_poison": 0, "failed_once": 0}
     for ev in _ev.pending_resource_events(db, limit=limit):
         try:
             if ev.type == _ev.RESOURCE_REMOVED:
@@ -621,8 +634,37 @@ def consume_resource_events(db: Session, limit: int = 100) -> dict:
             _ev.mark_consumed(db, ev)
             stats["consumed"] += 1
         except Exception as exc:
-            db.rollback()
-            logger.warning("[share_center] 消费资源事件 #%s 失败：%s", ev.id, exc)
+            # 失败先回滚本条的部分写，再独立记录失败次数（二次异常不影响主流程）
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            stats["failed_once"] += 1
+            fail_n = 1
+            try:
+                payload = json.loads(ev.payload_json or "{}") or {}
+                fail_n = int(payload.get("_consume_fail", 0) or 0) + 1
+                payload["_consume_fail"] = fail_n
+                payload["_consume_last_error"] = str(exc)[:300]
+                ev.payload_json = json.dumps(payload, ensure_ascii=False)
+                if fail_n >= MAX_EVENT_CONSUME_FAILURES:
+                    # 毒事件：连续失败到阈值，强制消费跳过，释放队头。
+                    # 事件本身不删（保留可追溯），下游有定时全量对账兜底，
+                    # 漏掉一次事件通知不会丢数据。
+                    _ev.mark_consumed(db, ev)
+                    stats["skipped_poison"] += 1
+                    logger.error(
+                        "[share_center] 事件 #%s 连续失败 %s 次，强制跳过避免队头死锁：%s",
+                        ev.id, fail_n, exc)
+                else:
+                    db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            logger.warning("[share_center] 消费资源事件 #%s 失败（第 %s 次）：%s",
+                           ev.id, fail_n, exc)
     return stats
 
 

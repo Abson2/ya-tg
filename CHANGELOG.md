@@ -8,6 +8,34 @@
 
 ---
 
+## v1.4.0 (2026-11-21)
+
+三块改动：① strict 严格顺序引擎升级为目录级批量复制；② 英文名改名并发提速（默认开）；③ **P0 修复资源事件消费死锁导致的全局饿死**。全量 pytest **790 passed, 3 warnings**，零回归。
+
+### ① strict 目录级批量（用户拍板 skip 目录级）
+- `_copy_jobs_strict()` 网络层从「逐文件 copy_file + 逐文件轮询 + 逐文件 idle」改为「按 B 库目标目录分桶 → 每桶一次 `copy_file(fids[], parent)`（`COPY_BATCH_SIZE=50` 分片）→ 统一 `_poll_tasks_batch` → 按名+大小回填副本 ID」。40 集单目录剧的复制请求从 40 次降到 1 次，分钟级→十几秒级。
+- sequence 顺序记录、`cursor_sequence` 续跑游标、pause/resume/skip/cancel 全部保留；**唯一语义变化**：skip/cancel 粒度从单文件升为目录桶（复制前只读列目录 1 次，不再每文件列一次）。`stats["done"/"failed"]` 仍按文件计数，口径不变。
+- 复制前一次、复制后一次列 B 库（整部 2 次，取代逐文件 N 次）；`unknown` 任务 status 复位供续跑。
+
+### ② 改名并发提速（用户拍板默认开）
+- **取证**：光鸭技能包 `rename` 是单文件单目标（`remote_id`+`new_name`），`operations[]` 只是把多个单项打包、服务端仍逐个执行，**没有批量改名/正则替换接口**。提速只能靠并发网络窗口，不能靠批量 API。
+- `rename_idle_seconds`（默认 0.3，下限 0.2）与复制 `file_idle_seconds` 解耦；40 集纯等待从 39 秒降到约 12 秒。
+- `rename_concurrency`（默认 3，上限 8，填 1 退回串行）：`_rename_concurrent` 用 `asyncio.gather` 并发发 `rename_file`；**写库仍在主协程串行**，网络协程绝不碰 db（防 SQLite 写锁/读快照升级，沿用 v1.3 教训）。冲突后缀 `with_conflict_suffix` 在准备阶段串行占位，防并发撞名；单文件失败就地转 failed，不中断同批。
+- 新增运行期配置 `rename_idle_seconds` / `rename_concurrency`，可在管理页调整；遇光鸭风控把并发度调 1 即降级串行。
+
+### ③ P0 全局饿死修复（真机事故，根因逐环验证）
+- **现象**：资源事件 `identified|work:开封府`（#6）卡 8 小时 `consumed_at=NULL`；APScheduler 所有 job `missed by 0:30+`；管理页 API timeout；122 文件全 synced 但 `rename_status` 全空（改名 job 被饿死）。
+- **根因链**：`_job_share_center` 是 async 协程却在事件循环线程**同步**调 `consume_resource_events`（main.py），`ensure_task` 的 `db.flush()` 撞 SQLite 写锁 → `busy_timeout=30s` 阻塞冻结整个 asyncio loop → 所有 job + API 一起饿死；毒事件失败后未 mark_consumed、无失败计数，`pending_resource_events` 按 id 升序使其永远排队头 → 死亡螺旋。对照：项目其它 DB 密集 job（`_job_mirror_task_reap`/`_job_log_prune`）早已用 `asyncio.to_thread`（A-07），唯独此处遗漏。
+- **修复 A**：同步事件消费改 `asyncio.to_thread(_consume_resource_events_in_thread)`（线程内独立 Session），锁等待不再冻结事件循环；async 段 `run_cycle` 保持 await。
+- **修复 B**：`consume_resource_events` 加毒事件隔离——每条独立 try，失败只 rollback 自己并继续下一条；失败计数写进 `payload_json._consume_fail`（不加列），连续失败 `MAX_EVENT_CONSUME_FAILURES=3` 次强制 mark_consumed 跳过（事件不删、可追溯，下游有定时全量对账兜底），队头不再永久卡死。存量卡住的事件部署后 3 个周期内自动清理，无需手工 SQL。
+
+### 验证
+- 新增 `tests/test_v140_strict_bulk_and_rename_fast.py` 7 项（跨目录分桶、目录级 skip、并发网络隔离、配置默认值与解耦、写库护栏、不虚构批量接口）。
+- 新增 `tests/test_v141_share_event_deadlock.py` 4 项（to_thread 护栏、毒事件阈值跳过、队头失败不阻断后续、失败计数持久化）。
+- 更新 v100/v105/v086 历史测试断言到目录级/并发新语义，保留控制生效、终态落库、错误可诊断等质量红线。
+- 全量 pytest **790 passed, 3 warnings**；前端仅版本号变更，build 验证见发版记录。
+- 回滚见 `ROLLBACK.md`（可切回 `IMAGE_TAG=v1.3.0`）。
+
 ## v1.3.0 (2026-11-21)
 
 修复真机"改英文名性能瓶颈 / 系统卡死"。用户提示借鉴 TgtoDrive v8.8.25；核查该 release notes 并无英文命名加速方法（仅命名语言偏好 + 中文名优化），可借鉴的是其"**已入库名称继续沿用、不重复解析**"思想。全量 pytest **779 passed**，零回归。

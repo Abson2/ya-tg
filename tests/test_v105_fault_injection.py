@@ -134,17 +134,24 @@ def _run_strict(db, rule, api):
 
 
 def test_copy_timeout_marks_single_file_failed_continues_batch(env):
-    """网盘超时：第 1 个文件复制抛超时 → 标 failed，第 2 个仍继续复制，整批不崩。"""
+    """网盘超时：copy_file 抛超时 → 整批（同目录一次请求）标 failed，不崩、错误可诊断。
+
+    v1.4 strict 升级为目录级批量：同目录多文件合并为一次 copy_file，请求失败则
+    整批一起 failed（这是批量的固有语义，用户已拍板目录级）。质量红线不变：
+    失败必须落库留痕、错误可见、批次正常收尾、后续作品/批次不被中断。
+    """
     db, rule, _, _ = env
     api = FaultAPI(fail_copy_n=1)
     stats = _run_strict(db, rule, api)
-    assert stats["failed"] >= 1 and stats["done"] >= 1, stats
-    assert api.copies == 2, "超时不应中断后续文件复制"
+    assert stats["failed"] >= 1, stats
+    assert stats["copy_batches"] >= 1, "目录级批量应记录批次数"
+    assert api.copies == 1, "同目录两文件合并为一次 copy_file（目录级批量）"
     rows = list(db.scalars(select(models.MirrorFile).order_by(models.MirrorFile.file_name)).all())
     statuses = {r.file_name: r.status for r in rows}
-    assert "failed" in statuses.values() and "synced" in statuses.values(), statuses
+    assert "failed" in statuses.values(), statuses
     # 失败行有错误原因，供 file_errors 诊断
     assert any("超时" in (r.error or "") for r in rows)
+    assert rule.batch_status == "idle", "异常路径也必须正常收尾批次"
 
 
 def test_remote_verify_skips_existing_file_idempotent(env):

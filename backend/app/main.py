@@ -495,24 +495,47 @@ async def _scheduled_scan(root: str) -> None:
             logger.warning("[scan] 定时全量扫描异常", exc_info=True)
 
 
+def _consume_resource_events_in_thread() -> None:
+    """P0：资源事件消费是纯同步 DB 操作，放线程池 + 线程内独立 Session。
+
+    对齐 A-07（_reap_stale_mirror_tasks_in_thread / _log_prune_in_thread）：
+    SQLite 单写者 + busy_timeout=30s，若在 async job 的事件循环线程里同步等待写锁，
+    30 秒冻结整个 loop → APScheduler 所有 job 与全部 API 一起饿死（2026-11-21 事故）。
+    """
+    from . import share_center as _sc
+    with SessionLocal() as db:
+        try:
+            _sc.consume_resource_events(db, limit=100)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center] 消费资源事件周期异常：%s", exc)
+
+
 async def _job_share_center() -> None:
     """四模块重构：分享中心调度周期（建分享→提交分发）。
 
     v1.1 默认开启（share_center_enabled=true）：扫描 planned 分享任务，建分享并
     提交到分发中心。开关关闭仅作旧链排障用。全程独立 Session，异常自行吞掉并留
     应用日志，不影响其它定时任务。
+
+    P0 修复：同步 DB 段（事件消费）改 to_thread，绝不在事件循环线程等 SQLite 写锁；
+    async 段（run_cycle 含建分享网络 await）保持 await，网络等待不占写事务。
     """
     from . import share_center as _sc
+    # 先判断开关（轻量只读查询，留在事件循环线程）
     with SessionLocal() as db:
         try:
             if not _sc.is_enabled(db):
                 return
-            # 先消费资源库事件（新入库/追更/删除出库 → 分享任务），再跑分享调度
-            try:
-                _sc.consume_resource_events(db, limit=100)
-            except Exception as exc:
-                db.rollback()
-                logger.warning("[share_center] 消费资源事件周期异常：%s", exc)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center] 开关读取异常：%s", exc)
+            return
+    # P0：同步事件消费挪出事件循环，锁等待不再冻结全站
+    await asyncio.to_thread(_consume_resource_events_in_thread)
+    # async 段：建分享/提交含网络 await，保持在主协程
+    with SessionLocal() as db:
+        try:
             await _sc.run_cycle(db, limit=20)
         except Exception as exc:
             db.rollback()
@@ -601,13 +624,13 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown(wait=True)
 
 
-app = FastAPI(title="Ya-TG", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.4.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.3.0", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.0", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------

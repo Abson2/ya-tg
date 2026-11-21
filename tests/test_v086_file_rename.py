@@ -308,9 +308,13 @@ def test_risk_idle_between_file_renames(db):
     db.commit()
     files = [_b_file(), _b_file("大醉侠 第06集 1080p.mkv", "B_FILE_3", 3072)]
     with _mocks(files=files) as m:
-        _run(mirror.rename_mirror_files(db, rule))
-    assert m.sleep.await_count == 1  # 第一个文件前不必等，文件之间必须等
-    assert m.sleep.await_args.args[0] >= mirror.MIN_FILE_IDLE_SECONDS
+        out = _run(mirror.rename_mirror_files(db, rule))
+    # v1.4：并发默认开（3），2 个文件落在同一窗口并发发出，窗口内不再逐文件 sleep。
+    # idle 只在「窗口之间」留，N 文件从 N-1 次等待降为 ceil(N/并发)-1 次。
+    assert out["renamed"] == 2
+    assert m.sleep.await_count == 0, "同窗口内并发改名不应逐文件等待"
+    # 风控下限仍守住（若真有窗口间等待，间隔不得低于下限）
+    assert mirror.MIN_RENAME_IDLE_SECONDS == 0.2
 
 
 # ---------- 5. 边界：A 库只读、目录名不变、开关与手动入口 ----------

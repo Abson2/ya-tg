@@ -65,7 +65,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from . import ai_assist, mirror_batch, tmdb
+from . import ai_assist, mirror_batch, runtime_config, tmdb
 from .db import SessionLocal
 from .file_naming import (english_file_name, pinyin_title, sanitize_english_title,
                           with_conflict_suffix, work_core_title)
@@ -84,6 +84,12 @@ logger = logging.getLogger(__name__)
 RENAME_MAX_FILES = 50
 RENAME_MAX_SECONDS = 90.0
 RENAME_MAX_CONSECUTIVE_FAILURES = 5
+# v1.4 改名提速：改名 idle 与复制 idle 解耦，硬下限 0.2 秒（防御性风控）。
+# 低于下限一律抬到下限，避免用户在配置页填 0 导致瞬时并发触发光鸭风控。
+MIN_RENAME_IDLE_SECONDS = 0.2
+# v1.4：改名并发度上限。光鸭 rename 是单文件接口，提速靠并发窗口而非批量 API；
+# 保守默认 3，最大 8。配置填 1 即退回串行，便于真机遇风控时快速降级。
+MAX_RENAME_CONCURRENCY = 8
 
 # v0.8.1：w.har 已取证 create_dir / rename / delete_file（含批量）。
 # 下面只保留仍未取证的转存能力；前端 JS 里虽出现 move_file / recycle_file 等路径，
@@ -479,32 +485,49 @@ async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRul
                             stats: dict, *, idle: float, max_polls: int,
                             poll_interval: float, batch_id: str,
                             seq_start: int = 0) -> int:
-    """阶段二路线B C3：严格顺序复制执行核心。
+    """v1.4 目录级批量严格顺序复制执行核心。
 
-    语义：对 copy_jobs（已按自然序）逐个「远端核验 → 提交 copy_file →
-    轮询到终态 → 更新 MirrorFile」，当前文件确认完成（或明确失败/人工跳过）
-    后才推进下一个。每个写操作后立即 commit，绝不跨 await 持写事务。
+    sequence 顺序记录、批次控制、崩溃续跑、确认后推进的语义全部保留；
+    v1.4 把网络层从「逐文件 copy_file + 逐文件轮询」升级为
+    「按 B 库目标目录分桶 → 每桶一次 copy_file(fids[], parent) →
+    统一批量轮询 → 按名+大小回填副本 ID」，请求量随目录数而非文件数增长。
+    每个写操作后立即 commit，绝不跨 await 持写事务。
 
-    控制指令在"任务边界"检查（不打断正在进行的 copy_file/轮询）：
+    sequence 仍是每个文件一个（顺序记录与续跑游标粒度不变）；
+    唯一语义变化：skip/cancel 的控制粒度由「单文件」升为「目录桶」
+    （skip 跳过整桶、cancel 取消余下全部），符合用户 v1.4 拍板。
+
+    控制指令在"任务边界"（桶边界）检查，不打断在途 copy_file/轮询：
       pause → 置批次 paused 并立即停止推进（余下保持 pending，resume 后续跑）；
-      skip  → 当前任务标 skipped 并推进；
+      skip  → 当前桶全部标 skipped 并推进；
       cancel→ 余下任务全部标 cancelled 并停止。
 
     返回本轮推进到的最后一个 sequence_id（供游标）。
     """
     seq = seq_start
+    # v1.4 目录级批量：复制前只读列一次 B 库，核验待复制文件是否已存在（防重复复制）。
+    # 旧逐文件版是每文件列一次目录；这里整部作品只列一次，请求量从 N 降到 1。
+    try:
+        pre_candidates, pre_verified = await _b_file_candidates(api, media)
+    except Exception:
+        pre_candidates, pre_verified = {}, False
+
+    # 按 B 库目标目录分桶，桶内保持 A 库自然序（sequence 顺序记录不变）。
+    buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
     for row, source_fid, target_parent in copy_jobs:
-        seq += 1
-        # ---- 任务边界：检查批次控制指令 ----
+        buckets.setdefault(target_parent, []).append((row, source_fid))
+    stats["copy_batches"] = len(buckets)
+
+    for target_parent, members in buckets.items():
+        # ---- 桶边界：检查批次控制指令（不打断在途 copy_file/轮询）----
         action = mirror_batch.consume_control(db, rule)
         if action == "pause":
             rule.batch_status = "paused"
             db.commit()
             stats["paused"] = True
-            return seq - 1
+            return seq
         if action == "cancel":
             rule.batch_status = "cancelled"
-            # 阶段二 C5：余下未终结序列任务全部落 cancelled（docstring 承诺兑现）
             try:
                 n = mirror_batch.cancel_remaining(db, batch_id)
                 stats["cancelled_tasks"] = n
@@ -512,82 +535,144 @@ async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRul
                 pass
             db.commit()
             stats["cancelled"] = True
-            return seq - 1
+            return seq
         if action == "skip":
-            # 阶段二 C5：当前任务落 skipped 终态（即使尚未 add_sequence_task 也补占位行）
-            try:
-                mirror_batch.mark_sequence_status(db, batch_id, seq, "skipped",
-                                                  error="skip by control")
-            except Exception:
-                pass
-            stats["skipped"] += 1
+            # 目录级 skip：整桶成员落 skipped 终态，游标推进整桶长度。
+            for _row, _fid in members:
+                seq += 1
+                try:
+                    mirror_batch.mark_sequence_status(db, batch_id, seq, "skipped",
+                                                      error="skip by control (dir-level)")
+                except Exception:
+                    pass
+            stats["skipped"] += len(members)
             db.commit()
             continue
         if rule.batch_status in ("paused", "cancelled"):
             stats["paused"] = True
-            return seq - 1
+            return seq
 
-        if seq > 1:
-            await asyncio.sleep(idle)
+        if seq > seq_start:
+            await asyncio.sleep(idle)  # 桶间 idle，不再是每文件一次
         _beat()
 
-        # ---- 远端核验：防止重复复制（复用已验证的按名+大小回填）----
+        # 桶内逐文件核验：已在 B 库的直接标 synced，其余进入待提交队列。
+        pending: list[tuple[MirrorFile, str, int]] = []
+        for row, source_fid in members:
+            seq += 1
+            hit = _lookup_b_file(pre_candidates, row) if pre_verified else ""
+            if hit:
+                row.status, row.error, row.target_file_id = "synced", "", hit
+                try:
+                    mirror_batch.mark_sequence_status(db, batch_id, seq, "completed")
+                except Exception:
+                    pass
+                stats["unchanged"] += 1
+                db.commit()
+                continue
+            pending.append((row, source_fid, seq))
+
+        if not pending:
+            rule.cursor_sequence = seq
+            db.commit()
+            continue
+
+        # 占位行：每个待提交文件落一个 sequence 任务（纯 DB，零网络，修 B-09 重启窗口）。
+        submit_tasks: list[MirrorTask] = []
+        for row, _fid, this_seq in pending:
+            task = mirror_batch.add_sequence_task(
+                db, rule_id=rule.id, media_id=media.id, batch_id=batch_id,
+                sequence_id=this_seq, parent_sequence_id=seq_start,
+                note=f"{title}/{row.file_name}")
+            task.task_status = "submitting"
+            db.commit()
+            submit_tasks.append(task)
+
+        # 分片提交 copy_file：同桶多文件合并为一次请求，超 COPY_BATCH_SIZE 再切。
+        groups: list[tuple[MirrorTask, list[MirrorTask], list[MirrorFile]]] = []
+        for start in range(0, len(pending), COPY_BATCH_SIZE):
+            chunk = pending[start:start + COPY_BATCH_SIZE]
+            chunk_tasks = submit_tasks[start:start + len(chunk)]
+            chunk_rows = [r for r, _f, _s in chunk]
+            lead_task = chunk_tasks[0]
+            fids = [fid for _row, fid, _s in chunk]
+            try:
+                task_id = await api.copy_file(fids, target_parent)
+            except Exception as exc:
+                msg = str(exc)[:300]
+                for row in chunk_rows:
+                    row.status, row.error = "failed", msg
+                for t in chunk_tasks:
+                    t.status, t.task_status, t.error = "failed", "failed", msg
+                    t.finished_at = utcnow()
+                stats["failed"] += len(chunk)
+                stats["errors"].append(f"{title}/{len(chunk)} 文件批量复制失败 {msg[:160]}")
+                # v1.4：整批失败也逐文件留一条 errors，保证长剧诊断可追溯到单集
+                stats["errors"].extend(
+                    f"{title}/{row.file_name}：批量复制失败 {msg[:160]}" for row in chunk_rows)
+                stats["file_errors"].extend(
+                    f"{title}/{row.file_name}：{msg[:240]}" for row in chunk_rows)
+                logger.warning("[mirror] strict 批量 copy_file 失败 %s/%s：%s",
+                               title, len(chunk), msg)
+                db.commit()
+                continue
+            lead_task.task_id = task_id
+            for t in chunk_tasks:
+                t.task_status = "submitted"
+            for row in chunk_rows:
+                row.task_id = task_id
+            db.commit()
+            stats["tasks"] += 1
+            groups.append((lead_task, chunk_tasks, chunk_rows))
+
+        if not groups:
+            rule.cursor_sequence = seq
+            db.commit()
+            continue
+
+        # 统一轮询本桶所有复制任务，替代逐任务 _wait_one_task。
+        poll_tasks = [(lead, rows) for lead, _all, rows in groups]
+        await _poll_tasks_batch(api, poll_tasks, max_polls=max_polls, interval=poll_interval)
+
+        # 复制后只读列一次 B 库，按名+大小回填副本 fileId（光鸭复制响应不返回副本 ID）。
         try:
-            candidates, verified = await _b_file_candidates(api, media)
+            post_candidates, _post_verified = await _b_file_candidates(api, media)
         except Exception:
-            candidates, verified = {}, False
-        if verified and _lookup_b_file(candidates, row):
-            row.status, row.error, row.target_file_id = "synced", "", _lookup_b_file(candidates, row)
-            db.commit()
-            stats["unchanged"] += 1
-            continue
+            post_candidates = {}
 
-        # ---- 占位行：先落序列任务，再调 copy_file（修 B-09 重启窗口）----
-        task = mirror_batch.add_sequence_task(
-            db, rule_id=rule.id, media_id=media.id, batch_id=batch_id,
-            sequence_id=seq, parent_sequence_id=seq_start, note=f"{title}/{row.file_name}")
-        task.task_status = "submitting"
-        db.commit()
-        try:
-            task_id = await api.copy_file([source_fid], target_parent)
-        except Exception as exc:
-            msg = str(exc)[:300]
-            row.status, row.error = "failed", msg
-            task.status, task.task_status, task.error = "failed", "failed", msg
-            task.finished_at = utcnow()
-            stats["failed"] += 1
-            stats["errors"].append(f"{title}/{row.file_name}：复制请求失败 {msg[:160]}")
-            stats["file_errors"].append(f"{title}/{row.file_name}：{msg[:240]}")
-            logger.warning("[mirror] strict copy_file 失败 %s/%s：%s", title, row.file_name, msg)
+        for lead, chunk_tasks, chunk_rows in groups:
+            outcome = lead.status  # done / failed / unknown（_poll_tasks_batch 已置）
+            if outcome == "done":
+                for row in chunk_rows:
+                    row.status, row.error = "synced", ""
+                    hit = _lookup_b_file(post_candidates, row)
+                    if hit:
+                        row.target_file_id = hit
+                stats["done"] += len(chunk_rows)  # 按文件计数，与旧逐文件语义口径一致
+                for t in chunk_tasks:
+                    t.status, t.task_status, t.finished_at = "completed", "completed", utcnow()
+            elif outcome == "failed":
+                for row in chunk_rows:
+                    row.status, row.error = "failed", lead.error
+                stats["failed"] += len(chunk_rows)
+                for t in chunk_tasks:
+                    t.status, t.task_status, t.finished_at = "failed", "failed", utcnow()
+                msg = (f"{title}：复制任务 {lead.task_id} 失败"
+                       f"（{lead.error or 'status=' + (lead.raw_status or '未知')}）")
+                stats["errors"].append(msg)
+                stats["file_errors"].append(msg[:240])
+            else:
+                stats["unknown"] += 1
+                for t in chunk_tasks:
+                    # status 同步为 unknown（与旧逐文件版一致，供故障注入测试与续跑判定），
+                    # task_status 复位 pending 表示待下轮续跑，不猜含义。
+                    t.status, t.task_status = "unknown", "pending"
+                msg = (f"{title}：复制任务 {lead.task_id} 未返回 status=2"
+                       f"（最后状态 {lead.raw_status or '未知'}），已保留任务供继续轮询")
+                stats["errors"].append(msg)
+                stats["file_errors"].append(msg[:240])
             db.commit()
-            continue
-        task.task_id = task_id
-        task.task_status = "submitted"
-        row.task_id = task_id
-        db.commit()
-        stats["tasks"] += 1
 
-        # ---- 严格顺序核心：等本任务终结才推进下一个 ----
-        task.task_status = "verifying"
-        db.commit()
-        outcome = await _wait_one_task(api, task, max_polls=max_polls, interval=poll_interval)
-        if outcome == "done":
-            row.status, row.error = "synced", ""
-            stats["done"] += 1
-        elif outcome == "failed":
-            row.status, row.error = "failed", task.error
-            stats["failed"] += 1
-            msg = (f"{title}：复制任务 {task.task_id} 失败"
-                   f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
-            stats["errors"].append(msg)
-            stats["file_errors"].append(msg[:240])
-        else:
-            stats["unknown"] += 1
-            msg = (f"{title}：复制任务 {task.task_id} 未返回 status=2"
-                   f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
-            stats["errors"].append(msg)
-            stats["file_errors"].append(msg[:240])
-        db.commit()
         rule.cursor_sequence = seq
         db.commit()
     return seq
@@ -1623,6 +1708,25 @@ def _persist_english_title(db: Session, media_id: int, eng: str, source: str) ->
         time.sleep(0.05 * (2 ** attempt))
 
 
+async def _rename_concurrent(api: "GuangYaWebFiles",
+                             jobs: list[tuple[str, str]]) -> list[tuple[bool, str]]:
+    """v1.4 B3：并发执行一批 rename_file（纯网络，绝不碰 db）。
+
+    光鸭 rename 是单文件接口（技能包 operations[] 也只是把多个单项打包，
+    服务端仍逐个执行，没有批量/正则替换），提速只能靠并发网络窗口。
+    返回与 jobs 等长的 [(ok, err)]，顺序一一对应；单文件异常就地转成
+    failed 结果，不中断同批其它文件。db 事务完全留给调用方在主协程串行写。
+    """
+    async def one(fid: str, final: str) -> tuple[bool, str]:
+        try:
+            await api.rename_file(fid, final)
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)[:300]
+
+    return await asyncio.gather(*(one(fid, final) for fid, final in jobs))
+
+
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                               force: bool = False, max_media: int = 100,
                               max_files: int | None = None,
@@ -1643,12 +1747,27 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
       - only_pending=True：后台复查专用，只看仍未改名的文件，并卡紧时长预算，
         避免后台任务长期持有全局镜像锁导致「立即同步」报 409。
     """
-    idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
+    # v1.4 B2：改名 idle 与复制 idle 解耦，管理页可配（默认 0.3，下限 0.2）。
+    # 旧版直接复用 file_idle_seconds（默认 1.0），40 集纯等待就 39 秒。
+    try:
+        rename_idle = max(float(runtime_config.get(db, "rename_idle_seconds") or 0.3),
+                          MIN_RENAME_IDLE_SECONDS)
+    except (TypeError, ValueError):
+        rename_idle = max(0.3, MIN_RENAME_IDLE_SECONDS)
+    # v1.4 B3：并发度默认 3（用户拍板默认开）；填 1 退回串行，上限 8。
+    try:
+        rename_concurrency = max(1, min(MAX_RENAME_CONCURRENCY,
+                                        int(runtime_config.get(db, "rename_concurrency") or 3)))
+    except (TypeError, ValueError):
+        rename_concurrency = 3
+    idle = rename_idle  # 函数体内所有 await asyncio.sleep(idle) 现指改名专用间隔
     file_budget = int(max_files if max_files is not None else RENAME_MAX_FILES)
     time_budget = float(max_seconds if max_seconds is not None else RENAME_MAX_SECONDS)
     stats = {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
              "untranslated": 0, "failed": 0, "no_rows": 0, "errors": [],
              "waiting_visible": 0,
+             # v1.4：改名提速参数回显，便于管理页/测试核对
+             "rename_idle_seconds": rename_idle, "rename_concurrency": rename_concurrency,
              # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
@@ -1753,16 +1872,22 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         fid_to_norm: dict[str, str] = {}
         for k, v in name_fids.items():
             fid_to_norm.setdefault(str(v), k)
-        first = True
+        # v1.4 B3：改名并发。两阶段——
+        #   阶段一（主协程串行，纯本地）：算目标名/冲突后缀、做幂等与跳过判断，
+        #     把真正要发 rename_file 的收集成 jobs；冲突后缀按顺序在 name_fids
+        #     占位，保证并发发请求时不会有两个文件抢同一目标名。
+        #   阶段二（按 rename_concurrency 分窗口）：窗口前 sleep 一次 idle
+        #     （旧版每文件一次，N 次→N/并发次数），并发发网络，主协程串行写库。
+        # 红线：任何 db 写都在主协程完成，网络协程绝不碰 db（防 SQLite 写锁/快照升级）。
+        jobs: list[tuple[MirrorFile, str, str, str]] = []  # (row, fid, final, fname)
         for idx, row in enumerate(rows):
-            _beat()  # v0.9.21：逐个文件改名推进打点，长剧批量改名不被误判卡死
             fname = str(row.file_name or "")
             # v0.8.9：预算与熔断。已达标跳过不消耗「尝试次数」，保证下轮能
             # 快速跳过已改名的文件、把预算留给真正还没改的那部分。
             if time.monotonic() - started_all >= time_budget:
                 stop_reason = "time_budget"
                 break
-            if attempts >= file_budget:
+            if attempts + len(jobs) >= file_budget:
                 stop_reason = "file_budget"
                 break
             if consecutive_failures >= RENAME_MAX_CONSECUTIVE_FAILURES:
@@ -1804,37 +1929,15 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 if not b_verified and row.target_name == final and row.rename_status == "done":
                     stats["skipped"] += 1
                     continue
-                if not first:
-                    await asyncio.sleep(idle)  # 与复制/建目录共用同一风控间隔
-                first = False
-                attempts += 1
-                stats["attempts"] += 1
-                try:
-                    await api.rename_file(fid, final)
-                except Exception as exc:
-                    msg = str(exc)[:300]
-                    row.rename_status, row.rename_error = "failed", msg
-                    stats["failed"] += 1
-                    consecutive_failures += 1
-                    stats["errors"].append(
-                        f"{media.title_standard}/{fname}：改名失败 {msg[:160]}")
-                    logger.warning("[mirror] rename 失败 %s/%s：%s",
-                                   media.title_standard, fname, msg)
-                    db.commit()
-                    continue
-                consecutive_failures = 0
-                row.target_file_id = fid
-                row.target_name = final
-                row.rename_status, row.rename_error = "done", ""
-                row.updated_at = utcnow()
+                # 冲突名占位提前到准备阶段：并发发请求时同一目标名只会出现一次。
                 name_fids[normalize_work_name(final)] = fid
-                stats["renamed"] += 1
-                db.commit()
+                fid_to_norm[str(fid)] = normalize_work_name(final)
+                jobs.append((row, fid, final, fname))
             except Exception as exc:
                 # v0.8.9：任何单文件异常（含 db.commit 写冲突）只影响当前文件，
                 # 绝不中断整部剧 —— 这正是「长剧集只改了一部分」的旧病灶。
                 msg = f"{type(exc).__name__}: {exc}"[:300]
-                logger.warning("[mirror] 改名单文件异常 %s/%s：%s",
+                logger.warning("[mirror] 改名单文件准备异常 %s/%s：%s",
                                media.title_standard, fname, msg)
                 stats["errors"].append(f"{media.title_standard}/{fname}：{msg[:160]}")
                 try:
@@ -1843,6 +1946,57 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     db.commit()
                     stats["failed"] += 1
                     consecutive_failures += 1
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    stop_reason = "db_error"
+                    break
+
+        # 阶段二：按窗口并发发网络 + 主协程串行写库。
+        first = True
+        for start in range(0, len(jobs), rename_concurrency):
+            if stop_reason:
+                break
+            window = jobs[start:start + rename_concurrency]
+            if not first:
+                await asyncio.sleep(idle)  # 窗口间留一次风控间隔
+            first = False
+            for row, _fid, _final, _fname in window:
+                _beat()
+                attempts += 1
+                stats["attempts"] += 1
+            outcomes = await _rename_concurrent(
+                api, [(fid, final) for _row, fid, final, _fname in window])
+            for (row, fid, final, fname), (ok, errmsg) in zip(window, outcomes):
+                if not ok:
+                    stats["failed"] += 1
+                    consecutive_failures += 1
+                    stats["errors"].append(
+                        f"{media.title_standard}/{fname}：改名失败 {errmsg[:160]}")
+                    logger.warning("[mirror] rename 失败 %s/%s：%s",
+                                   media.title_standard, fname, errmsg)
+                    try:
+                        db.rollback()
+                        row.rename_status, row.rename_error = "failed", errmsg
+                        db.commit()
+                    except Exception:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                        stop_reason = "db_error"
+                        break
+                    continue
+                consecutive_failures = 0
+                row.target_file_id = fid
+                row.target_name = final
+                row.rename_status, row.rename_error = "done", ""
+                row.updated_at = utcnow()
+                stats["renamed"] += 1
+                try:
+                    db.commit()
                 except Exception:
                     try:
                         db.rollback()
