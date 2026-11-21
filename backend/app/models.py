@@ -677,3 +677,247 @@ class ResourceEvent(Base):
     payload_json: Mapped[str] = mapped_column(Text, default="{}")  # share_dir_id / B fileId / 海报 / 旧 share 等
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ============================================================================
+# 分享中心 v2（全新数据体系，用户口径：旧库数据不用管，新模块全用新数据）
+# 表名统一 sc_ 前缀；旧 ShareTask/ShareRecord/QueueItem 仅保留给旧链运行，
+# v2 不读、不写、不迁移旧表。
+# ============================================================================
+
+
+class SCCategory(Base):
+    __tablename__ = "sc_categories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category_key: Mapped[str] = mapped_column(String(128), unique=True, index=True, default="")
+    name: Mapped[str] = mapped_column(String(128), default="")
+    source: Mapped[str] = mapped_column(String(32), default="tmdb")
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCWorkCategory(Base):
+    __tablename__ = "sc_work_categories"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), unique=True, index=True, default="")
+    category_key: Mapped[str] = mapped_column(String(128), index=True, default="genre:unknown")
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    source: Mapped[str] = mapped_column(String(32), default="tmdb")
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCLibraryVersion(Base):
+    __tablename__ = "sc_library_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    fingerprint: Mapped[str] = mapped_column(String(128), index=True, default="")
+    media_type: Mapped[str] = mapped_column(String(16), default="")
+    resource_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    change_type: Mapped[str] = mapped_column(String(32), default="created")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("work_key", "version_no", name="uq_sc_library_version"),
+        UniqueConstraint("work_key", "fingerprint", name="uq_sc_library_fingerprint"),
+    )
+
+
+class SCPushList(Base):
+    __tablename__ = "sc_push_lists"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_key: Mapped[str] = mapped_column(String(128), unique=True, index=True, default="")
+    name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    source: Mapped[str] = mapped_column(String(32), default="plan")
+    plan_version_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SCPushListItem(Base):
+    __tablename__ = "sc_push_list_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_push_lists.id"), index=True, default=0)
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    library_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_library_versions.id"), default=0)
+    category_key: Mapped[str] = mapped_column(String(128), index=True, default="genre:unknown")
+    target_type: Mapped[str] = mapped_column(String(16), index=True, default="channel")
+    bot_id: Mapped[int] = mapped_column(Integer, default=0)
+    chat_id: Mapped[str] = mapped_column(String(64), default="")
+    dedup_key: Mapped[str] = mapped_column(String(255), unique=True, index=True, default="")
+    source_kind: Mapped[str] = mapped_column(String(16), default="first")
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        Index("ix_sc_list_item_list_category", "list_id", "category_key", "id"),
+    )
+
+
+class SCSharePlan(Base):
+    __tablename__ = "sc_share_plans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    plan_type: Mapped[str] = mapped_column(String(16), index=True, default="daily")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCSharePlanVersion(Base):
+    __tablename__ = "sc_share_plan_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_share_plans.id"), index=True, default=0)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("plan_id", "version_no", name="uq_sc_plan_version"),
+        Index("uq_sc_plan_active", "plan_id", unique=True,
+              sqlite_where=(column("status") == "active")),
+    )
+
+
+class SCHourWindow(Base):
+    __tablename__ = "sc_hour_windows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_share_plan_versions.id"), index=True, default=0)
+    start_hour: Mapped[int] = mapped_column(Integer, default=8)
+    end_hour: Mapped[int] = mapped_column(Integer, default=24)
+    quota: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("plan_version_id", "start_hour", "end_hour", name="uq_sc_hour_window"),
+    )
+
+
+class SCCategoryCursor(Base):
+    __tablename__ = "sc_category_cursors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_version_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    category_key: Mapped[str] = mapped_column(String(128), index=True, default="genre:unknown")
+    last_work_key: Mapped[str] = mapped_column(String(256), default="")
+    last_library_version_id: Mapped[int] = mapped_column(Integer, default=0)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="idle", index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("plan_version_id", "category_key", name="uq_sc_cursor"),
+    )
+
+
+class SCUpdateWindow(Base):
+    __tablename__ = "sc_update_windows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    event_keys_json: Mapped[str] = mapped_column(Text, default="[]")
+    fingerprint: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("work_key", "window_start", name="uq_sc_update_window"),
+    )
+
+
+class SCPublishTask(Base):
+    __tablename__ = "sc_publish_tasks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_item_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_push_list_items.id"), index=True, default=0)
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    plan_version_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    kind: Mapped[str] = mapped_column(String(16), default="first", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str] = mapped_column(String(64), default="", index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    share_url: Mapped[str] = mapped_column(String(1024), default="")
+    link_state: Mapped[str] = mapped_column(String(32), default="unknown")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SCPublishExecution(Base):
+    __tablename__ = "sc_publish_executions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_publish_tasks.id"), index=True, default=0)
+    stage: Mapped[str] = mapped_column(String(32), index=True, default="")
+    status: Mapped[str] = mapped_column(String(16), default="running", index=True)
+    request_json: Mapped[str] = mapped_column(Text, default="{}")
+    response_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SCAISuggestion(Base):
+    __tablename__ = "sc_ai_suggestions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    week_start: Mapped[str] = mapped_column(String(10), index=True, default="")
+    suggestion_type: Mapped[str] = mapped_column(String(32), index=True, default="plan_weights")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    reviewed_by: Mapped[str] = mapped_column(String(64), default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCAIApplyLog(Base):
+    __tablename__ = "sc_ai_apply_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    suggestion_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    action: Mapped[str] = mapped_column(String(32), default="apply")
+    before_json: Mapped[str] = mapped_column(Text, default="{}")
+    after_json: Mapped[str] = mapped_column(Text, default="{}")
+    result: Mapped[str] = mapped_column(String(16), default="success")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCPushPacingRule(Base):
+    __tablename__ = "sc_push_pacing_rules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String(128), unique=True, index=True, default="")
+    target_type: Mapped[str] = mapped_column(String(16), index=True, default="channel")
+    bot_id: Mapped[int] = mapped_column(Integer, default=0)
+    chat_id: Mapped[str] = mapped_column(String(64), default="")
+    default_interval_seconds: Mapped[float] = mapped_column(Float, default=2.0)
+    min_interval_seconds: Mapped[float] = mapped_column(Float, default=1.0)
+    max_per_minute: Mapped[int] = mapped_column(Integer, default=0)
+    jitter_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_by: Mapped[str] = mapped_column(String(64), default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SCPushPacingState(Base):
+    __tablename__ = "sc_push_pacing_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_key: Mapped[str] = mapped_column(String(128), unique=True, index=True, default="")
+    target_type: Mapped[str] = mapped_column(String(16), default="channel")
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_after_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    retry_after_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consecutive_429: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

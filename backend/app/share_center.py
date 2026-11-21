@@ -520,6 +520,11 @@ def share_url_for_queue_item(db: Session, q: QueueItem) -> str:
     开关开启且队列项带 share_task_id 时返回任务 URL（可能为空=降级无链接）；
     否则返回 None 表示「不由分享中心管」，调用方走旧 ensure_share。
     """
+    # 分享中心 v2：新模块不写旧 ShareTask，队列项以 event_id 反向引用 sc_publish_tasks。
+    if getattr(q, "push_reason", "") == "sc_v2" and getattr(q, "event_id", 0):
+        from .models import SCPublishTask
+        v2_task = db.get(SCPublishTask, q.event_id)
+        return (v2_task.share_url or "") if v2_task else ""
     if not q.share_task_id:
         return None
     task = db.get(ShareTask, q.share_task_id)

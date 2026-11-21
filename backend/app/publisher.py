@@ -574,6 +574,14 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                 q.error = share_error
             # v0.9.10：ensure_share 内部已 commit；发 TG 前再确保无悬挂写事务。
             db.commit()
+            # 分享中心 v2：按频道/群分型取发送间隔；只读计算，等待期间绝不持写事务。
+            try:
+                from . import share_center_v2 as _sc2
+                pacing_wait = _sc2.pacing_wait_seconds(db, q)
+            except Exception:
+                pacing_wait = 0.0
+            if pacing_wait > 0:
+                await asyncio.sleep(min(pacing_wait, 60.0))
             # v1.5.1 P0 第七次：给单条发送加硬上限，杜绝「慢请求+sendPhoto回退」
             # 把一轮拖到数分钟。超时按可重试失败计退避，不破坏逐条保序与去重。
             try:
@@ -634,6 +642,16 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                         _sc.mark_result(db, q.share_task_id, ok=False, error=q.error)
                 except Exception:
                     pass
+            # 分享中心 v2：节奏状态与任务终态回写新表；429 retry_after 覆盖静态间隔。
+            if getattr(q, "push_reason", "") == "sc_v2" and getattr(q, "event_id", 0):
+                try:
+                    from . import share_center_v2 as _sc2
+                    _sc2.mark_pacing_attempt(db, q, retry_after=float(retry_after or 0), success=ok)
+                    if ok or q.status == "failed":
+                        _sc2.mark_result(db, q.event_id, success=ok, error=q.error)
+                except Exception:
+                    db.rollback()
+                    logger.warning("[publisher] 分享中心 v2 回写异常（不影响主链）", exc_info=True)
             # v0.9.10：本条发送结果立即落盘，绝不把写事务带进下一轮的 sleep / 网络 await。
             db.commit()
         return {"sent": sent, "failed": failed, "shares_created": shared}

@@ -118,6 +118,11 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 四模块重构：分享中心主链开关。v1.1 起默认 true=分享中心真正接管主链
     # （建分享→提交→原子领取→只读链接发送→回执）；设 false 可临时回退旧链排障。
     "share_center_enabled": ("share_center_enabled", "true"),
+    # 分享中心 v2（全新数据体系）：true=使用 sc_* 新表与四级计划引擎；
+    # 用户口径：旧库数据不用管，新模块上线后全部使用新数据。
+    "share_center_v2_enabled": ("share_center_v2_enabled", "true"),
+    # AI 调度建议默认只进审核队列；显式打开后才允许自动应用，且永远不直接推送。
+    "sc_ai_auto_apply": ("sc_ai_auto_apply", "false"),
     # 阶段二（资源库解耦）灰度开关：true=识别入口只发资源事件（携带 channel_targets），
     # 推送决策完全由分享中心 consume_resource_events→submit_to_dispatch 新链接管；
     # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。

@@ -187,8 +187,8 @@ def test_version_is_141_everywhere():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     main_src = (root / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="1.5.2"' in main_src
-    assert '"version": "1.5.2"' in main_src
-    assert "v1.5.2 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "1.5.2"
-    assert "当前版本：v1.5.2" in (root / "README.md").read_text(encoding="utf-8")
+    assert 'version="2.0.0"' in main_src
+    assert '"version": "2.0.0"' in main_src
+    assert "v2.0.0 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
+    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "2.0.0"
+    assert "当前版本：v2.0.0" in (root / "README.md").read_text(encoding="utf-8")

@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from . import (admin_session, ai_assist, async_scan_state, bot_listener,
                contribution_restore, guangya_auth, guangya_sms, log_retention,
-               mirror, mirror_batch, runtime_config, tgto, tmdb)
+               mirror, mirror_batch, runtime_config, share_center_v2, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
@@ -554,33 +554,50 @@ def _run_share_cycle_in_thread(limit: int = 20) -> dict:
             return {"built": 0, "submitted": 0, "skipped": 0, "failed": 0, "error": True}
 
 
-async def _job_share_center() -> None:
-    """四模块重构：分享中心调度周期（建分享→提交分发）。
-
-    v1.1 默认开启（share_center_enabled=true）：扫描 planned 分享任务，建分享并
-    提交到分发中心。开关关闭仅作旧链排障用。全程独立 Session，异常自行吞掉并留
-    应用日志，不影响其它定时任务。
-
-    P0 修复（v1.4.0→v1.4.2）：两段都挪出事件循环线程——
-      1. 事件消费（纯同步 DB）走 _consume_resource_events_in_thread；
-      2. 分享调度周期（run_cycle 含同步 commit + 网络 await）走
-         _run_share_cycle_in_thread（线程内 asyncio.run drive）。
-    主线程全程零 SQLite 锁等待，任何 30s busy_timeout 都不再冻结全站 job/API。
-    """
-    from . import share_center as _sc
-    # 先判断开关（轻量只读查询，留在事件循环线程）
+def _run_share_center_v2_cycle_in_thread(limit: int = 20) -> dict:
+    """分享中心 v2 调度周期：全部在 sc_* 新表上运行，线程内独立 Session。"""
     with SessionLocal() as db:
         try:
-            if not _sc.is_enabled(db):
-                return
+            share_center_v2.ensure_defaults(db)
+            return asyncio.run(share_center_v2.run_cycle(db, limit=limit))
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center_v2] 调度周期异常（线程内）", exc_info=True)
+            return {"enabled": True, "error": True, "message": str(exc)[:500]}
+
+
+def _run_sc_ai_weekly_in_thread() -> dict:
+    with SessionLocal() as db:
+        try:
+            return share_center_v2.generate_weekly_suggestions(db)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("[share_center_v2] AI 周度建议异常", exc_info=True)
+            return {"error": True, "message": str(exc)[:500]}
+
+
+async def _job_sc_ai_weekly() -> None:
+    await asyncio.to_thread(_run_sc_ai_weekly_in_thread)
+
+
+async def _job_share_center() -> None:
+    """分享中心调度入口：v2 新数据体系默认接管，旧链保留为降级路径。"""
+    with SessionLocal() as db:
+        try:
+            from . import share_center as _sc
+            v2_on = share_center_v2.is_enabled(db)
+            old_on = False if v2_on else _sc.is_enabled(db)
         except Exception as exc:
             db.rollback()
             logger.warning("[share_center] 开关读取异常：%s", exc)
             return
-    # P0：同步事件消费挪出事件循环，锁等待不再冻结全站
+    if v2_on:
+        await asyncio.to_thread(_run_share_center_v2_cycle_in_thread)
+        return
+    if not old_on:
+        return
+    from . import share_center as _sc
     await asyncio.to_thread(_consume_resource_events_in_thread)
-    # v1.4.2 洞2：分享调度周期（含同步 commit）也挪出事件循环，
-    # 避免主线程等待写锁冻结全站（第四次复现根因）
     await asyncio.to_thread(_run_share_cycle_in_thread)
 
 
@@ -659,6 +676,11 @@ async def lifespan(app: FastAPI):
                       CronTrigger.from_crontab("30 3 * * *", timezone="Asia/Shanghai"),
                       id="log_prune", replace_existing=True,
                       max_instances=1, coalesce=True)
+    # 分享中心 v2：AI 只做周度建议，默认只进审核队列，不直接推送。
+    scheduler.add_job(_job_sc_ai_weekly,
+                      CronTrigger.from_crontab("30 3 * * 1", timezone="Asia/Shanghai"),
+                      id="sc_ai_weekly", replace_existing=True,
+                      max_instances=1, coalesce=True)
     scheduler.start()
     yield
     # 阶段四 A-11：wait=True 等待正在执行的 job 收尾，避免容器停止时腰斩
@@ -673,13 +695,15 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="1.5.2", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.0.0", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
+# 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
+app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.5.2", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.0.0", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
