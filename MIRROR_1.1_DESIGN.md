@@ -58,13 +58,14 @@
    - **B 类（整部在 B 缺失）**：作品 work_key 在 `a_work_keys`（A 还在），且复用 `_b_file_candidates` 判 B 库整部为空（verified=True 且 visible 空）→ 判失效。
      - **预扫描只登记、不重置**：把该作品 work_key 记入 `reprocess_keys`，由 `sync_rule` 重排 works 优先进入本批。**不在预扫描里清 MirrorFile 为 pending**——v0.8.7 主循环（mirror.py:1323-1339）已有成熟的"B 库空→重置 pending→补复制→missing_in_b 计数"逻辑，且带 name_mismatch 保护，只重置真正缺失的行。预扫描提前清 pending 会让主循环 `synced_rows` 变空、`missing_in_b` 统计丢失（v087/v088 回归根因），还会误伤"改名后名字对不上"场景造成整部重复复制。
      - **计入第二轮剧部数**：重排进本批后走正常主循环，`stats["media"]` 自增（与正常复制同口径）。
-   - **A 类（单文件变化）**：个别 MirrorFile 的 source_file_id 在 A 但 fingerprint 变化，或 A 有新增单集 → 交给现有主循环 `1194-1256` 处理，**不计入剧部数**（1.0 已具备，预扫描只统计不新增动作）。
+   - **A 类（单文件变化 / 缺集）**：个别 MirrorFile 的 source_file_id 在 A 但 fingerprint 变化，或 A 有新增单集 → 交给现有主循环处理，**不计入剧部数**（1.0 已具备，预扫描只统计不新增动作）。
+     - **缺集识别（真机「我不是大师 S01E23」根因补齐）**：映射清单标 `synced` 且 A 库仍在的集，若 B 库逐集 `_lookup_b_file` 反查不到即为缺集。判定口径与主循环 v0.8.7 严格一致：只有 `b_file_count < len(synced_a_rows)` 才判缺集；B 数 ≥ synced 数时是改名加后缀的 name_mismatch，**绝不重排**，避免整部重复复制。缺集剧返回 `missing_keys`，由 `sync_rule` 抽成**不占 `max_works` 部数预算的优先补丁批次**（`priority_works`），先于正常 `batch` 同轮执行。预扫描只登记，绝不提前改 MirrorFile 状态；补复制仍由主循环复用同一行完成（`stats["missing_in_b"]`）。
    - **D 类（无变化）**：默认，走正常轮转。
 
 3. **优先处理排序**：B 类 `reprocess_keys` 对应的 work 排到 `works` 列表前部（在 `plan_work_batch` 选批之前重排），使"整部缺失需重处理"的作品优先进入本批。这样 B 类既"计入剧部数"又"优先处理"。
    - 实现注意：`_discover_works()` 返回的 `works` 元素是 `(node, cats)` 元组，重排 key 必须取 `work_key_of(pair[0])`，直接对 pair 调 `.get()` 会报 `'tuple' object has no attribute 'get'`（全量回归 v087/v088 曾踩坑）。`reprocess_keys` 存 `work:` 前缀键，与 `work_key_of()` 同口径；预扫描入口对 legacy 无前缀 `MirrorMedia.work_key` 统一补前缀，避免把 A 还在的作品误判成 C 类已删。
 
-4. **统计回写**：`stats["prepass"] = {"c_deleted_a": n, "c_b_files_removed": n, "b_invalid_reprocess": n, "a_single_file_fix": n, "d_unchanged": n}`。
+4. **统计回写**：`stats["prepass"] = {"c_deleted_a": n, "c_b_files_removed": n, "b_invalid_reprocess": n, "a_single_file_fix": n, "a_missing_episodes": n, "d_unchanged": n, "reprocess_prioritized": n, "priority_fix_works": n}`。`reprocess_prioritized` 是占部数的 B 类重排数，`priority_fix_works` 是不占部数的缺集补丁剧数；`stats["batch_size"]` 只计正常轮转部数，缺集补丁另在 `rule.last_message` 显示「另优先补齐 N 部缺集（不占限额）」。
 
 ### 2.3 护栏（红线）
 
@@ -76,7 +77,7 @@
 
 ### 2.4 与复制/翻译按部预算的关系
 
-- **A 类单文件补齐**：不计入 `stats["media"]`（剧部数）——现有单文件补齐本就不自增 media，符合 a。
+- **A 类单文件补齐 / 缺集**：不占 `max_works` 部数预算、不计入 `stats["batch_size"]`；缺集剧作为 `priority_works` 先于正常批次同轮执行，补复制交主循环复用同一行（`missing_in_b`）。符合 a「不计入第二轮任务剧部数数量」。
 - **B 类整部重处理**：排到批次前部，走正常复制主循环，`stats["media"]` 自增（现有 1265/1282/1358 三处）——符合 b"计入剧部数"。
 - **C/D 类**：不进本轮复制，C 类清清单，D 类顺序轮转——符合 c/d。
 

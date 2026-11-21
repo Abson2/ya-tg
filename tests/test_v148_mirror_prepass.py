@@ -137,7 +137,7 @@ def test_c_class_full_mirror_deletes_b_and_clears_by_default(env):
         return {}, True
     mirror._b_file_candidates = _bc  # c 类不查 B，但保险起见 mock
 
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, works, api, stats, complete=True))
     pp = stats["prepass"]
     assert pp["mirror_mode"] == "full"
@@ -161,7 +161,7 @@ def test_c_class_half_mirror_keeps_b_and_mapping(env):
     stats = {}
     api = _api()
 
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, _works("现存剧"), api, stats, complete=True))
     pp = stats["prepass"]
     assert pp["mirror_mode"] == "half"
@@ -209,10 +209,11 @@ def test_b_class_returns_reprocess_key_without_reset(env):
     mirror._b_file_candidates = _bc
     stats = {}
     api = _api()
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, works, api, stats, complete=True))
     assert stats["prepass"]["b_invalid_reprocess"] == 1
     assert "work:失效剧" in got
+    assert "work:失效剧" not in _missing, "B类整部失效走重排键，不进缺集补丁批次"
     # 预扫描只登记重排键，不提前清 pending：重置/补复制/计数交给主循环 v0.8.7。
     # 提前清会让主循环 synced_rows 变空、missing_in_b 丢失（v087/v088 回归根因）。
     rows = db.scalars(select(mirror.MirrorFile).where(mirror.MirrorFile.media_id == m.id)).all()
@@ -234,7 +235,7 @@ def test_a_class_single_file_change_not_counted(env):
         return {"chg1.mkv:999": "B-CHG1"}, True  # B 库有文件
     mirror._b_file_candidates = _bc
     api = _api()
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, _works("变化剧"), api, stats, complete=True))
     assert stats["prepass"]["a_single_file_fix"] == 1
     assert stats["prepass"]["b_invalid_reprocess"] == 0
@@ -254,7 +255,7 @@ def test_d_class_unchanged(env):
         return {"same1.mkv:100": "B-SAME1"}, True
     mirror._b_file_candidates = _bc
     api = _api()
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, _works("稳定剧"), api, stats, complete=True))
     assert stats["prepass"]["d_unchanged"] == 1
     assert got == []
@@ -270,7 +271,75 @@ def test_prepass_disabled_short_circuits(env):
     runtime_config.set_many(db, {"mirror_prepass_enabled": "false"})
     stats = {}
     api = _api()
-    got = asyncio.run(mirror.reconcile_mappings_prepass(
+    got, _missing = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, _nodes({}), _works(), api, stats, complete=True))
     assert got == []
     assert stats["prepass"]["enabled"] is False
+
+
+# ---------- A 类缺集：真机「我不是大师 S01E23」根因闭环 ----------
+
+def test_a_class_missing_episode_goes_to_missing_keys(env):
+    """B 库单集缺失、映射仍 synced、A 库仍在 → A 类缺集键，不误判 d_unchanged。"""
+    from app import mirror
+    S, eng, d = env
+    db = S()
+    rule = _rule(db)
+    m = _media(db, rule, "缺集剧", src_ids=["E22", "E23"])
+    nodes = _nodes({"d": [_a_file("E22"), _a_file("E23")]})
+    stats = {}
+
+    from app.utils import normalize_work_name
+
+    async def _bc(api_, media):
+        # key 口径与 _b_file_candidates 一致：normalize_work_name("E22.mkv")="e22mkv"
+        return {f"{normalize_work_name('E22.mkv')}:100": "B-E22"}, True  # E23 真缺失
+    mirror._b_file_candidates = _bc
+
+    got, missing = asyncio.run(mirror.reconcile_mappings_prepass(
+        db, rule, nodes, _works("缺集剧"), _api(), stats, complete=True))
+    pp = stats["prepass"]
+    assert pp["a_missing_episodes"] == 1
+    assert pp["a_single_file_fix"] == 1
+    assert pp["d_unchanged"] == 0
+    assert "work:缺集剧" in missing
+    assert got == [], "缺集走补丁批次，不占 B 类重排键"
+    # 红线：预扫描只登记，绝不提前改 MirrorFile；补复制交主循环 v0.8.7
+    rows = db.scalars(select(mirror.MirrorFile).where(mirror.MirrorFile.media_id == m.id)).all()
+    assert all(r.status == "synced" for r in rows)
+
+
+def test_a_class_name_mismatch_not_treated_as_missing(env):
+    """B 库文件数 >= synced 数（改名加后缀）→ 不判缺集，避免整部重复复制。"""
+    from app import mirror
+    S, eng, d = env
+    db = S()
+    rule = _rule(db)
+    _media(db, rule, "改名剧", src_ids=["R1", "R2"])
+    nodes = _nodes({"d": [_a_file("R1"), _a_file("R2")]})
+    stats = {}
+
+    from app.utils import normalize_work_name
+
+    async def _bc(api_, media):
+        # 两集都在 B 库，只是名字改了（键口径同真机 _b_file_candidates）
+        return {f"{normalize_work_name('R1.mkv')}:100": "B-R1",
+                f"{normalize_work_name('R2.mkv')}:100": "B-R2"}, True
+    mirror._b_file_candidates = _bc
+
+    got, missing = asyncio.run(mirror.reconcile_mappings_prepass(
+        db, rule, nodes, _works("改名剧"), _api(), stats, complete=True))
+    assert stats["prepass"]["a_missing_episodes"] == 0
+    assert "work:改名剧" not in missing
+    assert stats["prepass"]["d_unchanged"] == 1
+
+
+def test_priority_fix_batch_does_not_consume_max_works():
+    """缺集补丁批次先于正常批执行，且不占 max_works / batch_size 名额。"""
+    src = (Path(__file__).resolve().parents[1] / "backend" / "app" / "mirror.py").read_text(
+        encoding="utf-8")
+    assert "for work, cats in priority_works + batch:" in src
+    assert 'stats["batch_size"] = len(batch)' in src
+    assert 'stats["prepass"]["priority_fix_works"]' in src
+    assert "works = [p for p in works if work_key_of(p[0]) not in missing_set]" in src
+    assert "另优先补齐" in src

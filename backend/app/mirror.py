@@ -352,32 +352,40 @@ def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool
 
 async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                                       works: list, api: GuangYaWebFiles, stats: dict,
-                                      *, complete: bool) -> list[str]:
-    """镜像1.1：单轮开始三方对比，输出需优先重处理的作品键（B 类）。
+                                      *, complete: bool) -> tuple[list[str], list[str]]:
+    """镜像1.1：单轮开始三方对比，输出 (B 类重排键, A 类缺集键)。
 
-    a) 单文件变化：只统计，补齐交给主循环 1194-1256，不计剧部数；
+    a) 单文件变化/缺集：只统计+登记缺集键，绝不在这里改 MirrorFile。
+       A 库还在但 B 库逐集反查不到（且 B 可见数 < 应同步数，排除改名后缀造成的
+       name_mismatch 误伤）→ 缺集剧键进 missing_keys，交 sync_rule 作为
+       **不占 max_works 部数预算**的优先补丁批次处理；补复制仍由主循环 v0.8.7
+       （1326-1354）复用同一行完成，预扫描提前清 pending 会丢 missing_in_b 统计；
     b) 整部在 B 缺失（A 还在）：只识别+返回优先重处理键；重置/补复制/计数
-       一律交给主循环 v0.8.7（1323-1339）——预扫描提前清 pending 会让主循环
-       synced_rows 变空、missing_in_b 丢失，且误伤 name_mismatch 保护场景；
-    c) A 库已无该作品：默认清清单+统计；开关开且 complete 时真删 B 库文件；
+       一律交给主循环 v0.8.7——预扫描提前清 pending 会让 synced_rows 变空、
+       missing_in_b 丢失，且误伤 name_mismatch 保护场景。B 类重排进本批、
+       按用户确认「计入第二轮剧部数」占 max_works 名额；
+    c) A 库已无该作品：默认清清单+统计；full 模式且 complete 时真删 B 库文件；
     d) 无变化：不动作。
 
     任何判定都要求 complete=True（A 树完整），否则跳过 c/b。全程无跨 await 写事务。
-    返回 reprocess_keys（B 类作品键列表，供 sync_rule 重排 works 优先处理）。
+    返回 (reprocess_keys, missing_keys)：前者重排进 works 占部数，后者单独优先
+    批次、不计「整理整部剧」部数预算（设计文档 MIRROR_1.1_DESIGN.md 2.4 节）。
     """
     prepass = {"enabled": True, "complete": complete, "mirror_mode": "full",
                "c_deleted_a": 0, "c_b_files_removed": 0, "c_mapping_cleared": 0,
                "c_kept_in_half_mode": 0, "c_delete_failed": 0,
-               "b_invalid_reprocess": 0, "a_single_file_fix": 0, "d_unchanged": 0,
+               "b_invalid_reprocess": 0, "a_single_file_fix": 0,
+               "a_missing_episodes": 0, "d_unchanged": 0,
                "skipped": 0}
     stats["prepass"] = prepass
     reprocess_keys: list[str] = []
+    missing_keys: list[str] = []
     try:
         enabled = str(runtime_config.get(db, "mirror_prepass_enabled") or "true").lower() in (
             "1", "true", "yes", "on")
         if not enabled:
             prepass["enabled"] = False
-            return reprocess_keys
+            return reprocess_keys, missing_keys
         try:
             max_media = max(0, int(runtime_config.get(db, "mirror_prepass_max_media") or 50))
         except (TypeError, ValueError):
@@ -430,7 +438,7 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                         prepass["c_delete_failed"] = prepass.get("c_delete_failed", 0) + 1
                 continue
 
-            # 作品 A 库还在 → 判断是否整部在 B 缺失（B 类）或单文件变化（A 类）
+            # 作品 A 库还在 → B 类整部缺失 / A 类单文件缺集或变化 / D 无变化
             if not complete:
                 prepass["skipped"] += 1
                 continue
@@ -448,16 +456,33 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                 # 统一完成，避免 synced_rows 被提前清空导致 missing_in_b 丢失。
                 prepass["b_invalid_reprocess"] += 1
                 reprocess_keys.append(wk)
+                continue
+            # A 类缺集识别（镜像1.1 补齐，真机「我不是大师 S01E23」根因）：
+            # 映射清单标 synced 且 A 库仍在的集，若 B 库逐集反查不到就是缺集。
+            # 判定口径与主循环 v0.8.7（1336-1360）严格一致：只有 B 可见文件数
+            # 少于应同步数才判缺集；B 数 >= synced 数时多为改名加后缀的
+            # name_mismatch，绝不重排，避免整部重复复制。
+            synced_a_rows = [r for r in rows
+                             if r.status == "synced" and r.source_file_id in a_file_ids]
+            b_file_count = len({v for k, v in candidates.items() if ":" in k})
+            missing_rows = ([r for r in synced_a_rows if not _lookup_b_file(candidates, r)]
+                            if b_file_count < len(synced_a_rows) else [])
+            if missing_rows:
+                prepass["a_missing_episodes"] += len(missing_rows)
+                prepass["a_single_file_fix"] += 1
+                # 缺集剧优先进入本轮，但作为「补丁批次」单独处理、不占 max_works
+                # 部数预算；补复制仍由主循环复用同一行完成，这里绝不改 MirrorFile。
+                missing_keys.append(wk)
             elif changed_fp or len(in_a) < len(src_ids):
                 # A 有更新 或 A 源文件数 > 已同步源文件集合 → A 类单文件补齐（不计部数）
                 prepass["a_single_file_fix"] += 1
             else:
                 prepass["d_unchanged"] += 1
-        return reprocess_keys
+        return reprocess_keys, missing_keys
     except Exception as exc:
         logger.warning("[mirror1.1] 三方对比预扫描异常（不阻断同步）：%s", exc)
         stats.setdefault("prepass", prepass)["error"] = str(exc)[:200]
-        return []
+        return [], []
 
 
 async def api_b_candidates_safe(api: GuangYaWebFiles, media: MirrorMedia) -> tuple[dict, bool]:
@@ -1228,11 +1253,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
 
     works = _discover_works(nodes, root)
     # 镜像1.1：单轮开始三方对比预扫描（A树/B树/映射清单查漏补缺）。
-    # 返回的 reprocess_keys（B类整部失效）重排到 works 前部，优先进入本批重处理；
-    # A类单文件补齐仍交给主循环、不计剧部数；C类默认只清清单不删B库。
-    # 预扫描失败只记录不阻断同步；complete=False 时内部自动跳过 c/b 判定。
+    # reprocess_keys（B类整部失效）重排到 works 前部、占本批部数名额；
+    # missing_keys（A类单文件缺集）抽成不占 max_works 的优先补丁批次，本轮先补齐
+    # 再走正常轮转——真机「B库缺集、映射仍 synced」由此在下一轮自动补回。
+    # C类按 mirror_mode 清清单/删B库；预扫描失败只记录不阻断同步。
     try:
-        reprocess_keys = await reconcile_mappings_prepass(
+        reprocess_keys, missing_keys = await reconcile_mappings_prepass(
             db, rule, nodes, works, api, stats, complete=complete)
         if reprocess_keys:
             rank = {k: i for i, k in enumerate(reprocess_keys)}
@@ -1243,8 +1269,17 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 key=lambda pair: (0 if work_key_of(pair[0]) in rank else 1,
                                   rank.get(work_key_of(pair[0]), 0)))
             stats["prepass"]["reprocess_prioritized"] = len(reprocess_keys)
+        # A 类缺集剧从轮转池抽出，作为优先补丁批次单独处理。不消耗 max_works
+        # 部数预算（设计文档 2.4 节：A 类不计剧部数），但与本批同轮执行。
+        priority_works: list = []
+        if missing_keys:
+            missing_set = set(missing_keys)
+            priority_works = [p for p in works if work_key_of(p[0]) in missing_set]
+            works = [p for p in works if work_key_of(p[0]) not in missing_set]
+        stats["prepass"]["priority_fix_works"] = len(priority_works)
     except Exception as exc:
         logger.warning("[mirror1.1] 预扫描挂钩异常（不阻断同步）：%s", exc)
+        priority_works = []
     # v0.9.0：按单轮上限 + 轮转游标切批。max_works<=0 时退化为旧行为（全量，
     # 仍受 max_media 防御上限约束）；>0 时本批最多 max_works 部，剩余下轮继续。
     if max_works > 0:
@@ -1257,7 +1292,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     stats["works_cursor"] = new_cursor
     stats["wrapped"] = wrapped
     stats["total_works"] = len(works)
-    for work, cats in batch:
+    # 缺集补丁批次先于正常轮转执行；两者已去重（priority 从 works 抽出），
+    # 同一部剧不会在一轮内被处理两次。
+    for work, cats in priority_works + batch:
         cat_path = "/".join(n for n, _ in cats) or "__root__"
         title = standard_media_name(work["name"])
         expected = star_media_name(title) if rule.star_naming else title
@@ -1566,6 +1603,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         _left = max(0, stats.get("total_works", 0) - stats["batch_size"])
         rule.last_message += (f" · 本轮限额 {max_works} 部 / 实处理 {stats['batch_size']} 部"
                               f"（A 库共 {stats.get('total_works', 0)} 部，余 {_left} 部下轮继续）")
+        _pf = int((stats.get("prepass") or {}).get("priority_fix_works", 0) or 0)
+        if _pf:
+            rule.last_message += f" · 另优先补齐 {_pf} 部缺集（不占限额）"
     if stats["dir_errors"]:
         rule.last_message += " · 首个建目录错误：" + stats["dir_errors"][0][:300]
     # v0.8.4：文件级错误必须落到 last_message，刷新页面后仍看得到，
