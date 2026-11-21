@@ -305,7 +305,8 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
 # 镜像1.1（2026-11-21）：单轮开始的 A树/B树/映射清单三方对比预扫描（查漏补缺）。
 # 需求 a/b/c/d 见 MIRROR_1.1_DESIGN.md。设计红线：
 #   - complete=False（A 树不完整）跳过 c/b 判定，绝不误删；
-#   - 默认只清清单+统计、不删 B 库（真删靠 mirror_delete_b_on_a_missing 开关）；
+#   - 镜像模式 mirror_mode：full（默认，全镜像）= C 类 A 已删 → 删 B 库对应文件+清清单；
+#     half（半镜像）= C 类 B 文件与映射清单都保留、完全不动。边界：A 库只读；
 #   - 零跨 await 持写事务：网络 await 前先 commit；
 #   - 性能护栏 max_prepass_media 限制单轮核对部数。
 # ============================================================================
@@ -364,8 +365,9 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
     任何判定都要求 complete=True（A 树完整），否则跳过 c/b。全程无跨 await 写事务。
     返回 reprocess_keys（B 类作品键列表，供 sync_rule 重排 works 优先处理）。
     """
-    prepass = {"enabled": True, "complete": complete,
+    prepass = {"enabled": True, "complete": complete, "mirror_mode": "full",
                "c_deleted_a": 0, "c_b_files_removed": 0, "c_mapping_cleared": 0,
+               "c_kept_in_half_mode": 0, "c_delete_failed": 0,
                "b_invalid_reprocess": 0, "a_single_file_fix": 0, "d_unchanged": 0,
                "skipped": 0}
     stats["prepass"] = prepass
@@ -398,26 +400,34 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
             src_ids = {str(r.source_file_id or "") for r in rows if r.source_file_id}
             in_a = src_ids & a_file_ids
 
-            # C 类：A 库已无该作品（所有源文件都不在 A 树，且作品键也不在工作集）
+            # C 类：A 库已无该作品（所有源文件都不在 A 树，且作品键也不在工作集）。
+            # 镜像模式（用户口径 2026-11-21，边界=A 库只读）：
+            #   full（默认，全镜像）→ 自动删 B 库对应文件 + 清映射清单，A/B 保持一致；
+            #   half（半镜像）       → B 库文件与映射清单都原样保留，完全不动（B 是 A 超集）。
+            # 只有 A 树完整（complete=True）才进入本分支，绝不误删；删 B 库走已抓包
+            # api.delete_files（异步任务），失败只记录不中断；网络 await 前不持写事务。
             if complete and not in_a and wk not in a_work_keys:
                 prepass["c_deleted_a"] += 1
-                do_delete = str(runtime_config.get(
-                    db, "mirror_delete_b_on_a_missing") or "false").lower() in (
-                        "1", "true", "yes", "on")
+                mode = str(runtime_config.get(db, "mirror_mode") or "full").lower().strip()
+                prepass["mirror_mode"] = "half" if mode in (
+                    "half", "semi", "partial", "0", "false", "off") else "full"
+                full_mirror = prepass["mirror_mode"] == "full"
+                if not full_mirror:
+                    prepass["c_kept_in_half_mode"] += 1
+                    continue  # 半镜像：清单与 B 文件都保留
                 # 必须在清清单前捕获 b_ids：_clear_media_mappings 会清空 ORM 行的
                 # target_file_id，rows 与其共享 identity map，事后取不到。
-                b_ids: list[str] = []
-                if do_delete:
-                    b_ids = [str(r.target_file_id) for r in rows
-                             if r.target_file_id and str(r.target_file_id).strip()]
-                # 先清清单（不跨 await），再可选真删 B 库（网络 await 前已 commit）
+                b_ids: list[str] = [str(r.target_file_id) for r in rows
+                                    if r.target_file_id and str(r.target_file_id).strip()]
+                # 先清清单（不跨 await），再删 B 库（网络 await 前已 commit）
                 prepass["c_mapping_cleared"] += _clear_media_mappings(db, media)
-                if do_delete and b_ids:
+                if b_ids:
                     try:
                         await api.delete_files(b_ids)
                         prepass["c_b_files_removed"] += len(b_ids)
                     except Exception as exc:
-                        logger.warning("[mirror1.1] C类删B库失败 wk=%s：%s", wk, exc)
+                        logger.warning("[mirror1.1] C类(full)删B库失败 wk=%s：%s", wk, exc)
+                        prepass["c_delete_failed"] = prepass.get("c_delete_failed", 0) + 1
                 continue
 
             # 作品 A 库还在 → 判断是否整部在 B 缺失（B 类）或单文件变化（A 类）

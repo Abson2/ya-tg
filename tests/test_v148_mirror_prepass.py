@@ -105,8 +105,8 @@ def _api(b_candidates=None, verified=True):
 def test_defaults(env):
     from app.runtime_config import DEFAULTS
     assert DEFAULTS["mirror_prepass_enabled"][1] == "true"
-    assert DEFAULTS["mirror_delete_b_on_a_missing"][1] == "false"
     assert DEFAULTS["mirror_prepass_max_media"][1] == "50"
+    assert DEFAULTS["mirror_mode"][1] == "full", "默认全镜像"
 
 
 def test_build_a_facts():
@@ -121,7 +121,8 @@ def test_build_a_facts():
 
 # ---------- c 类：A 已删 ----------
 
-def test_c_class_clears_mapping_not_delete_b_by_default(env):
+def test_c_class_full_mirror_deletes_b_and_clears_by_default(env):
+    """默认全镜像：A 已删 → 删 B 库对应文件 + 清映射清单。"""
     from app import mirror
     S, eng, d = env
     db = S()
@@ -139,29 +140,40 @@ def test_c_class_clears_mapping_not_delete_b_by_default(env):
     got = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, works, api, stats, complete=True))
     pp = stats["prepass"]
+    assert pp["mirror_mode"] == "full"
     assert pp["c_deleted_a"] == 1
-    assert pp["c_mapping_cleared"] >= 1
-    assert pp["c_b_files_removed"] == 0, "默认不删 B 库"
-    api.delete_files.assert_not_called()
+    assert pp["c_mapping_cleared"] >= 1, "全镜像清清单"
+    assert pp["c_b_files_removed"] == 2, "全镜像删 B 库对应 2 个文件"
+    api.delete_files.assert_awaited_once()
     assert got == []  # c 类不进重处理
     db.rollback()
 
 
-def test_c_class_delete_when_switch_on(env):
+def test_c_class_half_mirror_keeps_b_and_mapping(env):
+    """半镜像：A 已删 → B 库文件与映射清单都原样保留，完全不动。"""
     from app import mirror, runtime_config
     S, eng, d = env
     db = S()
     rule = _rule(db)
-    _media(db, rule, "已删剧", src_ids=["GONE1"])
-    runtime_config.set_many(db, {"mirror_delete_b_on_a_missing": "true"})
+    m = _media(db, rule, "已删剧", src_ids=["GONE1", "GONE2"])
+    runtime_config.set_many(db, {"mirror_mode": "half"})
     nodes = _nodes({"other": [_a_file("F1")]})
     stats = {}
     api = _api()
 
-    asyncio.run(mirror.reconcile_mappings_prepass(
+    got = asyncio.run(mirror.reconcile_mappings_prepass(
         db, rule, nodes, _works("现存剧"), api, stats, complete=True))
-    assert stats["prepass"]["c_b_files_removed"] == 1
-    api.delete_files.assert_awaited_once()
+    pp = stats["prepass"]
+    assert pp["mirror_mode"] == "half"
+    assert pp["c_deleted_a"] == 1
+    assert pp["c_kept_in_half_mode"] == 1
+    assert pp["c_mapping_cleared"] == 0
+    assert pp["c_b_files_removed"] == 0
+    api.delete_files.assert_not_called()
+    # 映射清单原封不动
+    rows = db.scalars(select(mirror.MirrorFile).where(mirror.MirrorFile.media_id == m.id)).all()
+    assert all(r.target_file_id == f"B-{r.source_file_id}" and r.status == "synced"
+               for r in rows)
 
 
 def test_c_class_skipped_when_incomplete(env):
@@ -171,7 +183,7 @@ def test_c_class_skipped_when_incomplete(env):
     db = S()
     rule = _rule(db)
     _media(db, rule, "已删剧", src_ids=["GONE1"])
-    runtime_config.set_many(db, {"mirror_delete_b_on_a_missing": "true"})
+    runtime_config.set_many(db, {"mirror_mode": "full"})
     stats = {}
     api = _api()
     asyncio.run(mirror.reconcile_mappings_prepass(

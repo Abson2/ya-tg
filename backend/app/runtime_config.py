@@ -139,12 +139,18 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "rename_idle_seconds": ("rename_idle_seconds", "0.5"),
     "rename_concurrency": ("rename_concurrency", "3"),
     # 镜像1.1（查漏补缺）：单轮开始做 A树/B树/映射清单三方对比预扫描。
-    # prepass_enabled 默认开（只核对+统计，不删 B 库）；
-    # delete_b_on_a_missing 默认关（C类 A库已删时真删 B 库不可逆，真机验证后再开）；
+    # prepass_enabled 默认开（核对+统计，C类删 B 库由 mirror_mode 决定）；
     # prepass_max_media 预扫描单轮最多核对多少部作品（性能护栏，防接口风暴）。
     "mirror_prepass_enabled": ("mirror_prepass_enabled", "true"),
-    "mirror_delete_b_on_a_missing": ("mirror_delete_b_on_a_missing", "false"),
     "mirror_prepass_max_media": ("mirror_prepass_max_media", "50"),
+    # 镜像模式（用户口径 2026-11-21，默认全镜像）：
+    #   full（全镜像，默认）= A 库已删的文件/作品 → 预扫描自动删 B 库对应文件 + 清映射清单，
+    #                          保持 A/B 一致；仅 A 树完整时才删（complete 闸门）。
+    #   half（半镜像）       = A 库已删 → B 库文件与映射清单都原样保留，B 是 A 的超集，
+    #                          完全不动。
+    # 边界：A 库只读（任何模式都不写 A）。旧键 mirror_delete_b_on_a_missing 保留兼容读取，
+    # 但以 mirror_mode 为准；full 即等价于"允许删 B 库"。
+    "mirror_mode": ("mirror_mode", "full"),
 }
 
 

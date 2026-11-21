@@ -52,9 +52,9 @@
    - `a_work_keys` = `{work_key_of(w) for w in works}`
 
 2. **遍历该 rule 下 MirrorMedia + MirrorFile**（只读），按作品分类：
-   - **C 类（A 已删除）**：该作品所有 MirrorFile 的 `source_file_id` 均不在 `a_file_ids`，且该作品 work_key 不在 `a_work_keys` → A 库已无此作品。
-     - 保守默认（`mirror_delete_b_on_a_missing=false`）：清映射清单（删 MirrorFile/MirrorMedia 行或标 retired）+ 统计，**不删 B 库文件**。
-     - 开关开启：调 `api.delete_files(该作品 MirrorFile.target_file_id 集合)` 删 B 库文件（需轮询 task），再清清单。**仅 `complete=True` 时才允许真删**。
+   - **C 类（A 已删除）**：该作品所有 MirrorFile 的 `source_file_id` 均不在 `a_file_ids`，且该作品 work_key 不在 `a_work_keys` → A 库已无此作品。由**镜像模式** `mirror_mode` 决定动作（用户口径 2026-11-21，边界=A 库只读）：
+     - **全镜像 `full`（默认）**：调 `api.delete_files(该作品 MirrorFile.target_file_id 集合)` 删 B 库对应文件（异步 task），再清映射清单 + 统计。A/B 保持一致。**仅 `complete=True` 时才删**，删前不跨 await 持写事务，失败只记录不中断。
+     - **半镜像 `half`**：**B 库文件与映射清单都原样保留，完全不动**，只统计 `c_kept_in_half_mode`。B 作为 A 的超集。
    - **B 类（整部在 B 缺失）**：作品 work_key 在 `a_work_keys`（A 还在），且复用 `_b_file_candidates` 判 B 库整部为空（verified=True 且 visible 空）→ 判失效。
      - **预扫描只登记、不重置**：把该作品 work_key 记入 `reprocess_keys`，由 `sync_rule` 重排 works 优先进入本批。**不在预扫描里清 MirrorFile 为 pending**——v0.8.7 主循环（mirror.py:1323-1339）已有成熟的"B 库空→重置 pending→补复制→missing_in_b 计数"逻辑，且带 name_mismatch 保护，只重置真正缺失的行。预扫描提前清 pending 会让主循环 `synced_rows` 变空、`missing_in_b` 统计丢失（v087/v088 回归根因），还会误伤"改名后名字对不上"场景造成整部重复复制。
      - **计入第二轮剧部数**：重排进本批后走正常主循环，`stats["media"]` 自增（与正常复制同口径）。
@@ -69,8 +69,8 @@
 ### 2.3 护栏（红线）
 
 1. **完整性闸门**：`complete=False`（A 树分页不完整）时**整轮跳过 C/B 判定**，只做 A/D 统计——避免 A 树漏读导致误判"A 没了"而误删 B 库。
-2. **删除默认关闭**：`mirror_delete_b_on_a_missing` 默认 `false`；开启仍需 `complete=True` + verified + target_file_id 非空三重条件。删除走已取证 `api.delete_files()`，失败只记录不中断同步。
-3. **不删映射行物理数据**（保守）：C 类清理优先用状态标记 + 清字段（复用 prune 的"重置 pending"语义），物理删行仍走现有手动端点，避免不可逆。真删 B 库是可配置的高级选项。
+2. **镜像模式受完整性闸门约束**：`mirror_mode=full`（默认，全镜像）时 C 类自动删 B 库，但仍需 `complete=True` + target_file_id 非空条件；删除走已取证 `api.delete_files()`，失败只记录不中断。`half` 模式不删任何东西。
+3. **不删映射行物理数据**（保守）：C 类清清单用状态标记 + 清字段（复用 prune 的"重置 pending"语义），物理删行仍走现有手动端点。仅 `full` 模式删 B 库文件（不可逆），`half` 模式映射与 B 文件都保留。
 4. **零跨 await 写事务**：预扫描的 DB 写（重置 MirrorFile）在调用网络 API 前 commit（项目红线 mirror.py 禁跨 await 持写事务）；B 类核对的 `_b_file_candidates` 是网络 await，之前先 commit。
 5. **性能护栏**：预扫描对每部作品做 `_b_file_candidates` 会增加接口开销；用 `max_prepass_media` 上限（默认 = max_works × 2 或 50），避免单轮预扫描打爆接口。B 类判定可只在"该作品本轮会被选中或已被标记"时做，不全量做。
 
@@ -86,9 +86,11 @@
 
 | key | 默认 | 用途 |
 |---|---|---|
-| `mirror_prepass_enabled` | `true` | 单轮开始三方对比预扫描总开关（默认开，因为只是核对+统计；真删另控） |
-| `mirror_delete_b_on_a_missing` | `false` | C 类是否真删 B 库文件（默认关，只清清单+统计） |
+| `mirror_prepass_enabled` | `true` | 单轮开始三方对比预扫描总开关（默认开，核对+统计；C 类删 B 库由 mirror_mode 决定） |
+| `mirror_mode` | `full` | 镜像模式：`full`（全镜像，默认）= A 已删→删 B 库对应文件+清清单；`half`（半镜像）= B 文件与清单都保留。前端镜像设置页下拉可选，A 库始终只读 |
 | `mirror_prepass_max_media` | `50` | 预扫描单轮最多核对多少部作品（性能护栏） |
+
+> 旧键 `mirror_delete_b_on_a_missing` 已从 DEFAULTS 移除，勿再使用；其行为并入 `mirror_mode`（full 等价允许删 B 库）。
 
 ---
 
@@ -96,16 +98,18 @@
 
 1. **阶段 1.1-a**：`reconcile_mappings_prepass` 函数 + A 事实集构建 + A/D 统计（零网络、零写，最安全），挂到 `sync_rule` 插入点，加开关 `mirror_prepass_enabled`（默认 true）。
 2. **阶段 1.1-b**：B 类判定（复用 `_b_file_candidates`）+ MirrorFile 重置 pending + 优先重排 works +计入剧部数。
-3. **阶段 1.1-c**：C 类判定（A 反向检测）+ 清清单（默认）；`api.delete_files` 真删路径（开关 `mirror_delete_b_on_a_missing` 默认关）。
-4. **阶段 1.1-d**：测试 + 全量回归 + 文档，真机验证后再考虑是否放开删除开关。
+3. **阶段 1.1-c**：C 类判定（A 反向检测）+ 镜像模式 `mirror_mode`（默认 `full` 全镜像=删 B 库+清清单；`half` 半镜像=都保留）；`api.delete_files` 真删路径，前端镜像设置页下拉可选。
+4. **阶段 1.1-d**：测试 + 全量回归 + 文档，真机验证镜像模式行为（默认 full 自动删 B 库，需确认备份策略）。
 
 ## 5. 验收
 
-- A 树完整时：a 单文件补齐不计部数、b 整部缺失重处理计部数且优先、c A 删除触发清清单（真删需开关）、d 无变化走轮转。
+- A 树完整时：a 单文件补齐不计部数、b 整部缺失重处理计部数且优先、c A 删除按镜像模式处理（full 删 B 库+清清单 / half 都保留）、d 无变化走轮转。
 - A 树不完整时：跳过 c/b 判定，零误删。
+- 镜像模式切换：full/half 经前端下拉热更新；full 默认自动删 B 库，half 零删除。
 - 全量 pytest 零回归；镜像主链复制/翻译不受影响。
 
 ## 6. 用户决策（2026-11-21 已拍板）
 
-1. **C 类删除**：`[决策]` **默认只清清单+统计，真删靠开关** `mirror_delete_b_on_a_missing`（默认 false）。需求原文 c 说"对 B 库做删除"，但删除不可逆、历史红线是"禁先删旧再复制"，真机验证后再放开开关。
+1. **C 类删除 → 镜像模式**：`[决策]` 由用户选**镜像模式** `mirror_mode`，默认 **full（全镜像）**：A 库已删的文件 → 预扫描**自动删 B 库对应文件 + 清清单**，A/B 保持一致；**half（半镜像）**：B 文件与清单都保留、完全不动。边界=A 库只读（任何模式都不写 A）。
+   - 早期决策"默认只清清单、真删靠 `mirror_delete_b_on_a_missing` 开关"已被本决策取代（用户 2026-11-21 明确"默认全镜像"）。删除方式=预扫描自动删（非手动按钮确认），仅 A 树完整时执行。
 2. **B 类部数**：`[决策]` **优先排进本批 + 自增 stats.media**（与正常复制同一口径），即"计入第二轮处理剧部数"。

@@ -74,7 +74,7 @@ const reidentifying = ref(false), publishing = ref(0), runningQueue = ref(false)
 const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
-const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, interval_presets: [], unverified_endpoints: [], note: '' })
+const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, mirror_mode: 'full', interval_presets: [], unverified_endpoints: [], note: '' })
 const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 const mirrorDiagOpen = ref([])
@@ -2210,6 +2210,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="field inline"><label>B 库单集/电影文件英文改名</label><el-switch v-model="mirrorCfg.rename_files"/></div>
               <div class="field"><label>每个文件操作后的空闲时间（秒）</label><el-input-number v-model="mirrorCfg.file_idle_seconds" :min="mirrorCfg.min_idle_seconds || 0.5" :max="60" :step="0.5" :precision="1" controls-position="right" style="width:150px"/><small>硬下限 {{ mirrorCfg.min_idle_seconds || 0.5 }} 秒来自官方写接口 2 次/秒限频，不可调低；复制、建目录、改名、变化更新的每个文件操作前都会等待。</small></div>
               <div class="field"><label>单轮最多整理整部剧 / 电影（部）</label><el-input-number v-model="mirrorCfg.max_works_per_run" :min="0" :max="1000" :step="1" controls-position="right" style="width:150px"/><small>0 = 不限量（一次整理全部）。设 N 则每轮只整理 N 部就停，剩余等下一次定时同步接着做；同一部剧会一次整理完再休息，不会拆到两轮。进度按作品轮转，每部都能轮到。</small></div>
+              <div class="field"><label>镜像模式（A 库已删文件时）</label>
+                <el-select v-model="mirrorCfg.mirror_mode" style="width:220px">
+                  <el-option label="全镜像（默认，删 B 库对应文件）" value="full"/>
+                  <el-option label="半镜像（保留 B 库文件与映射）" value="half"/>
+                </el-select>
+                <small><b>A 库始终只读，两种模式都不写 A。</b>全镜像：A 库文件/作品已删除时，单轮预扫描会<b>自动删除 B 库对应文件并清理映射清单</b>（仅 A 目录树完整读取成功时才删，避免误删）；B 与 A 保持一致。半镜像：A 已删时 B 库文件与映射清单<b>都原样保留</b>，B 作为 A 的超集，不做任何删除。删除不可逆，请按你的备份策略选择。</small>
+              </div>
             </div>
             <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
               <el-collapse-item name="config-help">

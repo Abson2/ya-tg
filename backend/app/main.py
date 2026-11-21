@@ -1235,6 +1235,8 @@ class MirrorConfigInput(BaseModel):
     rename_files: bool = True
     # v0.9.0：单次同步最多整理多少部整部剧/电影（0=不限量，到上限下轮接着做）
     max_works_per_run: int = 0
+    # 镜像1.1：镜像模式 full（全镜像，默认：A 已删→删 B 库+清清单）/ half（半镜像：都保留）
+    mirror_mode: str = "full"
 
 
 class MirrorRetryInput(BaseModel):
@@ -1263,6 +1265,8 @@ def mirror_config_get(db: Session = Depends(get_db)):
         # v0.9.0：单轮作品上限与当前轮转游标（0=不限量）
         "max_works_per_run": max(0, int(getattr(r, "max_works_per_run", 0) or 0)) if r else 0,
         "works_cursor": str(getattr(r, "works_cursor", "") or "") if r else "",
+        # 镜像1.1：镜像模式（runtime_config 存储，默认 full 全镜像）
+        "mirror_mode": str(runtime_config.get(db, "mirror_mode") or "full").lower().strip(),
         "interval_presets": MIRROR_INTERVAL_PRESETS,
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
@@ -1302,12 +1306,18 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
     if new_cap == 0:
         r.works_cursor = ""
     r.max_works_per_run = new_cap
+    # 镜像1.1：镜像模式（full 全镜像 / half 半镜像），写入 runtime_config。
+    mode = str(p.mirror_mode or "full").lower().strip()
+    if mode not in ("full", "half"):
+        raise HTTPException(400, "镜像模式只能是 full（全镜像）或 half（半镜像）")
+    runtime_config.set_many(db, {"mirror_mode": mode})
     add_audit(db, "mirror_config_saved", target_type="mirror",
               detail=json_dumps({"source": r.source_root_id, "target": r.target_root_id,
                                  "interval": r.interval_minutes,
                                  "idle": r.file_idle_seconds, "auto_dirs": r.auto_create_dirs,
                                  "rename_files": r.rename_files,
-                                 "max_works_per_run": r.max_works_per_run}))
+                                 "max_works_per_run": r.max_works_per_run,
+                                 "mirror_mode": mode}))
     db.commit()
     _schedule_mirror_job(r.interval_minutes, r.enabled)
     return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
