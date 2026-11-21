@@ -8,6 +8,23 @@
 
 ---
 
+## v1.4.3 (2026-11-21)
+
+**P0 第五次死锁根治**：真机完整堆栈抓到真正的持锁源——不是 share_center（v1.4.2 确认已修好，事件 #10 已消费、书剑恩仇录 40 文件 done），而是 `_job_bot_poll` 每 10 秒无条件写 `app_config`。翻译本身完全正常（三家全部解析成功），卡的是「改名落盘」：bot_poll 的 `set_many` 与改名 job 的 58 次 `rename_status` 更新抢同一把 SQLite 写锁，双方互相饿死，容器持续 unhealthy。
+
+- **取证（真机堆栈）**：`_job_bot_poll`(main.py) → `bot_listener.poll_once` → `runtime_config.set_many` → `UPDATE app_config SET value_enc=?` → `database is locked`。`poll_once` 每轮无条件 `set_many(offset + err_key="")` + `db.commit()`，即使无新消息；异常分支另有 4 处 set_many。`contribution_update_offset` 只被 poll_once 读写、`bot_poll_error_*` 只被 poll_once 写 / status 端点读——读写面窄，可安全内存化。
+- **根治（去 DB 化 + 线程化）**（`bot_listener.py` / `main.py`）：
+  1. offset/error 改**进程内存态**（`_poll_state`，key=bot_id，有界清理）——轮询热路径零 DB 写；内存优先、DB 种子初始化（首次/重启）。重启 offset 回退安全：`ProcessedUpdate` 幂等台账跳过重复投递的 update（v0.9.15 #276 保证），不重复登记。
+  2. `poll_once` 只在**真有新消息**（ProcessedUpdate 新增）时才 `db.commit()`；空轮询/异常分支零写。
+  3. 新增 `flush_poll_state()`：优雅退出（lifespan shutdown `scheduler.shutdown` 后）低频落库一次。附带修复：`bot_poll_error_<id>` 动态 key 不在 DEFAULTS 白名单，旧版 `set_many` 一直跳过（status 端点 poll_error 恒空）——现在直接写 AppConfig，该状态真正可用。
+  4. `_job_bot_poll` 整体走 `asyncio.to_thread`（线程内 `asyncio.run` + 独立 Session），主线程零 SQLite 锁等待。
+- **澄清**：`_safe_rename`/`rename_mirror_files` 的写库是短事务、网络 await 不持锁，是受害者不是持锁源；本次不动它。至此五轮死锁的持锁源（share_center 毒事件计数→run_cycle→bot_poll）已逐个根除。
+- 新增 `tests/test_v143_bot_poll_no_write_lock.py` 7 项（内存态读写/flush 落库/空轮询零 config 写/错误分支零写/to_thread 护栏/shutdown flush/版本一致）。版本号四处一致升至 1.4.3。全量 pytest + 前端 build 通过。
+
+> 升级后开封府等未改名文件，由不再被饿死的 `_job_rename_pending` 后台复查 job 自动续改。
+
+---
+
 ## v1.4.2 (2026-11-21)
 
 **P0 第四次死锁根治**：v1.4.0/v1.4.1 的分享中心修复仍有两个洞，真机重启 40 分钟后复发——事件 #10 卡 `database is locked`、所有 APScheduler job missed、`_job_rename_pending` 跑不起来，3 部剧只有 1 部改好（开封府 58 文件没改名）。本版从根因断开死锁链，不再靠重启续命。

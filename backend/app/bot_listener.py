@@ -37,6 +37,84 @@ _POLL_RETRY_LIMIT = 5
 _POLL_RETRY_MAX_KEYS = 2000
 _poll_retry_counts: dict[str, int] = {}
 
+# v1.4.3 第五次死锁根治：Bot 轮询的 offset / error 每 10 秒无条件写 app_config，
+# 与改名 job 的 58 次 rename_status 更新抢同一把 SQLite 写锁（真机堆栈取证）。
+# 这两个 key 改为进程内存态，轮询路径零 DB 写；只在优雅退出/低频 checkpoint 落库。
+# 重启 offset 回退是安全的：ProcessedUpdate 幂等台账会跳过重复投递的 update，
+# 不会重复登记/重复回命令（v0.9.15 #276 已保证）。
+_poll_state: dict[str, dict] = {}  # key=bot_id 或 "global" → {"offset": int, "error": str}
+_POLL_STATE_MAX_BOTS = 256
+
+
+def _poll_state_key(bot_id: int | str | None) -> str:
+    return str(bot_id) if bot_id else "global"
+
+
+def get_poll_state(bot_id: int | str | None) -> dict:
+    """内存态读取轮询状态（不含 DB）。未初始化返回默认 offset=0/error=空。"""
+    return _poll_state.get(_poll_state_key(bot_id), {"offset": 0, "error": ""})
+
+
+def set_poll_state(bot_id: int | str | None, *, offset: int | None = None,
+                   error: str | None = None) -> dict:
+    """内存态更新轮询状态（不写 DB）。只覆盖显式传入的字段。"""
+    key = _poll_state_key(bot_id)
+    st = _poll_state.setdefault(key, {"offset": 0, "error": ""})
+    if offset is not None:
+        st["offset"] = int(offset)
+    if error is not None:
+        st["error"] = str(error)
+    if len(_poll_state) > _POLL_STATE_MAX_BOTS:
+        # 有界清理：只保留最近写入的若干 bot，避免长期运行无界增长
+        for k in list(_poll_state)[: len(_poll_state) - _POLL_STATE_MAX_BOTS]:
+            _poll_state.pop(k, None)
+    return st
+
+
+def flush_poll_state(db: Session) -> dict:
+    """低频 checkpoint：把内存态 offset/error 落库（供 lifespan 优雅退出调用）。
+
+    轮询热路径不再写 DB；这里是唯一的持久化出口。失败不抛（退出路径不阻断）。
+    """
+    from . import runtime_config as _rc
+    from .models import AppConfig
+    from .security import encrypt_secret
+    flushed = 0
+    for key, st in list(_poll_state.items()):
+        try:
+            # offset 是 DEFAULTS 里的固定 key，走 set_many；
+            # bot_poll_error_<id> 是动态 key，set_many 白名单会跳过（旧版也一直没写进去），
+            # 这里直接落 AppConfig，让 status 端点的 poll_error 真正可用。
+            _rc.set_many(db, {"contribution_update_offset": str(int(st.get("offset", 0) or 0))})
+            err_key = f"bot_poll_error_{key}"
+            err_val = str(st.get("error", "") or "")
+            row = db.get(AppConfig, err_key)
+            if err_val:
+                enc = encrypt_secret(err_val)
+                if row:
+                    row.value_enc = enc
+                else:
+                    db.add(AppConfig(key=err_key, value_enc=enc))
+            elif row:
+                db.delete(row)
+            flushed += 1
+        except Exception as exc:
+            logger.warning("[bot] 轮询状态 checkpoint 落库失败 key=%s：%s", key, exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    if flushed:
+        try:
+            db.commit()
+        except Exception as exc:
+            logger.warning("[bot] 轮询状态 checkpoint commit 失败：%s", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    return {"flushed": flushed}
+
 
 def is_retryable_poll_error(exc: BaseException) -> bool:
     """区分「可重试瞬时故障」与「业务拒答」。纯函数便于测试。
@@ -1641,13 +1719,22 @@ async def poll_once(db: Session) -> dict:
     # v0.9.9 #207：每个 token 首次轮询自动清空一次旧项目残留的 "/" 指令栏。
     # 指纹去重在 auto_clear_stale_commands 内部，正常轮询不产生额外请求。
     menu_cleared = await auto_clear_stale_commands(db, token)
-    try:
-        offset = int(runtime_config.get(db, "contribution_update_offset") or 0)
-    except ValueError:
-        offset = 0
+    # v1.4.3：offset 内存优先；内存未初始化时从 DB 读一次作为种子（首次/重启）。
+    # 之后热路径只读写内存，绝不再每 10 秒 set_many 写 app_config 抢写锁。
+    st = get_poll_state(bot_id)
+    if st.get("_seeded"):
+        offset = int(st.get("offset", 0) or 0)
+    else:
+        try:
+            offset = int(runtime_config.get(db, "contribution_update_offset") or 0)
+        except ValueError:
+            offset = 0
+        set_poll_state(bot_id, offset=offset, error=runtime_config.get(
+            db, f"bot_poll_error_{bot_id or 'global'}") or "")
+        st = get_poll_state(bot_id)
+    st["_seeded"] = True
     base = runtime_config.telegram_base(db)
     payload = {"offset": offset, "timeout": 2, "allowed_updates": ALLOWED_UPDATES}
-    err_key = f"bot_poll_error_{bot_id or 'global'}"
     try:
         async with httpx.AsyncClient(timeout=25) as client:
             r = await client.get(f"{base}/bot{token}/getUpdates", params=payload)
@@ -1656,8 +1743,7 @@ async def poll_once(db: Session) -> dict:
         except Exception:
             data = {}
     except Exception as exc:
-        runtime_config.set_many(db, {err_key: f"network: {str(exc)[:160]}"})
-        db.commit()
+        set_poll_state(bot_id, error=f"network: {str(exc)[:160]}")  # v1.4.3：内存态
         return {"enabled": True, "messages": 0, "error": str(exc)[:200]}
     # 兼容 mock/异常响应缺 status_code：按 200 处理，交由 ok=false 分支识别错误
     http_status = getattr(r, "status_code", 200)
@@ -1665,18 +1751,15 @@ async def poll_once(db: Session) -> dict:
     if http_status == 409 or (isinstance(data, dict) and data.get("ok") is False and
                               "conflict" in str(data.get("description", "")).lower()):
         kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, http_status)
-        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
-        db.commit()
+        set_poll_state(bot_id, error=f"{kind}: {hint}")  # v1.4.3：内存态，不写DB抢锁
         return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
     if http_status == 429 or http_status >= 500:
         kind, hint = _tg_error_hint(data if isinstance(data, dict) else {}, http_status)
-        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
-        db.commit()
+        set_poll_state(bot_id, error=f"{kind}: {hint}")  # v1.4.3：内存态，不写DB抢锁
         return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
     if isinstance(data, dict) and data.get("ok") is False:
         kind, hint = _tg_error_hint(data, http_status)
-        runtime_config.set_many(db, {err_key: f"{kind}: {hint}"})
-        db.commit()
+        set_poll_state(bot_id, error=f"{kind}: {hint}")  # v1.4.3：内存态，不写DB抢锁
         return {"enabled": True, "messages": 0, "error": hint, "error_kind": kind}
     updates = data.get("result") or [] if isinstance(data, dict) else []
     stats = {"enabled": True, "messages": len(updates), "handled": 0,
@@ -1780,9 +1863,12 @@ async def poll_once(db: Session) -> dict:
     if deferred_uid is not None:
         # A-10：有任何被延迟重试的 update，offset 不得越过它（否则重投捞不回来）
         new_offset = min(new_offset, deferred_uid)
-    runtime_config.set_many(db, {"contribution_update_offset": str(new_offset),
-                                 err_key: ""})  # 成功轮询清空上一轮错误状态
-    db.commit()
+    # v1.4.3：每轮无条件 set_many(offset + err_key="") + db.commit 是第五次死锁的持锁源，
+    # 与改名 58 次 rename_status 更新抢同一把 SQLite 写锁。改为内存态更新，热路径零 DB 写。
+    # 只有 _mark_update_processed 新增的 ProcessedUpdate 仍需落库（有新消息时才写）。
+    set_poll_state(bot_id, offset=new_offset, error="")  # 成功轮询清空上一轮错误状态
+    if updates:
+        db.commit()  # 仅当真有消息、ProcessedUpdate 有新增时才落库；空轮询零写
     stats["offset"] = new_offset
     return stats
 

@@ -64,6 +64,8 @@ def _poll_with(updates):
 @pytest.fixture
 def db():
     bl._poll_retry_counts.clear()
+    # v1.4.3：poll offset/error 改内存态后，每测试清空避免跨用例串扰
+    bl._poll_state.clear()
     with SessionLocal() as s:
         for k in ("interaction_bot_id", "contribution_enabled", "contribution_bot_token",
                   "contribution_update_offset", "push_routes_json", "bot_gate_mode"):

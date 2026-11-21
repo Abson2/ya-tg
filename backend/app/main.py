@@ -245,6 +245,21 @@ async def _job_token_refresh():
 _bot_poll_lock = asyncio.Lock()
 
 
+def _bot_poll_in_thread() -> None:
+    """v1.4.3：Bot 轮询整体挪出事件循环线程（线程内 asyncio.run + 独立 Session）。
+
+    第五次死锁取证：_job_bot_poll 每 10 秒在主协程 await poll_once，其内部
+    ProcessedUpdate 写 + 旧版 offset set_many 的 db.commit 撞写锁时在主线程等 30s，
+    冻结 loop → 改名 job missed。挪到线程后，任何 SQLite 锁等待都不再冻结全站。
+    """
+    with SessionLocal() as db:
+        try:
+            asyncio.run(bot_listener.poll_once(db))
+        except Exception:
+            db.rollback()
+            logger.warning("[bot] 消息轮询异常（线程内），本轮跳过", exc_info=True)
+
+
 async def _job_bot_poll():
     """v0.8.0：投稿/我想看 Bot 消息轮询（Telegram 官方 getUpdates）。
 
@@ -252,18 +267,12 @@ async def _job_bot_poll():
     reached` 是上一轮 poll_once（getUpdates 网络等待）未结束、下一轮 10 秒已到，
     APScheduler max_instances=1 拒绝新实例并记 warning。这里抢不到锁直接跳过本轮，
     杜绝 warning，且下一轮仍会正常轮询，不影响收消息（与推送故障无关，顺手加固）。
+    v1.4.3：整体走 to_thread，主线程零 SQLite 锁等待。
     """
     if _bot_poll_lock.locked():
         return
     async with _bot_poll_lock:
-        with SessionLocal() as db:
-            try:
-                await bot_listener.poll_once(db)
-            except Exception:
-                db.rollback()
-                # A-09：此前静默 rollback，网络抖动/Telegram 限流时无任何留痕，
-                # 与「Bot 收不到消息」排查方向脱节。补 exc_info 便于定位。
-                logger.warning("[bot] 消息轮询异常，本轮跳过", exc_info=True)
+        await asyncio.to_thread(_bot_poll_in_thread)
 
 
 _restore_lock = asyncio.Lock()
@@ -639,15 +648,22 @@ async def lifespan(app: FastAPI):
     # 阶段四 A-11：wait=True 等待正在执行的 job 收尾，避免容器停止时腰斩
     # 队列推送 / 转存 / 扫描（各 job 网络调用自带超时，不会无限阻塞）
     scheduler.shutdown(wait=True)
+    # v1.4.3：优雅退出时把内存态 Bot offset/error 低频落库一次（热路径已去 DB 化）。
+    # 容器被强杀时内存态丢失也安全：ProcessedUpdate 幂等台账会跳过重复投递的 update。
+    try:
+        with SessionLocal() as db:
+            bot_listener.flush_poll_state(db)
+    except Exception as exc:
+        logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="1.4.2", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="1.4.3", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.2", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "1.4.3", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -4981,9 +4997,14 @@ def discover_chats(db: Session = Depends(get_db), chat_type: str = "",
         if not include_inactive and not row["active"]:
             continue
         filtered.append(row)
-    # v0.9.15 #276：附带主 Bot 轮询错误状态（409 冲突 / 429 限流），供前端提示
+    # v0.9.15 #276：附带主 Bot 轮询错误状态（409 冲突 / 429 限流），供前端提示。
+    # v1.4.3：错误状态改内存态（轮询热路径不再写 app_config 抢锁），内存优先、DB 兜底。
     _main_bot_id = bot_listener.effective_bot_id(db)
-    poll_err = runtime_config.get(db, f"bot_poll_error_{_main_bot_id or 'global'}") or ""
+    _poll_st = bot_listener.get_poll_state(_main_bot_id)
+    if _poll_st.get("_seeded"):
+        poll_err = _poll_st.get("error", "") or ""
+    else:
+        poll_err = runtime_config.get(db, f"bot_poll_error_{_main_bot_id or 'global'}") or ""
     return {"chats": filtered, "total": len(filtered), "all_count": len(out),
             "poll_error": poll_err, "main_bot_id": _main_bot_id}
 

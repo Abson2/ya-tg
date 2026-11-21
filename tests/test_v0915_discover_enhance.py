@@ -53,6 +53,9 @@ TABLES = [DiscoveredChat, ProcessedUpdate, Bot]
 @pytest.fixture(autouse=True)
 def _fresh():
     migrate()
+    # v1.4.3：poll offset/error 改内存态后，每个测试须清空模块级状态避免串扰
+    from app import bot_listener as _bl
+    _bl._poll_state.clear()
     with SessionLocal() as db:
         for k in CFG_KEYS:
             row = db.get(AppConfig, k)
@@ -294,6 +297,10 @@ def test_offset_advances_after_success(db):
          patch.object(bl, "check_restriction", new=AsyncMock(return_value=(True, ""))), \
          patch.object(bl, "handle_text", new=AsyncMock(return_value=("ignored", ""))):
         _run(bl.poll_once(db))
+    # v1.4.3：offset 改内存态（热路径零 DB 写，避免与改名抢锁）；
+    # 优雅退出 flush 后才落库。这里同时验证内存推进与 checkpoint 落库。
+    assert bl.get_poll_state(bl.effective_bot_id(db))["offset"] == 7
+    bl.flush_poll_state(db)
     assert runtime_config.get(db, "contribution_update_offset") == "7"
 
 
