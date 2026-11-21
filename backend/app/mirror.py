@@ -1447,7 +1447,7 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     core, year = work_core_title(media.title_standard)
     eng, source = "", ""
     if not core:
-        _persist_english_title(db, media_id, "", "")
+        await _persist_english_title_async(db, media_id, "", "")
         return "", ""
 
     # ===== 事务分层（v1.1 修 database is locked）=====
@@ -1546,54 +1546,81 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
         if v:
             eng, source = v, "pinyin"
 
-    _persist_english_title(db, media_id, eng, source)
+    await _persist_english_title_async(db, media_id, eng, source)
     return eng, source
 
 
-def _persist_english_title(db: Session, media_id: int, eng: str, source: str) -> None:
-    """把解析出的英文名写回 MirrorMedia：独立短 Session + Core UPDATE + 写锁重试。
+def _write_english_title_once(media_id: int, eng: str, source: str) -> Exception | None:
+    """单次英文名写回：独立短 Session + Core UPDATE，返回异常或 None。
 
     真机 v1.0.0 `OperationalError: database is locked [UPDATE mirror_media SET
-    english_title=?, english_source=?]` 的根因：调用方 `_resolve_english_title`
-    在**同一个 db Session** 上先 SELECT 建读快照 → await TMDB/AI 网络 6~16s（其间
-    tmdb/ai_assist 内部又用该 db 读配置，autobegin 新的读事务）→ 再 UPDATE 想升级
-    成写事务时快照已过期，抛 SQLITE_BUSY_SNAPSHOT。这种情况 busy_timeout=30s 无效
-    （不是等待能解决的），必须换连接。
+    english_title=?, english_source=?]` 的根因：调用方在同一 db Session 先 SELECT
+    建读快照 → await TMDB/AI 网络 6~16s → 再 UPDATE 升级写事务时快照已过期
+    （SQLITE_BUSY_SNAPSHOT，busy_timeout=30s 无效），必须换连接。
 
-    修法：用**全新的独立 Session** 做这一条 UPDATE，绝不复用被网络调用污染过的
-    读快照；Core UPDATE 不走 ORM 对象避免 identity 问题；再叠加写锁退避重试兜底。
-    独立 Session 自己在 finally 关闭，异常一律吞掉，绝不因一次写冲突拖垮主链路。
+    这里用**全新独立 Session** 做这一条 Core UPDATE，绝不复用被网络调用污染的
+    读快照。**关键（v1.3）**：绝不回刷调用方 Session 的 ORM 对象——旧版回刷会把
+    调用方对象标脏，后续 db.commit() flush 时再次把读快照升级为写事务，等于把
+    刚修好的锁问题重新引入。缓存值由下一轮读取 DB 获得，不需要回刷内存对象。
+    """
+    if not media_id:
+        return None
+    try:
+        with SessionLocal() as write_db:
+            write_db.execute(update(MirrorMedia).where(MirrorMedia.id == media_id).values(
+                english_title=eng, english_source=source))
+            write_db.commit()
+        return None
+    except Exception as exc:
+        return exc
+
+
+async def _persist_english_title_async(db: Session, media_id: int,
+                                       eng: str, source: str) -> None:
+    """异步主链写回：用 await asyncio.sleep 退避，绝不阻塞事件循环。
+
+    v1.2 之前用同步 `time.sleep(0.05*2**attempt)`（8 次最坏 6.35 秒）跑在 asyncio
+    事件循环线程上，写锁冲突时冻结所有 HTTP 请求——用户感知「系统卡死」。改 async
+    退避后事件循环在等待期间照常服务管理页 / 健康检查 / 其它任务。
     """
     if not media_id:
         return
-    last_exc: Exception | None = None
     for attempt in range(8):
-        try:
-            with SessionLocal() as write_db:
-                write_db.execute(update(MirrorMedia).where(MirrorMedia.id == media_id).values(
-                    english_title=eng, english_source=source))
-                write_db.commit()
-            # 同步刷新调用方 Session 中的对象（若仍被引用），避免陈旧值误导后续逻辑
-            try:
-                obj = db.get(MirrorMedia, media_id)
-                if obj is not None:
-                    obj.english_title, obj.english_source = eng, source
-            except Exception:
-                pass
+        exc = await asyncio.to_thread(_write_english_title_once, media_id, eng, source)
+        if exc is None:
             return
-        except OperationalError as exc:
-            last_exc = exc
-            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
-                logger.warning("[mirror] 英文名回写失败（非锁冲突）media=%s：%s", media_id, exc)
-                return
-            if attempt == 7:
-                logger.warning("[mirror] 英文名回写重试 8 次仍锁，放弃 media=%s：%s",
-                               media_id, last_exc)
-                return
-            time.sleep(0.05 * (2 ** attempt))
-        except Exception as exc:
-            logger.warning("[mirror] 英文名回写异常 media=%s：%s", media_id, exc)
+        if not isinstance(exc, OperationalError) or (
+                "locked" not in str(exc).lower() and "busy" not in str(exc).lower()):
+            logger.warning("[mirror] 英文名回写失败（非锁冲突）media=%s：%s", media_id, exc)
             return
+        if attempt == 7:
+            logger.warning("[mirror] 英文名回写重试 8 次仍锁，放弃 media=%s：%s",
+                           media_id, exc)
+            return
+        await asyncio.sleep(0.05 * (2 ** attempt))
+
+
+def _persist_english_title(db: Session, media_id: int, eng: str, source: str) -> None:
+    """同步兼容入口（供单测 / 非 async 调用）：与 async 版共用同一单次写函数。
+
+    同步场景无事件循环，退避用 time.sleep；生产 async 路径走
+    `_persist_english_title_async`，不会阻塞事件循环。
+    """
+    if not media_id:
+        return
+    for attempt in range(8):
+        exc = _write_english_title_once(media_id, eng, source)
+        if exc is None:
+            return
+        if not isinstance(exc, OperationalError) or (
+                "locked" not in str(exc).lower() and "busy" not in str(exc).lower()):
+            logger.warning("[mirror] 英文名回写失败（非锁冲突）media=%s：%s", media_id, exc)
+            return
+        if attempt == 7:
+            logger.warning("[mirror] 英文名回写重试 8 次仍锁，放弃 media=%s：%s",
+                           media_id, exc)
+            return
+        time.sleep(0.05 * (2 ** attempt))
 
 
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
@@ -1651,6 +1678,11 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         if stop_reason or time.monotonic() - started_all >= time_budget:
             stop_reason = stop_reason or "time_budget"
             break
+        # v1.3 借鉴 TgtoDrive v8.8.25「已入库的名称继续沿用、不重复解析」：
+        # 名称沿用由 _resolve_english_title 的 english_title DB 缓存实现——缓存
+        # 命中即零网络返回（force 才强制重解析）。这里**不**按 DB rename_status
+        # 整段跳过作品：合法场景「DB 标 done 但 B 库文件被回滚/补复制成中文」
+        # 仍须列目录核对后重新改名（v088/v097 回归锁定），冒进跳过会漏改。
         eng, source = await _resolve_english_title(db, media, force=force)
         # v0.8.9：让用户看得到「TMDB 查不到 → 直接用直译」有没有生效
         if source == "ai":

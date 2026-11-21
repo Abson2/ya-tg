@@ -8,6 +8,23 @@
 
 ---
 
+## v1.3.0 (2026-11-21)
+
+修复真机"改英文名性能瓶颈 / 系统卡死"。用户提示借鉴 TgtoDrive v8.8.25；核查该 release notes 并无英文命名加速方法（仅命名语言偏好 + 中文名优化），可借鉴的是其"**已入库名称继续沿用、不重复解析**"思想。全量 pytest **779 passed**，零回归。
+
+### 取证与决策（不盲从）
+- `walkingddd/TgtoDrive` v8.8.25 release notes（GitHub API 原文）命名相关只有两条：① 优化中文名称选择（Slow horses→流人）；② 重命名策略新增语言偏好（默认中文优先、可切英文优先），注明"**已入库的文件名会继续沿用，不重复解析**"。该 commit（884c685）仅改 8 张 png，无性能优化代码。因此**不虚构不存在的加速算法**。
+- 借鉴"名称沿用"：本项目 `_resolve_english_title` 早有 `english_title` DB 缓存（命中零网络，仅 force 重解析），已对齐该思想；本版用测试锁定，不再额外加激进的"按 DB 状态整段跳过"——后者会漏掉"DB 标 done 但 B 库文件被回滚/补复制成中文仍需改名"的合法场景（v088/v097 回归证明），冒进必漏改。
+
+### 卡死真因修复（本地源码审计）
+- **事件循环冻结（主因）**：`_persist_english_title` 原在 async 链路用同步 `time.sleep(0.05*2**attempt)` 做写锁退避（8 次最坏 6.35 秒），跑在事件循环线程上会冻结所有 HTTP 请求（管理页 / 健康检查 / 其它任务一起停摆）＝用户感知"系统卡死"。改为 `_persist_english_title_async`：用 `await asyncio.sleep` 退避 + `asyncio.to_thread` 跑独立 Session 的 Core UPDATE，等待期间事件循环照常服务。同步版 `_persist_english_title` 保留兼容单测。
+- **写锁反复触发（次因）**：v1.1 的写回成功后会回刷调用方 Session 的 ORM 对象，把它标脏；调用方后续 `db.commit()` flush 时再次把读快照升级为写事务，重新引入 `SQLITE_BUSY_SNAPSHOT`。改为只写独立 Session、**不回刷调用方对象**，缓存值由下一轮读 DB 获得。
+
+### 验证
+- 新增 `tests/test_v130_rename_perf.py` 4 项（缓存命中零网络、force 重解析、async 退避不阻塞事件循环、写回不污染调用方 Session）。
+- 全量 pytest **779 passed, 3 warnings**；前端未改逻辑（仅版本号），无需重建。
+- 回滚见 `ROLLBACK.md`（可切回 `IMAGE_TAG=v1.2.0`）。
+
 ## v1.2.0 (2026-11-21)
 
 两项功能增强：① 镜像按 B 库目录「最大单元」批量复制提速；② 分享中心补全分享管理。全量 pytest **775 passed**、前端 build 通过。
