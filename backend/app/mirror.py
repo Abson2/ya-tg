@@ -90,6 +90,23 @@ MIN_RENAME_IDLE_SECONDS = 0.2
 # v1.4：改名并发度上限。光鸭 rename 是单文件接口，提速靠并发窗口而非批量 API；
 # 保守默认 3，最大 8。配置填 1 即退回串行，便于真机遇风控时快速降级。
 MAX_RENAME_CONCURRENCY = 8
+# v1.4.1：光鸭 code=127「操作过于频繁」写接口风控限流根治。
+# 127 是可恢复的瞬时限流，必须与「真实失败」区别对待：指数退避 + 同集自动重试，
+# 不因它触发「连续 5 次熔断」，也不让它干等下一轮 120s job。
+GUANGYA_RATE_LIMIT_CODE = 127
+RENAME_RATE_LIMIT_MAX_RETRIES = 5          # 单文件内最多退避重试 5 次（1/2/4/8/8）
+RENAME_RATE_LIMIT_BACKOFF_BASE = 1.0       # 退避基数秒
+RENAME_RATE_LIMIT_BACKOFF_CAP = 8.0        # 退避上限秒，防止单窗口阻塞过久
+RENAME_RATE_LIMIT_MARK = "@RATE_LIMIT_127@"  # 内层失败结果的限流标记，供主循环识别
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """识别光鸭 code=127 限流：结构化 code 优先，错误文本兜底（兼容旧版 code=None）。"""
+    if getattr(exc, "code", None) == GUANGYA_RATE_LIMIT_CODE:
+        return True
+    msg = str(exc).lower()
+    return ("code=127" in msg or "操作过于频繁" in str(exc)
+            or "too many requests" in msg or "rate limit" in msg)
 
 # v0.8.1：w.har 已取证 create_dir / rename / delete_file（含批量）。
 # 下面只保留仍未取证的转存能力；前端 JS 里虽出现 move_file / recycle_file 等路径，
@@ -1708,23 +1725,43 @@ def _persist_english_title(db: Session, media_id: int, eng: str, source: str) ->
         time.sleep(0.05 * (2 ** attempt))
 
 
-async def _rename_concurrent(api: "GuangYaWebFiles",
-                             jobs: list[tuple[str, str]]) -> list[tuple[bool, str]]:
-    """v1.4 B3：并发执行一批 rename_file（纯网络，绝不碰 db）。
+async def _rename_one_with_backoff(api: "GuangYaWebFiles", fid: str,
+                                   final: str) -> tuple[bool, str]:
+    """v1.4.1：单文件改名，遇光鸭 code=127 限流则指数退避 + 自动重试该集。
 
-    光鸭 rename 是单文件接口（技能包 operations[] 也只是把多个单项打包，
-    服务端仍逐个执行，没有批量/正则替换），提速只能靠并发网络窗口。
-    返回与 jobs 等长的 [(ok, err)]，顺序一一对应；单文件异常就地转成
-    failed 结果，不中断同批其它文件。db 事务完全留给调用方在主协程串行写。
+    - 仅对 127 限流重试（1/2/4/8/8 秒封顶），真实失败立即返回不重试；
+    - 纯网络，绝不碰 db；重试耗尽仍失败时在 err 前加 RENAME_RATE_LIMIT_MARK，
+      供主循环区别对待（不计入熔断、本轮尾部再排一次队列）；
+    - 成功即返回 (True, "")，调用方无需感知重试次数。
     """
-    async def one(fid: str, final: str) -> tuple[bool, str]:
+    delay = RENAME_RATE_LIMIT_BACKOFF_BASE
+    for attempt in range(RENAME_RATE_LIMIT_MAX_RETRIES + 1):
         try:
             await api.rename_file(fid, final)
             return True, ""
         except Exception as exc:
-            return False, str(exc)[:300]
+            if not _is_rate_limit_error(exc) or attempt >= RENAME_RATE_LIMIT_MAX_RETRIES:
+                msg = str(exc)[:300]
+                if _is_rate_limit_error(exc):
+                    msg = f"{RENAME_RATE_LIMIT_MARK}{msg}"
+                return False, msg
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RENAME_RATE_LIMIT_BACKOFF_CAP)
+    return False, f"{RENAME_RATE_LIMIT_MARK}rename 限流重试耗尽"
 
-    return await asyncio.gather(*(one(fid, final) for fid, final in jobs))
+
+async def _rename_concurrent(api: "GuangYaWebFiles",
+                             jobs: list[tuple[str, str]]) -> list[tuple[bool, str]]:
+    """v1.4 B3 + v1.4.1：并发执行一批 rename_file（纯网络，绝不碰 db）。
+
+    光鸭 rename 是单文件接口（技能包 operations[] 也只是把多个单项打包，
+    服务端仍逐个执行，没有批量/正则替换），提速只能靠并发网络窗口。
+    返回与 jobs 等长的 [(ok, err)]，顺序一一对应；单文件异常就地转成
+    failed 结果，不中断同批其它文件。code=127 限流在 _rename_one_with_backoff
+    内指数退避自动重试；db 事务完全留给调用方在主协程串行写。
+    """
+    return await asyncio.gather(
+        *(_rename_one_with_backoff(api, fid, final) for fid, final in jobs))
 
 
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
@@ -1768,6 +1805,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
              "waiting_visible": 0,
              # v1.4：改名提速参数回显，便于管理页/测试核对
              "rename_idle_seconds": rename_idle, "rename_concurrency": rename_concurrency,
+             # v1.4.1：127 限流统计
+             "rate_limited": 0, "rate_limit_recovered": 0, "rate_limit_retries_queued": 0,
              # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
@@ -1780,6 +1819,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     consecutive_failures = 0
     stop_reason = ""
     api = GuangYaWebFiles(db)
+    # v1.4.1：代码=127 限流重试耗尽的文件，本轮尾部再排一次队列（不干等下一轮 120s job）
+    requeue_rate_limited: list[tuple[MirrorFile, str, str, str]] = []
     media_q = select(MirrorMedia).where(
         MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")
     if only_pending:
@@ -1971,15 +2012,24 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 api, [(fid, final) for _row, fid, final, _fname in window])
             for (row, fid, final, fname), (ok, errmsg) in zip(window, outcomes):
                 if not ok:
+                    # v1.4.1：区分光鸭 127 限流与真实失败。限流不是「连续失败」，
+                    # 不计入熔断阈值（否则一次风控就把整轮熔断、误伤后续正常文件）；
+                    # 标 failed 可追溯，同时收集到 requeue 在本轮尾部再排一次。
+                    rate_limited = errmsg.startswith(RENAME_RATE_LIMIT_MARK)
+                    clean_err = errmsg[len(RENAME_RATE_LIMIT_MARK):] if rate_limited else errmsg
                     stats["failed"] += 1
-                    consecutive_failures += 1
+                    if rate_limited:
+                        stats["rate_limited"] += 1
+                        requeue_rate_limited.append((row, fid, final, fname))
+                    else:
+                        consecutive_failures += 1
                     stats["errors"].append(
-                        f"{media.title_standard}/{fname}：改名失败 {errmsg[:160]}")
+                        f"{media.title_standard}/{fname}：改名失败 {clean_err[:160]}")
                     logger.warning("[mirror] rename 失败 %s/%s：%s",
-                                   media.title_standard, fname, errmsg)
+                                   media.title_standard, fname, clean_err)
                     try:
                         db.rollback()
-                        row.rename_status, row.rename_error = "failed", errmsg
+                        row.rename_status, row.rename_error = "failed", clean_err
                         db.commit()
                     except Exception:
                         try:
@@ -2006,6 +2056,48 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     break
         stats["works"] += 1
         db.commit()
+    # v1.4.1：本轮尾部二次排队——code=127 限流重试耗尽的集，不干等下一轮 120s job，
+    # 在预算允许的范围内本轮再发一轮（函数内同样带退避）。成功则把 failed 计回 renamed。
+    # 红线：网络协程不碰 db，写库全部在主协程串行；撞到 time_budget/file_budget 即止。
+    if requeue_rate_limited and not stop_reason:
+        stats["rate_limit_retries_queued"] = len(requeue_rate_limited)
+        for qstart in range(0, len(requeue_rate_limited), rename_concurrency):
+            if stop_reason or time.monotonic() - started_all >= time_budget:
+                stop_reason = stop_reason or "time_budget"
+                break
+            if attempts >= file_budget:
+                stop_reason = "file_budget"
+                break
+            qwin = requeue_rate_limited[qstart:qstart + rename_concurrency]
+            for _row, _fid, _final, _fname in qwin:
+                _beat()
+                attempts += 1
+                stats["attempts"] += 1
+            qout = await _rename_concurrent(
+                api, [(fid, final) for _row, fid, final, _fname in qwin])
+            for (row, fid, final, fname), (ok, errmsg) in zip(qwin, qout):
+                limited_again = errmsg.startswith(RENAME_RATE_LIMIT_MARK)
+                clean_err = errmsg[len(RENAME_RATE_LIMIT_MARK):] if limited_again else errmsg
+                if ok:
+                    stats["failed"] = max(0, stats["failed"] - 1)
+                    stats["renamed"] += 1
+                    stats["rate_limit_recovered"] += 1
+                    row.target_file_id = fid
+                    row.target_name = final
+                    row.rename_status, row.rename_error = "done", ""
+                    row.updated_at = utcnow()
+                else:
+                    stats["errors"].append(f"{fname}：限流二次排队仍失败 {clean_err[:120]}")
+                    row.rename_status, row.rename_error = "failed", clean_err
+                try:
+                    db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    stop_reason = "db_error"
+                    break
     if stop_reason:
         # v0.8.9：一次性统计全局剩余（含本轮完全没触及的后续作品），只给一条
         # 明确提示。旧写法逐部累加还会在空 rows 时误用上一轮的 idx。

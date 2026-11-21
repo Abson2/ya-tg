@@ -1,11 +1,15 @@
 import base64
 import hashlib
 import logging
+import re
 from cryptography.fernet import Fernet, InvalidToken
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+# v1.4.1：数值型配置明文格式（整数/小数/负数），用于跳过无效的解密封装告警。
+_PLAIN_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 def secret_configured() -> bool:
@@ -29,6 +33,13 @@ def encrypt_secret(value: str) -> str:
 def decrypt_secret(value: str) -> str:
     if not value:
         return ""
+    # v1.4.1：数值型配置（如 file_idle_seconds / interval）被手工明文写入时，
+    # 值形如 "2" / "0.5"，不可能是 Fernet 密文（密文恒以 gAAAAA 开头的 URL-safe
+    # base64），却会触发 B-11 的 InvalidToken warning「凭证解密失败」误导排查。
+    # 纯数字字符串直接按明文返回且不告警；真正的密文损坏（gAAAAA… 但损坏）仍告警。
+    stripped = value.strip()
+    if _PLAIN_NUMBER_RE.fullmatch(stripped):
+        return stripped
     try:
         return _cipher().decrypt(value.encode("ascii")).decode("utf-8")
     except InvalidToken:

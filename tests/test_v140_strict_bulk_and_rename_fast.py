@@ -191,7 +191,8 @@ def test_rename_concurrent_runs_in_parallel_and_isolates_errors():
 
 def test_rename_config_defaults_and_bounds():
     from app import mirror, runtime_config
-    assert runtime_config.DEFAULTS["rename_idle_seconds"][1] == "0.3"
+    # v1.4.1：默认 idle 从 0.3 上调到 0.5（风控余量），并发仍保持 3
+    assert runtime_config.DEFAULTS["rename_idle_seconds"][1] == "0.5"
     assert runtime_config.DEFAULTS["rename_concurrency"][1] == "3"
     assert mirror.MIN_RENAME_IDLE_SECONDS == 0.2
     assert mirror.MAX_RENAME_CONCURRENCY == 8
@@ -242,13 +243,20 @@ def test_rename_idle_decoupled_from_copy_idle(env, monkeypatch):
 # ---------- ④ 源码护栏：写库不跨 await / 用并发 helper ----------
 
 def test_rename_write_stays_in_main_coroutine():
-    """护栏：内层改名循环调用 _rename_concurrent，网络协程 _rename_concurrent 不碰 db。"""
+    """护栏：内层改名循环调用 _rename_concurrent，网络协程不碰 db。
+
+    v1.4.1：网络调用下沉到 _rename_one_with_backoff（含 127 退避重试），
+    护栏随之检查该 helper；_rename_concurrent 只做 gather 编排。
+    """
     from app import mirror
     src = inspect.getsource(mirror._rename_concurrent)
-    assert "api.rename_file" in src
     # 网络 helper 不得出现 db 写操作
     assert "db.commit" not in src
     assert "db.rollback" not in src
+    net_src = inspect.getsource(mirror._rename_one_with_backoff)
+    assert "api.rename_file" in net_src
+    assert "db.commit" not in net_src
+    assert "db.rollback" not in net_src
 
     outer = inspect.getsource(mirror.rename_mirror_files)
     assert "_rename_concurrent" in outer, "改名主循环应走并发 helper"

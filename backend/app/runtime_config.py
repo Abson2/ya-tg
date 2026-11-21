@@ -127,9 +127,11 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # v1.2 发布节奏（设计文档 §5.4/§10）：相邻分享任务的最小释放间隔秒数，0=不限。
     # run_cycle 用它在同轮多个任务之间铺开 scheduled_at，避免瞬时并发推送。
     "share_release_interval_seconds": ("share_release_interval_seconds", "0"),
-    # v1.4 改名提速：改名 idle 与复制 idle 解耦（防御性默认 0.3，下限 0.2）。
-    # 并发开关默认 true、并发度 3；遇光鸭风控把并发度调 1 即退回串行。
-    "rename_idle_seconds": ("rename_idle_seconds", "0.3"),
+    # v1.4 改名提速：改名 idle 与复制 idle 解耦（下限 0.2）。
+    # v1.4.1：默认从 0.3 上调到 0.5（≈6 req/s 配合并发3），给光鸭风控留余量；
+    # 并发度仍保持 3（不消极降到 1），限流靠 127 专用指数退避+自动重试根治。
+    # 遇极端风控可把并发度调 1 退回串行，但默认不必牺牲吞吐。
+    "rename_idle_seconds": ("rename_idle_seconds", "0.5"),
     "rename_concurrency": ("rename_concurrency", "3"),
 }
 

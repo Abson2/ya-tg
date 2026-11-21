@@ -288,6 +288,12 @@ class GuangYaWebFiles:
                 except Exception:
                     pass
                 continue
+            # v1.4.1：code=127「操作过于频繁」是光鸭写接口（含 rename）的风控限流。
+            # 旧版走末尾兜底 raise WebFileError(last_error) → code=None，上层只能靠
+            # 错误消息文本猜；这里结构化带上 code=127，供改名执行器精确识别后退避重试。
+            # 127 不是鉴权失效也不是 5xx，立即抛出、不做 token 刷新/网络重试。
+            if code == 127:
+                raise WebFileError(last_error, code)
             if code in (401, 116, 117) or any(k in msg.lower() for k in
                                              ("login", "登录", "unauthor", "token")):
                 raise WebFileError(last_error, code)
