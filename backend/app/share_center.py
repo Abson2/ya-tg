@@ -56,6 +56,19 @@ def is_enabled(db: Session) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def is_paused(db: Session) -> bool:
+    """阶段六全局急停：publish_paused=true 时 run_cycle 空转。
+
+    保守默认 false。只拦新一轮「建分享+提交」，不撤销已在途任务、不触碰
+    分发中心发送核心（_send_telegram/_build_message/process_queue）。
+    """
+    try:
+        v = str(runtime_config.get(db, "publish_paused") or "").strip().lower()
+    except Exception:
+        return False
+    return v in ("1", "true", "yes", "on")
+
+
 def task_work_key(res: Resource) -> str:
     """分享中心作品键：与资源库展示/识别/扫描事件统一用 utils.work_group_key。"""
     return work_group_key(res)
@@ -537,8 +550,11 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
     不阻断其它任务。返回统计供前端任务中心展示。
     """
     from .utils import backoff_seconds
-    max_attempts = 8
     stats = {"built": 0, "submitted": 0, "skipped": 0, "failed": 0}
+    if is_paused(db):
+        stats["paused"] = True
+        return stats
+    max_attempts = 8
     now = utcnow()
     # v1.2 发布节奏（§5.4）：相邻任务按配置错开 scheduled_at，避免一瞬间并发提交。
     # 0=不限（保持 v1.1 行为）；只对本次真正提交的任务顺延，不改门禁/退避逻辑。
@@ -908,4 +924,88 @@ def share_records_list(db: Session, *, current_only: bool = False,
         "failure_reason": r.failure_reason,
         "last_verified_at": r.last_verified_at.isoformat() if r.last_verified_at else "",
         "created_at": r.created_at.isoformat() if r.created_at else "",
+        # 阶段五链接生命周期：前端分享管理页展示（本地推断，非光鸭实时）
+        "link_state": str(r.link_state or "active"),
+        "verify_fail_count": int(r.verify_fail_count or 0),
+        "cleaned_at": r.cleaned_at.isoformat() if r.cleaned_at else "",
+        "clean_state": str(r.clean_state or ""),
     } for r in rows]
+
+
+# ============================================================================
+# 阶段六：发布总览聚合 + 发布规则读写（只读为主，不碰发送核心）
+# ============================================================================
+
+def publish_overview(db: Session) -> dict:
+    """发布总览聚合（设计文档 §阶段六 1）：急停 / 今日配额进度 /
+    待处理资源事件数 / 链接有效性分布。全部本地库只读统计，不调用光鸭。
+    """
+    from .models import ResourceEvent
+    from . import share_link as _sl
+
+    today = utcnow().date()
+    day_start = datetime(today.year, today.month, today.day)
+    # 今日已发布分享任务数 / 今日已推送队列数（作为配额进度分母）
+    published_today = db.scalar(select(func.count()).select_from(ShareTask).where(
+        ShareTask.status == ST_PUBLISHED,
+        ShareTask.published_at.isnot(None),
+        ShareTask.published_at >= day_start)) or 0
+    sent_today = db.scalar(select(func.count()).select_from(QueueItem).where(
+        QueueItem.sent_at.isnot(None), QueueItem.sent_at >= day_start)) or 0
+    # 待处理资源事件（未消费）
+    pending_events = db.scalar(select(func.count()).select_from(ResourceEvent).where(
+        ResourceEvent.consumed_at.is_(None))) or 0
+    # 链接有效性分布：按当前分享记录的 link_state 聚合
+    link_rows = db.execute(select(ShareRecord.link_state, func.count()).where(
+        ShareRecord.current_flag == 1).group_by(ShareRecord.link_state)).all()
+    link_dist = {str(s or _sl.LINK_ACTIVE): int(n) for s, n in link_rows}
+
+    def _progress(used: int, key: str) -> dict:
+        limit = _int_cfg(db, key)
+        return {"used": int(used), "limit": limit,
+                "unlimited": limit == 0,
+                "pct": 0 if limit == 0 else min(100, round(used / limit * 100, 1))}
+
+    return {
+        "paused": is_paused(db),
+        "enabled": is_enabled(db),
+        "publish_today": _progress(published_today, "share_daily_limit"),
+        "push_today": _progress(sent_today, "push_daily_limit"),
+        "pending_events": int(pending_events),
+        "link_states": link_dist,
+    }
+
+
+# 发布规则页白名单：保守默认值 + 开关（设计文档 §阶段六 5 / §阶段五）
+PUBLISH_RULE_KEYS = (
+    "share_center_enabled", "resource_decoupled_enabled", "publish_paused",
+    "link_inactive_confirm_count", "link_inactive_min_minutes",
+    "auto_cleanup_enabled", "share_daily_limit", "push_daily_limit",
+    "stock_daily_quota", "fresh_daily_quota", "followup_daily_quota",
+    "share_release_interval_seconds",
+)
+
+
+def publish_rules_get(db: Session) -> dict:
+    """发布规则只读：布尔开关原样返回字符串值，前端按 0/1/true/false 判定。"""
+    out: dict[str, str] = {}
+    for key in PUBLISH_RULE_KEYS:
+        out[key] = str(runtime_config.get(db, key) or "")
+    return out
+
+
+def publish_rules_set(db: Session, values: dict) -> dict:
+    """写入发布规则：只接受白名单键、转字符串；脏值忽略不抛错。"""
+    clean: dict[str, str] = {}
+    for key in PUBLISH_RULE_KEYS:
+        if key not in values:
+            continue
+        v = values[key]
+        if isinstance(v, bool):
+            clean[key] = "true" if v else "false"
+        else:
+            clean[key] = str(v).strip()
+    if clean:
+        runtime_config.set_many(db, clean)
+        db.commit()
+    return publish_rules_get(db)

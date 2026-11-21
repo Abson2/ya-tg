@@ -214,6 +214,14 @@
 **耦合红线**：所有按钮只调现有 `share_center`/分发中心真实接口；新增只读查询接口可以，改发送核心不可以。`[事实]` 现 nav key=`推送队列`、label=`分享中心`（`App.vue:549-550`）错位 → 拆页时统一迁移为新 key，保留兼容断言。
 **验收**：状态两处（前后端）一致；每个按钮走真实后端、无空壳；推送功能零回归。
 
+**实施记录（2026-11-21，commit 见 CHANGELOG）**：
+- **5 页以「内层子标签」落地，未改 nav key**：`App.vue` 的「分享中心」section 内嵌 `el-tabs`（`shareSubTab`=overview/queue/manage/push/rules），nav key 仍保留 `推送队列` 以兼容任务中心卡片 `target:'推送队列'` 与既有 section 断言。`[推断]` 改 nav key 会牵动任务中心跳转与历史书签，收益低于零回归价值，故按"保留兼容断言"优先。
+- **发布总览**：新增真实配置 `publish_paused`（默认 false）+ `share_center.is_paused()` + `run_cycle` 入口急停门禁（只拦新一轮建分享/提交，不撤销在途、不碰发送核心）；新增只读聚合 `GET /api/share/publish-overview`（配额进度/待处理事件/link_state 分布）。
+- **发布规则**：新增 `GET/POST /api/share/rules` 白名单热更新（保守默认值开关）；分享管理列表 `share_records_list` 补 `link_state/verify_fail_count/cleaned_at/clean_state`；核验/清理按钮直连阶段五真实端点（清理二次确认）。
+- **资源卡角标**：`GET /api/library/series` 补 `pushed`（本地 sent 记录）与 `link_state`（本地推断）字段，卡片加「已推」「链接{state}」角标；不虚构光鸭状态。
+- **第六次死锁同源修复**：`POST /api/share/run` 原在主协程 `await run_cycle`，与 publisher 漏洞同源；改为复用 `_run_share_cycle_in_thread`（to_thread+独立 Session），并加静态守卫（helper 只能定义一次、禁裸 `await _sc.run_cycle(db`）。
+- **验收**：新增 `tests/test_v153_publish_center_frontend.py` 10 项（急停/聚合/规则白名单/link_state 字段/线程化守卫/5 页端点守卫）；前端 `vite build` 通过；全量 pytest 零回归。未升版本、未发版。
+
 ### 阶段七：全量测试 + 真机验收
 
 - 全量 pytest（当前 814 passed 基线）+ 前端 build；新增各阶段测试（资源解耦、事件幂等、9 态、跨季、链接生命周期、前端接口）。

@@ -123,6 +123,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。
     # 开启前须确保新链全量测试通过，且 share_center_enabled=true。
     "resource_decoupled_enabled": ("resource_decoupled_enabled", "false"),
+    # 阶段六（分享中心全重做）全局急停：true=run_cycle 直接空转，不发任何新分享。
+    # 保守默认 false；只拦「新提交」，不撤销已在途任务，也不动分发中心发送核心。
+    "publish_paused": ("publish_paused", "false"),
     # 阶段五（链接校验与清理，用户决策1）：有效性=本地元数据+删除事件驱动，非光鸭实时状态。
     # link_inactive_confirm_count：连续失效信号达此次数才可能判 inactive（默认2）；
     # link_inactive_min_minutes：两次失效信号最小间隔分钟（默认30），防抖动误判；

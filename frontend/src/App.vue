@@ -44,6 +44,11 @@ const shareWorkKeySearch = ref('') // v1.2 §5.6 work_key 过滤
 const shareSchedule = ref({})       // 发布节奏配置
 const shareFollowups = ref([])      // 追更关系聚合
 const shareRecords = ref([])        // 分享记录（当前/历史）
+// 阶段六：分享中心 5 页
+const shareSubTab = ref('overview')  // overview/queue/manage/push/rules
+const publishOverview = ref({ paused: false, enabled: false, publish_today: {}, push_today: {}, pending_events: 0, link_states: {} })
+const publishRules = ref({})        // 发布规则（保守默认值 + 开关）
+const linkDetail = ref(null)        // 单作品链接详情
 const shareStatusCounts = computed(() => shareCenterStatus.value.counts || {})
 const shareQueueCounts = computed(() => shareCenterStatus.value.queues || {})
 const shareFilteredTasks = computed(() => {
@@ -812,7 +817,8 @@ async function load() {
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
     'contributions?limit=50', 'media-requests?limit=50', 'logs/overview',
     'share/tasks?limit=200', 'share/center/status',
-    'share/schedule', 'share/followups', 'share/records?limit=100']
+    'share/schedule', 'share/followups', 'share/records?limit=100',
+    'share/publish-overview', 'share/rules']
   const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
   const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   overview.value = v(0) || overview.value
@@ -862,6 +868,8 @@ async function load() {
   const sched = v(24); if (sched) shareSchedule.value = sched
   const fu = v(25); if (fu) shareFollowups.value = fu.items || []
   const recs = v(26); if (recs) shareRecords.value = recs.items || []
+  const pov = v(27); if (pov) publishOverview.value = pov
+  const prules = v(28); if (prules) publishRules.value = prules
   // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
   try { await loadTgExtra() } catch (e) {}
   try { await loadPushStats() } catch (e) {}
@@ -1727,6 +1735,46 @@ async function saveShareSchedule() {
     ElMessage.success('发布节奏已保存')
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
+// 阶段六：发布总览/发布规则操作
+async function togglePublishPause() {
+  const next = !publishOverview.value.paused
+  try {
+    await ElMessageBox.confirm(next ? '确认急停？将暂停新一轮建分享与提交（在途任务不受影响）。' : '确认恢复发布？下一轮调度将正常建分享并提交。', next ? '全局急停' : '恢复发布', { type: 'warning' })
+    await api('/share/rules', { method: 'POST', body: JSON.stringify({ publish_paused: next }) })
+    ElMessage.success(next ? '已急停' : '已恢复发布')
+    await load()
+  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+}
+async function savePublishRules() {
+  try {
+    const d = await api('/share/rules', { method: 'POST', body: JSON.stringify(publishRules.value) })
+    publishRules.value = d
+    ElMessage.success('发布规则已保存（热更新）')
+    await load()
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+async function openLinkDetail(wk) {
+  try {
+    linkDetail.value = await api('/share/link/' + encodeURIComponent(wk))
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+async function reviewLink(wk) {
+  try {
+    const note = (linkDetail.value && linkDetail.value._note) || ''
+    await api('/share/link/review', { method: 'POST', body: JSON.stringify({ work_key: wk, note }) })
+    ElMessage.success('已提交人工核验')
+    await load(); if (wk) await openLinkDetail(wk)
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+async function cleanupLink(wk) {
+  try {
+    await ElMessageBox.confirm('确认清理该失效链接？仅将本地链接标记为已清理并归档，不删除网盘文件、不删历史记录、不影响队列与推送。', '手动清理（二次确认）', { type: 'warning' })
+    await api('/share/link/cleanup', { method: 'POST', body: JSON.stringify({ work_key: wk, operator: 'manual' }) })
+    ElMessage.success('已清理该链接')
+    await load(); if (wk) await openLinkDetail(wk)
+  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+}
+function isBoolOn(v) { return ['1', 'true', 'yes', 'on'].includes(String(v ?? '').toLowerCase()) }
 // v0.9.2：网页端扫码登录——光鸭 App 扫一扫，免开放平台应用凭证
 async function startWebqr() {
   try {
@@ -2766,6 +2814,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <input type="checkbox" class="card-check" :checked="selectedSeries.includes(g.key)" @click.stop="toggleSelect(g.key)"/>
                 <span v-if="g.share_status === 'active'" class="scrape-ok">✓</span>
                 <span class="media-badge" :class="'badge-'+g.share_status">{{ g.share_status === 'active' ? '已分享' : (g.share_status === 'not_created' ? '未分享' : g.share_status) }}</span>
+                <span v-if="g.pushed" class="push-badge" title="已推送到 Telegram">已推</span>
+                <span v-if="g.link_state && ['suspicious','inactive','cleaned','retired','manual_review'].includes(g.link_state)" class="link-badge" :title="'链接状态（本地推断）：'+g.link_state">链接{{ g.link_state }}</span>
                 <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结<span v-if="g.finish_locked">·手动</span></span>
                 <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更<span v-if="g.finish_locked">·手动</span></span>
                 <span v-if="g.share_duration" class="dur-badge">{{ durLabel(g.share_duration) }}</span>
@@ -2828,83 +2878,136 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         </section>
 
         <section v-else-if="tab === '推送队列'" class="fade">
-          <div class="page-head"><div><h2>分享中心</h2><p>分享生命周期 · 整剧一次目录分享 · 更新复用链接独立推送 · 与分发中心交接确认</p></div><div class="head-tools"><el-tag :type="shareCenterStatus.enabled ? 'success' : 'info'" size="small">{{ shareCenterStatus.enabled ? '新链已启用' : '旧链兼容模式' }}</el-tag><el-button size="small" type="primary" :loading="runningQueue" @click="shareRunCycle">跑一轮分享</el-button></div></div>
-          <!-- 总览（设计文档 §4.8）：三类队列积压 + 当前有效分享 + 各状态计数 -->
-          <div class="task-grid" style="margin-bottom:16px">
-            <div class="task-card"><div class="task-num">{{ shareQueueCounts.fresh || 0 }}</div><div class="task-label">全新资源</div></div>
-            <div class="task-card"><div class="task-num">{{ shareQueueCounts.stock || 0 }}</div><div class="task-label">存量资源</div></div>
-            <div class="task-card"><div class="task-num">{{ shareQueueCounts.followup || 0 }}</div><div class="task-label">追更资源</div></div>
-            <div class="task-card"><div class="task-num">{{ (shareCenterStatus.share_records || {}).current || 0 }}</div><div class="task-label">当前有效分享</div></div>
-          </div>
-          <div class="panel" style="margin-bottom:16px">
-            <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个有效分享；更新生成独立任务复用原链接；状态 planned→ready→submitted→accepted→published</span></div>
-            <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-              <el-radio-group v-model="shareQueueFilter" size="small">
-                <el-radio-button label="all">全部 {{ shareCenterTasks.length }}</el-radio-button>
-                <el-radio-button label="fresh">全新 {{ shareQueueCounts.fresh || 0 }}</el-radio-button>
-                <el-radio-button label="stock">存量 {{ shareQueueCounts.stock || 0 }}</el-radio-button>
-                <el-radio-button label="followup">追更 {{ shareQueueCounts.followup || 0 }}</el-radio-button>
-              </el-radio-group>
-              <el-input v-model="shareWorkKeySearch" size="small" clearable placeholder="按作品名/作品键搜索" style="width:220px"/>
-            </div>
-            <el-table :data="shareFilteredTasks" stripe max-height="480">
-              <el-table-column prop="id" label="ID" width="70"/>
-              <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
-              <el-table-column prop="queue_type" label="队列" width="90"><template #default="s"><el-tag size="small" :type="s.row.queue_type === 'followup' ? 'primary' : (s.row.queue_type === 'stock' ? 'warning' : 'info')">{{ s.row.queue_type || 'fresh' }}</el-tag></template></el-table-column>
-              <el-table-column prop="kind" label="类型" width="90"><template #default="s"><el-tag size="small" :type="s.row.kind === 'force' ? 'warning' : (s.row.kind === 'update' ? 'primary' : 'info')">{{ s.row.kind }}</el-tag></template></el-table-column>
-              <el-table-column prop="status" label="状态" width="120"><template #default="s"><span class="status-tag">{{ s.row.status }}</span></template></el-table-column>
-              <el-table-column prop="parent_task_id" label="追更自" width="90"><template #default="s">{{ s.row.parent_task_id || '—' }}</template></el-table-column>
-              <el-table-column label="推送目标" width="100"><template #default="s">{{ (JSON.parse(s.row.channel_targets || '[]') || []).length }}</template></el-table-column>
-              <el-table-column prop="share_url" label="分享链接" min-width="180" show-overflow-tooltip/>
-              <el-table-column prop="attempts" label="尝试" width="70"/>
-              <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip/>
-              <el-table-column label="操作" width="160"><template #default="s"><el-button size="small" type="warning" plain :disabled="['cancelled'].includes(s.row.status)" @click="shareRebuildTask(s.row.id)">重建</el-button><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
-            </el-table>
-            <div v-if="!shareFilteredTasks.length" class="empty">该队列暂无分享任务（识别入库后自动生成）</div>
-          </div>
-          <div class="panel">
-            <div class="panel-head"><h3>推送队列</h3><span class="hint">分发中心消费队列；失败项按指数退避自动重试，可手动重置</span></div>
-            <el-table :data="queue" stripe max-height="640"><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="resource" label="资源" min-width="200"/><el-table-column prop="channel" label="频道"/><el-table-column prop="status" label="状态" width="100"><template #default="s"><span class="status-tag" :class="'st-'+s.row.status">{{ s.row.status }}</span></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="next_retry_at" label="下次重试"/><el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip/><el-table-column label="操作" width="90"><template #default="s"><el-button size="small" @click="retry(s.row.id)">重试</el-button></template></el-table-column></el-table>
-            <div v-if="!queue.length" class="empty big">队列为空</div>
-          </div>
-          <!-- v1.2 分享管理（设计文档 §5.4/§5.7）：发布节奏 / 追更关系 / 分享记录 -->
-          <div class="panel" style="margin-top:16px">
-            <div class="panel-head"><h3>发布节奏与配额</h3><span class="hint">相邻分享任务的释放间隔 + 三类队列当日配额；0 = 不限。保存后下一轮 run_cycle 生效</span></div>
-            <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
-              <label class="hint">释放间隔(秒)<br><el-input-number v-model="shareSchedule.share_release_interval_seconds" :min="0" :max="3600" size="small"/></label>
-              <label class="hint">全新/日<br><el-input-number v-model="shareSchedule.fresh_daily_quota" :min="0" size="small"/></label>
-              <label class="hint">存量/日<br><el-input-number v-model="shareSchedule.stock_daily_quota" :min="0" size="small"/></label>
-              <label class="hint">追更/日<br><el-input-number v-model="shareSchedule.followup_daily_quota" :min="0" size="small"/></label>
-              <label class="hint">总分享/日<br><el-input-number v-model="shareSchedule.share_daily_limit" :min="0" size="small"/></label>
-              <label class="hint">总推送/日<br><el-input-number v-model="shareSchedule.push_daily_limit" :min="0" size="small"/></label>
-              <el-button size="small" type="primary" @click="saveShareSchedule">保存节奏配置</el-button>
-            </div>
-          </div>
-          <div class="panel" style="margin-top:16px">
-            <div class="panel-head"><h3>追更管理</h3><span class="hint">按作品聚合：一部剧一个有效分享链接，更新复用链接但独立重推</span></div>
-            <el-table :data="shareFollowups" stripe max-height="360">
-              <el-table-column prop="work_key" label="作品" min-width="180" show-overflow-tooltip/>
-              <el-table-column prop="total_pushes" label="已推次数" width="100"/>
-              <el-table-column prop="update_count" label="更新次数" width="100"/>
-              <el-table-column prop="first_task_id" label="首次任务" width="100"/>
-              <el-table-column prop="current_share_url" label="当前分享链接" min-width="200" show-overflow-tooltip/>
-              <el-table-column prop="last_published_at" label="最近推送" width="170"/>
-            </el-table>
-            <div v-if="!shareFollowups.length" class="empty">暂无追更记录</div>
-          </div>
-          <div class="panel" style="margin-top:16px">
-            <div class="panel-head"><h3>分享记录（当前 / 历史）</h3><span class="hint">share_records 是「作品→有效链接」真相源；历史记录作废后保留可追溯</span></div>
-            <el-table :data="shareRecords" stripe max-height="360">
-              <el-table-column prop="id" label="ID" width="70"/>
-              <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
-              <el-table-column label="当前" width="80"><template #default="s"><el-tag size="small" :type="s.row.current ? 'success' : 'info'">{{ s.row.current ? '有效' : '历史' }}</el-tag></template></el-table-column>
-              <el-table-column prop="share_status" label="状态" width="100"/>
-              <el-table-column prop="share_url" label="分享链接" min-width="200" show-overflow-tooltip/>
-              <el-table-column prop="failure_reason" label="作废原因" min-width="150" show-overflow-tooltip/>
-              <el-table-column prop="created_at" label="创建时间" width="170"/>
-            </el-table>
-            <div v-if="!shareRecords.length" class="empty">暂无分享记录</div>
-          </div>
+          <div class="page-head"><div><h2>分享中心</h2><p>发布总览 · 发布队列 · 分享管理 · 推送任务 · 发布规则（分享生命周期与分发中心深度耦合）</p></div><div class="head-tools"><el-tag :type="publishOverview.paused ? 'danger' : (shareCenterStatus.enabled ? 'success' : 'info')" size="small">{{ publishOverview.paused ? '已急停' : (shareCenterStatus.enabled ? '新链已启用' : '旧链兼容模式') }}</el-tag><el-button size="small" type="primary" :loading="runningQueue" @click="shareRunCycle">跑一轮分享</el-button></div></div>
+
+          <el-tabs v-model="shareSubTab" class="share-tabs">
+            <!-- 1. 发布总览 -->
+            <el-tab-pane label="发布总览" name="overview">
+              <div class="task-grid" style="margin-bottom:16px">
+                <div class="task-card"><div class="task-num">{{ publishOverview.paused ? '停' : '行' }}</div><div class="task-label">发布状态</div></div>
+                <div class="task-card"><div class="task-num">{{ publishOverview.pending_events || 0 }}</div><div class="task-label">待处理事件</div></div>
+                <div class="task-card"><div class="task-num">{{ (shareCenterStatus.share_records || {}).current || 0 }}</div><div class="task-label">当前有效分享</div></div>
+                <div class="task-card"><div class="task-num">{{ shareQueueCounts.fresh || 0 }}/{{ shareQueueCounts.stock || 0 }}/{{ shareQueueCounts.followup || 0 }}</div><div class="task-label">全新/存量/追更</div></div>
+              </div>
+              <div class="panel" style="margin-bottom:16px">
+                <div class="panel-head"><h3>今日配额进度</h3><span class="hint">来自本地库真实计数；上限 0 = 不限。</span></div>
+                <div style="display:flex;gap:32px;flex-wrap:wrap">
+                  <div style="min-width:220px"><div class="hint">今日发布 {{ publishOverview.publish_today?.used || 0 }} / {{ publishOverview.publish_today?.unlimited ? '不限' : (publishOverview.publish_today?.limit || 0) }}</div><el-progress :percentage="publishOverview.publish_today?.pct || 0" :stroke-width="14"/></div>
+                  <div style="min-width:220px"><div class="hint">今日推送 {{ publishOverview.push_today?.used || 0 }} / {{ publishOverview.push_today?.unlimited ? '不限' : (publishOverview.push_today?.limit || 0) }}</div><el-progress :percentage="publishOverview.push_today?.pct || 0" :stroke-width="14"/></div>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>链接有效性分布</h3><span class="hint">本地元数据 + 删除事件推断，非光鸭实时状态</span></div>
+                <div style="display:flex;gap:12px;flex-wrap:wrap">
+                  <el-tag v-for="(n, st) in publishOverview.link_states || {}" :key="st" :type="['inactive','cleaned','retired'].includes(st) ? 'danger' : (st === 'suspicious' || st === 'manual_review' ? 'warning' : 'success')" size="small">{{ st }} · {{ n }}</el-tag>
+                  <span v-if="!Object.keys(publishOverview.link_states || {}).length" class="hint">暂无当前分享链接</span>
+                </div>
+              </div>
+            </el-tab-pane>
+
+            <!-- 2. 发布队列 -->
+            <el-tab-pane label="发布队列" name="queue">
+              <div class="panel">
+                <div class="panel-head"><h3>分享任务</h3><span class="hint">一部剧一个有效分享；更新生成独立任务复用原链接；状态 planned→ready→submitted→accepted→published</span></div>
+                <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+                  <el-radio-group v-model="shareQueueFilter" size="small">
+                    <el-radio-button label="all">全部 {{ shareCenterTasks.length }}</el-radio-button>
+                    <el-radio-button label="fresh">全新 {{ shareQueueCounts.fresh || 0 }}</el-radio-button>
+                    <el-radio-button label="stock">存量 {{ shareQueueCounts.stock || 0 }}</el-radio-button>
+                    <el-radio-button label="followup">追更 {{ shareQueueCounts.followup || 0 }}</el-radio-button>
+                  </el-radio-group>
+                  <el-input v-model="shareWorkKeySearch" size="small" clearable placeholder="按作品名/作品键搜索" style="width:220px"/>
+                </div>
+                <el-table :data="shareFilteredTasks" stripe max-height="520">
+                  <el-table-column prop="id" label="ID" width="70"/>
+                  <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
+                  <el-table-column prop="queue_type" label="队列" width="90"><template #default="s"><el-tag size="small" :type="s.row.queue_type === 'followup' ? 'primary' : (s.row.queue_type === 'stock' ? 'warning' : 'info')">{{ s.row.queue_type || 'fresh' }}</el-tag></template></el-table-column>
+                  <el-table-column prop="kind" label="类型" width="90"><template #default="s"><el-tag size="small" :type="s.row.kind === 'force' ? 'warning' : (s.row.kind === 'update' ? 'primary' : 'info')">{{ s.row.kind }}</el-tag></template></el-table-column>
+                  <el-table-column prop="status" label="状态" width="120"><template #default="s"><span class="status-tag">{{ s.row.status }}</span></template></el-table-column>
+                  <el-table-column prop="parent_task_id" label="追更自" width="90"><template #default="s">{{ s.row.parent_task_id || '—' }}</template></el-table-column>
+                  <el-table-column label="推送目标" width="100"><template #default="s">{{ (JSON.parse(s.row.channel_targets || '[]') || []).length }}</template></el-table-column>
+                  <el-table-column prop="share_url" label="分享链接" min-width="180" show-overflow-tooltip/>
+                  <el-table-column prop="attempts" label="尝试" width="70"/>
+                  <el-table-column prop="error" label="错误" min-width="180" show-overflow-tooltip/>
+                  <el-table-column label="操作" width="160"><template #default="s"><el-button size="small" type="warning" plain :disabled="['cancelled'].includes(s.row.status)" @click="shareRebuildTask(s.row.id)">重建</el-button><el-button size="small" type="danger" plain :disabled="['published','cancelled'].includes(s.row.status)" @click="shareCancelTask(s.row.id)">取消</el-button></template></el-table-column>
+                </el-table>
+                <div v-if="!shareFilteredTasks.length" class="empty">该队列暂无分享任务（识别入库后自动生成）</div>
+              </div>
+            </el-tab-pane>
+
+            <!-- 3. 分享管理 -->
+            <el-tab-pane label="分享管理" name="manage">
+              <div class="panel" style="margin-bottom:16px">
+                <div class="panel-head"><h3>分享记录（当前 / 历史）</h3><span class="hint">share_records 是「作品→有效链接」真相源；链接状态为本地推断，核验/清理走真实后端端点</span></div>
+                <el-table :data="shareRecords" stripe max-height="480">
+                  <el-table-column prop="id" label="ID" width="70"/>
+                  <el-table-column prop="work_key" label="作品" min-width="150" show-overflow-tooltip/>
+                  <el-table-column label="当前" width="80"><template #default="s"><el-tag size="small" :type="s.row.current ? 'success' : 'info'">{{ s.row.current ? '有效' : '历史' }}</el-tag></template></el-table-column>
+                  <el-table-column label="链接状态" width="120"><template #default="s"><el-tag size="small" :type="['inactive','cleaned','retired'].includes(s.row.link_state) ? 'danger' : (['suspicious','manual_review'].includes(s.row.link_state) ? 'warning' : 'success')">{{ s.row.link_state }}</el-tag></template></el-table-column>
+                  <el-table-column prop="verify_fail_count" label="失效信号" width="90"/>
+                  <el-table-column prop="share_url" label="分享链接" min-width="180" show-overflow-tooltip/>
+                  <el-table-column prop="failure_reason" label="作废原因" min-width="140" show-overflow-tooltip/>
+                  <el-table-column label="操作" width="200"><template #default="s"><el-button size="small" @click="openLinkDetail(s.row.work_key)">详情</el-button><el-button size="small" type="warning" plain @click="reviewLink(s.row.work_key)">核验</el-button><el-button size="small" type="danger" plain :disabled="!s.row.current" @click="cleanupLink(s.row.work_key)">清理</el-button></template></el-table-column>
+                </el-table>
+                <div v-if="!shareRecords.length" class="empty">暂无分享记录</div>
+                <div v-if="linkDetail" class="hint" style="margin-top:10px;padding:10px;background:var(--yg-panel)">
+                  链接详情：状态 {{ linkDetail.state }} · 失效信号 {{ linkDetail.fail_count }} · 判定来源 {{ linkDetail.source || 'local_event' }} · 可复用 {{ linkDetail.reusable ? '是' : '否' }}
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>追更管理</h3><span class="hint">按作品聚合：一部剧一个有效分享链接，更新复用链接但独立重推</span></div>
+                <el-table :data="shareFollowups" stripe max-height="360">
+                  <el-table-column prop="work_key" label="作品" min-width="180" show-overflow-tooltip/>
+                  <el-table-column prop="total_pushes" label="已推次数" width="100"/>
+                  <el-table-column prop="update_count" label="更新次数" width="100"/>
+                  <el-table-column prop="first_task_id" label="首次任务" width="100"/>
+                  <el-table-column prop="current_share_url" label="当前分享链接" min-width="200" show-overflow-tooltip/>
+                  <el-table-column prop="last_published_at" label="最近推送" width="170"/>
+                </el-table>
+                <div v-if="!shareFollowups.length" class="empty">暂无追更记录</div>
+              </div>
+            </el-tab-pane>
+
+            <!-- 4. 推送任务 -->
+            <el-tab-pane label="推送任务" name="push">
+              <div class="panel">
+                <div class="panel-head"><h3>分发交接与发送队列</h3><span class="hint">分享中心提交（submitted）→分发中心原子领取（accepted）→发送；只读为主，失败项可重试</span></div>
+                <el-table :data="queue" stripe max-height="640"><el-table-column prop="id" label="ID" width="70"/><el-table-column prop="resource" label="资源" min-width="200"/><el-table-column prop="channel" label="频道"/><el-table-column prop="status" label="状态" width="100"><template #default="s"><span class="status-tag" :class="'st-'+s.row.status">{{ s.row.status }}</span></template></el-table-column><el-table-column prop="attempts" label="尝试" width="70"/><el-table-column prop="next_retry_at" label="下次重试"/><el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip/><el-table-column label="操作" width="90"><template #default="s"><el-button size="small" @click="retry(s.row.id)">重试</el-button></template></el-table-column></el-table>
+                <div v-if="!queue.length" class="empty big">队列为空</div>
+              </div>
+            </el-tab-pane>
+
+            <!-- 5. 发布规则 -->
+            <el-tab-pane label="发布规则" name="rules">
+              <div class="panel" style="margin-bottom:16px">
+                <div class="panel-head"><h3>全局急停</h3><span class="hint">开启后 run_cycle 空转，暂停新一轮建分享与提交；在途任务不受影响，不触碰发送核心。</span></div>
+                <div style="display:flex;gap:16px;align-items:center"><el-tag :type="publishOverview.paused ? 'danger' : 'success'" size="small">{{ publishOverview.paused ? '已急停' : '正常运行' }}</el-tag><el-button size="small" :type="publishOverview.paused ? 'success' : 'danger'" plain @click="togglePublishPause">{{ publishOverview.paused ? '恢复发布' : '全局急停' }}</el-button></div>
+              </div>
+              <div class="panel" style="margin-bottom:16px">
+                <div class="panel-head"><h3>发布节奏与配额</h3><span class="hint">相邻分享任务的释放间隔 + 三类队列当日配额；0 = 不限。保存后下一轮 run_cycle 生效</span></div>
+                <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+                  <label class="hint">释放间隔(秒)<br><el-input-number v-model="shareSchedule.share_release_interval_seconds" :min="0" :max="3600" size="small"/></label>
+                  <label class="hint">全新/日<br><el-input-number v-model="shareSchedule.fresh_daily_quota" :min="0" size="small"/></label>
+                  <label class="hint">存量/日<br><el-input-number v-model="shareSchedule.stock_daily_quota" :min="0" size="small"/></label>
+                  <label class="hint">追更/日<br><el-input-number v-model="shareSchedule.followup_daily_quota" :min="0" size="small"/></label>
+                  <label class="hint">总分享/日<br><el-input-number v-model="shareSchedule.share_daily_limit" :min="0" size="small"/></label>
+                  <label class="hint">总推送/日<br><el-input-number v-model="shareSchedule.push_daily_limit" :min="0" size="small"/></label>
+                  <el-button size="small" type="primary" @click="saveShareSchedule">保存节奏配置</el-button>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>保守默认值开关（热更新）</h3><span class="hint">默认均为保守值；生产稳定前不建议开启自动清理/资源解耦。所有改动实时生效。</span></div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px">
+                  <label class="hint">分享中心主链（share_center_enabled）<br><el-select v-model="publishRules.share_center_enabled" size="small" style="width:100%"><el-option label="true" value="true"/><el-option label="false" value="false"/></el-select></label>
+                  <label class="hint">资源解耦（resource_decoupled_enabled）<br><el-select v-model="publishRules.resource_decoupled_enabled" size="small" style="width:100%"><el-option label="true" value="true"/><el-option label="false" value="false"/></el-select></label>
+                  <label class="hint">自动清理（auto_cleanup_enabled，默认关）<br><el-select v-model="publishRules.auto_cleanup_enabled" size="small" style="width:100%"><el-option label="false" value="false"/><el-option label="true" value="true"/></el-select></label>
+                  <label class="hint">失效确认次数（link_inactive_confirm_count）<br><el-input-number v-model="publishRules.link_inactive_confirm_count" :min="1" size="small"/></label>
+                  <label class="hint">失效最小间隔分（link_inactive_min_minutes）<br><el-input-number v-model="publishRules.link_inactive_min_minutes" :min="0" size="small"/></label>
+                </div>
+                <div style="margin-top:16px"><el-button size="small" type="primary" @click="savePublishRules">保存发布规则</el-button></div>
+              </div>
+            </el-tab-pane>
+          </el-tabs>
         </section>
 
         <section v-else-if="tab === 'TMDB 设置'" class="fade">
@@ -3374,6 +3477,10 @@ button{font-family:inherit}
 .media-poster{height:270px;position:relative;background:#eef0f6}.no-poster{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#b4bcd2}.no-poster .ico{width:30px;height:30px}.no-poster span{font-size:11px;letter-spacing:1px}
 .media-badge{position:absolute;top:10px;left:10px;padding:4px 9px;border-radius:20px;font-size:10px;font-weight:700;color:#fff;background:#98a1b8}.badge-active{background:#19b3a6}.badge-not_created{background:#e29328}.badge-failed{background:#e5526b}.badge-cancelled{background:#98a1b8}
 .series-card .media-badge{left:auto;right:10px}.scrape-ok{position:absolute;top:10px;left:10px;width:22px;height:22px;border-radius:50%;background:#19b3a6;color:#fff;font-size:13px;font-weight:800;display:grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.2)}.ep-count{position:absolute;bottom:8px;right:8px;padding:3px 8px;border-radius:12px;background:rgba(20,24,40,.78);color:#fff;font-size:10px;font-weight:700}
+/* 阶段六资源卡角标：推送 / 链接有效性（本地推断） */
+.push-badge{position:absolute;top:34px;right:10px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;background:#4b7bec;z-index:4}
+.link-badge{position:absolute;bottom:26px;right:8px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;background:#e5526b;z-index:4}
+.share-tabs .el-tabs__content{padding-top:4px}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
 .media-actions{display:flex;gap:5px;padding:0 12px 12px;flex-wrap:wrap}
 .step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}

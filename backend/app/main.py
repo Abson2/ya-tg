@@ -532,7 +532,7 @@ def _consume_resource_events_in_thread() -> None:
             logger.warning("[share_center] 消费资源事件周期异常：%s", exc)
 
 
-def _run_share_cycle_in_thread() -> None:
+def _run_share_cycle_in_thread(limit: int = 20) -> dict:
     """v1.4.2 洞2根治：分享调度周期整体挪出事件循环线程。
 
     2026-11-21 第四次复现：v1.4.0 只把「事件消费」挪进 to_thread，但 run_cycle
@@ -540,14 +540,18 @@ def _run_share_cycle_in_thread() -> None:
     是同步写，撞上被占的写锁就在主线程等 30s，冻结整个 loop → 全 job missed + API 超时。
     这里在独立线程用 asyncio.run() 跑完整 run_cycle（含 build_share 网络 await 与全部
     commit），线程内自建 Session。主线程只等一个 to_thread，零 SQLite 锁等待。
+
+    阶段六：share_run 手动端点复用本 helper（第六次死锁同源漏网修复），limit 参数化
+    并返回统计 dict；_job_share_center 保持无参调用不变。
     """
     from . import share_center as _sc
     with SessionLocal() as db:
         try:
-            asyncio.run(_sc.run_cycle(db, limit=20))
+            return asyncio.run(_sc.run_cycle(db, limit=limit))
         except Exception as exc:
             db.rollback()
             logger.warning("[share_center] 调度周期异常（线程内）", exc_info=True)
+            return {"built": 0, "submitted": 0, "skipped": 0, "failed": 0, "error": True}
 
 
 async def _job_share_center() -> None:
@@ -2599,6 +2603,16 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         stmt = stmt.where(Resource.media_type == media_type)
     rows = list(db.scalars(stmt).all())
     by_id = {x.id: x for x in rows}  # 阶段三 A-08：复用已取资源，避免筛选时逐条 db.get
+    # 阶段六资源卡角标：一次性预加载「已推送资源集合」与「作品→链接状态」，
+    # 避免逐卡查询（N+1）。两者均来自本地库，失败降级为空不阻断列表。
+    try:
+        from .models import ShareRecord as _SR
+        sent_ids = {r[0] for r in db.execute(select(QueueItem.resource_id).where(
+            QueueItem.sent_at.isnot(None))).all()}
+        link_by_key = {r.work_key: str(r.link_state or "active") for r in db.scalars(
+            select(_SR).where(_SR.current_flag == 1)).all()}
+    except Exception:
+        sent_ids, link_by_key = set(), {}
     groups: dict[str, dict] = {}
     for x in rows:
         key = _series_group_key(x)
@@ -2678,6 +2692,9 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             label += f" · 已识别 E{eps[0][1]:02d}"
         g["episode_label"] = label
         g["season_count"] = len(seasons)
+        # 阶段六资源卡角标：是否已推送（任一成员有 sent 记录）+ 当前链接状态（本地推断）
+        g["pushed"] = any(i in sent_ids for i in g["ids"])
+        g["link_state"] = link_by_key.get(g["key"], "")
         # 筛选：标题/文件名关键词
         if q and q.lower() not in (str(g["title"]) + " " + " ".join(str(i) for i in g["ids"])).lower():
             # 关键词也匹配成员文件名
@@ -4346,10 +4363,36 @@ def share_followups(db: Session = Depends(get_db)):
 
 @app.post("/api/share/run", dependencies=ADMIN)
 async def share_run():
-    """手动跑一轮分享中心调度（建分享→提交分发）。"""
-    from . import share_center as _sc
-    with SessionLocal() as db:
-        return await _sc.run_cycle(db, limit=20)
+    """手动跑一轮分享中心调度（建分享→提交分发）。
+
+    阶段六第六次死锁同源修复：复用 _run_share_cycle_in_thread（线程内独立 Session），
+    避免前端「跑一轮」按钮在主协程撞写锁冻结 event loop。
+    """
+    return await asyncio.to_thread(_run_share_cycle_in_thread, 20)
+
+
+@app.get("/api/share/publish-overview", dependencies=ADMIN)
+def share_publish_overview(db: Session = Depends(get_db)):
+    """阶段六发布总览：急停 / 今日配额进度 / 待处理事件 / 链接有效性分布（只读）。"""
+    from . import share_center
+    return share_center.publish_overview(db)
+
+
+@app.get("/api/share/rules", dependencies=ADMIN)
+def share_rules_get(db: Session = Depends(get_db)):
+    """阶段六发布规则只读：保守默认值 + 开关。"""
+    from . import share_center
+    return share_center.publish_rules_get(db)
+
+
+@app.post("/api/share/rules", dependencies=ADMIN)
+def share_rules_set(payload: dict, db: Session = Depends(get_db)):
+    """阶段六发布规则写入：白名单键、热更新。"""
+    from . import share_center
+    result = share_center.publish_rules_set(db, payload or {})
+    add_audit(db, "publish_rules_changed", detail=json_dumps({"rules": payload or {}}))
+    db.commit()
+    return result
 
 
 @app.get("/api/share/center/status", dependencies=ADMIN)
