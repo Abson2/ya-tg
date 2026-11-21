@@ -802,6 +802,32 @@ class SCHourWindow(Base):
     )
 
 
+class SCCategorySchedule(Base):
+    """v2.0.5：分类-时间排期（category-centric，每分类一行）。
+
+    与 SCHourWindow（每时段一行）并存、职责不同：本表承载设计稿「分类-时间排期配置」
+    的每小时上限/日上限/时段/AI建议采纳；SCHourWindow 仍供小时分类轮转。
+    分类 key 指向 TMDB 官方 genre 字典（tmdb:<id>）。
+    """
+    __tablename__ = "sc_category_schedules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_version_id: Mapped[int] = mapped_column(Integer, ForeignKey("sc_share_plan_versions.id"), index=True, default=0)
+    category_key: Mapped[str] = mapped_column(String(128), index=True, default="")
+    window_start: Mapped[int] = mapped_column(Integer, default=8)   # 当前配置时段起（小时，含）
+    window_end: Mapped[int] = mapped_column(Integer, default=24)    # 当前配置时段止（小时，不含）
+    hourly_limit: Mapped[int] = mapped_column(Integer, default=0)   # 每小时上限，0=不限
+    daily_limit: Mapped[int] = mapped_column(Integer, default=0)    # 日上限，0=不限
+    ai_window_start: Mapped[int] = mapped_column(Integer, default=0)   # AI 建议时段（真实发布分布派生）
+    ai_window_end: Mapped[int] = mapped_column(Integer, default=0)
+    ai_adopted: Mapped[bool] = mapped_column(Boolean, default=False)   # 是否已采纳 AI 建议
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("plan_version_id", "category_key", name="uq_sc_category_schedule"),
+    )
+
+
 class SCCategoryCursor(Base):
     __tablename__ = "sc_category_cursors"
     id: Mapped[int] = mapped_column(primary_key=True)

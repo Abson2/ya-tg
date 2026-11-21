@@ -30,6 +30,7 @@ from .models import (
     SCAISuggestion,
     SCCategory,
     SCCategoryCursor,
+    SCCategorySchedule,
     SCHourWindow,
     SCLibraryVersion,
     SCPublishExecution,
@@ -51,6 +52,26 @@ DEFAULT_INTERVAL_SECONDS = {"channel": 2.0, "private": 2.0, "group": 4.0}
 ACTIVE_TASK_STATUS = {"planned", "building", "ready", "submitted", "accepted", "publishing"}
 TERMINAL_TASK_STATUS = {"published", "failed", "cancelled"}
 
+# v2.0.5：TMDB 官方 genre 全集为影视分类唯一权威（源 tmdb.py::TMDB_GENRES，27 项）。
+# 设计稿原写「连续剧/院线电影/综艺」，但那不是 TMDB 官方 genre 概念；按用户决策改为
+# 官方全集。category_key 沿用 genre:<规范化中文名>，与 _primary_category 的归类口径
+# 完全一致——这样分类字典、作品归类、环图统计、排期表天然对齐，不产生 key 分裂。
+# 懒加载避免模块导入环（tmdb 不依赖本模块）。
+def _tmdb_genre_catalog() -> list[dict[str, Any]]:
+    from .tmdb import TMDB_GENRES
+    tv_ids = {10759, 10762, 10763, 10764, 10765, 10766, 10767, 10768}
+    out = []
+    for gid, name in sorted(TMDB_GENRES.items(), key=lambda kv: kv[0]):
+        out.append({"category_key": f"genre:{utils.normalize_work_name(name)}",
+                    "tmdb_genre_id": gid, "name": name,
+                    "media_type": "tv" if gid in tv_ids else "movie",
+                    "source": "tmdb"})
+    return out
+
+
+# 分类排期默认窗口（每分类一行）：08:00–24:00、不限上限、AI 建议未采纳。
+DEFAULT_SCHEDULE_WINDOW = (8, 24, 0, 0)
+
 
 class Payload(BaseModel):
     payload: dict[str, Any] = {}
@@ -58,6 +79,10 @@ class Payload(BaseModel):
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def shanghai_tz() -> timezone:
+    return timezone(timedelta(hours=8))
 
 
 def _jload(value: str | None, default):
@@ -122,6 +147,21 @@ def ensure_defaults(db: Session) -> None:
                 db.add(SCHourWindow(plan_version_id=version.id, start_hour=start,
                                     end_hour=start + 1, category_key=cat,
                                     quota=0, enabled=True))
+    # v2.0.5：种子 TMDB 官方 genre 全集（27 项）作为分类字典。
+    # priority=-1 让其排在真实归类（priority>=0）之后，不抢占 category_limit 轮转名额；
+    # 用户启用/停用、改名、分类排期都在这套字典上操作。
+    for cat in _tmdb_genre_catalog():
+        row = db.scalar(select(SCCategory).where(SCCategory.category_key == cat["category_key"]))
+        if not row:
+            db.add(SCCategory(category_key=cat["category_key"], name=cat["name"],
+                              source="tmdb", media_type=cat["media_type"],
+                              enabled=True, priority=-1))
+            changed = True
+        elif row.name in ("", row.category_key):
+            # 归一历史懒生成行（name 曾等于 category_key）为官方中文名
+            row.name = cat["name"]
+            row.media_type = cat["media_type"]
+            changed = True
     if changed:
         db.commit()
 
@@ -156,9 +196,16 @@ def _primary_category(resource: Resource) -> tuple[str, str]:
 def _ensure_category(db: Session, category_key: str, media_type: str, name: str = "") -> None:
     row = db.scalar(select(SCCategory).where(SCCategory.category_key == category_key))
     if row:
+        # v2.0.5：字典种子行 priority=-1（不抢轮转名额）；一旦被真实资源归类命中，
+        # 提升为 0 表示「有实际作品使用」，进入轮转。用户手动改过的 priority>0 不覆盖。
+        if row.priority < 0:
+            row.priority = 0
+            if media_type:
+                row.media_type = media_type
+            db.flush()
         return
     db.add(SCCategory(category_key=category_key, name=name or category_key,
-                      source="tmdb", media_type=media_type, enabled=True))
+                      source="tmdb", media_type=media_type, enabled=True, priority=0))
     db.flush()
 
 
@@ -293,8 +340,19 @@ def plan_engine(db: Session) -> dict[str, int]:
     if not version or not _current_hour_allowed(db, version):
         return {"lists": 0, "items": 0, "tasks": 0}
     cfg = _jload(version.config_json, {})
+    # v2.0.5：周期计划静默保护真实生效——命中静默时段不生成任何任务。
+    cycle = cfg.get("cycle_plan") or {}
+    if cycle.get("quiet_enabled"):
+        sh_hour = datetime.now(shanghai_tz()).hour
+        q_start = int(cycle.get("quiet_start") or 0)
+        q_end = int(cycle.get("quiet_end") or 0)
+        in_quiet = (q_start <= sh_hour < q_end) if q_end > q_start else (sh_hour >= q_start or sh_hour < q_end)
+        if in_quiet:
+            return {"lists": 0, "items": 0, "tasks": 0, "quiet": 1}
     category_limit = max(1, int(cfg.get("category_limit") or 20))
     work_limit = max(1, int(cfg.get("work_limit") or 50))
+    # v2.0.5：周期计划的小时上限真实夹逼单轮任务数（0=不限）
+    hour_max = int((cycle.get("hour_max") or 0))
 
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
     if not channels:
@@ -362,6 +420,10 @@ def plan_engine(db: Session) -> dict[str, int]:
             cursor.last_work_key = lv.work_key
             cursor.last_success_at = utcnow()
             cursor.status = "idle"
+            if hour_max and task_count >= hour_max:
+                break
+        if hour_max and task_count >= hour_max:
+            break
     db.commit()
     return {"lists": 1, "items": item_count, "tasks": task_count}
 
@@ -744,11 +806,111 @@ def apply_suggestion(db: Session, suggestion_id: int, reviewer: str = "admin",
 
 
 # ---------------------------------------------------------------------------
+# v2.0.5 设计稿真实聚合：趋势 / 分类占比 / 热门作品 / 三视图
+# 全部来自 sc_* 与 Resource 真实表，不使用设计稿示例数字
+# ---------------------------------------------------------------------------
+
+def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
+    """推送趋势：published_at 成功计数 + created_at 失败计数，按日/周/月分桶。
+
+    真实来源 sc_publish_tasks；无数据时 series 为空（前端显示空态，不画假曲线）。
+    """
+    rows = list(db.scalars(select(SCPublishTask)).all())
+    buckets: dict[str, dict[str, int]] = {}
+    sh = timezone(timedelta(hours=8))
+
+    def key_of(dt: datetime) -> str:
+        local = dt.astimezone(sh) if dt.tzinfo else dt.replace(tzinfo=sh)
+        if period == "month":
+            return local.strftime("%Y-%m")
+        if period == "week":
+            monday = local - timedelta(days=local.weekday())
+            return monday.strftime("%Y-%m-%d")
+        return local.strftime("%Y-%m-%d")
+
+    def add(label: str, field: str) -> None:
+        b = buckets.setdefault(label, {"published": 0, "failed": 0, "total": 0})
+        b[field] += 1
+        b["total"] += 1
+
+    for t in rows:
+        moment = t.published_at or t.updated_at or t.created_at
+        if moment:
+            add(key_of(moment), "published" if t.status == "published" else "failed")
+    series = [{"label": k, **buckets[k]} for k in sorted(buckets)]
+    # 轻量时间上限，避免筛选器里塞入上一年所有历史 buckets
+    return {"period": period, "series": series[-90:]}
+
+
+def _aggregate_category_ratio(db: Session) -> dict[str, Any]:
+    """分类推送占比：已发布任务 JOIN 清单项分类 + 分类字典中文名。"""
+    rows = db.execute(
+        select(SCPushListItem.category_key, func.count(SCPublishTask.id))
+        .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.status == "published")
+        .group_by(SCPushListItem.category_key)
+    ).all()
+    names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
+    items = []
+    total = sum(int(n or 0) for _, n in rows)
+    for key, n in rows:
+        count = int(n or 0)
+        items.append({"category_key": str(key or ""),
+                      "name": names.get(str(key or ""), str(key or "未分类")),
+                      "count": count,
+                      "ratio": round(count * 100 / total, 1) if total else 0.0})
+    items.sort(key=lambda x: x["count"], reverse=True)
+    return {"total": total, "items": items}
+
+
+def _aggregate_hot_works(db: Session, limit: int = 5) -> dict[str, Any]:
+    """热门作品榜：按 TMDB 评分 vote_average 取已识别作品 TopN（真实评分，非虚构热度）。
+
+    vote_average 已在 Resource 落库（识别时写入），是系统内唯一可信的「作品热度」代理值。
+    前端明确标注「来源：TMDB 评分」，不冒充设计稿的热度 98.2。
+    """
+    rows = list(db.scalars(
+        select(Resource).where(Resource.vote_average > 0,
+                               Resource.identify_status == "identified")
+        .order_by(Resource.vote_average.desc(), Resource.id).limit(limit)
+    ).all())
+    # 同名作品（剧集多集）取一条代表
+    seen: set[str] = set()
+    items = []
+    for r in rows:
+        title = str(getattr(r, "media_title", "") or getattr(r, "name", ""))
+        if title in seen:
+            continue
+        seen.add(title)
+        items.append({"title": title, "score": round(float(r.vote_average or 0), 1),
+                      "media_type": str(getattr(r, "media_type", "") or ""),
+                      "tmdb_id": getattr(r, "tmdb_id", None),
+                      "source": "TMDB 评分"})
+    return {"items": items, "metric": "TMDB 评分", "note": "按已落库的 TMDB 评分排序，非设计稿示例热度值"}
+
+
+def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
+    """推送三视图：历史(published)/队列(active)/失败(failed)真实任务行。"""
+    def rows_for(statuses: set[str] | None) -> list[dict[str, Any]]:
+        q = select(SCPublishTask)
+        if statuses:
+            q = q.where(SCPublishTask.status.in_(statuses))
+        rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(limit)).all()
+        return [{k: v for k, v in _model_dict(r).items() if k in (
+            "id", "work_key", "kind", "status", "link_state", "share_url",
+            "error", "attempts", "created_at", "published_at", "updated_at")} for r in rows]
+
+    return {"history": rows_for({"published"}),
+            "queue": rows_for(ACTIVE_TASK_STATUS),
+            "failed": rows_for({"failed"})}
+
+
+# ---------------------------------------------------------------------------
 # API：前端只作为管理入口，所有按钮走真实后端
 # ---------------------------------------------------------------------------
 
 @router.get("/overview")
-def api_overview(db: Session = Depends(get_db)):
+def api_overview(db: Session = Depends(get_db), period: str = "day"):
     """发布总览仪表盘数据。
 
     全部字段来自 sc_* 真实表聚合：不读旧 ShareRecord/ShareTask，不使用截图示例值。
@@ -848,12 +1010,36 @@ def api_overview(db: Session = Depends(get_db)):
                        "min_seconds": rule["min"],
                        "max_per_minute": int(base.max_per_minute or 0) if base else 0})
     active_version = _active_version(db)
+    # v2.0.5 设计稿总览：趋势 / 分类占比 / 热门作品 / 三视图（全部真实聚合）
+    now_sh = datetime.now(shanghai_tz())
+    day_start_utc = datetime(now_sh.year, now_sh.month, now_sh.day, tzinfo=shanghai_tz()).astimezone(timezone.utc)
+    day_end_utc = day_start_utc + timedelta(days=1)
+    today_published = db.scalar(select(func.count(SCPublishTask.id)).where(
+        SCPublishTask.status == "published",
+        SCPublishTask.published_at >= day_start_utc,
+        SCPublishTask.published_at < day_end_utc)) or 0
+    total_terminal = status_counts.get("published", 0) + status_counts.get("failed", 0)
+    success_rate = round(published_total * 100 / total_terminal, 1) if total_terminal else 0.0
+    enriched_kpi = dict(kpi)
+    enriched_kpi.update({
+        "pending_list": push_list_counts["pending_first"] + push_list_counts["pending_update"],
+        "today_published": today_published,
+        "auto_delivered": status_counts.get("published", 0),
+        "success_rate": success_rate,
+        "weekly_ai_candidates": db.scalar(select(func.count(SCAISuggestion.id)).where(
+            SCAISuggestion.status == "pending")) or 0,
+        "failed_pending": status_counts.get("failed", 0),
+    })
     return {"enabled": is_enabled(db), "paused": _is_paused(db), "counts": counts,
-            "status_counts": status_counts, "pacing": pacing, "kpi": kpi,
+            "status_counts": status_counts, "pacing": pacing, "kpi": enriched_kpi,
             "link_state_counts": link_state_counts, "kind_counts": kind_counts,
             "schedule": schedule, "windows": windows, "recent_tasks": recent_tasks,
             "push_list_counts": push_list_counts,
-            "active_version_id": active_version.id if active_version else 0}
+            "active_version_id": active_version.id if active_version else 0,
+            "trend": _aggregate_trend(db, period if period in ("day", "week", "month") else "day"),
+            "category_ratio": _aggregate_category_ratio(db),
+            "hot_works": _aggregate_hot_works(db),
+            "views": _aggregate_views(db)}
 
 
 @router.post("/run")
@@ -1165,6 +1351,231 @@ def api_ai_reject(suggestion_id: int, db: Session = Depends(get_db)):
     db.add(SCAIApplyLog(suggestion_id=suggestion_id, action="reject", result="success"))
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# v2.0.5 发布规则端点：TMDB 分类字典 / 分类时间排期 / 基础规则 / 周期计划
+# ---------------------------------------------------------------------------
+
+@router.get("/categories/catalog")
+def api_category_catalog(db: Session = Depends(get_db)):
+    """TMDB 官方 genre 全集字典（27 项），带本地启用/改名/priority 状态。"""
+    ensure_defaults(db)
+    local = {c.category_key: c for c in db.scalars(select(SCCategory)).all()}
+    items = []
+    for cat in _tmdb_genre_catalog():
+        row = local.get(cat["category_key"])
+        items.append({**cat,
+                      "id": row.id if row else 0,
+                      "enabled": bool(row.enabled) if row else True,
+                      "priority": int(row.priority) if row else -1,
+                      "custom_name": row.name if row and row.name != cat["name"] else ""})
+    return {"items": items, "source": "tmdb.py::TMDB_GENRES", "total": len(items)}
+
+
+def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
+    """为版本幂等补齐所有 TMDB 官方分类的排期行（disabled 字典也建行，前端可勾选启用）。"""
+    rows = {r.category_key: r for r in db.scalars(
+        select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
+    added = False
+    for cat in _tmdb_genre_catalog():
+        if cat["category_key"] not in rows:
+            ws, we, hl, dl = DEFAULT_SCHEDULE_WINDOW
+            row = SCCategorySchedule(plan_version_id=version_id, category_key=cat["category_key"],
+                                     window_start=ws, window_end=we, hourly_limit=hl,
+                                     daily_limit=dl, ai_adopted=False, enabled=False)
+            db.add(row)
+            added = True
+    if added:
+        db.flush()
+    return list(db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version_id)).all())
+
+
+def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
+    """AI 建议时段：按该分类已发布任务的小时分布取最密集连续小时（真实派生，不编造）。
+
+    无历史发布数据时返回 (0,0)，前端显示「暂无建议」，不伪造时段。
+    """
+    rows = db.execute(
+        select(SCPublishTask.published_at)
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.status == "published",
+               SCPushListItem.category_key == category_key)
+    ).all()
+    hours: dict[int, int] = {}
+    for (moment,) in rows:
+        if moment:
+            h = moment.astimezone(shanghai_tz()).hour
+            hours[h] = hours.get(h, 0) + 1
+    if not hours:
+        return (0, 0)
+    peak_hour = max(hours, key=lambda h: (hours[h], -h))
+    return (peak_hour, min(24, peak_hour + 2))
+
+
+@router.get("/category-schedules")
+def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
+    """分类-时间排期表：每分类一行，含 AI 建议时段（真实派生）。"""
+    version = _active_version(db) if not version_id else db.get(SCSharePlanVersion, version_id)
+    if not version:
+        return {"items": [], "version_id": 0, "reason": "无活动计划版本"}
+    rows = _ensure_schedules(db, version.id)
+    db.commit()
+    names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
+    cat_map = {c["category_key"]: c for c in _tmdb_genre_catalog()}
+    items = []
+    for r in rows:
+        d = _model_dict(r)
+        d["name"] = names.get(r.category_key, cat_map.get(r.category_key, {}).get("name", r.category_key))
+        d["tmdb_genre_id"] = cat_map.get(r.category_key, {}).get("tmdb_genre_id", 0)
+        ai_start, ai_end = _ai_suggest_window(db, r.category_key)
+        if not r.ai_adopted:
+            d["ai_window_start"], d["ai_window_end"] = ai_start, ai_end
+        items.append(d)
+    items.sort(key=lambda x: (x.get("tmdb_genre_id") or 0))
+    return {"items": items, "version_id": version.id}
+
+
+@router.post("/category-schedules")
+def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
+    p = body.payload
+    active = _active_version(db)
+    version_id = int(p.get("plan_version_id") or (active.id if active else 0))
+    category_key = str(p.get("category_key") or "").strip()
+    if not version_id or not category_key:
+        return {"ok": False, "reason": "plan_version_id 与 category_key 必填"}
+    row = db.scalar(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version_id,
+        SCCategorySchedule.category_key == category_key))
+    if not row:
+        row = SCCategorySchedule(plan_version_id=version_id, category_key=category_key)
+        db.add(row)
+    row.window_start = max(0, min(23, int(p.get("window_start") or 0)))
+    row.window_end = max(row.window_start + 1, min(24, int(p.get("window_end") or 24)))
+    row.hourly_limit = max(0, int(p.get("hourly_limit") or 0))
+    row.daily_limit = max(0, int(p.get("daily_limit") or 0))
+    row.ai_window_start = max(0, min(23, int(p.get("ai_window_start") or 0)))
+    row.ai_window_end = max(row.ai_window_start + 1, min(24, int(p.get("ai_window_end") or 0))) if p.get("ai_window_end") else 0
+    row.ai_adopted = bool(p.get("ai_adopted", False))
+    row.enabled = bool(p.get("enabled", False))
+    row.updated_at = utcnow()
+    db.commit()
+    return {"ok": True, "item": _model_dict(row)}
+
+
+@router.post("/category-schedules/adopt-ai")
+def api_adopt_schedule_ai(body: Payload, db: Session = Depends(get_db)):
+    """采纳 AI 建议时段：把真实派生的建议窗口写入当前配置并标记已采纳。"""
+    p = body.payload
+    row = db.get(SCCategorySchedule, int(p.get("id") or 0))
+    if not row:
+        return {"ok": False, "reason": "排期行不存在"}
+    ai_start, ai_end = _ai_suggest_window(db, row.category_key)
+    if not ai_start:
+        return {"ok": False, "reason": "该分类暂无历史发布数据，无真实建议可采纳"}
+    row.window_start, row.window_end = ai_start, ai_end
+    row.ai_adopted = True
+    row.updated_at = utcnow()
+    db.commit()
+    return {"ok": True, "window_start": ai_start, "window_end": ai_end}
+
+
+@router.post("/category-schedules/copy")
+def api_copy_category_schedule(body: Payload, db: Session = Depends(get_db)):
+    """把一行排期配置复制到目标分类（真实写库）。"""
+    p = body.payload
+    src = db.get(SCCategorySchedule, int(p.get("id") or 0))
+    target_keys = [str(x).strip() for x in (p.get("target_keys") or []) if str(x).strip()]
+    if not src or not target_keys:
+        return {"ok": False, "reason": "源排期与目标分类必填"}
+    version_id = src.plan_version_id
+    copied = 0
+    for key in target_keys:
+        if key == src.category_key:
+            continue
+        row = db.scalar(select(SCCategorySchedule).where(
+            SCCategorySchedule.plan_version_id == version_id,
+            SCCategorySchedule.category_key == key))
+        if not row:
+            row = SCCategorySchedule(plan_version_id=version_id, category_key=key)
+            db.add(row)
+        row.window_start, row.window_end = src.window_start, src.window_end
+        row.hourly_limit, row.daily_limit = src.hourly_limit, src.daily_limit
+        row.enabled = src.enabled
+        row.ai_adopted = False
+        row.updated_at = utcnow()
+        copied += 1
+    db.commit()
+    return {"ok": True, "copied": copied}
+
+
+BASIC_RULE_KEYS = {
+    "quick_publish_enabled": "sc_quick_publish_enabled",
+    "update_detect_minutes": "sc_update_detect_minutes",
+    "quick_publish_hourly_limit": "sc_quick_publish_hourly_limit",
+    "conflict_policy": "sc_conflict_policy",
+}
+
+
+@router.get("/basic-rules")
+def api_basic_rules(db: Session = Depends(get_db)):
+    """上新即时推送基础规则（真实持久化于 app_config）。"""
+    vals = runtime_config.get_many(db, list(BASIC_RULE_KEYS.values()))
+    return {field: vals.get(key, "") for field, key in BASIC_RULE_KEYS.items()}
+
+
+@router.post("/basic-rules")
+def api_save_basic_rules(body: Payload, db: Session = Depends(get_db)):
+    p = body.payload
+    values = {}
+    for field, key in BASIC_RULE_KEYS.items():
+        if field in p:
+            values[key] = str(p[field])
+    if values:
+        runtime_config.set_many(db, values)
+        db.commit()
+    return {"ok": True, "rules": api_basic_rules(db)}
+
+
+CYCLE_PLAN_DEFAULTS = {
+    "hour_max": 60, "category_hour_max": 8, "quiet_start": 0, "quiet_end": 7,
+    "quiet_enabled": True, "day_max": 180, "window_start": 8, "window_end": 24,
+    "week_max": 1200, "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
+    "month_max": 5000, "month_rest_enabled": False,
+}
+
+
+@router.get("/cycle-plan")
+def api_cycle_plan(db: Session = Depends(get_db)):
+    """周期计划（小时/日/周/月配额 + 静默保护），持久化于活动版本 config_json.cycle_plan。"""
+    version = _active_version(db)
+    if not version:
+        return {**CYCLE_PLAN_DEFAULTS, "version_id": 0}
+    cfg = _jload(version.config_json, {})
+    saved = cfg.get("cycle_plan") or {}
+    return {**CYCLE_PLAN_DEFAULTS, **saved, "version_id": version.id}
+
+
+@router.post("/cycle-plan")
+def api_save_cycle_plan(body: Payload, db: Session = Depends(get_db)):
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "无活动计划版本"}
+    cfg = _jload(version.config_json, {})
+    saved = {k: body.payload.get(k, v) for k, v in CYCLE_PLAN_DEFAULTS.items() if k in body.payload}
+    cycle = {**CYCLE_PLAN_DEFAULTS, **(cfg.get("cycle_plan") or {}), **saved}
+    # 数值夹逼，防非法输入破坏调度
+    for k in ("hour_max", "category_hour_max", "day_max", "week_max", "month_max"):
+        cycle[k] = max(0, int(cycle.get(k) or 0))
+    for k in ("quiet_start", "window_start", "week_rest_hour"):
+        cycle[k] = max(0, min(23, int(cycle.get(k) or 0)))
+    for k in ("quiet_end", "window_end"):
+        cycle[k] = max(1, min(24, int(cycle.get(k) or 24)))
+    cfg["cycle_plan"] = cycle
+    version.config_json = _jdump(cfg)
+    db.commit()
+    return {"ok": True, "cycle_plan": cycle}
 
 
 def _model_dict(row) -> dict[str, Any]:

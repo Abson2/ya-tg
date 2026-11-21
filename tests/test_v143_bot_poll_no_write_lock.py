@@ -179,6 +179,6 @@ def test_version_is_144():
     import json
     root = Path(__file__).resolve().parents[1]
     main_src = (root / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="2.0.4"' in main_src
-    assert "v2.0.4 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "2.0.4"
+    assert 'version="2.0.5"' in main_src
+    assert "v2.0.5 · Asia/Shanghai" in (root / "frontend/src/App.vue").read_text(encoding="utf-8")
+    assert json.loads((root / "frontend/package.json").read_text(encoding="utf-8"))["version"] == "2.0.5"

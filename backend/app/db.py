@@ -134,6 +134,21 @@ _COLUMNS = {
     "sc_hour_windows": {
         "category_key": "TEXT DEFAULT ''",
     },
+    # v2.0.5：分类-时间排期（category-centric），表由 create_all 新建，老库 ALTER 补列兜底
+    "sc_category_schedules": {
+        "plan_version_id": "INTEGER DEFAULT 0",
+        "category_key": "TEXT DEFAULT ''",
+        "window_start": "INTEGER DEFAULT 8",
+        "window_end": "INTEGER DEFAULT 24",
+        "hourly_limit": "INTEGER DEFAULT 0",
+        "daily_limit": "INTEGER DEFAULT 0",
+        "ai_window_start": "INTEGER DEFAULT 0",
+        "ai_window_end": "INTEGER DEFAULT 0",
+        "ai_adopted": "BOOLEAN DEFAULT 0",
+        "enabled": "BOOLEAN DEFAULT 1",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+    },
     "auth_tokens": {
         "device_id": "TEXT DEFAULT ''",
     },

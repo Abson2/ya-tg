@@ -123,6 +123,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "share_center_v2_enabled": ("share_center_v2_enabled", "true"),
     # AI 调度建议默认只进审核队列；显式打开后才允许自动应用，且永远不直接推送。
     "sc_ai_auto_apply": ("sc_ai_auto_apply", "false"),
+    # v2.0.5：分享中心「基础规则」——上新即时推送。更新检测频率合并窗口（分钟）、
+    # 上新即时推送每小时上限（条，0=不限）、冲突处理策略（pause_normal/prefer_new）。
+    # 全部走管理页配置，与 SCUpdateWindow 的 10 分钟合并窗口口径一致。
+    "sc_quick_publish_enabled": ("sc_quick_publish_enabled", "true"),
+    "sc_update_detect_minutes": ("sc_update_detect_minutes", "10"),
+    "sc_quick_publish_hourly_limit": ("sc_quick_publish_hourly_limit", "3"),
+    "sc_conflict_policy": ("sc_conflict_policy", "pause_normal"),
     # 阶段二（资源库解耦）灰度开关：true=识别入口只发资源事件（携带 channel_targets），
     # 推送决策完全由分享中心 consume_resource_events→submit_to_dispatch 新链接管；
     # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。
