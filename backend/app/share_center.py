@@ -600,12 +600,25 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
             # 任务留 error 供前端诊断；下一轮 run_cycle 会自动重试建分享（task.status 已是
             # submitted/accepted/published，不再进 planned 候选——故另用 ShareRecord 修复
             # job 补建，这里不阻塞推送）。分享失败与推送失败彻底解耦。
-            task.error = f"[建分享失败·降级无链接推送] {str(exc)[:600]}"
-            task.status = ST_READY
-            task.share_url = ""
-            task.next_retry_at = None
-            db.commit()
+            # P0 第六次死锁根治：异常可能就是 database is locked / PendingRollbackError，
+            # 此时 Session 处于 failed 态，必须先 rollback 再写，否则下面的 commit 本身
+            # 再抛 PendingRollbackError，把整批 run_cycle 拖垮（真机日志同款）。
+            try:
+                db.rollback()
+            except Exception:
+                pass
             stats["degraded"] = int(stats.get("degraded", 0)) + 1
+            try:
+                task.error = f"[建分享失败·降级无链接推送] {str(exc)[:600]}"
+                task.status = ST_READY
+                task.share_url = ""
+                task.next_retry_at = None
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
             # 降级后继续走门禁+提交（不 continue），确保消息送达
             try:
                 ok, reason = can_publish(db, task)
@@ -617,7 +630,10 @@ async def run_cycle(db: Session, limit: int = 20) -> dict:
                 else:
                     stats["skipped"] = int(stats.get("skipped", 0)) + 1
             except Exception:
-                db.rollback()
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
     return stats
 
 

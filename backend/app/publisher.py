@@ -381,6 +381,34 @@ def _work_group_key(res: Resource) -> str:
     return f"file:{res.id}"
 
 
+def _run_share_center_in_thread(limit: int = 20) -> None:
+    """P0 第六次死锁根治：分享中心的事件消费 + run_cycle 整体挪出事件循环线程。
+
+    2026-11-21 真机：queue_worker 的 process_queue 每 60s 在**主协程**里直接
+    `await run_cycle(db)`（publisher.py:419），其内部 build_share/submit_to_dispatch
+    的同步 db.commit() 撞写锁就在主线程等 30s → 冻结整个 event loop →
+    process_queue 的 _queue_lock 一直不释放 → 后续所有调度 skipped、队列停滞但
+    容器 healthy（第六次锁故障，新持锁点 build_share，与前五轮不同位置）。
+
+    main.py:_job_share_center 早在 v1.4.2 已用同款 to_thread 保护，但 queue_worker
+    这条调用路径漏了。这里在独立线程用 asyncio.run 跑完整 run_cycle（含网络 await
+    与全部 commit），线程内自建 Session；主线程只等一个 to_thread，零 SQLite 锁等待。
+    事件消费也一并挪进来（它同样是同步 DB 写）。
+    """
+    from . import events as _ev
+    from . import share_center as _sc
+    with SessionLocal() as sdb:
+        try:
+            _sc.consume_resource_events(sdb, limit=100)
+            asyncio.run(_sc.run_cycle(sdb, limit=max(limit, 20)))
+        except Exception as exc:
+            try:
+                sdb.rollback()
+            except Exception:
+                pass
+            logger.warning("[publisher] 分享中心周期异常（线程内已隔离）", exc_info=True)
+
+
 async def _process_queue_impl(limit: int = 20) -> dict:
     db: Session = SessionLocal()
     sent = failed = shared = 0
@@ -415,11 +443,17 @@ async def _process_queue_impl(limit: int = 20) -> dict:
             # 「立即处理队列」/手动 queue/run 必须也能把 planned 任务推到 submitted，
             # 否则入队项 status_ext 为空会一直卡住不被本函数消费（真机漏发风险）。
             try:
-                _sc.consume_resource_events(db, limit=100)
-                await _sc.run_cycle(db, limit=max(limit, 20))
+                # P0 第六次死锁根治：事件消费 + run_cycle 含同步 commit，必须挪出
+                # 事件循环线程（线程内自建 Session），否则撞写锁会冻结全站并让
+                # _queue_lock 永不释放（队列停滞但容器 healthy）。详见
+                # _run_share_center_in_thread 注释。
+                await asyncio.to_thread(_run_share_center_in_thread, max(limit, 20))
             except Exception as exc:
-                db.rollback()
-                logger.exception("[publisher] 分享中心提交周期异常")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                logger.exception("[publisher] 分享中心提交周期异常（主线程兜底）")
             # 重新读取 rows（run_cycle 可能刚新建/重置了队列项的 status_ext）
             rows = list(db.scalars(
                 select(QueueItem).where(
