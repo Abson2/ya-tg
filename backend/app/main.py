@@ -515,6 +515,16 @@ def _consume_resource_events_in_thread() -> None:
     from . import share_center as _sc
     with SessionLocal() as db:
         try:
+            # 阶段三：先消费归档镜像事件（防未消费堆积），再消费资源事件。
+            # 镜像事件不转资源事件——MirrorMedia.id 与 Resource.id 无可靠映射，
+            # 恢复走 pipeline→_enqueue_ready 的 ever_cancelled 判定（不虚构关联）。
+            # consume_mirror_events 纯短事务，不引入新持锁源（五轮死锁教训）。
+            try:
+                from . import events as _ev
+                _ev.consume_mirror_events(db, limit=100)
+            except Exception as exc:
+                db.rollback()
+                logger.warning("[events] 消费镜像事件周期异常：%s", exc)
             _sc.consume_resource_events(db, limit=100)
         except Exception as exc:
             db.rollback()

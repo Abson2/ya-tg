@@ -147,6 +147,16 @@
 **回滚**：事件表新增 consume 逻辑用开关控制，关掉后回到周期全量扫描。
 **风险**：`[P1]` 幂等键扩展可能让旧事件重复消费 → 迁移时对存量事件按旧键去重一次。
 
+#### 阶段三实际落地记录（2026-11-21，代码完成待真机验收）
+
+1. **幂等键扩展**：`emit_resource_event` 新增可选 `fingerprint`，传入时键扩展为 `type|work_key|resource_id|fingerprint`，支持同资源同类型多次变化各落一条；不传保持旧键（零迁移、兼容存量）。
+2. **5 类事件常量**：补齐 `RESOURCE_CREATED/FILE_CHANGED/RENAMED/MOVED/DELETED` + `ALL_RESOURCE_EVENT_TYPES`。只定义/可 emit，**不被分享中心自动推送消费**（避免高频文件事件重复推送）；消费端仍只处理 identified/restored/removed。
+3. **`consume_mirror_events()` 落地并挂到 `_consume_resource_events_in_thread`**（同线程同 Session，先归档镜像事件再消费资源事件），不再是死代码。
+
+`[事实]+决策` **镜像事件不做类型转换**（原计划 MIRROR_RESTORED → RESOURCE_RESTORED 已放弃）：镜像事件带 `MirrorMedia.id`，分享中心消费端要 `Resource.id`，两者无可靠映射（Resource 无 work_group_key 列可反查）。强行转换会**虚构关联**，违反安全底线。镜像恢复仍走已验证的可靠链路：mirror.py 重建 → pipeline `run_scan→post_identify→_enqueue_ready` 按 `ever_cancelled` 判 restored。`[缺口]` 后续若给 Resource 加稳定作品键列，再评估接入镜像事件转换。
+
+**验收结果**：新增 `tests/test_v146_event_system.py` 7 项全过；未升版本未发版。
+
 ### 阶段四：分享中心生命周期（含 9 态 + 跨季一次 + 统一发布引擎）
 
 **目标**：`share_status` 收口 9 态；跨季一剧一链接；三套建分享逻辑收敛到统一发布引擎；can_publish 增强。

@@ -34,6 +34,21 @@ RESOURCE_EPISODE_ADDED = "episode_added"
 RESOURCE_FILE_UPDATED = "updated"
 RESOURCE_REMOVED = "removed"
 RESOURCE_RESTORED = "restored"
+# 阶段三补齐的 5 类资源事件（原为死常量/未定义）：
+# created=资源首次入库；file_changed=单文件内容变化；renamed=改名；moved=目录移动；deleted=删除。
+# 这些类型供资源库内部追踪与下游按需订阅；分享中心当前只消费 identified/restored/removed，
+# 新增类型的 emit 不会再触发自动推送（避免高频文件事件造成重复推送）。
+RESOURCE_CREATED = "created"
+RESOURCE_FILE_CHANGED = "file_changed"
+RESOURCE_RENAMED = "renamed"
+RESOURCE_MOVED = "moved"
+RESOURCE_DELETED = "deleted"
+
+ALL_RESOURCE_EVENT_TYPES = frozenset({
+    RESOURCE_NEW, RESOURCE_EPISODE_ADDED, RESOURCE_FILE_UPDATED, RESOURCE_REMOVED,
+    RESOURCE_RESTORED, RESOURCE_CREATED, RESOURCE_FILE_CHANGED, RESOURCE_RENAMED,
+    RESOURCE_MOVED, RESOURCE_DELETED,
+})
 
 
 def emit_mirror_event(db: Session, *, work_key: str, rule_id: int = 0,
@@ -64,9 +79,17 @@ def emit_mirror_event(db: Session, *, work_key: str, rule_id: int = 0,
 
 def emit_resource_event(db: Session, *, event_type: str, work_key: str,
                         resource_id: int = 0,
-                        payload: dict | None = None) -> ResourceEvent | None:
-    """资源状态变化落事件（幂等：同 type+work_key+resource_id 未消费时只一条）。"""
+                        payload: dict | None = None,
+                        fingerprint: str = "") -> ResourceEvent | None:
+    """资源状态变化落事件（幂等：同 type+work_key+resource_id 未消费时只一条）。
+
+    阶段三：新增可选 fingerprint（内容指纹/序号）。传入时幂等键扩展为
+    `type|work_key|resource_id|fingerprint`，使「同一资源同一类型的多次变化」能各自
+    落一条事件；不传则保持旧键格式（零迁移、兼容存量事件与所有旧调用方）。
+    """
     idem = f"{event_type}|{work_key}|{resource_id}"
+    if fingerprint:
+        idem = f"{idem}|{str(fingerprint)[:64]}"
     try:
         existing = db.scalar(select(ResourceEvent).where(ResourceEvent.idem_key == idem).limit(1))
         if existing:
@@ -98,3 +121,33 @@ def pending_resource_events(db: Session, limit: int = 200) -> list[ResourceEvent
 def mark_consumed(db: Session, ev: MirrorEvent | ResourceEvent) -> None:
     ev.consumed_at = utcnow()
     db.commit()
+
+
+def consume_mirror_events(db: Session, limit: int = 200) -> dict:
+    """阶段三：消费并归档镜像事件（镜像同步 → 资源库的可追溯通道）。
+
+    设计纪律（对齐五轮死锁教训 + 不虚构关联红线）：
+      - 纯短事务、零网络、零高频配置写、零 to_thread 需求，不制造新持锁源；
+      - **不做事件类型转换**：镜像事件带 MirrorMedia.id，分享中心消费端要 Resource.id，
+        两者无可靠映射（Resource 无 work_group_key 列可反查），强行转换会虚构关联。
+        镜像恢复仍走已验证的可靠链路：mirror.py 重建 → pipeline run_scan→post_identify
+        →_enqueue_ready 按 ever_cancelled 判 restored（main.py:3079-3082）。
+      - MIRROR_COMPLETED 不触发全量重扫——镜像后处理 pipeline 已同步完成刷新，
+        重复触发只会叠加长任务；本函数只标记消费，防止 mirror_events 未消费堆积。
+      - 每条独立 try，失败只 rollback 自己并继续，毒事件不阻断整批。
+
+    返回 {"consumed": n, "failed": n}。
+    """
+    stats = {"consumed": 0, "failed": 0}
+    for ev in pending_mirror_events(db, limit=limit):
+        try:
+            mark_consumed(db, ev)
+            stats["consumed"] += 1
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            stats["failed"] += 1
+            logger.warning("[events] 消费镜像事件 #%s 失败：%s", ev.id, exc)
+    return stats
