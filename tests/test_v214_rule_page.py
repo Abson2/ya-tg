@@ -584,12 +584,23 @@ def test_assign_preference_new_row_uses_media_type_limits(env):
 # ---------------------------------------------------------------------------
 
 def test_frontend_rule_page_is_full_width():
-    """发布规则页必须整行满宽（不再挤在两列 Grid 的半格子里）。"""
+    """发布规则页必须整行满宽（不再挤在两列 Grid 的半格子里）。
+
+    v2.1.5 真机回归：v2.1.4 的满宽实现有两层根因——
+      ① 满宽类 .sc-board-full 定义在 .sc-board **之前**（同特异度 → 后者胜出），
+         满宽规则完全失效，页面仍被塞进两列 Grid 的半格子里；
+      ② 发布规则页在半幅容器内又套一层两列 .sc-rule-layout →
+         每列只剩 1/4 页宽，卡片被压成「缩小版」，尺寸与页面严重不符。
+    v2.1.5 修法：三页移出 Grid，由 .sc-subpage 独占整行满宽。
+    """
     app = APP_VUE.read_text(encoding="utf-8")
-    assert "sc-board-full" in app, "缺少满宽布局类"
-    assert ".sc-board-full{grid-template-columns:minmax(0,1fr)}" in app, \
-        "满宽布局样式缺失"
-    assert 'class="sc-board sc-board-full"' in app, "发布规则页未应用满宽容器"
+    assert "sc-subpage" in app, "缺少满宽子页容器"
+    assert ".sc-subpage{display:block;width:100%;min-width:0}" in app, \
+        "满宽子页容器样式缺失"
+    assert ".sc-board-full{" not in app, \
+        "旧的 .sc-board-full 满宽修饰类仍在（层叠顺序会再次失效）"
+    assert 'class="sc-board sc-board-full"' not in app, \
+        "三页仍挂在 .sc-board 两列 Grid 里"
     assert "sc-rule-layout" in app, "发布规则页内部应使用两列布局"
 
 

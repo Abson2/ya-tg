@@ -8,6 +8,19 @@
 
 ---
 
+## v2.1.5 (2026-11-22)
+
+**分享中心「缩小版」布局回归根治**：v2.1.4 发布后的真机反馈——「2.14 版本分享中心里面，除开总览整体页面是铺满了，其余页面均是缩小版，尺寸与页面不符，比例失调」。本版把发布规则 / 推送任务 / 分享管理三页的**宽度根因**彻底挖掉并修好，同时把「层叠顺序」这条隐性陷阱固化成可执行的门禁测试。回滚 `IMAGE_TAG=v2.1.4`。
+
+- **根因一：满宽规则因 CSS 层叠顺序完全失效**：v2.1.4 为三页新增的满宽修饰类 `.sc-board-full{grid-template-columns:minmax(0,1fr)}` 定义在 **4516 行**，而它要覆盖的 `.sc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}` 定义在 **4576 行**——两者**同特异度**（都是单类选择器 0,1,0），**后定义者胜出** → 满宽规则被完全覆盖，三页仍旧被塞进两列 Grid 的半格子里，只占约 1/2 页宽。**总览页为什么正常**：它用 `.sc-dash{display:flex;flex-direction:column;gap:18px}` 直接挂在 `.sc-workspace` 下，**根本不经过 Grid**，因此不受这条规则影响——这也印证了根因定位正确（同一容器、同一 `.content` 上限、唯独经过 Grid 的三页被切半）。
+- **根因二：发布规则页页内二次收缩**：发布规则页在半幅容器内**又套了一层** `.sc-rule-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}`（基础规则 / 周期计划并列）→ 每列实际只剩 **1/4 页宽**，卡片被压成「缩小版」，这就是用户看到的「尺寸与页面不符、比例失调」。分享管理页与推送任务页虽然页内是单栏（`.sc-share-layout,.sc-task-layout{display:block}`），但它们同样被 Grid 切半，表格列被迫挤在一起。
+- **修法：把三页移出 Grid，与总览页平级**：不再靠「修饰类覆盖 Grid 列数」这种脆弱手法，而是**从结构上让三页不再经过任何 Grid 容器**——新增 `.sc-subpage{display:block;width:100%;min-width:0}`，三页（连同总览页）统一挂在 `.sc-workspace` 下、各自独占整行满宽；页内需要并排时由各页自己的内部容器负责（发布规则页保留 `.sc-rule-layout` 两列 + 排期表 `grid-column:1/-1` 整行，窄屏 `@media(max-width:1100px)` 降级单列）。同时把 `.sc-board` 本身从「默认两列 Grid」改为「默认单列满宽」，并**彻底删除 `.sc-board-full`**——它已无存在意义，留着只会诱导下一个人再挂回 Grid 重蹈覆辙。
+- **层叠顺序陷阱固化为可执行门禁**：新增 `tests/test_v215_share_center_layout.py`，把这次的真机教训写成**会失败**的断言而不是注释——①三页必须挂在 `.sc-subpage` 下、不得再出现 `class="sc-board sc-board-full"`；②`.sc-subpage` 满宽定义存在、`.sc-board` 不得再含 `repeat(2`；③**层叠顺序守卫**：若将来有人重新引入 `.sc-board-full` 同特异度修饰类，断言会检查它是否定义在 `.sc-board` **之后**（或已提高特异度），否则直接判红；④**构建产物校验**：若 `frontend/dist` 存在，产出 CSS 中不得再出现 `sc-board-full`、`.sc-board` 不得仍是两列——这条守住「源码改对了但产物没同步」的缝隙。同时把 v2.1.4 三个测试文件（`test_v214_rule_page.py` / `test_v215_task_page.py` / `test_v216_share_manage_page.py`）里断言旧满宽实现的契约改为新口径。
+- **测试编写口径修正（避免假红）**：新增的守卫测试第一版用 `r"\.sc-board-full[^{]*\{"` 匹配选择器，`[^{]*` 会一路吞过注释结束符直到撞上下一个 `{`，把源码注释里的历史根因说明**误判成选择器定义**而误报。已改为先剥除 `/* */` 与 `<!-- -->` 注释再匹配（`r"\.sc-board-full\s*\{"`），既消除假红，又让「将来真引入时仍能正确触发层叠顺序断言」这一意图保持有效。
+- **版本与门禁**：版本号六处一致升级到 v2.1.5（`main.py` 的 `app` version + health `version`、`App.vue` 页脚、`package.json`、`package-lock.json` 顶层两处、`README.md`；`require-directory@2.1.1` 第三方依赖未被误改），版本断言测试 `test_v141_rate_limit_backoff.py`（5 处）/ `test_v143_bot_poll_no_write_lock.py`（3 处）/ `test_v144_budget_drain_fix.py`（5 处）同步。前端 build 通过（1450 modules）。
+
+---
+
 ## v2.1.4 (2026-11-22)
 
 **发布规则页重做 + 推送任务页与分享管理页排版与信息补全 + 镜像「清空待处理清单」永久拉黑根治**：按用户五组截图反馈一次性收敛分享中心三页的可读性与可操作性——「发布规则页右边留空较多、内容拥挤在左侧」「配置时间段默认值应该跟偏好档位推荐值一样」「AI 建议时间段要按周维度生成」「整个表按配置时间段自动排序」「启用静默时间后配置时间不能选静默内的时间」「推送任务页的 failed 标签用户看不懂」「增加推送渠道展示频道和群」「分享内容最前面和详情内页要展示 TMDB 海报」「分享管理页右边留空较多、也要加海报」，外加真机反馈的镜像事故——「清空待处理清单」后重新同步**永远不再翻译**。回滚 `IMAGE_TAG=v2.1.3`。

@@ -197,10 +197,20 @@ def test_frontend_task_detail_has_poster():
 
 
 def test_frontend_task_page_full_width():
-    """推送任务页满宽（与发布规则页一致）。"""
+    """推送任务页满宽（与发布规则页一致）。
+
+    v2.1.5 真机回归：旧的 .sc-board-full 满宽修饰类定义在 .sc-board 之前
+    （同特异度 → 后者胜出），满宽规则完全失效 → 三页在真机呈「缩小版」。
+    v2.1.5 修法：三页移出两列 Grid，由 .sc-subpage 独占整行满宽。
+    """
     app = APP_VUE.read_text(encoding="utf-8")
-    assert "sc-board-full" in app, "缺少满宽容器"
-    assert ".sc-board-full{grid-template-columns:minmax(0,1fr)}" in app, "满宽样式缺失"
+    assert "sc-subpage" in app, "缺少满宽子页容器"
+    assert ".sc-subpage{display:block;width:100%;min-width:0}" in app, \
+        "满宽子页容器样式缺失"
+    assert ".sc-board-full{" not in app, \
+        "旧的 .sc-board-full 满宽修饰类仍在（层叠顺序会再次失效）"
+    assert 'class="sc-board sc-board-full"' not in app, \
+        "三页仍挂在 .sc-board 两列 Grid 里"
     assert ".sc-share-layout,.sc-task-layout{display:block}" in app, "两页应单栏满宽"
 
 

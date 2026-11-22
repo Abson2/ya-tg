@@ -237,7 +237,22 @@ def test_frontend_link_state_tones_css():
 
 
 def test_frontend_share_page_full_width():
-    """分享管理页满宽（不再挤在 .sc-board 的半格子里）。"""
+    """分享管理页满宽（不再挤在 .sc-board 的半格子里）。
+
+    v2.1.5 真机回归：v2.1.4 的满宽实现有两层根因——
+      ① 满宽类 .sc-board-full 定义在 .sc-board **之前**（同特异度 → 后者胜出），
+         满宽规则完全失效，页面仍被塞进两列 Grid 的半格子里 → 真机呈「缩小版」；
+      ② 三页挂在 Grid 里时，页内再套两列布局 → 每列只剩 1/4 页宽。
+    v2.1.5 修法：三页移出 Grid，由 .sc-subpage 独占整行满宽。
+    """
     app = APP_VUE.read_text(encoding="utf-8")
-    assert "sc-board-full" in app, "缺少满宽容器"
-    assert ".sc-board-full{grid-template-columns:minmax(0,1fr)}" in app, "满宽样式缺失"
+    assert "sc-subpage" in app, "缺少满宽子页容器"
+    assert ".sc-subpage{display:block;width:100%;min-width:0}" in app, \
+        "满宽子页容器样式缺失"
+    # 旧的满宽修饰类已被三页移出 Grid 的修法取代，不得再作为生效路径存在
+    assert ".sc-board-full{" not in app, \
+        "旧的 .sc-board-full 满宽修饰类仍在（层叠顺序会再次失效）"
+    # 三页必须挂在满宽容器下，而不是两列 Grid 里
+    assert 'class="sc-board sc-board-full"' not in app, \
+        "三页仍挂在 .sc-board 两列 Grid 里"
+    assert "sc-share-layout" in app and "sc-task-layout" in app

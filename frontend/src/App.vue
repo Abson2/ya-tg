@@ -2535,7 +2535,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.4 · Asia/Shanghai</span>
+          <span>v2.1.5 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3592,11 +3592,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </div>
               </template>
 
-              <!-- 其它子页卡片（按子导航显示） -->
-              <!-- v2.1.4：发布规则 / 分享管理 / 推送任务三页改为**整行满宽**——
-                   此前三者是 .sc-board（两列 Grid）里的单个格子，只占半幅，
-                   PC 端右侧大片留白、内容挤在左侧。现在这三页各自跨满两列。 -->
-              <div class="sc-board sc-board-full" v-show="scSubNav !== '发布总览'">
+              <!-- 其它子页卡片（按子导航显示）
+                   v2.1.5 布局根治：这三页此前挂在 .sc-board（两列 Grid）里，
+                   ① 满宽类 .sc-board-full 定义在 .sc-board **之前**（同特异度后者胜出）
+                      → 满宽规则完全失效，仍只占半幅；
+                   ② 发布规则页内部再套一层两列 .sc-rule-layout → 每列只剩 1/4 页宽，
+                      卡片被压成「缩小版」，尺寸与页面严重不符。
+                   修法：把三页**移出 Grid**，与总览页（.sc-dash，flex column）平级，
+                   各自独占整行满宽；页内需要并排时由各页自己的内部容器负责。 -->
+              <div class="sc-subpage" v-show="scSubNav !== '发布总览'">
             <!-- 设计稿分享管理：搜索 + 状态筛选 + 批量 + 统计卡 + 记录表（详情为隐藏式弹窗） -->
             <div class="sc-share-layout" v-show="scSubNav === '分享管理'">
               <div class="sc-share-main">
@@ -4412,6 +4416,12 @@ button{font-family:inherit}
 .sc-tab.active{background:linear-gradient(135deg,#eef0ff,#f4f0ff);color:var(--yg-primary);box-shadow:0 2px 8px rgba(91,91,214,.12)}
 .sc-tab-ico{font-size:15px}
 .sc-workspace{min-width:0}
+/* v2.1.5：分享中心「非总览」子页的满宽容器。
+   总览页用 .sc-dash（flex column）直接挂在 .sc-workspace 下 → 天然铺满；
+   其余三页（发布规则 / 推送任务 / 分享管理）此前挂在 .sc-board（两列 Grid）里，
+   叠加 .sc-board-full 的层叠顺序 bug，只占半幅 → 真机呈「缩小版」。
+   现在三页与总览页平级，由本容器独占整行满宽。 */
+.sc-subpage{display:block;width:100%;min-width:0}
 /* v2.1.1：已按设计稿整块删除的汇总面板，其死样式一并清除（避免留下无人引用的 CSS）。 */
 /* 小时分类排期 */
 .sc-hour-list{display:flex;flex-direction:column;gap:7px}
@@ -4506,10 +4516,16 @@ button{font-family:inherit}
 .sc-cycle-grid .hint{font-size:11px}
 .sc-time-cell{display:flex;align-items:center;gap:3px}
 .sc-time-cell .el-input-number{width:64px}
-/* v2.1.4：发布规则页满宽 + 配置时段下拉 + 周维度建议网格。
-   真机问题：PC 端右侧大片留白、内容挤在左侧——根因是发布规则页被放在
-   .sc-board（两列 Grid）的一个格子里，只占半幅。现在该页跨满两列。 */
-.sc-board-full{grid-template-columns:minmax(0,1fr)}
+/* v2.1.5：发布规则页满宽容器 + 配置时段下拉 + 周维度建议网格。
+   真机问题（v2.1.4 回归）：PC 端三页（发布规则 / 推送任务 / 分享管理）
+   均呈「缩小版」，尺寸与页面不符、比例失调。
+   根因有两层：
+   ① 满宽类 .sc-board-full 定义在 .sc-board **之前**——两者同特异度（单类选择器），
+      后者胜出 → 满宽规则完全失效，页面仍被塞进两列 Grid 的半格子里；
+   ② 发布规则页在半幅容器内又套一层两列 .sc-rule-layout → 每列只剩 1/4 页宽，
+      卡片被二次压扁。
+   v2.1.5 修法：三页**移出 Grid**，由 .sc-subpage 独占整行满宽（与总览页 .sc-dash 平级）；
+   页内需要并排时由各页自己的内部容器负责。 */
 /* 发布规则页内部：基础规则 / 周期计划 两卡并列，分类排期表独占整行 */
 .sc-rule-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
 .sc-rule-layout .sc-rule-full{grid-column:1/-1}
@@ -4569,7 +4585,12 @@ button{font-family:inherit}
 @media(max-width:1200px){.sc-kpi-grid{grid-template-columns:repeat(2,1fr)}.sc-dash-two{grid-template-columns:1fr}.sc-kpi-six{grid-template-columns:repeat(3,1fr)}.sc-dash-three{grid-template-columns:1fr}}
 @media(max-width:900px){.sc-tab{padding:10px 12px;font-size:12px}}
 /* 分享中心：全卡片化工作台 */
-.sc-board{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+/* v2.1.5：.sc-board 不再是两列 Grid。
+   它此前是 grid-template-columns:repeat(2,minmax(0,1fr))，而满宽修饰类
+   .sc-board-full 又定义在它**之前**（同特异度 → 后者胜出）→ 满宽永远失效，
+   子页被塞进半格子里，真机呈「缩小版」。
+   现在：默认单列满宽；三页已移出 Grid，由 .sc-subpage 承载。 */
+.sc-board{display:block;width:100%;min-width:0}
 .sc-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;box-shadow:var(--yg-shadow);min-width:0;overflow:hidden;transition:.22s}
 .sc-card:hover{box-shadow:var(--yg-shadow-lg)}
 .sc-hero-card{background:linear-gradient(135deg,#4f4fc4 0%,#6b5ce0 50%,#3aa9c9 100%);color:#fff;border:0}
@@ -4596,7 +4617,7 @@ button{font-family:inherit}
 .sc-form-row .hint{margin:0;line-height:1.6}
 .sc-form-row .hint input,.sc-form-row .hint .el-select{display:block}
 /* v2.1.1：已删面板的 sc-pacing-now 样式随之清除。 */
-@media(max-width:1100px){.sc-board{grid-template-columns:1fr}.sc-stat-row{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:1100px){.sc-stat-row{grid-template-columns:repeat(3,1fr)}}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
 .media-actions{display:flex;gap:5px;padding:0 12px 12px;flex-wrap:wrap}
 .step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}
