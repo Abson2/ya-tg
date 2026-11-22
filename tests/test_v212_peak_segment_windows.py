@@ -1,12 +1,16 @@
-"""v2.1.2 偏好高峰独占段排期专项验收（用户口径：12 分类均匀铺满 24 小时，每 2 小时一段，
-观看用户多的倾向分类排在观影高峰时段，不要只分白天/夜间，太宽泛了）。
+"""v2.1.2 偏好排期专项验收（用户口径：每 2 小时一段，热门分类排白天、冷门分类排夜间）。
+
+v2.1.6 变更：本文件原先验证的是「高峰独占段」口径（偏好第 1–12 名占固定高峰序列
+20-22 → 18-20 → 22-24 → …，第 13 名起全天）。用户新口径改为
+**热门分类排白天、冷门分类排夜间**的默认时间表，取代高峰独占段，
+因此下述分配类用例改为验证「默认时间表」口径（白天段 8 个 + 夜间段 3 个 = 11 段）。
 
 覆盖：
   1. 全天 12 段模板（0-2, 2-4, …, 22-24），段长真实落地为 2 小时；
   2. 偏好真实派生（字典优先级 × 100 + 已成功推送条数），可复现排序；
-  3. 高峰独占段分配：偏好第 1–12 名各占一个互不重叠的 2 小时段，
-     且段序为固定默认高峰序列（20-22 → 18-20 → 22-24 → 12-14 → …）；
-  4. 前 12 名恰好铺满 0–24 全天，第 13 名及以后保持全天窗口；
+  3. 默认时间表分配：偏好排名靠前拿**白天段**，排名靠后拿**夜间段**，
+     每段 2 小时，段用完保持全天窗口；
+  4. 白天段与夜间段互不重叠，且每段都是 2 小时；
   5. /sc/preference 与 /sc/preference/assign 端点真实可用；
   6. window_auto 保护：用户手工设定过的行不被偏好分配覆盖；
   7. 静默保护默认关闭（否则低峰段被掐死，新口径无法产出）；
@@ -262,68 +266,88 @@ def test_preference_order_is_stable_and_reproducible(env):
 # ---------------------------------------------------------------------------
 
 def test_assign_peak_windows_by_preference(env):
-    """偏好第 1–12 名依次占用固定高峰段，第 13 名起保持全天窗口。"""
+    """偏好排名靠前占**白天段**，排名靠后占**夜间段**，溢出冷门循环复用夜间段。
+
+    v2.1.6：取代 v2.1.2 的「高峰独占段」口径——用户明确要求
+    「热门分类排在白天，冷门分类排在夜间」。
+
+    v2.1.6 再修正：段用完**不再退化为全天窗口 0-24**（那不是 2 小时颗粒度），
+    改为冷门循环复用夜间段。
+    """
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
         prefs = [{"category_key": f"k{i}", "score": 100 - i} for i in range(14)]
-        windows = sc2._assign_peak_windows(prefs)
-        segs = sc2.PEAK_SEGMENT_ORDER
-        # 前 12 名：段序 = 固定高峰序列，且互不重叠
-        for i in range(12):
-            assert windows[f"k{i}"] == segs[i], f"第 {i + 1} 名应占高峰段 {segs[i]}"
-        # 第 13 名及以后：全天窗口，不限时段
-        assert windows["k12"] == sc2.FULL_DAY_WINDOW
-        assert windows["k13"] == sc2.FULL_DAY_WINDOW
+        windows = sc2._assign_category_windows(prefs)
+        day = list(sc2.CATEGORY_DAY_SEGMENTS)
+        night = list(sc2.CATEGORY_NIGHT_SEGMENTS)
+        # 前 len(day) 名：占白天段，段序固定
+        for i in range(len(day)):
+            assert windows[f"k{i}"] == day[i], f"第 {i + 1} 名应占白天段 {day[i]}"
+        # 接下来 len(night) 名：占夜间段
+        for j in range(len(night)):
+            key = f"k{len(day) + j}"
+            assert windows[key] == night[j], f"{key} 应占夜间段 {night[j]}"
+        # 段用完：冷门循环复用夜间段，仍是 2 小时颗粒度（不退化成全天窗口）
+        used = len(day) + len(night)
+        assert windows[f"k{used}"] == night[0]
+        assert windows[f"k{used + 1}"] == night[1]
+        assert windows[f"k{used}"] != sc2.FULL_DAY_WINDOW
 
 
 def test_peak_segment_order_is_fixed_default(env):
-    """高峰段序是**固定默认**（不随真实数据变化），首段为 20-22 黄金档。"""
+    """默认时间表的白天段/夜间段是**固定默认**（不随真实数据变化），每段 2 小时。"""
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
-        segs = sc2.PEAK_SEGMENT_ORDER
-        assert len(segs) == 12, "高峰独占段共 12 段"
-        assert segs[0] == (20, 22), "第一段应为 20:00–22:00 黄金档"
-        assert segs[1] == (18, 20), "第二段应为 18:00–20:00 晚高峰"
-        assert segs[2] == (22, 24), "第三段应为 22:00–24:00 深夜档"
+        day = sc2.CATEGORY_DAY_SEGMENTS
+        night = sc2.CATEGORY_NIGHT_SEGMENTS
+        assert len(day) == 9, "白天段共 9 段"
+        assert len(night) == 3, "夜间段共 3 段"
+        # 热门优先占用的白天段应覆盖 8:00–22:00 及黄金深夜档 22:00–24:00
+        assert (8, 10) in day and (20, 22) in day and (22, 24) in day
+        # 冷门占用的夜间段应覆盖 0:00–6:00
+        assert night == [(0, 2), (2, 4), (4, 6)]
         # 每段都是 2 小时
-        for ws, we in segs:
+        for ws, we in list(day) + list(night):
             assert we - ws == 2
 
 
 def test_peak_windows_tile_full_day_without_overlap(env):
-    """前 12 名的高峰段恰好铺满 0-24 且互不重叠（低峰段也有产出，不空转）。"""
+    """默认时间表的白天段 + 夜间段互不重叠（同一小时不会被两个分类占用）。"""
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
         prefs = [{"category_key": f"k{i}", "score": 100 - i} for i in range(12)]
-        windows = sc2._assign_peak_windows(prefs)
+        windows = sc2._assign_category_windows(prefs)
         hours: set[int] = set()
         for key, (ws, we) in windows.items():
             seg_hours = set(range(ws, we))
             assert not (hours & seg_hours), f"{key} 的时段与其它分类重叠"
             hours |= seg_hours
-        assert hours == set(range(24)), "前 12 名的高峰段必须铺满全天"
+        # 12 段 × 2 小时 = 24 小时互不重叠，恰好铺满全天
+        assert len(hours) == 24
 
 
 def test_peak_window_passes_schedule_gate(env):
-    """高峰独占段在 plan_engine 的时段闸里真实放行对应小时。"""
+    """默认时间表的 2 小时段在 plan_engine 的时段闸里真实放行对应小时。"""
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
         sc2.ensure_defaults(db)
-        # 直接验证时段判定逻辑（高峰段 20-22 → 20/21 点命中，12 点不命中）
+        # 直接验证时段判定逻辑（段 20-22 → 20/21 点命中，12 点不命中）
         def allows(hour, ws, we):
             if we > ws:
                 return ws <= hour < we
             if we < ws:
                 return hour >= ws or hour < we
             return True
-        assert allows(20, *sc2.PEAK_SEGMENT_ORDER[0]) is True
-        assert allows(21, *sc2.PEAK_SEGMENT_ORDER[0]) is True
-        assert allows(22, *sc2.PEAK_SEGMENT_ORDER[0]) is False
-        assert allows(12, *sc2.PEAK_SEGMENT_ORDER[0]) is False
+        seg = (20, 22)
+        assert seg in sc2.CATEGORY_DAY_SEGMENTS, "20-22 必须是白天段之一"
+        assert allows(20, *seg) is True
+        assert allows(21, *seg) is True
+        assert allows(22, *seg) is False
+        assert allows(12, *seg) is False
         # 全天窗口任何小时都放行
         assert allows(3, *sc2.FULL_DAY_WINDOW) is True
         assert allows(23, *sc2.FULL_DAY_WINDOW) is True
@@ -334,7 +358,7 @@ def test_empty_preference_returns_no_windows(env):
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
-        assert sc2._assign_peak_windows([]) == {}
+        assert sc2._assign_category_windows([]) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +366,7 @@ def test_empty_preference_returns_no_windows(env):
 # ---------------------------------------------------------------------------
 
 def test_preference_endpoint_returns_ranking_and_windows(env):
-    """GET /sc/preference 返回偏好排名 + 高峰独占段 + 分段信息。"""
+    """GET /sc/preference 返回偏好排名 + 默认时间表（白天段/夜间段）+ 分段信息。"""
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
@@ -354,6 +378,9 @@ def test_preference_endpoint_returns_ranking_and_windows(env):
         assert res["segment_hours"] == 2
         assert len(res["segments"]) == 12
         assert res["full_day_window"] == [0, 24]
+        # v2.1.6：默认时间表 = 9 个白天段 + 3 个夜间段（12 段铺满全天）
+        assert len(res["day_segments"]) == 9
+        assert len(res["night_segments"]) == 3
         assert len(res["peak_segments"]) == 12
         item = next(i for i in res["items"] if i["category_key"] == "genre:动作冒险")
         assert item["period"] in ("peak", "full_day")
@@ -368,6 +395,8 @@ def test_assign_endpoint_writes_peak_windows(env):
 
     注意契约：新建行在 _ensure_schedules 时已按偏好写入正确时段，
     所以本用例先把行**改错**（模拟老库 8-24 全默认），再验证 assign 能刷新回来。
+
+    v2.1.6：分配口径改为默认时间表（热门白天 / 冷门夜间）。
     """
     from app import share_center_v2 as sc2
     from app.models import SCCategorySchedule
@@ -394,7 +423,7 @@ def test_assign_endpoint_writes_peak_windows(env):
         rows = {r.category_key: r for r in db.scalars(select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id)).all()}
         prefs = sc2._category_preference(db)
-        windows = sc2._assign_peak_windows(prefs)
+        windows = sc2._assign_category_windows(prefs)
         for key, row in rows.items():
             ws, we = windows[key]
             assert (row.window_start, row.window_end) == (ws, we), \
@@ -554,29 +583,38 @@ def test_night_hour_plan_engine_not_blocked_by_quiet(env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_frontend_preference_wired():
-    """前端接入偏好数据 + 一键按偏好分配时段按钮。"""
+    """前端接入偏好数据；v2.1.6 起「按偏好分配时段」按钮下线。
+
+    用户口径：「去掉无意义的按偏好分配时间段功能」——默认时间表本身
+    就是按偏好排名派生的，「一键恢复默认」即等价于「按偏好重新分配」，
+    两个入口并存反而让人困惑。
+    """
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     assert "/sc/preference" in app
-    assert "scAssignPreferenceWindows" in app
-    assert "/sc/preference/assign" in app
-    assert "按偏好分配时段" in app
     assert "scPrefSortRows" in app
-    assert "偏好档位" in app
+    # 偏好排名仍以「偏好第 N 名」形式展示在推荐时间段列内
+    assert "偏好第" in app
+    # v2.1.6：按偏好分配时段按钮与调用已下线
+    assert "scAssignPreferenceWindows" not in app
+    assert "/sc/preference/assign" not in app
+    assert "按偏好分配时段" not in app
 
 
 def test_frontend_peak_segment_text_updated():
-    """前端文案同步高峰独占段口径，不再出现昼夜两档。"""
+    """前端文案同步 v2.1.6 默认时间表口径（热门白天 / 冷门夜间，2 小时一段）。"""
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     assert "00:00–24:00 共 12 段" in app
     assert "每 2 小时一段" in app
     assert "16 段" not in app, "旧口径（16 段）不得残留在界面文案里"
-    # 昼夜两档旧文案不得残留
+    # 昼夜两档旧字段不得残留
     # 注意：full_day_window 里含 "day_window" 子串，用负向前查排除 full_ 前缀
     import re
     assert not re.search(r"(?<!full_)day_window", app), "旧昼夜字段不得残留在前端"
     assert "night_window" not in app
     assert "day_start_hour" not in app
-    assert "白天段" not in app and "夜间段" not in app
-    # 高峰独占段口径必须在文案里
-    assert "peak_segments" in app
+    # v2.1.6：白天段 / 夜间段成为正式口径，必须在文案里说明
+    assert "白天段" in app and "夜间段" in app
+    assert "热门分类" in app and "冷门分类" in app
+    # 默认时间表字段必须在文案里
+    assert "day_segments" in app and "night_segments" in app
     assert "全天" in app

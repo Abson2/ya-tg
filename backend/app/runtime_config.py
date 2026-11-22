@@ -125,12 +125,18 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # AI 调度建议默认只进审核队列；显式打开后才允许自动应用，且永远不直接推送。
     "sc_ai_auto_apply": ("sc_ai_auto_apply", "false"),
     # v2.0.5：分享中心「基础规则」——上新即时推送。更新检测频率合并窗口（分钟）、
-    # 上新即时推送每小时上限（条，0=不限）、冲突处理策略（pause_normal/prefer_new）。
-    # 全部走管理页配置，与 SCUpdateWindow 的 10 分钟合并窗口口径一致。
+    # 上新即时推送每小时上限（条，0=不限）、冲突处理策略。
+    # v2.1.6：冲突处理由两档（pause_normal/prefer_new，语义重复且后端从未消费）
+    # 改为三档**互斥且真实生效**的口径：
+    #   prefer_release —— 新上映优先：同一小时内同时有「新上架」与「存量排期」待发时，
+    #                    先发新上架（release_date 落在近期窗口内）的作品；
+    #   prefer_new     —— 新入库优先：先发刚入库（scanned_at 最新）的作品；
+    #   prefer_backlog —— 存量排期优先：先发已排期的存量作品，新入库的排到后面。
+    # 三者决定的是**同批次内的先后顺序**，不改变任何配额上限。
     "sc_quick_publish_enabled": ("sc_quick_publish_enabled", "true"),
     "sc_update_detect_minutes": ("sc_update_detect_minutes", "10"),
     "sc_quick_publish_hourly_limit": ("sc_quick_publish_hourly_limit", "3"),
-    "sc_conflict_policy": ("sc_conflict_policy", "pause_normal"),
+    "sc_conflict_policy": ("sc_conflict_policy", "prefer_release"),
     # 阶段二（资源库解耦）灰度开关：true=识别入口只发资源事件（携带 channel_targets），
     # 推送决策完全由分享中心 consume_resource_events→submit_to_dispatch 新链接管；
     # false（默认）=识别入口仍走 _enqueue_after_identify 旧链直连入队，零回归。
@@ -184,6 +190,24 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 边界：A 库只读（任何模式都不写 A）。旧键 mirror_delete_b_on_a_missing 保留兼容读取，
     # 但以 mirror_mode 为准；full 即等价于"允许删 B 库"。
     "mirror_mode": ("mirror_mode", "full"),
+    # ------------------------------------------------------------------------
+    # v2.1.7 #241：Telegram 阅读量采集（MTProto user account）
+    # Bot API 拿不到消息浏览量，只有 MTProto 的 Message.views 才有 → 必须用户账号接入。
+    # 凭证走本表（Fernet 加密落库 + 管理页配置），明文**绝不**回前端。
+    # api_id 是 my.telegram.org 申请的数字；api_hash 是 32 位十六进制。
+    # 登录验证码是**一次性**的，只在登录流程内存活，不落库。
+    # ------------------------------------------------------------------------
+    "tg_stats_enabled": ("tg_stats_enabled", "false"),
+    "tg_api_id": ("tg_api_id", ""),
+    "tg_api_hash": ("tg_api_hash", ""),
+    "tg_phone": ("tg_phone", ""),
+    # 会话文件目录（会话文件等同账号凭据，只落本地，绝不通过接口返回）
+    "tg_session_dir": ("tg_session_dir", "./data/tg_session"),
+    # 采集回溯窗口（小时）与单轮上限（防接口风暴护栏）
+    "tg_stats_lookback_hours": ("tg_stats_lookback_hours", "72"),
+    "tg_stats_max_per_run": ("tg_stats_max_per_run", "200"),
+    # MTProto 接入点（默认官方；支持自建 DC）
+    "tg_api_base": ("tg_api_base", ""),
 }
 
 

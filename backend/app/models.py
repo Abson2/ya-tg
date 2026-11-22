@@ -947,6 +947,83 @@ class SCPushPacingRule(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_by: Mapped[str] = mapped_column(String(64), default="admin")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ============================================================================
+# v2.1.7 #241：Telegram 阅读量采集（MTProto user account）
+#
+# 数据来源：Telethon（MTProto）以**用户账号**身份读取频道帖的浏览量 / 转发数 / 表情回应。
+# 与 Bot API 的区别（决定了本表的口径）：
+#   - Bot API 的 getChat / getFile 等**看不到**消息浏览量，只有 MTProto 的
+#     messages.GetHistory 返回的 Message.views 才有；
+#   - **群聊不暴露浏览量**（只有频道帖有 views 字段），
+#     群聊只能拿到 forwards / reactions —— 因此本表用 target_kind 区分口径，
+#     前端与报表**必须**区分频道/群展示，不得对群承诺浏览量；
+#   - 阅读量是**累计值**（Telegram 只给当前总数，不给增量），因此本表存快照，
+#     趋势由相邻两次快照求差得到。
+#
+# 采集锚点：push_queue.telegram_message_id（publisher 发送成功时落库）
+#           + channels.chat_id（推送目标）+ push_queue.sent_at（发布时间）。
+# ============================================================================
+
+
+class TelegramMessageStat(Base):
+    """一条推送消息在某一时刻的阅读量快照（累计值）。
+
+    同一 (queue_id, message_id) 会有**多条**快照（按 collected_at 递增），
+    趋势报表由相邻快照求差得到。唯一约束 (queue_id, message_id, collected_at)
+    保证同一采集轮次重复写入时幂等。
+    """
+    __tablename__ = "telegram_message_stats"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # 关联的推送队列项（消息锚点）。不设外键约束——队列项可能被清理，
+    # 但**阅读量快照必须保留**（历史趋势不能因为队列清理而丢失）。
+    queue_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    # 推送目标标识（频道/群的 chat id）。存字符串——TG 的 id 有负数形式，
+    # 用 Integer 存不下超范围值。
+    chat_id: Mapped[str] = mapped_column(String(128), index=True, default="")
+    # 该目标的类型：channel / group。**决定口径**：群聊无浏览量。
+    target_kind: Mapped[str] = mapped_column(String(16), index=True, default="channel")
+    # 目标展示名（频道名/群名），采集时快照，避免后续改名导致历史报表失真。
+    target_name: Mapped[str] = mapped_column(String(256), default="")
+    # Telegram 侧的消息 ID（字符串形式，频道帖 ID 可能是大整数）。
+    message_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    # 浏览量（累计）。**仅频道有值**；群聊恒为 0 且 unavailable 标记为真。
+    views: Mapped[int] = mapped_column(Integer, default=0)
+    # 转发数（累计）。频道/群都有。
+    forwards: Mapped[int] = mapped_column(Integer, default=0)
+    # 表情回应总数（累计）。
+    reactions: Mapped[int] = mapped_column(Integer, default=0)
+    # 该条消息是否**可采集**：False 表示目标类型不暴露该指标
+    # （群聊无浏览量）或消息已被删除 / 不可见。
+    available: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 不可采集的原因（展示用中性文案，不暴露后端字段名）。
+    note: Mapped[str] = mapped_column(String(256), default="")
+    # 作品键（来自队列项 → 资源 → 作品归一化），用于按作品维度聚合趋势。
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    # 快照采集时刻。
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    __table_args__ = (
+        UniqueConstraint("queue_id", "message_id", "collected_at",
+                         name="uq_tg_stat_queue_msg_time"),
+    )
+
+
+class TelegramStatRun(Base):
+    """一轮阅读量采集的执行记录（可诊断：采集了多少、成功多少、失败原因）。"""
+    __tablename__ = "telegram_stat_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    # 本轮扫描的候选消息数 / 成功采集数 / 跳过数。
+    scanned: Mapped[int] = mapped_column(Integer, default=0)
+    collected: Mapped[int] = mapped_column(Integer, default=0)
+    skipped: Mapped[int] = mapped_column(Integer, default=0)
+    # 本轮采集覆盖的窗口起点（回溯多少小时内推送的消息）。
+    lookback_hours: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

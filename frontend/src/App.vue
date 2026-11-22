@@ -47,11 +47,31 @@ const scPacingForm = ref({ scope_key: 'global:group', target_type: 'group', defa
 const scActiveList = ref(null) // 当前展开明细的清单（卡片内交互）
 // 发布总览：左侧子导航 + KPI 点击筛选 + 任务详情（全部基于 /api/sc/* 真实数据）
 const scSubNav = ref('发布总览')
-// 顶部 tab：发布总览 → 发布规则 → 推送任务（合并原发布队列）→ 分享管理
+// 顶部 tab：发布总览 → 发布规则 → 推送任务（合并原发布队列）→ 分享管理 → 阅读量
 const scSubNavs = [
   { key: '发布总览', ico: '◈' }, { key: '发布规则', ico: '◷' },
-  { key: '推送任务', ico: '▷' }, { key: '分享管理', ico: '▦' }
+  { key: '推送任务', ico: '▷' }, { key: '分享管理', ico: '▦' },
+  { key: '阅读量', ico: '◉' }
 ]
+// ---------------------------------------------------------------------------
+// v2.1.7 #241：阅读量统计（MTProto user account）
+// 口径边界（页面必须如实表达，不得越界承诺）：
+//   - **只有频道帖有浏览量**，群聊 Telegram 根本不提供 → 群聊目标不显示阅读量列；
+//   - **阅读量是累计值**，趋势按相邻两次采集求差 → 展示的是「期间新增」；
+//   - 读不到的消息标记为不可采集，**不显示 0**（0 会被误读成「没人看」）。
+// 页面只使用中性展示名，不出现任何后端字段名。
+// ---------------------------------------------------------------------------
+const scStatsStatus = ref({ ready: false, dependency_ready: false, configured: false, logged_in: false, enabled: false, reason: '', capability: {} })
+const scStatsTrend = ref({ buckets: [], targets: [], works: [], totals: {}, capability: {} })
+const scStatsItems = ref([])
+const scStatsRuns = ref([])
+const scStatsDays = ref(7)
+const scStatsLoading = ref(false)
+const scStatsCollecting = ref(false)
+const scStatsConfig = ref({ api_id: '', api_hash: '', phone: '', enabled: false, lookback_hours: 72, max_per_run: 200 })
+const scStatsLoginCode = ref('')
+const scStatsLoginCodeSent = ref(false)
+const scStatsSaving = ref(false)
 // 小时分类排期：每行一条 sc_hour_windows 记录，分类下拉来自真实 SCCategory
 const scHourRows = ref([])
 const scHourSaving = ref(false)
@@ -59,11 +79,12 @@ const scHourSaving = ref(false)
 const scTrendPeriod = ref('day')
 const scGenreCatalog = ref([])   // TMDB 官方 genre 字典（来自 /sc/categories/catalog）
 const scSchedRows = ref([]), scSchedSaving = ref(false)
+// v2.1.6：分类排期表勾选集（批量操作按勾选生效；未勾选或全勾选 = 全部）
+const scSchedSelection = ref([]), scSchedTableRef = ref(null)
 // v2.1.2：分类偏好排名（真实派生：字典优先级 + 已成功推送数），决定高峰独占时段分配
-const scPreference = ref({ items: [], segments: [], peak_segments: [], full_day_window: [0, 24], segment_hours: 2, source: '' })
-const scPrefAssigning = ref(false)
-const scBasicRules = ref({ quick_publish_enabled: 'true', update_detect_minutes: '10', quick_publish_hourly_limit: '3', conflict_policy: 'pause_normal' })
-const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24, week_max: 1200, week_rest_enabled: false, month_max: 5000 })
+const scPreference = ref({ items: [], segments: [], peak_segments: [], day_segments: [], night_segments: [], full_day_window: [0, 24], segment_hours: 2, source: '' })
+const scBasicRules = ref({ quick_publish_enabled: 'true', update_detect_minutes: '10', quick_publish_hourly_limit: '3', conflict_policy: 'prefer_release' })
+const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24, week_max: 1200, week_rest_enabled: false, month_max: 5000 })
 const scRuleTab = ref('基础规则') // 基础规则 / 分类时间排期
 const scCycleTab = ref('小时')     // 小时 / 日度 / 周度 / 月度
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
@@ -109,10 +130,20 @@ const mediaLinkLabel = (state) => ({
   cleaned: '链接已清理', retired: '链接已退役', manual_review: '链接待人工',
 }[state || ''] || '')
 // 推送任务状态中文化（界面上不暴露内部枚举名）
+// v2.1.6：新增 skipped ——「该资源在此渠道已推送过，跳过重复投递」
+// （泰迪熊2 双推修复：已 sent 的队列行不得被复活，故任务落到已跳过终态）。
 const scTaskStatusLabel = (status) => ({
   planned: '待发布', ready: '待推送', building: '建链中',
   submitted: '已提交', accepted: '已领取', publishing: '推送中',
   published: '已成功', failed: '失败', cancelled: '已取消',
+  skipped: '已跳过',
+}[status || ''] || status || '—')
+// v2.1.6：执行记录里的「阶段 / 状态」同样中文化，页面不得直出内部枚举名。
+const scExecStageLabel = (stage) => ({
+  build: '建分享', submit: '提交队列', send: '发送',
+}[stage || ''] || stage || '—')
+const scExecStatusLabel = (status) => ({
+  running: '进行中', success: '成功', failed: '失败', skipped: '已跳过',
 }[status || ''] || status || '—')
 // v2.1.3：时间显示统一简化。
 // 真机问题：后端原先直接吐 ISO 串 `2026-11-22T01:00:17.123456+00:00`——
@@ -179,11 +210,24 @@ const scTaskViewRows = computed(() => {
 })
 // v2.1.4：推送任务页的渠道筛选（全部 / 仅频道 / 仅群）
 const scTaskChannelFilter = ref('')
+// v2.1.6：推送渠道展示口径——「群:名称（群id或用户名）」「频道:名称（频道id或用户名）」。
+// 后端下发结构化条目 {label, ref}，ref 优先取 Bot 发现台账里的 @用户名，
+// 没有用户名时退回 chat_id。旧字段 channel_names / group_names 仍在下拉筛选里用。
+function scChannelTargetLines(row) {
+  const lines = []
+  for (const t of (row?.channel_targets || [])) {
+    lines.push(`频道:${t.label}（${t.ref}）`)
+  }
+  for (const t of (row?.group_targets || [])) {
+    lines.push(`群:${t.label}（${t.ref}）`)
+  }
+  return lines
+}
 // v2.1.4：任务状态筛选下拉的选项（中文标签，不暴露内部枚举名）
 const scTaskStatusOptions = computed(() => {
   const counts = scOverview.value.status_counts || {}
   const order = ['planned', 'ready', 'building', 'submitted', 'accepted',
-                 'publishing', 'published', 'failed', 'cancelled', 'cleaned']
+                 'publishing', 'published', 'failed', 'cancelled', 'skipped', 'cleaned']
   return order
     .filter(st => counts[st])
     .map(st => ({ value: st, label: `${scTaskStatusLabel(st)}（${counts[st]}）` }))
@@ -198,6 +242,13 @@ const typeFilter = ref(''), identifyFilter = ref('')
 const finishFilter = ref(''), statusTab = ref('all'), typeTab = ref('all')
 const selectedSeries = ref([]), batchBusy = ref(false)
 const batchDuration = ref(0)
+// v2.1.6：资源库按 TMDB 分类分组展示 + 分类折叠。
+// 分组依据后端 /api/library/series 返回的 primary_genre（TMDB 官方中文名，
+// 与分享中心分类字典同一权威口径）；无分类的作品归「未分类」桶。
+// collapsedGroups 记录被折叠的分类名；groupByCategory 关闭时回到原来的平铺海报墙。
+const groupByCategory = ref(true)
+const collapsedGroups = ref([])
+const UNGROUPED_NAME = '未分类'
 // v0.7.0：TG 分发扩展配置 + 赞赏码
 const tgExtra = ref({ push_mode: 'channel', custom_bot_token: '', custom_chat_id: '', fubao_bot: '', link_style: 'button', detail_level: 'compact' })
 const tgExtraSaving = ref(false), rewardCfg = ref({ code: '' }), rewardSaving = ref(false)
@@ -869,6 +920,47 @@ const allSelected = computed(() => filteredSeries.value.length > 0 && filteredSe
 function toggleSelectAll() {
   selectedSeries.value = allSelected.value ? [] : filteredSeries.value.map(g => g.key)
 }
+
+// v2.1.6：资源库按 TMDB 分类分组。
+// 依据后端 /api/library/series 的 primary_genre（TMDB 官方中文名）；
+// 无分类的作品进「未分类」桶，**不丢弃**（未识别资源仍要能看到、仍可批量操作）。
+// 排序：作品数倒序，同数按分类名——「未分类」永远排最后，不与真实分类抢位置。
+const seriesGroupsByCategory = computed(() => {
+  const buckets = new Map()
+  for (const g of filteredSeries.value) {
+    const name = String(g.primary_genre || '').trim() || UNGROUPED_NAME
+    if (!buckets.has(name)) buckets.set(name, [])
+    buckets.get(name).push(g)
+  }
+  const list = Array.from(buckets.entries()).map(([name, items]) => ({
+    name,
+    items,
+    count: items.length,
+    collapsed: collapsedGroups.value.includes(name),
+  }))
+  list.sort((a, b) => {
+    if (a.name === UNGROUPED_NAME) return 1
+    if (b.name === UNGROUPED_NAME) return -1
+    if (b.count !== a.count) return b.count - a.count
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
+  return list
+})
+// 一键折叠/展开所有分类
+function toggleAllGroups(collapse) {
+  collapsedGroups.value = collapse
+    ? seriesGroupsByCategory.value.map(g => g.name)
+    : []
+}
+function toggleGroup(name) {
+  collapsedGroups.value = collapsedGroups.value.includes(name)
+    ? collapsedGroups.value.filter(n => n !== name)
+    : [...collapsedGroups.value, name]
+}
+const allGroupsCollapsed = computed(() => {
+  const groups = seriesGroupsByCategory.value
+  return groups.length > 0 && groups.every(g => g.collapsed)
+})
 function toggleSelect(key) {
   selectedSeries.value = selectedSeries.value.includes(key)
     ? selectedSeries.value.filter(k => k !== key)
@@ -1854,7 +1946,7 @@ async function loadSc() {
     '/sc/category-schedules', '/sc/basic-rules', '/sc/cycle-plan',
     // v2.1.1：分享管理改用独立真实端点（口径与统计卡一致，不再混用 overview.views）
     '/sc/share-records?limit=200',
-    // v2.1.1：分类偏好排名（真实派生），用于「按偏好分配时段」
+    // v2.1.1：分类偏好排名（真实派生），用于默认时间表的时段分配
     '/sc/preference']
   const settled = await Promise.allSettled(paths.map(p => api(p)))
   const val = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
@@ -1883,7 +1975,117 @@ async function loadSc() {
   const sr = val(13); if (sr) scShareRecords.value = sr.items || []
   const pf = val(14); if (pf) scPreference.value = { ...scPreference.value, ...pf }
 }
+
+// ---------- v2.1.7 #241：阅读量统计 ----------
+// 单独一个 loader，不混进 loadSc()——阅读量是**辅助能力**，
+// 它的端点失败（未配置 / 未装依赖）绝不能影响发布中心的正常加载。
+async function loadScStats() {
+  scStatsLoading.value = true
+  try {
+    const [st, tr, items, runs] = await Promise.allSettled([
+      api('/sc/stats/status'),
+      api('/sc/stats/trend?days=' + scStatsDays.value),
+      api('/sc/stats/items?limit=50'),
+      api('/sc/stats/runs?limit=5'),
+    ])
+    if (st.status === 'fulfilled') {
+      scStatsStatus.value = st.value || scStatsStatus.value
+      // 配置表单只回填「非密文」项（凭证永远不回显明文）。
+      scStatsConfig.value = {
+        ...scStatsConfig.value,
+        enabled: !!scStatsStatus.value.enabled,
+        lookback_hours: Number(scStatsStatus.value.lookback_hours || 72),
+        max_per_run: Number(scStatsStatus.value.max_per_run || 200),
+      }
+    }
+    if (tr.status === 'fulfilled') scStatsTrend.value = tr.value || scStatsTrend.value
+    if (items.status === 'fulfilled') scStatsItems.value = items.value?.items || []
+    if (runs.status === 'fulfilled') scStatsRuns.value = runs.value?.runs || []
+  } catch (e) {
+    // 阅读量加载失败不提示错误弹窗——它是可选功能，静默降级即可。
+  } finally { scStatsLoading.value = false }
+}
+async function saveScStatsConfig() {
+  scStatsSaving.value = true
+  try {
+    const body = {
+      enabled: !!scStatsConfig.value.enabled,
+      lookback_hours: Number(scStatsConfig.value.lookback_hours || 72),
+      max_per_run: Number(scStatsConfig.value.max_per_run || 200),
+    }
+    // 凭证只在**用户实际填写时**才提交；留空表示不修改。
+    if (scStatsConfig.value.api_id) body.api_id = scStatsConfig.value.api_id
+    if (scStatsConfig.value.api_hash) body.api_hash = scStatsConfig.value.api_hash
+    if (scStatsConfig.value.phone) body.phone = scStatsConfig.value.phone
+    const d = await api('/sc/stats/config', { method: 'POST', body: JSON.stringify({ payload: body }) })
+    // 保存后清空凭证输入框——明文不留存在页面状态里。
+    scStatsConfig.value.api_id = ''
+    scStatsConfig.value.api_hash = ''
+    ElMessage.success('阅读量采集配置已保存')
+    await loadScStats()
+    return d
+  } catch (e) { ElMessage.error(e.message) }
+  finally { scStatsSaving.value = false }
+}
+async function scStatsSendLoginCode() {
+  scStatsSaving.value = true
+  try {
+    const d = await api('/sc/stats/login/code', { method: 'POST', body: JSON.stringify({ payload: {} }) })
+    if (d.ok && d.sent) {
+      scStatsLoginCodeSent.value = true
+      ElMessage.success('验证码已发送到该手机号，请填写后提交')
+    } else if (d.ok) {
+      ElMessage.info('该账号已登录，无需重复验证')
+    } else {
+      ElMessage.error(d.error || '获取验证码失败')
+    }
+  } catch (e) { ElMessage.error(e.message) }
+  finally { scStatsSaving.value = false }
+}
+async function scStatsSubmitLoginCode() {
+  const code = String(scStatsLoginCode.value || '').trim()
+  if (!code) { ElMessage.warning('请填写验证码'); return }
+  scStatsSaving.value = true
+  try {
+    const d = await api('/sc/stats/login/verify', { method: 'POST', body: JSON.stringify({ payload: { code } }) })
+    if (d.ok) {
+      scStatsLoginCode.value = ''
+      scStatsLoginCodeSent.value = false
+      ElMessage.success('登录成功')
+      await loadScStats()
+    } else {
+      ElMessage.error(d.error || '验证码校验失败')
+    }
+  } catch (e) { ElMessage.error(e.message) }
+  finally { scStatsSaving.value = false }
+}
+async function scStatsCollect() {
+  scStatsCollecting.value = true
+  try {
+    const d = await api('/sc/stats/collect', { method: 'POST', body: JSON.stringify({ payload: {} }) })
+    if (d.ok) ElMessage.success(`采集完成：新采集 ${d.collected || 0} 条，跳过 ${d.skipped || 0} 条`)
+    else ElMessage.warning(d.error || d.reason || '采集未执行，请检查配置与登录状态')
+    await loadScStats()
+    return d
+  } catch (e) { ElMessage.error(e.message) }
+  finally { scStatsCollecting.value = false }
+}
+async function scStatsSwitchDays(days) {
+  scStatsDays.value = days
+  await loadScStats()
+}
+// 采集轮次状态的中文标签（页面不暴露后端状态码）
+function scStatsRunLabel(status) {
+  return ({ success: '成功', running: '进行中', failed: '失败',
+            disabled: '未开启', unavailable: '通道不可用' })[status] || '未知'
+}
 async function scSwitchTrend(period) { scTrendPeriod.value = period; await loadSc() }
+// 切换分享中心子页。阅读量子页的数据**按需加载**——
+// 它是辅助能力，不该拖慢其它子页的打开速度。
+async function scSwitchSubNav(key) {
+  scSubNav.value = key
+  if (key === '阅读量') { try { await loadScStats() } catch (e) {} }
+}
 async function scRun() {
   try {
     const d = await api('/sc/run', { method: 'POST' })
@@ -1980,15 +2182,21 @@ async function scCleanupLinks() {
   finally { scCleaningLinks.value = false }
 }
 // v2.1.2：批量采纳 AI 建议时段（后端按各分类真实历史派生，无历史的不编造）
+// v2.1.6：批量采纳 AI 建议时段——按勾选生效（未勾选或全勾选 = 全部）。
+// 每个分类都有建议（实测优先，无实测用默认时间表兜底），因此采纳率不再为零。
 async function scAdoptAllAi() {
+  const keys = scSchedTargetKeys()
+  if (!keys.length) { ElMessage.warning('没有可采纳的分类'); return }
+  const scope = keys.length >= scSchedRows.value.length ? '全部分类' : `选中的 ${keys.length} 个分类`
   try {
     await ElMessageBox.confirm(
-      '批量采纳 AI 建议时段？只对有真实历史发布数据的分类生效；没有历史建议的分类会被跳过，不会编造时段。',
+      `批量采纳${scope}的建议时段？建议优先取该分类的真实发布分布，无实测时用默认时间表兜底；落在静默保护区间内的分类会被跳过。`,
       '批量采纳 AI 建议', { type: 'warning' })
     scAdoptingAllAi.value = true
-    const d = await api('/sc/category-schedules/adopt-ai-all', { method: 'POST', body: JSON.stringify({ payload: {} }) })
+    const d = await api('/sc/category-schedules/adopt-ai-all', { method: 'POST', body: JSON.stringify({ payload: {
+      category_keys: keys } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '批量采纳失败'); return }
-    ElMessage.success(`已采纳 ${d.adopted || 0} 个分类的建议时段${d.skipped ? `，跳过 ${d.skipped} 个暂无建议的分类` : ''}`)
+    ElMessage.success(`已采纳 ${d.adopted || 0} 个分类的建议时段${d.skipped ? `，跳过 ${d.skipped} 个与静默时段冲突的分类` : ''}`)
     await loadSc()
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
   finally { scAdoptingAllAi.value = false }
@@ -2120,15 +2328,29 @@ async function scSaveAllHourRows() {
   finally { scHourSaving.value = false }
 }
 // ---- v2.0.5 设计稿：发布规则 / 基础规则 / 周期计划 / 分享管理交互 ----
+// v2.1.6：批量操作的目标集合——**按勾选生效**。
+// 口径：勾选为空 → 全部；勾选数 == 总行数 → 全部；否则只处理勾选的行。
+// （用户口径：「若都未勾选或者全勾选则表示全部分类选中」）
+function scSchedTargetRows() {
+  const rows = scPrefSortRows(scSchedRows.value)
+  const picked = scSchedSelection.value || []
+  if (!picked.length || picked.length >= rows.length) return rows
+  const keys = new Set(picked.map(r => r.ref || r.category_key))
+  return rows.filter(r => keys.has(r.ref || r.category_key))
+}
+// 目标分类 key 列表（供后端批量端点按分类过滤）
+function scSchedTargetKeys() {
+  return scSchedTargetRows().map(r => r.ref || r.category_key).filter(Boolean)
+}
+// v2.1.6：分类排期保存**不再携带 hourly_limit / daily_limit**——
+// 分类级上限已从表中移除，速率统一由周期计划管理约束。
+// 若继续携带，历史值会被原样写回（后端只在显式携带时写入），前端无从清理；
+// 故此处彻底不带这两个字段。
 async function scSaveSchedRow(row) {
   try {
     const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
       plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
       window_start: row.window_start, window_end: row.window_end,
-      hourly_limit: row.hourly_limit, daily_limit: row.daily_limit,
-      ai_window_start: row.ai_window_start, ai_window_end: row.ai_window_end,
-      // v2.1.4：周维度配置窗口随保存一起写入（逐日生效）
-      week_windows: row.week_windows || {},
       ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '保存失败'); return }
     ElMessage.success(`${row.name || '分类'} 排期已保存`)
@@ -2136,20 +2358,18 @@ async function scSaveSchedRow(row) {
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
 async function scSaveAllSchedRows() {
+  const targets = scSchedTargetRows()
+  if (!targets.length) { ElMessage.warning('没有可保存的分类'); return }
   scSchedSaving.value = true
   try {
-    for (const row of scSchedRows.value) {
-const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
-          plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
-          window_start: row.window_start, window_end: row.window_end,
-          hourly_limit: row.hourly_limit, daily_limit: row.daily_limit,
-          ai_window_start: row.ai_window_start, ai_window_end: row.ai_window_end,
-          // v2.1.4：周维度配置窗口随保存一起写入（逐日生效）
-          week_windows: row.week_windows || {},
-          ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
-        if (!d.ok) throw new Error(d.reason || '保存失败')
+    for (const row of targets) {
+      const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
+        plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
+        window_start: row.window_start, window_end: row.window_end,
+        ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
+      if (!d.ok) throw new Error(d.reason || '保存失败')
     }
-    ElMessage.success(`已保存 ${scSchedRows.value.length} 个分类排期`)
+    ElMessage.success(`已保存 ${targets.length} 个分类排期`)
     await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
   finally { scSchedSaving.value = false }
@@ -2158,49 +2378,36 @@ async function scAdoptSchedAI(row) {
   try {
     const d = await api('/sc/category-schedules/adopt-ai', { method: 'POST', body: JSON.stringify({ payload: { id: row.id } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '暂无可采纳建议'); return }
-    ElMessage.success(`已采纳 AI 建议时段 ${d.window_start}:00–${d.window_end}:00`)
+    ElMessage.success(`已采纳建议时段 ${d.window_start}:00–${d.window_end}:00`)
     await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
-async function scCopySched(row) {
-  try {
-    const { value } = await ElMessageBox.prompt('复制当前排期到其它分类（逗号分隔的 TMDB 分类名或键）', '复制排期', { inputPlaceholder: '科幻,喜剧' })
-    const keys = String(value || '').split(/[,，]/).map(x => x.trim()).filter(Boolean)
-    if (!keys.length) return
-    // 名称→category_key 映射（真实 TMDB 字典）
-    const targetKeys = keys.map(k => scGenreCatalog.value.find(c => c.name === k || c.category_key === k)?.category_key || k)
-    const d = await api('/sc/category-schedules/copy', { method: 'POST', body: JSON.stringify({ payload: { id: row.id, target_keys: targetKeys } }) })
-    if (!d.ok) { ElMessage.warning(d.reason || '复制失败'); return }
-    ElMessage.success(`已复制到 ${d.copied} 个分类`); await loadSc()
-  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
-}
+// v2.1.6：「复制」按钮已下线（用户口径：去掉每个分类后的复制按钮）。
+// 批量场景改用表格勾选 + 「保存」，无需逐行复制。
+// v2.1.6：语义由「一键应用默认（只填空行）」改为「一键恢复默认」——
+// 把所选分类的时段**重置回默认时间表**（热门白天 / 冷门夜间，2 小时一段，
+// 自动避开静默时段），并重新纳入系统托管（此后跟随默认时间表刷新）。
+// 未勾选或全勾选 = 全部；只处理勾选行。
 async function scApplySchedDefaults() {
-  try {
-    await ElMessageBox.confirm('把未配置过的分类排期应用为内置默认建议值并启用？已改过的行不会被覆盖。', '一键应用默认建议', { type: 'warning' })
-    const d = await api('/sc/category-schedules/apply-defaults', { method: 'POST', body: JSON.stringify({ payload: {} }) })
-    if (!d.ok) { ElMessage.warning(d.reason || '应用失败'); return }
-    ElMessage.success(`已应用默认建议：${d.applied || 0} / ${d.total || 0} 类`)
-    await loadSc()
-  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
-}
-// v2.1.2：按偏好分配时段——偏好高的分类占高峰独占段（每 2 小时一段），
-// 第 13 名及以后保持全天窗口。只改时段，不动每小时/每日上限；用户手工设定过的行不被覆盖。
-async function scAssignPreferenceWindows() {
-  const segs = scPreference.value.peak_segments || []
-  const full = scPreference.value.full_day_window || [0, 24]
-  const top = segs.length ? `第 1 名占 ${segs[0][0]}:00–${segs[0][1]}:00，第 ${segs.length} 名占 ${segs[segs.length - 1][0]}:00–${segs[segs.length - 1][1]}:00` : '按偏好排序依次占用高峰时段'
+  const keys = scSchedTargetKeys()
+  if (!keys.length) { ElMessage.warning('没有可恢复的分类'); return }
+  const scope = keys.length >= scSchedRows.value.length ? '全部分类' : `选中的 ${keys.length} 个分类`
   try {
     await ElMessageBox.confirm(
-      `按分类偏好重新分配时段？${top}；第 ${segs.length + 1} 名及以后保持全天 ${full[0]}:00–${full[1]}:00。每小时/每日上限保持不变，你手工设定过时段的分类不会被覆盖。`,
-      '按偏好分配时段', { type: 'warning' })
-    scPrefAssigning.value = true
-    const d = await api('/sc/preference/assign', { method: 'POST', body: JSON.stringify({ payload: {} }) })
-    if (!d.ok) { ElMessage.warning(d.reason || '分配失败'); return }
-    ElMessage.success(`已按偏好分配 ${d.changed || 0} 个分类时段${d.skipped ? `，跳过手工设定 ${d.skipped} 个` : ''}`)
+      `把${scope}的推送时段恢复为默认时间表？手工设定过的时段会被覆盖（启用状态保留）。`,
+      '一键恢复默认', { type: 'warning' })
+    scSchedSaving.value = true
+    const d = await api('/sc/category-schedules/apply-defaults', { method: 'POST', body: JSON.stringify({ payload: {
+      category_keys: keys, force: true } }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '恢复失败'); return }
+    ElMessage.success(`已恢复默认时段：${d.applied || 0} / ${d.total || 0} 类`)
     await loadSc()
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
-  finally { scPrefAssigning.value = false }
+  finally { scSchedSaving.value = false }
 }
+// v2.1.6：「按偏好分配」按钮已下线（用户口径：去掉无意义的按偏好分配时间段功能）——
+// 默认时间表（热门白天 / 冷门夜间）本就由偏好排名派生，
+// 「一键恢复默认」即等价于「按偏好重新分配」，无需两个入口。
 // 偏好排名 → 分类引用映射（真实派生，供表格展示排序与高峰档位）
 // v2.1.4：统一用后端下发的中性引用名 ref 作键，页面不出现后端字段名。
 const scPrefRank = computed(() => {
@@ -2208,16 +2415,6 @@ const scPrefRank = computed(() => {
   for (const it of scPreference.value.items || []) m[it.ref ?? it.category_key] = it
   return m
 })
-// v2.1.2：档位文案改为「高峰独占段 / 全天窗口」，不再用宽泛的白天/夜间
-function scPrefLabel(key) {
-  const it = scPrefRank.value[key]
-  if (!it) return { text: '—', period: '' }
-  const period = it.period === 'peak' ? 'peak' : 'full_day'
-  const text = period === 'peak'
-    ? `第 ${it.peak_rank ?? it.rank ?? '—'} 名 · 高峰 ${it.window_start}:00–${it.window_end}:00`
-    : `第 ${it.rank ?? '—'} 名 · 全天`
-  return { text, period }
-}
 function scPrefSortRows(rows) {
   // v2.1.4：整表按**配置时间段**升序（0-2 → 2-4 → 4-6 …），
   // 与用户巡检时「按时间顺序看每个时段」的直觉一致；
@@ -2254,36 +2451,8 @@ const scHourDisabled = (h) => scQuietHours.value.has(Number(h))
 // 起止下拉的可用项：起始用 0-23，止点用 1-24（止点按「结束那一小时」判定是否落在静默）
 const scEndHourDisabled = (h) => scQuietHours.value.has((Number(h) - 1 + 24) % 24)
 
-// v2.1.4：周维度 AI 建议 / 已采纳的周维度配置窗口
-const scWeekdayNames = { 1: '周一', 2: '周二', 3: '周三', 4: '周四', 5: '周五', 6: '周六', 7: '周日' }
-// 取某行某天的时段：优先已采纳的配置，其次 AI 建议；返回 [start, end] 或 null
-function scWeekWindowOf(row, day) {
-  const cfg = row?.week_windows || {}
-  if (Array.isArray(cfg[day]) && cfg[day].length >= 2) return cfg[day]
-  const ai = row?.ai_week_windows || {}
-  if (Array.isArray(ai[day]) && ai[day].length >= 2) return ai[day]
-  return null
-}
-// 一行的周维度建议概览：有几天有建议
-function scWeekCoverage(row) {
-  let n = 0
-  for (let d = 1; d <= 7; d++) if (scWeekWindowOf(row, d)) n++
-  return n
-}
-// v2.1.4：只有**实测**（真实发布分布派生）的建议才可采纳——
-// 「通用习惯」是作息规律不是本分类的实测数据，采纳它等于把规律当结论。
-function scWeekMeasured(row) {
-  let n = 0
-  const src = row?.ai_week_source || {}
-  for (let d = 1; d <= 7; d++) if (src[String(d)] === 'history') n++
-  return n
-}
-const scWeekSourceLabel = (row, day) => {
-  const cfg = row?.week_windows || {}
-  if (Array.isArray(cfg[day]) && cfg[day].length >= 2) return '已采纳'
-  const src = row?.ai_week_source || {}
-  return src[day] === 'history' ? '实测' : '通用习惯'
-}
+// v2.1.6：周维度辅助函数已下线——用户口径「只推荐时间段（2 小时颗粒度），
+// 不用到周维度」。后端仍兼容读取 week_windows（历史数据），但页面不再展示。
 async function scResetSchedDefault(row) {
   try {
     await ElMessageBox.confirm(`把「${row.name}」的排期恢复为内置默认（按媒体类型分档）？`, '恢复默认', { type: 'warning' })
@@ -2535,7 +2704,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.5 · Asia/Shanghai</span>
+          <span>v2.1.7 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3380,9 +3549,68 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">只读核对，不自动改状态；TMDB 状态滞后时用卡片上的「完结状态」手动修正并锁定。</p>
           </div>
 
-          <!-- 作品视图：整部剧/电影一张海报卡，支持勾选批量管理 -->
-          <div class="grid-toolbar"><label class="select-all"><input type="checkbox" :checked="allSelected" @change="toggleSelectAll"/> 全选本页（{{ filteredSeries.length }}）</label></div>
-          <div class="media-grid">
+          <!-- 作品视图：整部剧/电影一张海报卡，支持勾选批量管理
+               v2.1.6：按 TMDB 分类分组展示 + 每个分类可折叠；
+               「按分类分组」关闭时回到原来的平铺海报墙（功能完全一致）。 -->
+          <div class="grid-toolbar">
+            <label class="select-all"><input type="checkbox" :checked="allSelected" @change="toggleSelectAll"/> 全选本页（{{ filteredSeries.length }}）</label>
+            <div class="grid-toolbar-right">
+              <label class="select-all"><input type="checkbox" :checked="groupByCategory" @change="groupByCategory = !groupByCategory"/> 按 TMDB 分类分组</label>
+              <template v-if="groupByCategory && seriesGroupsByCategory.length">
+                <el-button size="small" text @click="toggleAllGroups(!allGroupsCollapsed)">{{ allGroupsCollapsed ? '展开所有' : '折叠所有' }}</el-button>
+              </template>
+            </div>
+          </div>
+
+          <!-- 分组视图：每个 TMDB 分类一块，可单独折叠 -->
+          <div v-if="groupByCategory" class="lib-groups">
+            <div v-for="grp in seriesGroupsByCategory" :key="grp.name" class="lib-group">
+              <button class="lib-group-head" @click="toggleGroup(grp.name)">
+                <span class="lib-group-caret">{{ grp.collapsed ? '▸' : '▾' }}</span>
+                <b>{{ grp.name }}</b>
+                <span class="lib-group-count">{{ grp.count }} 部</span>
+                <span class="lib-group-hint">{{ grp.collapsed ? '展开' : '折叠' }}</span>
+              </button>
+              <div v-show="!grp.collapsed" class="media-grid">
+                <div v-for="g in grp.items" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
+                  <div class="media-poster">
+                    <el-image v-if="g.poster_path" :src="'https://image.tmdb.org/t/p/w342'+g.poster_path" fit="cover" style="width:100%;height:100%"/>
+                    <div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ mediaLabel(g.media_type) || 'MEDIA' }}</span></div>
+                    <input type="checkbox" class="card-check" :checked="selectedSeries.includes(g.key)" @click.stop="toggleSelect(g.key)"/>
+                    <span v-if="g.share_status === 'active'" class="scrape-ok">✓</span>
+                    <span class="media-badge" :class="'badge-'+g.share_status">{{ mediaShareLabel(g.share_status) }}</span>
+                    <span v-if="g.pushed" class="push-badge" title="已推送到 Telegram">已推送</span>
+                    <span v-if="g.link_state && mediaLinkLabel(g.link_state)" class="link-badge" :title="mediaLinkLabel(g.link_state)">{{ mediaLinkLabel(g.link_state) }}</span>
+                    <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结<span v-if="g.finish_locked">·手动</span></span>
+                    <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更<span v-if="g.finish_locked">·手动</span></span>
+                    <span v-if="g.share_duration" class="dur-badge">{{ durLabel(g.share_duration) }}</span>
+                    <span class="ep-count">{{ g.count }} 集</span>
+                  </div>
+                  <div class="media-body"><b :title="g.title">{{ g.title }}</b><small>{{ mediaLabel(g.media_type) }}{{ g.year ? ' · ' + g.year : '' }}{{ g.episode_label ? ' · ' + g.episode_label : '' }}</small><div class="media-meta"><span v-if="g.tmdb_id">TMDB #{{ g.tmdb_id }}</span><span v-if="g.vote_average">评分 {{ Number(g.vote_average).toFixed(1) }}</span><span v-if="g.identified_count && g.identified_count < g.count" class="identify-chip">{{ g.identified_count }}/{{ g.count }} 已识别</span><span v-else-if="g.identify_status && g.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(g.identify_status) }}</span></div></div>
+                  <div class="media-actions" @click.stop>
+                    <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="seriesRepresentative(g) && publishResource(seriesRepresentative(g))">推送</el-button>
+                    <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">取消分享</el-button>
+                    <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
+                    <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
+                    <el-button size="small" text @click="openMatch(seriesRepresentative(g) || {id:g.representative_id, name:g.title, path_hint:''})">手动修正</el-button>
+                    <el-dropdown size="small" trigger="click" @command="c => setFinish(g, c)">
+                      <el-button size="small" text>完结状态 ▾</el-button>
+                      <template #dropdown><el-dropdown-menu>
+                        <el-dropdown-item command="ended">标记完结（锁定）</el-dropdown-item>
+                        <el-dropdown-item command="returning">标记追更（锁定）</el-dropdown-item>
+                        <el-dropdown-item command="">清除状态（锁定）</el-dropdown-item>
+                        <el-dropdown-item command="auto">恢复 TMDB 自动判断</el-dropdown-item>
+                      </el-dropdown-menu></template>
+                    </el-dropdown>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
+          </div>
+
+          <!-- 平铺视图（不分组）：与分组视图共用同一批卡片，操作完全一致 -->
+          <div v-else class="media-grid">
             <div v-for="g in filteredSeries" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
               <div class="media-poster">
                 <el-image v-if="g.poster_path" :src="'https://image.tmdb.org/t/p/w342'+g.poster_path" fit="cover" style="width:100%;height:100%"/>
@@ -3455,9 +3683,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
         <section v-else-if="tab === '推送队列'" class="fade">
           <div class="sc-shell">
-            <!-- 顶部 tab（发布总览 → 发布规则 → 推送任务 → 分享管理） -->
+            <!-- 顶部 tab（发布总览 → 发布规则 → 推送任务 → 分享管理 → 阅读量） -->
             <div class="sc-tabbar">
-              <button v-for="n in scSubNavs" :key="n.key" :class="['sc-tab', { active: scSubNav === n.key }]" @click="scSubNav = n.key">
+              <button v-for="n in scSubNavs" :key="n.key" :class="['sc-tab', { active: scSubNav === n.key }]" @click="scSwitchSubNav(n.key)">
                 <span class="sc-tab-ico">{{ n.ico }}</span>{{ n.key }}
               </button>
             </div>
@@ -3713,15 +3941,16 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <label class="hint">启用即时推送<br><el-switch v-model="scBasicRules.quick_publish_enabled" active-value="true" inactive-value="false"/></label>
                   <label class="hint">更新检测频率(分钟)<br><el-input-number v-model="scBasicRules.update_detect_minutes" :min="1" size="small"/></label>
                   <label class="hint">每小时上限(条)<br><el-input-number v-model="scBasicRules.quick_publish_hourly_limit" :min="0" size="small" title="0=不限"/></label>
-                  <label class="hint">冲突处理<br><el-select v-model="scBasicRules.conflict_policy" size="small" style="width:160px"><el-option label="暂停普通排期，优先上新" value="pause_normal"/><el-option label="上新优先" value="prefer_new"/></el-select></label>
+                  <label class="hint">冲突处理<br><el-select v-model="scBasicRules.conflict_policy" size="small" style="width:160px"><el-option label="新上映优先" value="prefer_release"/><el-option label="新入库优先" value="prefer_new"/><el-option label="存量排期优先" value="prefer_backlog"/></el-select></label>
                   <el-button size="small" type="primary" @click="scSaveBasicRules">保存基础规则</el-button>
                 </div>
+                <p class="hint sc-source-note">冲突处理决定**同一批待推任务**的先后顺序，不改变任何配额上限：新上映优先 = 近期上映的作品先发；新入库优先 = 刚入库的作品先发；存量排期优先 = 已排期的存量作品先发。</p>
               </div>
 
               <!-- 周期计划管理：小时/日/周/月度配额 + 静默保护（真实持久化并生效）
-                   v2.1.1：按设计稿改为**常驻可见**（不再只挂在「基础规则」子 tab 下），
-                   两个子 tab 都能直接调整周期配额。 -->
-              <div class="sc-card">
+                   v2.1.6：仅在「基础规则」子 tab 下常驻，分类时间排期 tab 不再重复露出
+                   （此前无 v-show，两个 tab 都显示，排期区会冒出一张重复卡片）。 -->
+              <div class="sc-card" v-show="scRuleTab==='基础规则'">
                 <div class="sc-card-head"><span class="sc-ico">▦</span><div><h3>周期计划管理</h3><p>小时/日/周/月度配额与静默保护；保存后由调度引擎夹逼执行</p></div>
                   <el-button size="small" type="primary" plain @click="scSaveCyclePlan">调整周期计划</el-button></div>
                 <div class="sc-subtabbar sc-subtab-sm">
@@ -3738,6 +3967,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   </template>
                   <template v-else-if="scCycleTab==='日度'">
                     <label class="hint">单日推送总上限<br><el-input-number v-model="scCyclePlan.day_max" :min="0" size="small"/></label>
+                    <label class="hint">单分类每日上限<br><el-input-number v-model="scCyclePlan.category_day_max" :min="0" size="small" title="0=不限"/></label>
                     <label class="hint">主推送窗口起<br><el-input-number v-model="scCyclePlan.window_start" :min="0" :max="23" size="small"/></label>
                     <label class="hint">主推送窗口止<br><el-input-number v-model="scCyclePlan.window_end" :min="1" :max="24" size="small"/></label>
                   </template>
@@ -3752,18 +3982,35 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </div>
               </div>
 
-              <!-- 分类-时间排期配置：每分类一行（TMDB 官方分类） -->
+              <!-- 分类-时间排期配置：每分类一行（TMDB 官方分类）
+                   v2.1.6：表格瘦身 + 勾选批量操作
+                   - 去掉「周期维度 / 每小时上限 / 日上限 / 周维度建议」四列；
+                   - 「偏好档位 + AI 建议」合并为单一「推荐时间段」（2 小时颗粒度）；
+                   - 批量操作（一键恢复默认 / 批量采纳建议 / 保存）按勾选生效，
+                     未勾选或全勾选 = 全部。 -->
               <div class="sc-card sc-hour-card sc-rule-full" v-show="scRuleTab==='分类时间排期'">
-                <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段与上限；内置默认建议值（电视 5 条每时 / 30 条每日，电影 3 条每时 / 20 条每日），共 {{ scSchedRows.length }} 类</p></div>
-                  <el-button size="small" plain @click="scApplySchedDefaults">一键应用默认建议</el-button>
-                  <el-button size="small" type="primary" :loading="scPrefAssigning" @click="scAssignPreferenceWindows">按偏好分配时段</el-button>
+                <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段；默认按观影习惯分配 2 小时一段（热门分类排白天、冷门分类排夜间，自动避开静默时段），共 {{ scSchedRows.length }} 类</p></div>
+                  <el-button size="small" plain :loading="scSchedSaving" @click="scApplySchedDefaults">一键恢复默认</el-button>
                   <el-button size="small" plain :loading="scAdoptingAllAi" @click="scAdoptAllAi">批量采纳 AI 建议</el-button>
-                  <el-button size="small" type="primary" :loading="scSchedSaving" @click="scSaveAllSchedRows">保存全部</el-button></div>
+                  <el-button size="small" type="primary" :loading="scSchedSaving" @click="scSaveAllSchedRows">保存</el-button></div>
                 <div class="sc-table-scroll sc-sched-scroll">
-                <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420">
+                <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420"
+                          ref="scSchedTableRef" @selection-change="scSchedSelection = $event">
+                  <el-table-column type="selection" width="46" fixed/>
                   <el-table-column label="TMDB 分类" width="120" fixed><template #default="s"><b>{{ s.row.name }}</b></template></el-table-column>
-                  <el-table-column label="周期维度" width="86"><template #default="s"><span class="sc-mini-tag">{{ s.row.media_type === 'tv' ? '日' : '日/周/月' }}</span></template></el-table-column>
-                  <el-table-column label="偏好档位" min-width="190"><template #default="s"><span :class="['sc-dot-state', scPrefLabel(s.row.ref).period === 'peak' ? 'active' : 'unknown']">{{ scPrefLabel(s.row.ref).text }}</span></template></el-table-column>
+                  <el-table-column label="推荐时间段" min-width="188">
+                    <template #default="s">
+                      <!-- v2.1.6：用来源标记判定「有没有建议」，不能用起点数值真伪——
+                           夜间段 00:00–02:00 的起点是 0，用 v-if="s.row.suggest_start"
+                           会把这类建议显示成「暂无建议」并让采纳按钮置灰。 -->
+                      <div v-if="s.row.suggest_source" class="sc-suggest-cell">
+                        <span class="sc-suggest-time">{{ s.row.suggest_start }}:00–{{ s.row.suggest_end }}:00</span>
+                        <span :class="['sc-mini-tag', s.row.suggest_source === 'history' ? '' : 'muted']">{{ s.row.suggest_source === 'history' ? '实测' : '习惯基线' }}</span>
+                      </div>
+                      <span v-else class="hint">暂无建议</span>
+                      <div v-if="s.row.pref_rank" class="sc-suggest-rank">偏好第 {{ s.row.pref_rank }} 名</div>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="配置时间段" width="196">
                     <template #default="s">
                       <div class="sc-time-cell">
@@ -3778,35 +4025,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div v-if="s.row.quiet_conflict" class="sc-cell-warn">与静默保护时段重叠</div>
                     </template>
                   </el-table-column>
-                  <el-table-column label="每小时上限" width="104"><template #default="s"><el-input-number v-model="s.row.hourly_limit" :min="0" size="small" controls-position="right"/></template></el-table-column>
-                  <el-table-column label="日上限" width="104"><template #default="s"><el-input-number v-model="s.row.daily_limit" :min="0" size="small" controls-position="right"/></template></el-table-column>
-                  <el-table-column label="AI 建议时间段（周维度）" min-width="290">
-                    <template #default="s">
-                      <div v-if="scWeekCoverage(s.row)" class="sc-week-grid">
-                        <div v-for="d in [1,2,3,4,5,6,7]" :key="'d'+d" :class="['sc-week-cell', scWeekWindowOf(s.row, d) ? 'has' : 'none']">
-                          <span class="sc-week-day">{{ scWeekdayNames[d] }}</span>
-                          <span v-if="scWeekWindowOf(s.row, d)" class="sc-week-time">{{ scWeekWindowOf(s.row, d)[0] }}:00–{{ scWeekWindowOf(s.row, d)[1] }}:00</span>
-                          <span v-else class="sc-week-time sc-week-blank">—</span>
-                          <span v-if="scWeekWindowOf(s.row, d)" class="sc-week-src">{{ scWeekSourceLabel(s.row, d) }}</span>
-                        </div>
-                      </div>
-                      <span v-else class="hint">暂无建议</span>
-                    </template>
-                  </el-table-column>
                   <el-table-column label="是否采纳" width="88"><template #default="s"><span :class="['sc-dot-state', s.row.ai_adopted ? 'active' : 'unknown']">{{ s.row.ai_adopted ? '已采纳' : '未采纳' }}</span></template></el-table-column>
-                  <el-table-column label="采纳操作" width="88"><template #default="s"><el-button size="small" link type="primary" :disabled="!scWeekMeasured(s.row)" @click="scAdoptSchedAI(s.row)">采纳建议</el-button></template></el-table-column>
+                  <el-table-column label="采纳操作" width="88"><template #default="s"><el-button size="small" link type="primary" :disabled="!s.row.suggest_source" @click="scAdoptSchedAI(s.row)">采纳建议</el-button></template></el-table-column>
                   <el-table-column label="启用" width="72"><template #default="s"><el-switch v-model="s.row.enabled" size="small"/></template></el-table-column>
-                  <el-table-column label="操作" width="160" fixed="right"><template #default="s">
+                  <el-table-column label="操作" width="118" fixed="right"><template #default="s">
                     <el-button size="small" link type="primary" @click="scSaveSchedRow(s.row)">保存</el-button>
-                    <el-button size="small" link @click="scCopySched(s.row)">复制</el-button>
                     <el-button size="small" link @click="scResetSchedDefault(s.row)">默认</el-button>
                   </template></el-table-column>
                 </el-table>
                 </div>
-                <div v-if="!scSchedRows.length" class="empty">暂无分类排期，点击「保存全部」按 TMDB 官方分类初始化</div>
-                <p class="hint sc-source-note">分类来自 tmdb.py 官方 genre（{{ scGenreCatalog.length }} 项）；AI 建议时段按**周维度**生成——逐日给出建议，「实测」= 该分类该日真实发布的小时分布（可采纳），「通用习惯」= 国人观影作息基线（工作日晚间黄金档、周末双峰，仅供参考、不可采纳）。</p>
-                <p v-if="scQuietOn" class="hint sc-source-note">静默保护已开启（{{ scCyclePlan.quiet_start }}:00–{{ scCyclePlan.quiet_end }}:00），配置时间段中落在静默区间的小时**不可选**，已选中的会标红提示。</p>
-                <p class="hint sc-source-note">偏好档位由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）；全天 {{ scPreference.segment_hours || 2 }} 小时一段共 {{ (scPreference.segments || []).length }} 段，前 {{ (scPreference.peak_segments || []).length }} 名分类各占一个互不重叠的高峰时段（第一名为 {{ (scPreference.peak_segments || [])[0] ? (scPreference.peak_segments[0][0] + ':00–' + scPreference.peak_segments[0][1] + ':00') : '—' }}），其余分类保持全天 {{ (scPreference.full_day_window || [0, 24])[0] }}:00–{{ (scPreference.full_day_window || [0, 24])[1] }}:00 不限时段。整表按配置时间段从 0:00 起升序排列。</p>
+                <div v-if="!scSchedRows.length" class="empty">暂无分类排期，点击「一键恢复默认」按 TMDB 官方分类初始化</div>
+                <p class="hint sc-source-note">分类来自 tmdb.py 官方 genre（{{ scGenreCatalog.length }} 项）；推荐时间段为**单一时间段**（2 小时颗粒度），来源标注「实测」= 该分类真实发布的小时分布，「习惯基线」= 默认时间表派生的作息基线——每个分类都有建议，采纳按钮始终可用。</p>
+                <p v-if="scQuietOn" class="hint sc-source-note">静默保护已开启（{{ scCyclePlan.quiet_start }}:00–{{ scCyclePlan.quiet_end }}:00），配置时间段中落在静默区间的小时**不可选**，默认时间表也会自动避开静默时段。</p>
+                <p class="hint sc-source-note">默认时间表按观影习惯排布：热门分类优先占白天段、冷门分类排夜间段，每段 2 小时（{{ (scPreference.day_segments || []).length }} 个白天段 + {{ (scPreference.night_segments || []).length }} 个夜间段），段用完的分类保持全天 {{ (scPreference.full_day_window || [0, 24])[0] }}:00–{{ (scPreference.full_day_window || [0, 24])[1] }}:00。偏好排名由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）。速率上限统一由「周期计划管理」约束，不在分类表内单独配置。</p>
               </div>
               </div>
             </div>
@@ -3870,11 +4101,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       </div>
                     </template>
                   </el-table-column>
-                  <el-table-column label="推送渠道" min-width="180" show-overflow-tooltip>
+                  <el-table-column label="推送渠道" min-width="240" show-overflow-tooltip>
                     <template #default="s">
-                      <span v-if="(s.row.channel_names||[]).length" class="sc-mini-tag">频道 {{ s.row.channel_names.join('、') }}</span>
-                      <span v-if="(s.row.group_names||[]).length" class="sc-mini-tag">群 {{ s.row.group_names.join('、') }}</span>
-                      <span v-if="!s.row.target_summary" class="hint">—</span>
+                      <div v-if="scChannelTargetLines(s.row).length" class="sc-target-cell">
+                        <span v-for="(line, li) in scChannelTargetLines(s.row)" :key="li" class="sc-mini-tag">{{ line }}</span>
+                      </div>
+                      <span v-else class="hint">—</span>
                     </template>
                   </el-table-column>
                   <el-table-column label="类型" width="86"><template #default="s">{{ s.row.kind==='first'?'首次发布':'追更' }}</template></el-table-column>
@@ -3892,6 +4124,162 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-button size="small" plain :loading="scCleaningTasks" @click="scCleanupTasks">清理无效任务</el-button>
                 </div>
                 <div v-if="!scTaskViewRows.length" class="empty">暂无发布任务（当前筛选条件下为空）</div>
+              </div>
+            </div>
+
+            <!-- ================================================================
+                 v2.1.7 #241：阅读量统计
+                 口径如实表达：①只有频道帖有浏览量，群聊 Telegram 根本不提供，
+                 群聊目标因此不显示阅读量列；②展示的是**期间新增**（累计值相邻
+                 两次采集求差），不是累计总数；③读不到的消息标记为「暂不可采集」，
+                 **不显示 0**（0 会被误读成「没人看」）。
+                 ================================================================ -->
+            <div class="sc-stats-layout" v-show="scSubNav === '阅读量'">
+              <!-- 顶部：就绪状态 + 采集操作 -->
+              <div class="sc-card">
+                <div class="sc-card-head">
+                  <span class="sc-ico">◉</span>
+                  <div><h3>阅读量统计</h3><p>统计频道帖的浏览量、转发与表情回应</p></div>
+                  <div class="head-tools">
+                    <el-select :model-value="scStatsDays" size="small" style="width:110px" @change="scStatsSwitchDays">
+                      <el-option label="近 7 天" :value="7"/>
+                      <el-option label="近 30 天" :value="30"/>
+                      <el-option label="近 90 天" :value="90"/>
+                    </el-select>
+                    <el-button size="small" type="primary" :loading="scStatsCollecting" :disabled="!scStatsStatus.ready || !scStatsStatus.enabled" @click="scStatsCollect">立即采集</el-button>
+                    <el-button size="small" plain :loading="scStatsLoading" @click="loadScStats">刷新</el-button>
+                  </div>
+                </div>
+
+                <!-- 就绪状态：如实说明为什么不能用 -->
+                <div class="sc-stats-state">
+                  <span class="sc-state-dot" :class="scStatsStatus.ready ? 'on' : 'off'"></span>
+                  <span v-if="scStatsStatus.ready">采集通道已就绪</span>
+                  <span v-else>{{ scStatsStatus.reason || '尚未配置采集通道' }}</span>
+                  <span class="sc-state-hint">{{ scStatsStatus.capability?.group_note || '群聊不提供浏览量统计' }}</span>
+                </div>
+
+                <!-- 配置区：凭证 + 采集参数 + 登录 -->
+                <div class="sc-stats-config">
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>应用编号（api_id）</label>
+                      <el-input v-model="scStatsConfig.api_id" placeholder="在 my.telegram.org 申请的数字编号"/>
+                      <small>用于连接 Telegram 的应用凭据，加密存储，不会回显。</small>
+                    </div>
+                    <div class="field">
+                      <label>应用密钥（api_hash）</label>
+                      <el-input v-model="scStatsConfig.api_hash" type="password" show-password placeholder="32 位十六进制字符串"/>
+                      <small>与编号配套使用，加密存储，不会回显。</small>
+                    </div>
+                    <div class="field">
+                      <label>登录手机号</label>
+                      <el-input v-model="scStatsConfig.phone" placeholder="含国际区号，如 +86"/>
+                      <small>仅用于首次登录验证，验证码由 Telegram 直接发送给你。</small>
+                    </div>
+                    <div class="field inline"><label>启用采集</label><el-switch v-model="scStatsConfig.enabled"/></div>
+                    <div class="field">
+                      <label>回溯窗口</label>
+                      <el-input-number v-model="scStatsConfig.lookback_hours" :min="1" :max="720" controls-position="right" style="width:130px"/><span class="unit">小时</span>
+                      <small>只回溯这段时间内推送过的消息，避免每轮全量扫描。</small>
+                    </div>
+                    <div class="field">
+                      <label>单轮上限</label>
+                      <el-input-number v-model="scStatsConfig.max_per_run" :min="1" :max="2000" controls-position="right" style="width:130px"/><span class="unit">条</span>
+                      <small>接口风暴护栏：单轮最多采集多少条消息。</small>
+                    </div>
+                  </div>
+                  <div class="sc-form-row" style="margin-top:12px">
+                    <el-button size="small" type="primary" :loading="scStatsSaving" @click="saveScStatsConfig">保存配置</el-button>
+                    <el-button size="small" plain :loading="scStatsSaving" :disabled="!scStatsConfig.phone && !scStatsConfig.api_id" @click="scStatsSendLoginCode">获取登录验证码</el-button>
+                    <el-input v-if="scStatsLoginCodeSent" v-model="scStatsLoginCode" size="small" placeholder="填写收到的验证码" style="width:170px"/>
+                    <el-button v-if="scStatsLoginCodeSent" size="small" type="primary" plain :loading="scStatsSaving" @click="scStatsSubmitLoginCode">完成登录</el-button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 概览四数 -->
+              <div class="sc-task-stats" style="margin-top:14px">
+                <div><small>期间新增阅读</small><b>{{ scStatsTrend.totals?.reads_gain || 0 }}</b></div>
+                <div><small>期间新增转发</small><b>{{ scStatsTrend.totals?.shares_gain || 0 }}</b></div>
+                <div><small>期间新增回应</small><b>{{ scStatsTrend.totals?.reactions_gain || 0 }}</b></div>
+                <div><small>统计消息数</small><b class="muted">{{ scStatsTrend.totals?.posts || 0 }}</b></div>
+              </div>
+
+              <!-- 按日趋势 + 各目标表现 -->
+              <div class="sc-dash-three" style="margin-top:14px">
+                <div class="sc-card">
+                  <div class="sc-card-head"><span class="sc-ico">⌁</span><div><h3>每日新增阅读</h3><p>相邻两次采集的差值</p></div></div>
+                  <el-table :data="scStatsTrend.buckets || []" stripe size="small" max-height="260">
+                    <el-table-column prop="day" label="日期" min-width="110"/>
+                    <el-table-column label="新增阅读" width="100"><template #default="s">{{ s.row.reads_gain || 0 }}</template></el-table-column>
+                    <el-table-column label="新增转发" width="100"><template #default="s">{{ s.row.shares_gain || 0 }}</template></el-table-column>
+                    <el-table-column label="新增回应" width="100"><template #default="s">{{ s.row.reactions_gain || 0 }}</template></el-table-column>
+                  </el-table>
+                  <div v-if="!(scStatsTrend.buckets || []).length" class="empty">暂无采集数据，开启采集并运行一轮后即可看到趋势</div>
+                </div>
+                <div class="sc-card">
+                  <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>各推送目标表现</h3><p>频道与群聊分列</p></div></div>
+                  <el-table :data="scStatsTrend.targets || []" stripe size="small" max-height="260">
+                    <el-table-column prop="name" label="推送目标" min-width="140" show-overflow-tooltip/>
+                    <el-table-column label="类型" width="76"><template #default="s">{{ s.row.kind_label || '频道' }}</template></el-table-column>
+                    <el-table-column label="阅读量" width="100"><template #default="s">
+                      <span v-if="s.row.reads_shown">{{ s.row.reads_total || 0 }}</span>
+                      <span v-else class="muted" :title="'群聊不提供浏览量统计'">不适用</span>
+                    </template></el-table-column>
+                    <el-table-column label="转发" width="80"><template #default="s">{{ s.row.shares_total || 0 }}</template></el-table-column>
+                    <el-table-column label="回应" width="80"><template #default="s">{{ s.row.reactions_total || 0 }}</template></el-table-column>
+                  </el-table>
+                  <div v-if="!(scStatsTrend.targets || []).length" class="empty">暂无目标数据</div>
+                </div>
+                <div class="sc-card">
+                  <div class="sc-card-head"><span class="sc-ico">✦</span><div><h3>作品新增阅读榜</h3><p>按期间新增阅读排序</p></div></div>
+                  <el-table :data="scStatsTrend.works || []" stripe size="small" max-height="260">
+                    <el-table-column prop="title" label="作品" min-width="150" show-overflow-tooltip/>
+                    <el-table-column label="新增阅读" width="100"><template #default="s">{{ s.row.reads_gain || 0 }}</template></el-table-column>
+                    <el-table-column label="转发" width="80"><template #default="s">{{ s.row.shares_gain || 0 }}</template></el-table-column>
+                    <el-table-column label="回应" width="80"><template #default="s">{{ s.row.reactions_gain || 0 }}</template></el-table-column>
+                  </el-table>
+                  <div v-if="!(scStatsTrend.works || []).length" class="empty">暂无作品数据</div>
+                </div>
+              </div>
+
+              <!-- 最近采集明细 + 采集记录 -->
+              <div class="sc-dash-three" style="margin-top:14px">
+                <div class="sc-card">
+                  <div class="sc-card-head"><span class="sc-ico">≡</span><div><h3>最近采集明细</h3><p>每条消息的最新状态</p></div></div>
+                  <el-table :data="scStatsItems || []" stripe size="small" max-height="300">
+                    <el-table-column prop="title" label="作品" min-width="140" show-overflow-tooltip/>
+                    <el-table-column prop="target" label="推送目标" min-width="120" show-overflow-tooltip/>
+                    <el-table-column label="类型" width="70"><template #default="s">{{ s.row.kind_label || '频道' }}</template></el-table-column>
+                    <el-table-column label="阅读量" width="92"><template #default="s">
+                      <span v-if="s.row.reads !== null && s.row.reads !== undefined">{{ s.row.reads }}</span>
+                      <span v-else class="muted" :title="'群聊不提供浏览量统计'">不适用</span>
+                    </template></el-table-column>
+                    <el-table-column label="转发" width="76"><template #default="s">{{ s.row.shares || 0 }}</template></el-table-column>
+                    <el-table-column label="回应" width="76"><template #default="s">{{ s.row.reactions || 0 }}</template></el-table-column>
+                    <el-table-column label="状态" width="110"><template #default="s">
+                      <el-tag v-if="s.row.available" size="small" type="success" effect="plain">已采集</el-tag>
+                      <el-tooltip v-else :content="s.row.note || '该消息暂不可采集'" placement="top">
+                        <el-tag size="small" type="info" effect="plain">暂不可采集</el-tag>
+                      </el-tooltip>
+                    </template></el-table-column>
+                  </el-table>
+                  <div v-if="!(scStatsItems || []).length" class="empty">暂无采集明细</div>
+                </div>
+                <div class="sc-card">
+                  <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>采集记录</h3><p>每轮采集的执行结果</p></div></div>
+                  <el-table :data="scStatsRuns || []" stripe size="small" max-height="300">
+                    <el-table-column label="状态" width="110"><template #default="s">
+                      <el-tag size="small" :type="s.row.status === 'success' ? 'success' : (s.row.status === 'running' ? 'warning' : 'info')" effect="plain">{{ scStatsRunLabel(s.row.status) }}</el-tag>
+                    </template></el-table-column>
+                    <el-table-column label="扫描" width="76"><template #default="s">{{ s.row.scanned || 0 }}</template></el-table-column>
+                    <el-table-column label="采集" width="76"><template #default="s">{{ s.row.collected || 0 }}</template></el-table-column>
+                    <el-table-column label="跳过" width="76"><template #default="s">{{ s.row.skipped || 0 }}</template></el-table-column>
+                    <el-table-column prop="error" label="说明" min-width="150" show-overflow-tooltip/>
+                  </el-table>
+                  <div v-if="!(scStatsRuns || []).length" class="empty">尚无采集记录</div>
+                </div>
               </div>
             </div>
           </div>
@@ -3927,8 +4315,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="sc-subhead">执行记录（{{ scDetailExecutions.length }}）</div>
               <el-table :data="scDetailExecutions" stripe size="small" max-height="360">
                 <el-table-column prop="id" label="ID" width="60"/>
-                <el-table-column prop="stage" label="阶段" width="110"/>
-                <el-table-column prop="status" label="状态" width="90"/>
+                <el-table-column label="阶段" width="110"><template #default="s">{{ scExecStageLabel(s.row.stage) }}</template></el-table-column>
+                <el-table-column label="状态" width="90"><template #default="s">{{ scExecStatusLabel(s.row.status) }}</template></el-table-column>
                 <el-table-column label="耗时" width="90"><template #default="s">{{ fmtDuration(s.row.duration_ms) }}</template></el-table-column>
                 <el-table-column label="错误" min-width="160" show-overflow-tooltip><template #default="s">{{ s.row.error || '—' }}</template></el-table-column>
                 <el-table-column label="开始" width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.started_at, true) }}</template></el-table-column>
@@ -4160,10 +4548,25 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
   --yg-shadow:0 1px 2px rgba(30,39,69,.03),0 12px 32px rgba(30,39,69,.06);
   --yg-shadow-lg:0 2px 4px rgba(30,39,69,.04),0 20px 48px rgba(30,39,69,.10);
   --yg-radius:20px;--yg-radius-sm:14px;
+  /* v2.1.6 #245：全局语义色 token（浅色基线）。
+     此前这些色值散落成 20+ 处硬编码字面量（#eef0ff / #e7f8f0 / #fff3e2 / #fdecef …），
+     深色主题下无法跟随主题 → 逐处失配（浅底 + 深字在深色背景上刺眼且对比不足）。
+     现在统一成「底色 + 字色」成对 token：浅色写在这里，深色在 html.dark 里换值，
+     换主题只改一处，页面样式不再出现裸色值。 */
+  --yg-tone-blue-bg:#eef0ff;--yg-tone-blue-fg:#5b5bd6;
+  --yg-tone-green-bg:#e7f8f0;--yg-tone-green-fg:#159a6b;
+  --yg-tone-amber-bg:#fff3e2;--yg-tone-amber-fg:#cf7f1c;
+  --yg-tone-red-bg:#fdecef;--yg-tone-red-fg:#d9435e;
+  --yg-tone-violet-bg:#f0ebff;--yg-tone-violet-fg:#7b5bd6;
+  --yg-tone-teal-bg:#e6f7f7;--yg-tone-teal-fg:#199a9a;
+  --yg-tone-slate-bg:#eef1f7;--yg-tone-slate-fg:#7e88a8;
+  --yg-panel:#f7f8fd;
+  --yg-grad-a:#eef0ff;--yg-grad-b:#e9f8f5;
+  --yg-border:#e6e8eb;--yg-panel-soft:rgba(127,127,127,.05);
   --el-color-primary:#5b5bd6;--el-border-radius-base:10px;--el-font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
 }
 *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(1200px 600px at 100% -10%,#eef0ff 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,#e9f8f5 0%,transparent 55%),var(--yg-bg);background-attachment:fixed;color:var(--yg-ink);font-family:var(--el-font-family);font-size:14px;-webkit-font-smoothing:antialiased}
+body{margin:0;background:radial-gradient(1200px 600px at 100% -10%,var(--yg-grad-a) 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,var(--yg-grad-b) 0%,transparent 55%),var(--yg-bg);background-attachment:fixed;color:var(--yg-ink);font-family:var(--el-font-family);font-size:14px;-webkit-font-smoothing:antialiased}
 button{font-family:inherit}
 .ico{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex:none}
 /* ============ v0.9.0 全站设计语言：embyhub 图标块 + 大圆角白卡 ============ */
@@ -4180,13 +4583,17 @@ button{font-family:inherit}
 /* 顶栏、表格、表单控件全站统一圆角与留白 */
 .topbar{box-shadow:0 1px 0 var(--yg-line),0 6px 20px rgba(30,39,69,.03)}
 .el-table{--el-table-border-color:var(--yg-line);border-radius:12px;overflow:hidden}
-.el-table th.el-table__cell{background:#fafbfe!important;color:#5b6484;font-weight:650;font-size:12px}
+.el-table th.el-table__cell{background:var(--yg-panel)!important;color:var(--yg-muted);font-weight:650;font-size:12px}
 .el-input__wrapper,.el-select__wrapper{border-radius:10px;box-shadow:0 0 0 1px var(--yg-line) inset}
 .el-button{border-radius:10px;font-weight:600}
 .el-tag{border-radius:8px}
-/* 二级数据卡：授权摘要 / 凭证条 / 分享会话，圆角阴影对齐主卡 */
-.auth-summary-item,.credential-bar,.method-card,.kv-grid>div{border-radius:var(--yg-radius-sm)}
-.auth-summary-item{box-shadow:var(--yg-shadow);border-color:var(--yg-line)}
+/* 二级数据卡：授权摘要 / 凭证条 / 分享会话，圆角阴影对齐主卡。
+   v2.1.6 #245：原先这里还有一条独立的 ``.auth-summary-item{box-shadow:…;border-color:…}``
+   与一条 ``.method-card{border-radius:var(--yg-radius-sm)}``——
+   前者的属性已被下面的主定义完全覆盖（死代码），后者被 .method-card 主定义的
+   var(--yg-radius) 覆盖（同特异度后者胜 → 声明已成死代码）。
+   两条一并清除，避免「同选择器多处定义」这种隐性坑（v2.1.5 的层叠顺序教训）。 */
+.credential-bar,.kv-grid>div{border-radius:var(--yg-radius-sm)}
 /* 概览「最近操作」卡片标题图标块颜色随卡片语义微调 */
 .stat-card .stat-bar i{opacity:.9}
 .app-shell{display:flex;min-height:100vh}
@@ -4221,7 +4628,9 @@ button{font-family:inherit}
 .fade{animation:fade .3s ease}@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .page-head{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:22px;gap:16px;flex-wrap:wrap;padding-bottom:16px;border-bottom:1px solid var(--yg-line)}
 .page-head h2{margin:0 0 6px;font-size:23px;letter-spacing:-.4px;font-weight:750}.page-head p{margin:0 0 0 16px;color:var(--yg-muted);font-size:12px}
-.head-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* v2.1.6 #245：.head-tools 此前定义两处（此处 gap:8px 与下方 gap:6px 8px），
+   同特异度后者胜 → 本条的 gap 一直失效。合并为一处，只保留最终生效的取值。 */
+.head-tools{display:flex;gap:6px 8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .hero{border-radius:20px;background:linear-gradient(120deg,#4f4fc4 0%,#6b5ce0 52%,#3aa9c9 100%);color:#fff;padding:26px 30px;display:flex;justify-content:space-between;align-items:center;gap:20px;box-shadow:0 18px 40px rgba(91,91,214,.22);position:relative;overflow:hidden}
 .hero:after{content:"";position:absolute;width:280px;height:280px;border-radius:50%;border:40px solid rgba(255,255,255,.07);right:-70px;top:-120px}
 .hero-tag{font-size:10px;letter-spacing:2px;opacity:.75;margin-bottom:6px}.hero h2{margin:0 0 6px;font-size:26px}.hero p{margin:0;opacity:.82;font-size:12px}
@@ -4231,7 +4640,7 @@ button{font-family:inherit}
 .stat-card:hover{transform:translateY(-4px);box-shadow:var(--yg-shadow-lg)}
 .stat-icon{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;margin-bottom:14px}
 .stat-icon .ico{width:20px;height:20px}
-.tone-indigo .stat-icon{background:#eeedff;color:#5b5bd6}.tone-teal .stat-icon{background:#e5f8f5;color:#19b3a6}.tone-amber .stat-icon{background:#fff3e2;color:#e29328}.tone-violet .stat-icon{background:#f2edff;color:#8b6cf0}.tone-rose .stat-icon{background:#ffedf0;color:#e5526b}.tone-slate .stat-icon{background:#eef1f7;color:#8a93aa}
+.tone-indigo .stat-icon{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}.tone-teal .stat-icon{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}.tone-amber .stat-icon{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}.tone-violet .stat-icon{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}.tone-rose .stat-icon{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}.tone-slate .stat-icon{background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}
 .stat-num{font-size:30px;font-weight:780;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.5px}.stat-label{color:var(--yg-muted);font-size:12px;margin-top:6px}
 /* v0.9.8 #194 推送效果报表 */
 .stats-cards{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
@@ -4241,13 +4650,13 @@ button{font-family:inherit}
 .chart-col{flex:1;min-width:14px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
 .chart-stack{width:70%;max-width:26px;height:100%;display:flex;flex-direction:column;justify-content:flex-end}
 .chart-stack i{display:block;width:100%;min-height:0}
-.bar-sent{background:var(--yg-accent,#4f7cff);border-radius:3px 3px 0 0}
-.bar-fail{background:#e05a5a;border-radius:3px 3px 0 0}
+.bar-sent{background:var(--yg-primary);border-radius:3px 3px 0 0}
+.bar-fail{background:var(--yg-tone-red-fg);border-radius:3px 3px 0 0}
 .chart-col small{font-size:10px;color:var(--yg-muted);margin-top:6px;white-space:nowrap;transform:rotate(-30deg);transform-origin:center}
 .chart-legend{display:flex;gap:16px;justify-content:center;margin-top:14px;font-size:12px;color:var(--yg-muted)}
 .chart-legend span{display:flex;align-items:center;gap:6px}.chart-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
-.lg-sent{background:var(--yg-accent,#4f7cff)}.lg-fail{background:#e05a5a}
-.empty-hint{padding:28px;text-align:center;color:var(--yg-muted);font-size:13px}
+.lg-sent{background:var(--yg-primary)}.lg-fail{background:var(--yg-tone-red-fg)}
+/* v2.1.6 #245：.empty-hint 的旧定义已并入下方「空态统一」段，避免同选择器两处定义。 */
 .unavailable-box{margin-top:16px;background:var(--yg-surface);border:1px dashed var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px}
 .unavailable-box>b{font-size:12px;color:var(--yg-muted)}
 .unavailable-row{display:flex;gap:12px;padding:6px 0;font-size:12px;border-top:1px solid var(--yg-line);margin-top:6px}
@@ -4255,7 +4664,7 @@ button{font-family:inherit}
 /* v0.9.8 #195 镜像流程节点 + 进度 */
 .sync-progress{display:flex;align-items:center;gap:12px;margin-bottom:16px;font-size:12px;color:var(--yg-muted)}
 .sync-progress-track{flex:1;height:8px;background:var(--yg-line);border-radius:6px;overflow:hidden}
-.sync-progress-track i{display:block;height:100%;background:var(--yg-accent,#4f7cff);border-radius:6px;transition:width .3s}
+.sync-progress-track i{display:block;height:100%;background:var(--yg-primary);border-radius:6px;transition:width .3s}
 .pipeline-flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
 .pipe-node{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px;position:relative;overflow:hidden}
 .pipe-node.is-done{border-color:#19b3a6}.pipe-node.is-active{border-color:#f2a33c}.pipe-node.is-idle{opacity:.6}
@@ -4282,107 +4691,118 @@ button{font-family:inherit}
 .tm-label{font-size:11px;color:var(--yg-muted)}
 .task-card-foot{margin-top:14px;padding-top:10px;border-top:1px dashed var(--yg-line);display:flex;justify-content:space-between;align-items:flex-end;gap:8px}
 .task-card-foot small{color:var(--yg-muted);font-size:10px;line-height:1.4;flex:1}.task-card-foot .link-btn{white-space:nowrap}
-.stat-bar{height:4px;background:#f0f2f8;border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
+.stat-bar{height:4px;background:var(--yg-line);border-radius:4px;margin-top:16px;overflow:hidden}.stat-bar i{display:block;height:100%;width:42%;background:linear-gradient(90deg,var(--yg-primary),var(--yg-primary-2));border-radius:4px}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.three-col{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-.panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px 24px;box-shadow:var(--yg-shadow);margin-bottom:18px}
+/* v2.1.6 #245：主体容器统一到分享中心基准（.sc-card 口径）。
+   此前全站有 5 套主体容器（.panel / .bot-card / .media-card / .method-card / 裸 div），
+   圆角（20/16/14/11/10px）、内边距、阴影各写各的 → 同一屏里卡片体量参差。
+   统一后：主体面板一律 var(--yg-radius) 圆角 + var(--yg-surface) 底 + var(--yg-shadow) 阴影，
+   内边距统一 20px 22px（与 .sc-card 一致）。 */
+.panel{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;box-shadow:var(--yg-shadow);margin-bottom:18px}
 .panel.narrow{max-width:780px}.mirror-two-col{margin-bottom:18px}.mirror-col{max-width:none;min-width:0}.mirror-col .form-grid{grid-template-columns:1fr}
 /* c/d 联动模块并排：每列内部表单单列、panel 不限宽；窄屏(<1100px)自动堆叠 */
 .link-modules{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-top:22px}.link-module{min-width:0;display:flex;flex-direction:column}.link-module .sec-band{margin-top:0}.link-module .panel{max-width:none;flex:1}.link-module .form-grid{grid-template-columns:1fr;gap:14px}.link-module .panel-head{flex-wrap:wrap}.panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px}.panel-head h3{margin:0;font-size:16px;font-weight:720}.panel-head>span{font-size:11px;color:var(--yg-muted)}
 .link-btn{border:0;background:transparent;color:var(--yg-primary);cursor:pointer;font-size:12px}
 .check-row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--yg-line)}.check-row:last-child{border:0}
-.check-dot{width:24px;height:24px;border-radius:8px;display:grid;place-items:center}.check-dot.ok{background:#e5f8f5;color:#19b3a6}.check-dot.no{background:#fff3e2;color:#e29328}.check-dot .ico{width:14px;height:14px}
+.check-dot{width:24px;height:24px;border-radius:8px;display:grid;place-items:center}.check-dot.ok{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}.check-dot.no{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}.check-dot .ico{width:14px;height:14px}
 .check-copy{flex:1}.check-copy b{display:block;font-size:13px}.check-copy small{color:var(--yg-muted);font-size:11px}
 .check-state{font-size:11px;font-weight:600}.check-state.ok{color:#19b3a6}.check-state.no{color:#e29328}
-.dist-row{display:flex;align-items:center;gap:10px;padding:8px 0}.dist-label{width:56px;font-size:12px;color:var(--yg-muted)}.dist-track{flex:1;height:8px;background:#f1f3f9;border-radius:8px;overflow:hidden}.dist-track i{display:block;height:100%;border-radius:8px;transition:width .3s}.dist-row b{width:24px;text-align:right;font-variant-numeric:tabular-nums}
+.dist-row{display:flex;align-items:center;gap:10px;padding:8px 0}.dist-label{width:56px;font-size:12px;color:var(--yg-muted)}.dist-track{flex:1;height:8px;background:var(--yg-line);border-radius:8px;overflow:hidden}.dist-track i{display:block;height:100%;border-radius:8px;transition:width .3s}.dist-row b{width:24px;text-align:right;font-variant-numeric:tabular-nums}
 .timeline .tl-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:12px}.timeline .tl-row:last-child{border:0}
 .tl-dot{width:7px;height:7px;border-radius:50%;background:var(--yg-primary-2);flex:none}.tl-time{color:var(--yg-muted);font-variant-numeric:tabular-nums;min-width:70px}.tl-action{color:var(--yg-primary);min-width:150px}.tl-detail{color:var(--yg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tl-target{color:#8a93aa}
-.empty{text-align:center;color:var(--yg-muted);padding:24px}.empty.big{padding:60px;font-size:13px}
-.sub-head{margin:4px 0 12px;padding-left:10px;border-left:3px solid #4f7cff;color:var(--yg-muted);font-size:12px}
-.connect-hero{background:linear-gradient(135deg,#f0f7ff,#f7fbff);border:1px solid #d5e6ff;margin-bottom:18px}
+/* v2.1.6 #245：空态统一。此前全站有 4 种写法（.empty / .empty.big / .empty-hint / el-empty），
+   字号与留白各不相同（padding 24 / 28 / 60px）→ 同一屏里空态体量参差。
+   现在统一为一套：.empty 基础态 + .empty.big 强调态（仅放大留白，字号同基础态），
+   .empty-hint 保留类名但复用基础态口径（历史上用于图表区提示）。 */
+.empty{text-align:center;color:var(--yg-muted);padding:24px;font-size:13px}
+.empty.big{padding:60px}
+.empty-hint{padding:28px;text-align:center;color:var(--yg-muted);font-size:13px}
+.sub-head{margin:4px 0 12px;padding-left:10px;border-left:3px solid var(--yg-primary);color:var(--yg-muted);font-size:12px}
+.connect-hero{background:linear-gradient(135deg,var(--yg-tone-blue-bg),var(--yg-surface));border:1px solid var(--yg-line);margin-bottom:18px}
 .connect-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
 .connect-head h3{margin:0 0 4px;font-size:17px;color:#1b2b4b}
 .connect-head p{margin:0;color:var(--yg-muted);font-size:12px}
 .connect-steps{display:flex;gap:8px;margin:18px 0}
-.cstep{flex:1;display:flex;align-items:center;gap:9px;padding:10px 12px;border-radius:10px;background:#fff;border:1px solid var(--yg-line);color:var(--yg-muted);font-size:12px}
-.cstep b{width:22px;height:22px;border-radius:50%;background:#e8edf5;color:#8a97ad;display:flex;align-items:center;justify-content:center;font-size:12px;flex:none}
+.cstep{flex:1;display:flex;align-items:center;gap:9px;padding:10px 12px;border-radius:var(--yg-radius-sm);background:var(--yg-surface);border:1px solid var(--yg-line);color:var(--yg-muted);font-size:12px}
+.cstep b{width:22px;height:22px;border-radius:50%;background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg);display:flex;align-items:center;justify-content:center;font-size:12px;flex:none}
 .cstep.active{border-color:#4f7cff;color:#2a5bd7}.cstep.active b{background:#4f7cff;color:#fff}
 .cstep.done{border-color:#19b3a6;color:#12897f}.cstep.done b{background:#19b3a6;color:#fff}
 .connect-form{display:flex;flex-direction:column;gap:10px;max-width:560px}
 .connect-actions{display:flex;gap:10px}
 .connect-done .el-result{padding:6px 0}
 .connect-foot{display:flex;gap:20px;margin-top:14px;font-size:12px;color:var(--yg-muted);flex-wrap:wrap;align-items:center}
-.credential-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;padding:16px 18px;border-radius:14px;background:linear-gradient(135deg,#f2fbf9,#f7f9fe);border:1px solid #d8efe9}
+.credential-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;padding:16px 18px;border-radius:var(--yg-radius-sm);background:linear-gradient(135deg,var(--yg-tone-teal-bg),var(--yg-surface));border:1px solid var(--yg-line)}
 .cred-cell small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:7px}
 .cred-cell b{font-size:13px;word-break:break-all}
 .credential-bar .good{color:#128f84}.credential-bar .bad{color:var(--yg-rose)}.credential-bar .warn{color:#d8861a}
 .dot.live{background:#19b3a6;box-shadow:0 0 0 4px rgba(25,179,166,.15);margin-right:6px;animation:pulseDot 1.8s ease-in-out infinite}
 @keyframes pulseDot{0%,100%{opacity:1}50%{opacity:.45}}
-.auth-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.auth-summary-item{background:#fff;border:1px solid var(--yg-line);border-radius:14px;padding:15px 18px}.auth-summary-item small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px}.auth-summary-item b{font-size:14px;word-break:break-all}.auth-summary-item .good{color:#19b3a6}.auth-summary-item .bad{color:var(--yg-rose)}
-.method-card{background:#fff;border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:22px;box-shadow:var(--yg-shadow);margin-bottom:18px}
+.auth-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.auth-summary-item{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:15px 18px;box-shadow:var(--yg-shadow)}.auth-summary-item small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px}.auth-summary-item b{font-size:14px;word-break:break-all}.auth-summary-item .good{color:var(--yg-tone-green-fg)}.auth-summary-item .bad{color:var(--yg-rose)}
+.method-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;box-shadow:var(--yg-shadow);margin-bottom:18px}
 .method-top{display:flex;gap:14px;align-items:center;margin-bottom:16px}.method-top h3{margin:0 0 4px;font-size:16px}.method-top p{margin:0;color:var(--yg-muted);font-size:12px}
-.method-icon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;flex:none}.method-icon.indigo{background:#eeedff;color:#5b5bd6}.method-icon.teal{background:#e5f8f5;color:#19b3a6}.method-icon .ico{width:21px;height:21px}
+.method-icon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;flex:none}.method-icon.indigo{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}.method-icon.teal{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}.method-icon .ico{width:21px;height:21px}
 .steps{margin:0 0 18px;padding-left:20px;color:#5b6484;font-size:12px;line-height:2}.steps li::marker{color:var(--yg-primary)}
 .method-foot{display:flex;justify-content:space-between;align-items:center;border-top:1px dashed var(--yg-line);padding-top:16px}
-.device-panel{border-color:#cfd0f8;background:linear-gradient(180deg,#fafaff,#fff)}
+.device-panel{border-color:var(--yg-line);background:linear-gradient(180deg,var(--yg-tone-violet-bg),var(--yg-surface))}
 .pulse{color:var(--yg-primary);animation:blink 1.4s infinite}@keyframes blink{50%{opacity:.35}}
-.device-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:30px;letter-spacing:6px;text-align:center;background:#f5f5ff;border:1px dashed #c9c9f5;border-radius:12px;padding:18px;margin-bottom:16px;color:#3b3b8f}
-.webqr-box{display:flex;justify-content:center;padding:14px;background:#fff;border:1px solid var(--yg-line);border-radius:12px;margin-bottom:14px}.webqr-box img{width:240px;height:240px;image-rendering:pixelated}
-.webqr-code{text-align:center;font-size:14px;color:var(--yg-muted);margin-bottom:14px}.webqr-code b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;letter-spacing:2px;color:#3b3b8f}
+.device-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:30px;letter-spacing:6px;text-align:center;background:var(--yg-tone-violet-bg);border:1px dashed var(--yg-line);border-radius:12px;padding:18px;margin-bottom:16px;color:var(--yg-tone-violet-fg)}
+.webqr-box{display:flex;justify-content:center;padding:14px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:12px;margin-bottom:14px}.webqr-box img{width:240px;height:240px;image-rendering:pixelated}
+.webqr-code{text-align:center;font-size:14px;color:var(--yg-muted);margin-bottom:14px}.webqr-code b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;letter-spacing:2px;color:var(--yg-tone-violet-fg)}
 .device-actions{display:flex;gap:12px;justify-content:center;align-items:center}.device-link{color:var(--yg-primary);text-decoration:none;font-size:13px;display:flex;align-items:center;gap:5px}
 .kv-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.kv-grid small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.kv-grid b{font-size:13px;word-break:break-all}
-.hint{color:#929bb5;font-size:11px;line-height:1.8;margin:12px 0 0}
+.hint{color:var(--yg-muted);font-size:11px;line-height:1.8;margin:12px 0 0}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
 /* v0.9.6：镜像锁占用提示——后台改名复查静默持锁时，让用户知道为何「立即同步」会 409 */
-.mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:#fff8e6;border:1px solid #f5d98a;border-radius:10px;color:#8a6d1f;font-size:12px;line-height:1.7}
-.batch-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px;padding:10px 14px;background:#f4f7ff;border:1px solid #dbe3ff;border-radius:10px;font-size:12px}
-.batch-control-row .hint{color:#5b6484}
+.mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:var(--yg-tone-amber-bg);border:1px solid var(--yg-line);border-radius:10px;color:var(--yg-tone-amber-fg);font-size:12px;line-height:1.7}
+.batch-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px;padding:10px 14px;background:var(--yg-tone-blue-bg);border:1px solid var(--yg-line);border-radius:10px;font-size:12px}
+.batch-control-row .hint{color:var(--yg-muted)}
 /* v0.9.0：镜像同步页分区治理——状态数字按语义分组，配置/接口改成结构化 chip */
 .mirror-fold{margin-top:16px;border-top:1px solid var(--yg-line);border-bottom:0}
 .mirror-fold .el-collapse-item__header{font-size:13px;font-weight:650;color:#3b4361;min-height:42px;height:auto;padding:10px 4px}
 .mirror-fold .el-collapse-item__content{padding-bottom:10px}
 .fold-title{font-size:13px;font-weight:650;color:#3b4361;display:inline-flex;align-items:center;gap:8px}
 .fold-title::before{content:"";width:18px;height:18px;border-radius:6px;flex:none;background:linear-gradient(135deg,#8271ef,#5b5bd6);background-image:radial-gradient(circle at 50% 50%,#fff 0 2px,transparent 2.4px)}
-.fold-sub{margin-left:8px;font-size:11px;color:#929bb5;font-weight:400}
+.fold-sub{margin-left:8px;font-size:11px;color:var(--yg-muted);font-weight:400}
 /* 状态分组：标题 + 网格，一组一类，不再一屏 15 个数字 */
 .stat-group{margin-bottom:16px}.stat-group:last-child{margin-bottom:0}
-.stat-group-title{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:#4b5270;margin:0 0 10px}
-.stat-group-title .grp-ico{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;font-size:11px;background:#eef1fb;color:#5b5bd6;flex:none}
-.stat-group-title .grp-ico.g-teal{background:#e5f8f5;color:#12897f}
-.stat-group-title .grp-ico.g-amber{background:#fff3e2;color:#c47b12}
-.stat-group-title .grp-ico.g-violet{background:#f2edff;color:#8b6cf0}
+.stat-group-title{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:var(--yg-muted);margin:0 0 10px}
+.stat-group-title .grp-ico{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;font-size:11px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);flex:none}
+.stat-group-title .grp-ico.g-teal{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}
+.stat-group-title .grp-ico.g-amber{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
+.stat-group-title .grp-ico.g-violet{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}
 .mini-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
-.mini-stat{background:#fafbfe;border:1px solid var(--yg-line);border-radius:11px;padding:11px 13px;transition:.16s}
-.mini-stat:hover{background:#fff;border-color:#d9dcf5}
+.mini-stat{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:11px 13px;box-shadow:var(--yg-shadow);transition:.16s}
+.mini-stat:hover{border-color:var(--yg-primary-2);box-shadow:var(--yg-shadow-lg)}
 .mini-stat small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px;line-height:1.3}
 .mini-stat b{font-size:18px;font-variant-numeric:tabular-nums;font-weight:750}
 /* 生效配置 / 接口清单：结构化 chip 行，替代长串小字 */
 .info-chips{display:flex;flex-wrap:wrap;gap:8px 10px;margin:2px 0 0}
-.info-chip{display:inline-flex;align-items:center;gap:6px;background:#f6f7fb;border:1px solid var(--yg-line);border-radius:9px;padding:6px 11px;font-size:12px;color:#4b5270}
+.info-chip{display:inline-flex;align-items:center;gap:6px;background:var(--yg-bg);border:1px solid var(--yg-line);border-radius:9px;padding:6px 11px;font-size:12px;color:var(--yg-muted)}
 .info-chip b{font-weight:700;color:var(--yg-ink)}
-.info-chip.on b{color:#12897f}.info-chip.off b{color:var(--yg-rose)}
+.info-chip.on b{color:var(--yg-tone-green-fg)}.info-chip.off b{color:var(--yg-rose)}
 .endpoint-list{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 0}
-.endpoint-list code{font-size:11px;background:#eef1fb;color:#4b5270;border:1px solid #e2e6f5;border-radius:6px;padding:3px 8px;word-break:break-all}
+.endpoint-list code{font-size:11px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);border:1px solid var(--yg-line);border-radius:6px;padding:3px 8px;word-break:break-all}
 /* v0.9.3：分发与互动中心三板块标题（a / b / c） */
 .sec-band{display:flex;align-items:center;gap:12px;margin:22px 0 14px}
 .sec-band .sec-key{display:inline-grid;place-items:center;width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#5b5bd6,#3b3b8f);color:#fff;font-weight:800;font-size:15px;flex:none}
 .sec-band h3{margin:0;font-size:16px;font-weight:750;color:var(--yg-ink)}
 .sec-band p{margin:2px 0 0;font-size:11px;color:var(--yg-muted)}
 .sec-band .sec-line{flex:1;height:1px;background:var(--yg-line)}
-/* v0.9.0：Bot 交互中心卡片（参考 embyhub） */
-.bot-card{background:#fff;border:1px solid var(--yg-line);border-radius:16px;padding:22px 24px;margin-bottom:16px;box-shadow:0 2px 12px rgba(28,36,72,.04)}
+/* v0.9.0：Bot 交互中心卡片（参考 embyhub）——v2.1.6 #245 已统一到 .panel 口径 */
+.bot-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius);padding:20px 22px;margin-bottom:16px;box-shadow:var(--yg-shadow)}
 .bot-card-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
 .bot-card-head h3{font-size:16px;margin:0;font-weight:700}
-.bot-ico{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:#eef1fb;color:#4b5270;font-size:16px;font-weight:700}
+.bot-ico{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);font-size:16px;font-weight:700}
 .restrict-sub{font-size:12px;color:#929bb5}
 .cmd-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.cmd-item{display:flex;align-items:center;gap:12px;background:#f6f7fb;border:1px solid #eef0f6;border-radius:11px;padding:12px 14px}
-.cmd-chip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:#3b5bdb;background:#eaf0ff;border:1px solid #d6e0ff;border-radius:7px;padding:4px 10px;white-space:nowrap}
+.cmd-item{display:flex;align-items:center;gap:12px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px;box-shadow:var(--yg-shadow)}
+.cmd-chip{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--yg-tone-blue-fg);background:var(--yg-tone-blue-bg);border:1px solid var(--yg-line);border-radius:7px;padding:4px 10px;white-space:nowrap}
 .cmd-desc{font-size:12px;color:#5a6178;flex:1}
 .cmd-add{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;padding-top:16px;border-top:1px dashed var(--yg-line)}
-.restrict-card{background:linear-gradient(180deg,#f4fbf6,#fff);border-color:#d8efdd}
-.restrict-card .bot-ico{background:#e3f6e8;color:#1f8a4c}
-.restrict-row{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px dashed #e2f0e6}
+.restrict-card{background:linear-gradient(180deg,var(--yg-tone-green-bg),var(--yg-surface));border-color:var(--yg-line)}
+.restrict-card .bot-ico{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
+.restrict-row{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px dashed var(--yg-line)}
 .restrict-row.col{flex-direction:column;align-items:stretch;gap:8px}
 .restrict-row:last-of-type{border-bottom:0}
 .restrict-label b{display:block;font-size:12px;color:#2f6b45;margin-bottom:4px}
@@ -4390,19 +4810,18 @@ button{font-family:inherit}
 .restrict-row .unit{font-size:12px;color:#2f6b45}
 .hint.warn{color:#b8860b}
 .cursor-box{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.cursor-box small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.cursor-box b{font-size:18px}
-.view-switch{display:flex;border:1px solid var(--yg-line);border-radius:9px;overflow:hidden}.view-switch button{border:0;background:#fff;padding:7px 10px;cursor:pointer;color:#9aa3bd}.view-switch button.on{background:#eeedff;color:var(--yg-primary)}
+.view-switch{display:flex;border:1px solid var(--yg-line);border-radius:9px;overflow:hidden}.view-switch button{border:0;background:var(--yg-surface);padding:7px 10px;cursor:pointer;color:var(--yg-muted)}.view-switch button.on{background:var(--yg-tone-violet-bg);color:var(--yg-primary)}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:14px}
 /* v0.6.4：参考 STRM 刮削海报墙——紧凑竖版卡片、统一 2:3 海报、状态角标 */
-.series-card{border-radius:11px}.series-card .media-poster{height:auto;aspect-ratio:2/3;background:#f0f2f8}
-.series-card .media-body{padding:9px 10px}.series-card .media-body b{font-size:12px}.series-card .media-body small{font-size:10px;color:var(--yg-muted);margin-top:3px}
+.series-card{border-radius:11px}.series-card .media-poster{height:auto;aspect-ratio:2/3;background:var(--yg-bg)}.series-card .media-body{padding:9px 10px}.series-card .media-body b{font-size:12px}.series-card .media-body small{font-size:10px;color:var(--yg-muted);margin-top:3px}
 .series-card .media-meta{flex-wrap:wrap;gap:4px 8px;margin-top:6px}.series-card .media-actions{padding:0 9px 10px}.series-card .media-actions .el-button{margin:0 2px 4px 0;padding:5px 8px;font-size:11px}
 .series-card .media-badge{border-radius:6px;padding:3px 7px;font-size:9px}
-.scrape-ok{position:absolute;top:8px;left:8px;width:20px;height:20px;border-radius:50%;background:#19b3a6;color:#fff;font-size:12px;font-weight:800;display:grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.2)}
-.ep-count{position:absolute;bottom:6px;right:6px;padding:2px 7px;border-radius:10px;background:rgba(20,24,40,.75);color:#fff;font-size:9px;font-weight:700}
-.head-tools{flex-wrap:wrap;gap:6px 8px;justify-content:flex-end}
+/* v2.1.6 #245：原先这里还有一条独立的 .scrape-ok 与 .ep-count 定义，
+   被下方 .series-card .media-badge 那一行里的同名定义完全覆盖（同特异度后者胜）
+   → 死代码。清除，避免「同选择器多处定义」的隐性坑。 */
 .schedule-controls{align-items:center;gap:8px}.schedule-label{color:var(--yg-muted);font-size:11px;white-space:nowrap}
-.media-card{background:#fff;border:1px solid var(--yg-line);border-radius:14px;overflow:hidden;box-shadow:var(--yg-shadow);transition:.2s}.media-card:hover{transform:translateY(-3px);box-shadow:0 16px 34px rgba(28,36,66,.12)}
-.media-poster{height:270px;position:relative;background:#eef0f6}.no-poster{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#b4bcd2}.no-poster .ico{width:30px;height:30px}.no-poster span{font-size:11px;letter-spacing:1px}
+.media-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);overflow:hidden;box-shadow:var(--yg-shadow);transition:.2s}.media-card:hover{transform:translateY(-3px);box-shadow:var(--yg-shadow-lg)}
+.media-poster{height:270px;position:relative;background:var(--yg-bg)}.no-poster{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--yg-muted)}.no-poster .ico{width:30px;height:30px}.no-poster span{font-size:11px;letter-spacing:1px}
 .media-badge{position:absolute;top:10px;left:10px;padding:4px 9px;border-radius:20px;font-size:10px;font-weight:700;color:#fff;background:#98a1b8}.badge-active{background:#19b3a6}.badge-not_created{background:#e29328}.badge-failed{background:#e5526b}.badge-cancelled{background:#98a1b8}
 .series-card .media-badge{left:auto;right:10px}.scrape-ok{position:absolute;top:10px;left:10px;width:22px;height:22px;border-radius:50%;background:#19b3a6;color:#fff;font-size:13px;font-weight:800;display:grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.2)}.ep-count{position:absolute;bottom:8px;right:8px;padding:3px 8px;border-radius:12px;background:rgba(20,24,40,.78);color:#fff;font-size:10px;font-weight:700}
 /* 阶段六资源卡角标：推送 / 链接有效性（本地推断） */
@@ -4413,7 +4832,7 @@ button{font-family:inherit}
 .sc-tabbar{display:flex;gap:8px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:6px;box-shadow:var(--yg-shadow);overflow-x:auto}
 .sc-tab{border:0;background:transparent;white-space:nowrap;padding:11px 20px;border-radius:10px;display:flex;align-items:center;gap:9px;color:var(--yg-muted);font-size:13px;font-weight:700;cursor:pointer;transition:.18s}
 .sc-tab:hover{background:var(--yg-bg);color:var(--yg-ink)}
-.sc-tab.active{background:linear-gradient(135deg,#eef0ff,#f4f0ff);color:var(--yg-primary);box-shadow:0 2px 8px rgba(91,91,214,.12)}
+.sc-tab.active{background:linear-gradient(135deg,var(--yg-tone-blue-bg),var(--yg-tone-violet-bg));color:var(--yg-primary);box-shadow:0 2px 8px rgba(91,91,214,.12)}
 .sc-tab-ico{font-size:15px}
 .sc-workspace{min-width:0}
 /* v2.1.5：分享中心「非总览」子页的满宽容器。
@@ -4430,19 +4849,19 @@ button{font-family:inherit}
 .sc-topbar{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--yg-line)}
 .sc-topbar h2{margin:0 0 5px;font-size:23px;letter-spacing:-.4px;font-weight:750}
 .sc-topbar p{margin:0;color:var(--yg-muted);font-size:12px}
-.sc-run-badge{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:20px;background:#e7f8f0;color:#159a6b;font-size:12px;font-weight:700}
+.sc-run-badge{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:20px;background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg);font-size:12px;font-weight:700}
 .sc-run-badge i{width:7px;height:7px;border-radius:50%;background:#19b98a}
-.sc-run-badge.paused{background:#fdecef;color:#d9435e}
+.sc-run-badge.paused{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}
 .sc-run-badge.paused i{background:#e5526b}
 .sc-dash{display:flex;flex-direction:column;gap:18px}
 .sc-kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
 .sc-kpi{border:1px solid var(--yg-line);background:var(--yg-surface);border-radius:var(--yg-radius-sm);padding:18px;display:flex;align-items:center;gap:14px;cursor:pointer;text-align:left;box-shadow:var(--yg-shadow);transition:.2s}
 .sc-kpi:hover{transform:translateY(-3px);box-shadow:var(--yg-shadow-lg)}
 .sc-kpi-ico{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;font-size:20px;font-weight:800;flex:none}
-.sc-kpi-blue .sc-kpi-ico{background:#eef0ff;color:#5b5bd6}
-.sc-kpi-green .sc-kpi-ico{background:#e7f8f0;color:#19a97c}
-.sc-kpi-amber .sc-kpi-ico{background:#fff3e2;color:#e08a1e}
-.sc-kpi-rose .sc-kpi-ico{background:#fdecef;color:#e5526b}
+.sc-kpi-blue .sc-kpi-ico{background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg)}
+.sc-kpi-green .sc-kpi-ico{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
+.sc-kpi-amber .sc-kpi-ico{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
+.sc-kpi-rose .sc-kpi-ico{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}
 .sc-kpi-body{flex:1;min-width:0}
 .sc-kpi-body small{display:block;color:var(--yg-muted);font-size:12px;margin-bottom:5px}
 .sc-kpi-body b{display:block;font-size:27px;font-weight:790;line-height:1;font-variant-numeric:tabular-nums}
@@ -4453,16 +4872,16 @@ button{font-family:inherit}
 .sc-dash-two{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:18px;align-items:start}
 .sc-link-btn{border:0;background:transparent;color:var(--yg-primary);font-size:12px;font-weight:700;cursor:pointer;padding:4px 6px}
 .sc-link-btn:hover{text-decoration:underline}
-.sc-mini-tag{background:#eef0ff;color:var(--yg-primary);border-radius:7px;padding:2px 7px;font-size:10px;font-weight:700}
+.sc-mini-tag{background:var(--yg-tone-blue-bg);color:var(--yg-primary);border-radius:7px;padding:2px 7px;font-size:10px;font-weight:700}
 .sc-dot-state{font-size:10px;font-weight:700;padding:2px 6px;border-radius:7px;background:var(--yg-bg);color:var(--yg-muted)}
-.sc-dot-state.published{background:#e7f8f0;color:#159a6b}.sc-dot-state.failed{background:#fdecef;color:#d9435e}
+.sc-dot-state.published{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}.sc-dot-state.failed{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}
 /* v2.1.4：链接状态视觉态四档（后端 link_tone 下发：ok / muted / warn / bad）。
    此前只有 published / failed 两档，链接状态全部落回灰底灰字，
    「有效」和「疑似失效」在页面上看不出区别。 */
-.sc-dot-state.ok{background:#e7f8f0;color:#159a6b}
+.sc-dot-state.ok{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
 .sc-dot-state.muted{background:var(--yg-bg);color:var(--yg-muted)}
-.sc-dot-state.warn{background:#fff3e2;color:#cf7f1c}
-.sc-dot-state.bad{background:#fdecef;color:#d9435e}
+.sc-dot-state.warn{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
+.sc-dot-state.bad{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}
 .sc-health-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .sc-health{border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:14px;text-align:left;cursor:pointer;position:relative;transition:.2s;background:var(--yg-surface)}
 .sc-health:hover{transform:translateY(-2px);box-shadow:var(--yg-shadow-lg)}
@@ -4477,15 +4896,37 @@ button{font-family:inherit}
 .sc-detail-kv b{display:block;font-size:12px;font-weight:700}
 /* v2.0.5 设计稿：发布总览 */
 .sc-kpi-six{grid-template-columns:repeat(6,minmax(0,1fr))}
-.sc-kpi-six .sc-kpi{padding:14px;gap:9px}
-.sc-kpi-six .sc-kpi-ico{width:38px;height:38px;font-size:17px}
-.sc-kpi-six .sc-kpi-body b{font-size:21px}
-.sc-kpi-violet .sc-kpi-ico{background:#f0ebff;color:#7b5bd6}.sc-kpi-teal .sc-kpi-ico{background:#e6f7f7;color:#199a9a}
+/* v2.1.6：KPI 卡与基础 .sc-kpi 对齐（此前六卡被压到 padding:14px / ico 38px / 数字 21px，
+   与页面其它卡片的视觉体量不一致 → 「尺寸与页面不符」）。
+   保留略紧的排版是为了六列并排时不换行，但不再做「缩小版」处理。 */
+.sc-kpi-six .sc-kpi{padding:16px;gap:11px;min-height:76px}
+.sc-kpi-six .sc-kpi-ico{width:40px;height:40px;font-size:18px}
+.sc-kpi-six .sc-kpi-body b{font-size:24px}
+.sc-kpi-violet .sc-kpi-ico{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}.sc-kpi-teal .sc-kpi-ico{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}
 .sc-link-source-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:-4px 0 16px;padding:9px 13px;background:var(--yg-surface);border:1px dashed var(--yg-line);border-radius:10px;font-size:11px;color:var(--yg-muted)}
 .sc-link-source-note b{color:var(--yg-primary)}
 .sc-link-source-note .sc-ico{color:var(--yg-primary);font-style:normal}
 .sc-link-mini{margin-left:auto;font-weight:600;color:var(--yg-primary)}
-.sc-dash-three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:start;margin-bottom:18px}
+/* v2.1.6：发布总览卡片尺寸对齐。
+   此前 .sc-dash-three 显式 align-items:start → 同一行三张卡各自按内容高度收缩，
+   上下边缘参差不齐（趋势图 160px / 占比图 130px / 热门候选随行数变）。
+   修法：① 同行卡片改 stretch 等高；② 卡片改纵向 flex、内容区撑满并对齐底部。 */
+.sc-dash-three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch;margin-bottom:18px}
+.sc-dash-three>.sc-card{display:flex;flex-direction:column}
+.sc-dash-three>.sc-card>.sc-card-head{flex:none}
+/* 趋势图：撑满卡片剩余高度，绘图区随卡片一起等高 */
+.sc-dash-three .sc-trend-wrap{flex:1;display:flex;flex-direction:column;justify-content:center}
+.sc-dash-three .sc-trend-svg{flex:1;height:auto;min-height:150px}
+.sc-dash-three .sc-trend-labels{flex:none}
+/* 占比图：撑满并垂直居中 */
+.sc-dash-three .sc-ratio-wrap{flex:1;min-height:150px}
+/* 热门候选：列表撑满，「查看候选详情」贴卡片底部（与三表行的底部对齐） */
+.sc-dash-three .sc-hot-list{flex:1;justify-content:center}
+.sc-dash-three .sc-hot-more{margin-top:auto;padding-top:12px}
+/* 三表行：卡片等高（stretch 已保证），表格保持自身 max-height，
+   不给 el-table 加 flex:1 —— el-table 依赖显式 height 才撑内部滚动区，
+   强行 flex:1 会让短表格塌陷。空态提示占满剩余高度，与表格底部对齐。 */
+.sc-three-tables>.sc-card>.empty{flex:1;display:grid;place-items:center}
 .sc-seg{display:flex;gap:3px;background:var(--yg-bg);border-radius:8px;padding:3px}
 .sc-seg button{border:0;background:transparent;color:var(--yg-muted);font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer}
 .sc-seg button.on{background:var(--yg-primary);color:#fff}
@@ -4505,7 +4946,8 @@ button{font-family:inherit}
 .sc-hot-rank.top{background:#6d5efc;color:#fff}
 .sc-hot-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .sc-hot-score{color:var(--yg-primary);font-variant-numeric:tabular-nums;font-weight:700}
-.sc-hot-more{display:block;margin-top:12px;text-align:center;width:100%}
+/* v2.1.6：底部按钮改为撑满卡片底部（margin-top:auto 由 .sc-dash-three 段提供） */
+.sc-hot-more{display:block;text-align:center;width:100%}
 .sc-three-tables .sc-card-head p{white-space:normal}
 /* v2.0.5 设计稿：发布规则 */
 .sc-subtabbar{display:flex;gap:6px;margin-bottom:14px;border-bottom:1px solid var(--yg-line)}
@@ -4526,27 +4968,24 @@ button{font-family:inherit}
       卡片被二次压扁。
    v2.1.5 修法：三页**移出 Grid**，由 .sc-subpage 独占整行满宽（与总览页 .sc-dash 平级）；
    页内需要并排时由各页自己的内部容器负责。 */
-/* 发布规则页内部：基础规则 / 周期计划 两卡并列，分类排期表独占整行 */
-.sc-rule-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+/* 发布规则页内部：v2.1.6 改为**竖向上下对齐**——
+   「上新即时推送」与「周期计划管理」两张卡片上下依次排布（单列），
+   分类排期表独占整行。此前是 2 列 Grid 并排，两卡宽度被压到半格、
+   高度不齐，视觉上「不对齐」。 */
+.sc-rule-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;align-items:stretch}
 .sc-rule-layout .sc-rule-full{grid-column:1/-1}
-@media(max-width:1100px){.sc-rule-layout{grid-template-columns:1fr}}
 /* 配置时段下拉：小时级选择，静默区间内的小时不可选 */
 .sc-hour-select{width:82px}
 .sc-time-dash{color:var(--yg-muted);font-size:11px}
 /* 与静默保护时段重叠的提示 */
 .sc-cell-warn{margin-top:3px;font-size:10px;color:#e5526b;line-height:1.3}
-/* 周维度建议网格：7 天一行排布，每格显示星期 + 时段 + 来源 */
-.sc-week-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}
-.sc-week-cell{border:1px solid var(--yg-line);border-radius:8px;padding:5px 4px;text-align:center;background:var(--yg-panel);min-width:0}
-.sc-week-cell.has{border-color:var(--yg-primary);background:var(--yg-primary-2)}
-.sc-week-cell.none{opacity:.5}
-.sc-week-day{display:block;font-size:10px;color:var(--yg-muted);font-weight:600}
-.sc-week-time{display:block;font-size:10px;font-weight:700;margin-top:2px;white-space:nowrap;transform:scale(.94);transform-origin:center}
-.sc-week-blank{color:var(--yg-muted);font-weight:500}
-.sc-week-src{display:block;font-size:9px;color:var(--yg-muted);margin-top:1px}
-@media(max-width:900px){
-  .sc-week-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
-}
+/* v2.1.6：推送渠道单元格（频道/群 各一行，格式「群:名称（群id或用户名）」） */
+.sc-target-cell{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+/* v2.1.6：推荐时间段单元格（单一时间段 + 来源标签 + 偏好排名） */
+.sc-suggest-cell{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.sc-suggest-time{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.sc-suggest-rank{margin-top:3px;font-size:10px;color:var(--yg-muted)}
+.sc-mini-tag.muted{background:var(--yg-bg);color:var(--yg-muted)}
 /* v2.1.4：推送任务页 TMDB 海报缩略图 */
 .sc-media-cell{display:flex;align-items:center;gap:9px;min-width:0}
 .sc-media-thumb{width:38px;height:54px;border-radius:6px;overflow:hidden;flex:none;background:var(--yg-bg);display:grid;place-items:center}
@@ -4569,7 +5008,22 @@ button{font-family:inherit}
 /* v2.1.2：详情改为隐藏式弹窗后，两页不再需要常驻侧栏——
    单栏满宽，表格列不再被挤扁（配合 .sc-table-scroll 横向滚动）。 */
 .sc-share-layout,.sc-task-layout{display:block}
+/* v2.1.7 #241：阅读量统计页同样单栏满宽。
+   **独立成条，不并入上面那条 v2.1.2 规则**——那条选择器串是 v2.1.2/v2.1.5
+   三版回归断言的字面量锚点，往里加类名会让历史守卫整体失配。
+   拆开写两边语义各自独立，断言锚点也保持原样。 */
+.sc-stats-layout{display:block}
 .sc-share-main,.sc-task-main{min-width:0}
+/* ---------- v2.1.7 #241：阅读量统计页 ---------- */
+.sc-stats-layout .sc-card{margin-bottom:0}
+.sc-stats-state{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0;padding:10px 14px;border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);background:var(--yg-panel-soft)}
+.sc-state-dot{width:8px;height:8px;border-radius:50%;flex:none}
+.sc-state-dot.on{background:#19a97c;box-shadow:0 0 0 3px rgba(25,169,124,.16)}
+.sc-state-dot.off{background:#8992ac;box-shadow:0 0 0 3px rgba(137,146,172,.16)}
+.sc-state-hint{color:var(--yg-muted);font-size:12px;margin-left:auto}
+.sc-stats-config{border-top:1px solid var(--yg-line);padding-top:14px;margin-top:4px}
+.sc-stats-config .unit{color:var(--yg-muted);font-size:12px;margin-left:6px}
+.sc-stats-config small{display:block;color:var(--yg-muted);font-size:11px;margin-top:4px;line-height:1.5}
 /* 表格横向滚动容器：列保持自身宽度，超出时整体滚动而不是把列压扁 */
 .sc-table-scroll{overflow-x:auto;max-width:100%}
 .sc-table-scroll .el-table{min-width:100%}
@@ -4601,7 +5055,7 @@ button{font-family:inherit}
 .sc-card-head>div{flex:1;min-width:180px}
 .sc-card-head h3{margin:0;font-size:15px;font-weight:750}
 .sc-card-head p{margin:3px 0 0;color:var(--yg-muted);font-size:11px;line-height:1.5}
-.sc-ico{width:34px;height:34px;border-radius:11px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:18px;font-weight:700;flex:none}
+.sc-ico{width:34px;height:34px;border-radius:11px;background:var(--yg-tone-violet-bg);color:var(--yg-primary);display:grid;place-items:center;font-size:18px;font-weight:700;flex:none}
 .sc-stat-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
 .sc-stat{background:rgba(255,255,255,.14);border-radius:12px;padding:14px 8px;text-align:center}
 .sc-stat b{display:block;font-size:23px;font-weight:790;line-height:1.1;font-variant-numeric:tabular-nums}
@@ -4620,38 +5074,38 @@ button{font-family:inherit}
 @media(max-width:1100px){.sc-stat-row{grid-template-columns:repeat(3,1fr)}}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
 .media-actions{display:flex;gap:5px;padding:0 12px 12px;flex-wrap:wrap}
-.step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:#eeedff;color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}
+.step-panel .step-head{display:flex;align-items:center;gap:10px;margin-bottom:16px}.step-head span{width:28px;height:28px;border-radius:9px;background:var(--yg-tone-violet-bg);color:var(--yg-primary);display:grid;place-items:center;font-size:12px;font-weight:800}.step-head h3{margin:0;font-size:14px}
 /* v0.6.2：分发规则三卡片管理布局 */
 .manage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;align-items:start}.manage-card{margin-bottom:0;min-width:0}.manage-card .panel-head h3{font-size:15px}.manage-card .panel-head .hint{display:block;font-size:11px;color:var(--yg-muted);margin-top:3px}.manage-card .el-table{font-size:12px}.manage-card .el-table .el-button+.el-button{margin-left:2px}
 .mini-row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px dashed var(--yg-line);font-size:11px}.mini-row:last-child{border:0}.mini-row b{font-size:12px;flex:none}.mini-row>span:not(.row-actions){color:var(--yg-muted);max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row-actions{display:flex;gap:4px;flex:none;max-width:none!important;overflow:visible!important}
-.row-btn{border:1px solid var(--yg-line);background:#fff;border-radius:6px;padding:3px 7px;font-size:10px;color:var(--yg-primary);cursor:pointer;white-space:nowrap}
-.row-btn:hover{background:#eeedff}.row-btn.danger{color:var(--yg-rose)}.row-btn.danger:hover{background:#ffedf0}.row-btn:disabled{opacity:.5;cursor:wait}
-.status-tag{padding:3px 9px;border-radius:14px;font-size:11px;font-weight:600;background:#eef1f7;color:#7e88a8}.st-sent{background:#e5f8f5;color:#129688}.st-pending{background:#fff3e2;color:#cf7f1c}.st-review{background:#f2edff;color:#7a55dd}.st-retry{background:#ffedf0;color:#d63f59}.st-failed{background:#f1f2f6;color:#7e88a8}
-.tpl-layout{align-items:start}.var-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}.var-grid button{border:1px solid var(--yg-line);background:#fafbff;border-radius:8px;padding:8px 4px;font-size:11px;color:var(--yg-primary);cursor:pointer}.var-grid button:hover{background:#eeedff}
+.row-btn{border:1px solid var(--yg-line);background:var(--yg-surface);border-radius:6px;padding:3px 7px;font-size:10px;color:var(--yg-primary);cursor:pointer;white-space:nowrap}
+.row-btn:hover{background:var(--yg-tone-violet-bg)}.row-btn.danger{color:var(--yg-rose)}.row-btn.danger:hover{background:var(--yg-tone-red-bg)}.row-btn:disabled{opacity:.5;cursor:wait}
+.status-tag{padding:3px 9px;border-radius:14px;font-size:11px;font-weight:600;background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}.st-sent{background:var(--yg-tone-teal-bg);color:var(--yg-tone-teal-fg)}.st-pending{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}.st-review{background:var(--yg-tone-violet-bg);color:var(--yg-tone-violet-fg)}.st-retry{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}.st-failed{background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}
+.tpl-layout{align-items:start}.var-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}.var-grid button{border:1px solid var(--yg-line);background:var(--yg-surface);border-radius:8px;padding:8px 4px;font-size:11px;color:var(--yg-primary);cursor:pointer}.var-grid button:hover{background:var(--yg-tone-violet-bg)}
 /* v0.9.6：模板列表项可点编辑 + 删除；名称区域可点 */
 .tpl-mini{display:flex;align-items:center;justify-content:space-between;gap:8px}.tpl-mini-name{display:inline-flex;align-items:center;gap:8px;cursor:pointer;flex:1;min-width:0}.tpl-mini-name:hover b{color:var(--yg-primary)}
-.preview-box{border:1px dashed var(--yg-line);border-radius:12px;padding:14px;background:#fafbff}.preview-title{font-size:11px;color:var(--yg-muted);margin-bottom:8px}.preview-body{font-size:13px;white-space:pre-wrap;line-height:1.7;min-height:60px}
+.preview-box{border:1px dashed var(--yg-line);border-radius:12px;padding:14px;background:var(--yg-surface)}.preview-title{font-size:11px;color:var(--yg-muted);margin-bottom:8px}.preview-body{font-size:13px;white-space:pre-wrap;line-height:1.7;min-height:60px}
 .mt{margin-top:12px}.ml{margin-left:18px}
-.login-screen{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#eef0fb 0%,#f7f9fd 60%,#eaf7f6 100%);position:relative;overflow:hidden}
+.login-screen{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,var(--yg-bg) 0%,var(--yg-surface) 60%,var(--yg-tone-teal-bg) 100%);position:relative;overflow:hidden}
 .login-deco{position:absolute;border-radius:50%;filter:blur(2px)}.login-deco.d1{width:420px;height:420px;background:rgba(91,91,214,.10);top:-140px;left:-100px}.login-deco.d2{width:360px;height:360px;background:rgba(25,179,166,.11);bottom:-120px;right:-80px}
-.login-card{width:400px;max-width:90vw;background:#fff;border:1px solid var(--yg-line);border-radius:22px;padding:34px;box-shadow:0 24px 70px rgba(40,48,90,.13);z-index:1}
+.login-card{width:400px;max-width:90vw;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:22px;padding:34px;box-shadow:var(--yg-shadow-lg);z-index:1}
 .login-brand{display:flex;align-items:center;gap:14px}.login-brand h1{margin:0;font-size:24px;letter-spacing:-.5px}.login-brand p{margin:3px 0 0;color:var(--yg-muted);font-size:12px}
 .login-divider{height:1px;background:var(--yg-line);margin:26px 0}.login-card h3{margin:0 0 5px;font-size:18px}.login-hint{color:var(--yg-muted);font-size:12px;margin:0 0 18px}
 .login-btn{width:100%;margin-top:16px}.login-foot{display:flex;align-items:center;gap:7px;justify-content:center;color:#9aa3bd;font-size:11px;margin-top:20px}
 .type-chip{padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;color:#fff;background:#98a1b8}
 .type-tv{background:#8b6cf0}.type-movie{background:#5b5bd6}
-.identify-chip{color:#d8861a;background:#fff3e2;padding:2px 7px;border-radius:10px;font-size:10px}
-.match-path{background:#f2f6ff;border:1px solid #dbe6ff;border-radius:10px;padding:12px 14px;margin-bottom:14px}
+.identify-chip{color:var(--yg-tone-amber-fg);background:var(--yg-tone-amber-bg);padding:2px 7px;border-radius:10px;font-size:10px}
+.match-path{background:var(--yg-tone-blue-bg);border:1px solid var(--yg-line);border-radius:10px;padding:12px 14px;margin-bottom:14px}
 .match-path small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}
 .match-path b{font-size:13px;word-break:break-all}
 .dir-clue{display:block;margin-top:3px;color:#6b74a8;font-size:11px;word-break:break-all}
 .match-controls{display:flex;gap:10px}
 .match-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px;max-height:46vh;overflow-y:auto;margin-top:12px}
-.match-card{display:flex;gap:10px;border:1px solid var(--yg-line);border-radius:12px;padding:10px;cursor:pointer;background:#fff;transition:.18s}
-.match-card:hover{border-color:#a9a4f5;transform:translateY(-2px)}
-.match-card.on{border-color:var(--yg-primary);box-shadow:0 0 0 2px rgba(91,91,214,.18);background:#fafaff}
-.match-poster{width:68px;height:96px;flex:none;border-radius:8px;overflow:hidden;background:#eef0f6}
+.match-card{display:flex;gap:10px;border:1px solid var(--yg-line);border-radius:12px;padding:10px;cursor:pointer;background:var(--yg-surface);transition:.18s}
+.match-card:hover{border-color:var(--yg-primary-2);transform:translateY(-2px)}
+.match-card.on{border-color:var(--yg-primary);box-shadow:0 0 0 2px rgba(91,91,214,.18);background:var(--yg-tone-blue-bg)}
+.match-poster{width:68px;height:96px;flex:none;border-radius:8px;overflow:hidden;background:var(--yg-bg)}
 .match-no-poster{height:100%;display:grid;place-items:center;color:#aab2c9;font-size:11px}
 .match-info{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
 .match-info b{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -4662,21 +5116,33 @@ button{font-family:inherit}
 .match-genres{color:var(--yg-primary)!important}
 .match-footer{display:flex;justify-content:space-between;align-items:center}
 .ai-test{display:flex;gap:10px;margin-top:14px}
-.ai-result{margin-top:10px;background:#f7f8fc;border:1px solid var(--yg-line);border-radius:10px;padding:10px}
+.ai-result{margin-top:10px;background:var(--yg-bg);border:1px solid var(--yg-line);border-radius:10px;padding:10px}
 .ai-result pre{margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:#4a5578}
 /* ============ v0.7.0：状态栏 / 批量管理 / 角标 ============ */
 .status-tabs{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;margin-bottom:14px;padding:10px 14px;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:12px}
 .status-tab-group{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .stab-label{font-size:11px;color:var(--yg-muted);margin-right:2px}
-.status-tab-group button{border:1px solid transparent;background:#f4f6fb;color:#6b74a8;border-radius:16px;padding:5px 12px;font-size:12px;cursor:pointer;transition:.16s}
-.status-tab-group button:hover{background:#eeedff;color:var(--yg-primary)}
+.status-tab-group button{border:1px solid transparent;background:var(--yg-bg);color:var(--yg-muted);border-radius:16px;padding:5px 12px;font-size:12px;cursor:pointer;transition:.16s}
+.status-tab-group button:hover{background:var(--yg-tone-violet-bg);color:var(--yg-primary)}
 .status-tab-group button.on{background:var(--yg-primary);color:#fff;box-shadow:0 4px 10px rgba(91,91,214,.22)}
-.batch-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;padding:10px 14px;background:linear-gradient(135deg,#eeedff,#f6f4ff);border:1px solid #d9d4ff;border-radius:12px;font-size:12px}
+.batch-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;padding:10px 14px;background:linear-gradient(135deg,var(--yg-tone-violet-bg),var(--yg-surface));border:1px solid var(--yg-line);border-radius:12px;font-size:12px}
 .batch-bar b{color:var(--yg-primary)}
-.grid-toolbar{display:flex;align-items:center;margin:0 0 8px 2px;font-size:12px;color:var(--yg-muted)}
+.grid-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 8px 2px;font-size:12px;color:var(--yg-muted)}
+.grid-toolbar-right{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .select-all{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
 .select-all input,.card-check{width:15px;height:15px;accent-color:var(--yg-primary);cursor:pointer}
-.media-card.series-card{cursor:pointer;position:relative;transition:.18s}
+/* v2.1.6：资源库按 TMDB 分类分组 + 折叠 */
+.lib-groups{display:flex;flex-direction:column;gap:16px}
+.lib-group{border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);background:var(--yg-surface);padding:12px 14px 14px;box-shadow:var(--yg-shadow)}
+.lib-group-head{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:2px 0 10px;cursor:pointer;text-align:left;color:var(--yg-ink)}
+.lib-group-head:hover b{color:var(--yg-primary)}
+.lib-group-caret{font-size:13px;color:var(--yg-muted);width:14px;flex:none}
+.lib-group-head b{font-size:14px;font-weight:750}
+.lib-group-count{font-size:11px;color:var(--yg-muted);background:var(--yg-bg);border-radius:8px;padding:2px 8px;font-weight:700}
+.lib-group-hint{margin-left:auto;font-size:11px;color:var(--yg-muted)}
+/* v2.1.6 #245：transition 与 .media-card 基础档统一（此前 .2s / .18s 两处取值
+   同特异度后者胜，基础档的 .2s 一直失效）——统一为 .2s。 */
+.media-card.series-card{cursor:pointer;position:relative;transition:.2s}
 .media-card.series-card.picked{border-color:var(--yg-primary);box-shadow:0 0 0 2px rgba(91,91,214,.25)}
 .card-check{position:absolute;top:8px;left:8px;z-index:5;width:18px;height:18px;background:rgba(255,255,255,.9);border-radius:4px}
 .finish-badge{position:absolute;bottom:8px;left:8px;padding:2px 7px;border-radius:9px;font-size:9px;font-weight:700;color:#fff;z-index:4}
@@ -4798,17 +5264,30 @@ button{font-family:inherit}
 @media(max-width:820px){.disc-addtarget{grid-template-columns:1fr}}
 
 /* ============ 阶段六：深色主题（附加层，浅色默认不变，删掉 html.dark 即回到原样） ============ */
-:root{--yg-border:#e6e8eb;--yg-panel-soft:rgba(127,127,127,.05)}
+/* v2.1.6 #245：浅色兜底变量（--yg-border / --yg-panel-soft）已上移到主 :root 块，
+   深色段只保留 html.dark 的覆盖值——避免「删掉 html.dark 即回到原样」时
+   浅色兜底还留在深色段里造成语义混淆。 */
 html.dark{
   --yg-bg:#0f1422;--yg-surface:#1a2133;--yg-ink:#e6eaf5;--yg-muted:#96a0bd;--yg-line:#2b3450;
   --yg-primary:#8b8bf0;--yg-primary-2:#a99bf7;--yg-teal:#3fd0c2;--yg-amber:#f5b65c;--yg-rose:#f07a90;
   --yg-shadow:0 1px 2px rgba(0,0,0,.25),0 12px 32px rgba(0,0,0,.35);
   --yg-shadow-lg:0 2px 4px rgba(0,0,0,.3),0 20px 48px rgba(0,0,0,.45);
   --yg-border:#2b3450;--yg-panel-soft:rgba(255,255,255,.04);
+  /* v2.1.6 #245：语义色 token 的深色值——底色转深色、字色转亮色，
+     保证「浅色底 + 深字」的成对关系在深色下依然成立（对比度不塌）。 */
+  --yg-tone-blue-bg:#232a52;--yg-tone-blue-fg:#a9b0ff;
+  --yg-tone-green-bg:#13352e;--yg-tone-green-fg:#5fd3b6;
+  --yg-tone-amber-bg:#3a2d16;--yg-tone-amber-fg:#f0b464;
+  --yg-tone-red-bg:#3a1f28;--yg-tone-red-fg:#f08a9c;
+  --yg-tone-violet-bg:#2a2450;--yg-tone-violet-fg:#b5a6ff;
+  --yg-tone-teal-bg:#123338;--yg-tone-teal-fg:#5ec9c9;
+  --yg-tone-slate-bg:#242c42;--yg-tone-slate-fg:#9aa3bd;
+  --yg-panel:#1b2233;
+  --yg-grad-a:#1b2140;--yg-grad-b:#12262b;
   --el-color-primary:#8b8bf0;
   color-scheme:dark;
 }
-html.dark body{background:radial-gradient(1200px 600px at 100% -10%,#1b2140 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,#12262b 0%,transparent 55%),var(--yg-bg)}
+html.dark body{background:radial-gradient(1200px 600px at 100% -10%,var(--yg-grad-a) 0%,transparent 55%),radial-gradient(900px 500px at -10% 100%,var(--yg-grad-b) 0%,transparent 55%),var(--yg-bg)}
 /* 面板/卡片/表格：把硬编码白底换成 surface 变量 */
 html.dark .panel,html.dark .card,html.dark .stat-card,html.dark .section-card,
 html.dark .method-card,html.dark .bot-card,html.dark .media-card,html.dark .login-card,
@@ -4829,10 +5308,83 @@ html.dark .status-tag,html.dark .tone-indigo .stat-icon,html.dark .tone-teal .st
 html.dark .grp-ico.g-amber,html.dark .grp-ico.g-violet{color:var(--yg-ink)}
 html.dark .hero{background:linear-gradient(120deg,#1b2340,#172a2f);color:var(--yg-ink)}
 html.dark .unavailable-box,html.dark .mirror-lock-tip,html.dark .batch-control-row{background:#242c44}
+/* v2.1.6 #245：其余页面的「带底色容器」深色覆盖。
+   这些容器此前写死浅色渐变/浅底（.connect-hero 浅蓝渐变、.credential-bar 浅青渐变、
+   .restrict-card 浅绿渐变、.device-panel 浅紫渐变、.match-path 浅蓝底、.device-code 浅紫底），
+   深色下是一块块刺眼浅斑。 */
+html.dark .connect-hero{background:linear-gradient(135deg,#1a2340,#16283a);border-color:var(--yg-line)}
+html.dark .connect-head h3{color:var(--yg-ink)}
+html.dark .credential-bar{background:linear-gradient(135deg,#162a2b,#1b2338);border-color:var(--yg-line)}
+html.dark .restrict-card{background:linear-gradient(180deg,#16281f,#1a2133);border-color:var(--yg-line)}
+html.dark .restrict-card .bot-ico{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
+html.dark .restrict-label b,html.dark .restrict-row .unit{color:var(--yg-tone-green-fg)}
+html.dark .restrict-label small{color:var(--yg-muted)}
+html.dark .restrict-row{border-bottom-color:var(--yg-line)}
+html.dark .device-panel{border-color:var(--yg-line);background:linear-gradient(180deg,#1b2136,#1a2133)}
+html.dark .device-code{background:#1b2140;border-color:var(--yg-line);color:var(--yg-tone-violet-fg)}
+html.dark .webqr-code b{color:var(--yg-tone-violet-fg)}
+html.dark .match-path{background:var(--yg-tone-blue-bg);border-color:var(--yg-line)}
+html.dark .match-card{background:var(--yg-surface);border-color:var(--yg-line)}
+html.dark .match-card.on{background:var(--yg-tone-blue-bg)}
+html.dark .match-poster{background:var(--yg-bg)}
+html.dark .media-poster{background:#232c42}
+html.dark .series-card .media-poster{background:#232c42}
+html.dark .no-poster,html.dark .match-no-poster{color:var(--yg-muted)}
+html.dark .view-switch button{background:var(--yg-surface)}
+html.dark .view-switch button.on{background:var(--yg-tone-violet-bg);color:var(--yg-primary)}
+html.dark .stat-bar{background:var(--yg-line)}
+html.dark .dist-track{background:var(--yg-line)}
 html.dark .el-input__wrapper,html.dark .el-select__wrapper,html.dark .el-textarea__inner{background:var(--yg-surface);box-shadow:0 0 0 1px var(--yg-line) inset}
 html.dark .el-dialog,html.dark .el-message-box,html.dark .el-popper{background:var(--yg-surface);color:var(--yg-ink)}
 html.dark .nav-item:hover{background:rgba(255,255,255,.06)}
 html.dark .task-notice{background:#242c44;color:var(--yg-muted)}
 html.dark .task-card-foot small,html.dark .tm-label{color:var(--yg-muted)}
 html.dark .task-state{background:rgba(255,255,255,.06)}
+/* v2.1.6 #245：分享中心（.sc-*）深色覆盖。
+   此前 .sc-* 体系**零条** html.dark 覆盖——所有卡片/表格/徽标都写死浅色底或浅色字，
+   切到深色主题后分享中心整页失配（浅底白字不可读、深底黑字不可见）。
+   语义色已 token 化（--yg-tone-*），此处只需补齐「结构性」覆盖：
+   ①卡片容器底色/描边；②表格与横向滚动条；③弹窗内文字；④深色下的分隔线与占位底。 */
+html.dark .sc-card,html.dark .sc-tabbar,html.dark .sc-health,html.dark .sc-kpi,
+html.dark .sc-source-note,html.dark .sc-inline-detail,html.dark .sc-task-stats{
+  background:var(--yg-surface);border-color:var(--yg-line);color:var(--yg-ink)
+}
+html.dark .sc-tab{color:var(--yg-muted)}
+html.dark .sc-tab:hover{background:var(--yg-bg);color:var(--yg-ink)}
+html.dark .sc-subtab{color:var(--yg-muted)}
+html.dark .sc-detail-kv>div,html.dark .sc-media-thumb,html.dark .sc-detail-poster,
+html.dark .sc-share-poster,html.dark .sc-hot-rank,html.dark .sc-seg,
+html.dark .sc-hour-row{background:var(--yg-bg);color:var(--yg-ink)}
+html.dark .sc-week-cell{background:var(--yg-panel);border-color:var(--yg-line)}
+html.dark .sc-week-cell.has{background:var(--yg-tone-violet-bg)}
+html.dark .sc-card-head h3,html.dark .sc-card-head p{color:var(--yg-ink)}
+html.dark .sc-card-head p{color:var(--yg-muted)}
+html.dark .sc-table-scroll .el-table{color:var(--yg-ink)}
+html.dark .sc-task-stats b.ok{color:var(--yg-tone-green-fg)}
+html.dark .sc-task-stats b.bad{color:var(--yg-tone-red-fg)}
+html.dark .sc-task-stats b.muted{color:var(--yg-muted)}
+html.dark .sc-health span{box-shadow:0 2px 6px rgba(0,0,0,.35)}
+html.dark .sc-hero-card{background:linear-gradient(120deg,#1b2340 0%,#1b2a3a 52%,#16303a 100%)}
+html.dark .sc-link-source-note{background:var(--yg-surface);border-color:var(--yg-line)}
+html.dark .sc-seg button.on{background:var(--yg-primary);color:#fff}
+html.dark .sc-cell-warn{color:var(--yg-rose)}
+/* v2.1.6 #245：登录页 / 步骤条 / 状态标签的深色收口。 */
+html.dark .login-screen{background:linear-gradient(135deg,var(--yg-bg) 0%,var(--yg-surface) 60%,var(--yg-tone-teal-bg) 100%)}
+html.dark .login-foot{color:var(--yg-muted)}
+html.dark .step-head span{background:var(--yg-tone-violet-bg)}
+html.dark .cstep b{background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}
+html.dark .status-tag{color:var(--yg-tone-slate-fg)}
+html.dark .st-sent{color:var(--yg-tone-teal-fg)}
+/* v2.1.7 #241：阅读量统计页的深色收口。 */
+html.dark .sc-stats-state{background:var(--yg-surface);border-color:var(--yg-line)}
+html.dark .sc-state-dot.on{background:var(--yg-tone-green-fg);box-shadow:0 0 0 3px rgba(95,211,182,.16)}
+html.dark .sc-state-dot.off{background:var(--yg-muted);box-shadow:0 0 0 3px rgba(154,163,189,.16)}
+html.dark .sc-state-hint{color:var(--yg-muted)}
+html.dark .sc-stats-config{border-color:var(--yg-line)}
+html.dark .sc-stats-config .unit,html.dark .sc-stats-config small{color:var(--yg-muted)}
+html.dark .st-pending{color:var(--yg-tone-amber-fg)}
+html.dark .st-review{color:var(--yg-tone-violet-fg)}
+html.dark .st-retry{color:var(--yg-tone-red-fg)}
+html.dark .st-failed{color:var(--yg-tone-slate-fg)}
+html.dark .card-check{background:rgba(20,24,40,.9)}
 </style>

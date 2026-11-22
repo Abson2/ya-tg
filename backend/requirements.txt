@@ -7,3 +7,7 @@ httpx==0.28.1
 apscheduler==3.11.0
 cryptography==44.0.2
 pypinyin==0.55.0
+# v2.1.7 #241：Telegram 阅读量采集（MTProto user account）。
+# Bot API 拿不到消息浏览量，只有 MTProto 的 Message.views 才有 → 必须用户账号接入。
+# 纯 Python wheel，无编译依赖；未安装时应用照常运行（功能显示为未启用）。
+telethon==1.44.0

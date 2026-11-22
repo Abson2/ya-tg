@@ -23,7 +23,8 @@ from sqlalchemy.orm import Session
 
 from . import (admin_session, ai_assist, async_scan_state, bot_listener,
                contribution_restore, guangya_auth, guangya_sms, log_retention,
-               mirror, mirror_batch, runtime_config, share_center_v2, tgto, tmdb)
+               mirror, mirror_batch, runtime_config, share_center_v2, tg_stats_api,
+               tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
@@ -720,15 +721,17 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.5", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.7", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
+# v2.1.7 #241：Telegram 阅读量采集与趋势报表。同样走管理会话鉴权。
+app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.5", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.7", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2762,6 +2765,11 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "seasons": set(), "episodes": [],
                 "ids": [], "representative_id": x.id,
                 "unidentified_count": 0,
+                # v2.1.6：作品级 TMDB 分类集合（资源库按分类分组展示用）。
+                # primary_genre = genres 列表第一个（与分享中心同口径）；
+                # genre_names 只含官方 genre 字典里的中文名（不编造分类）。
+                "primary_genre": "",
+                "genre_names": [],
             }
         g["count"] += 1
         g["ids"].append(x.id)
@@ -2795,6 +2803,24 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             if x.season:
                 g["seasons"].add(int(x.season))
             g["episodes"].append((int(x.season or 0), int(x.episode or 0)))
+        # v2.1.6：收集作品级 TMDB 分类（资源库按分类分组展示用）。
+        # 只收**官方 genre 字典里存在的中文名**——tmdb.py::TMDB_GENRES 是唯一权威，
+        # 非官方名（如接口偶发的其它写法）不入组，避免页面上出现自造分类。
+        # 「主分类」另记：严格取 genres 列表的**第一个**（与 share_center_v2
+        # ._primary_category 完全同口径）——即使它不在官方字典里，主分类也仍是它，
+        # 避免与分享中心出现「同一作品两处归类不同」。
+        try:
+            from .tmdb import TMDB_GENRES as _TG
+            from .tmdb import as_list as _as_list
+            for _name in _as_list(x.genres):
+                if not _name:
+                    continue
+                if not g["primary_genre"]:
+                    g["primary_genre"] = _name
+                if _name in _TG.values() and _name not in g["genre_names"]:
+                    g["genre_names"].append(_name)
+        except Exception:
+            pass
     out = []
     for g in groups.values():
         seasons = sorted(g.pop("seasons"))
@@ -2815,6 +2841,10 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             label += f" · 已识别 E{eps[0][1]:02d}"
         g["episode_label"] = label
         g["season_count"] = len(seasons)
+        # v2.1.6：作品级分类（资源库按 TMDB 分类分组展示用）。
+        # primary_genre 已在收集阶段按「genres 列表第一个」定好（与分享中心同口径）；
+        # genre_names 只含官方 genre 字典里的中文名，这里排序后返回（前端展示顺序稳定）。
+        g["genre_names"] = sorted(g["genre_names"])
         # 阶段六资源卡角标：是否已推送（任一成员有 sent 记录）+ 当前链接状态（本地推断）
         #
         # v2.1.3：「已推送」与「已分享」由**同一份真相**派生，两者天然同步：

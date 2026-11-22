@@ -28,6 +28,7 @@ from .guangya import GuangYaShareClient, create_share_parsed
 from .push_gate import evaluate_push_gate
 from .models import (
     Channel,
+    DiscoveredChat,
     QueueItem,
     Resource,
     ResourceEvent,
@@ -360,19 +361,182 @@ PEAK_SEGMENT_ORDER: list[tuple[int, int]] = [
 # v2.1.2：第 13 名及以后保持**全天窗口**（不限时段），保证长尾分类仍有产出，
 # 不因「前 12 名独占时段」把其余分类挤到完全推不出去。
 FULL_DAY_WINDOW = (0, 24)
+# ---------------------------------------------------------------------------
+# v2.1.6：分类默认时间表（按分类观影习惯，2 小时一段）
+# ---------------------------------------------------------------------------
+# 用户口径：「配置时段，按照分类观影习惯排默认时间表，格式举例战争：0-2，
+# 犯罪：2-4；战争：4-6，默认两个小时为一个时间段，不要全都是 0-8，
+# 热门分类排在白天，冷门分类排在夜间，注意时间段和周期计划若管理配置的
+# 静默时间启用避开」。
+#
+# 落地口径：
+#   ① 粒度统一 2 小时一段（全天 12 段），不再出现 0-8 / 8-24 这种大颗粒；
+#   ② **热门分类排白天、冷门分类排夜间**——与 v2.1.2 的「高峰优先」相反：
+#      用户要的是把冷门分类挪到夜里，腾出白天给热门分类；
+#   ③ 静默保护开启时，落在静默区间的段整体跳过并顺延，绝不静默冲突；
+#   ④ 段用完（分类数 > 可用段数）后剩余分类保持全天窗口，保证都能产出。
+#
+# 白天段（热门优先占用）：10-12 / 12-14 / 14-16 / 16-18 / 8-10 / 18-20 / 20-22 / 22-24 / 6-8；
+# 夜间段（冷门占用）：00-02 / 02-04 / 04-06。
+# 段给哪个分类由偏好排名决定 → 排名靠前先拿白天段，即「热门白天、冷门夜间」。
+#
+# v2.1.6：白天段补上 (22,24) 黄金深夜档，段池共 12 段 × 2 小时 = **恰好铺满 0-24 全天**。
+# 此前段池只有 11 段（8 白天 + 3 夜间 = 22 小时），22:00-24:00 是**空洞**——
+# 没有任何分类的排期窗口覆盖这一小时，而它恰恰是晚间黄金档：
+# 该小时 plan_engine 的分类过滤会把所有分类都筛掉 → **整个 22-24 点零产出**。
+# 补齐后 12 段覆盖 0-24 互不重叠，与旧的 PEAK_SEGMENT_ORDER 段集合完全对齐。
+CATEGORY_DAY_SEGMENTS: list[tuple[int, int]] = [
+    (10, 12), (12, 14), (14, 16), (16, 18), (8, 10), (18, 20),
+    (20, 22), (22, 24), (6, 8),
+]
+CATEGORY_NIGHT_SEGMENTS: list[tuple[int, int]] = [
+    (0, 2), (2, 4), (4, 6),
+]
+# 分类排期可用的全部 2 小时段（白天优先 → 夜间兜底）。
+CATEGORY_WINDOW_SEGMENTS: list[tuple[int, int]] = (
+    CATEGORY_DAY_SEGMENTS + CATEGORY_NIGHT_SEGMENTS
+)
 # v2.1.2：**系统曾经分配过**的窗口形态全集（判定「这行的时段是系统给的，还是用户手改的」）。
-# 含 v2.1.1 的昼夜两档（8-24 / 0-8）、v2.1.2 的 12 段高峰与全天窗口。
+# 含 v2.1.1 的昼夜两档（8-24 / 0-8）、v2.1.2 的 12 段高峰与全天窗口，
+# 以及 v2.1.6 的热门白天/冷门夜间时段。
 # 老库 ALTER 补 window_auto 列时 DEFAULT 1，用户手工改过时段但上限仍 0/0 的行
 # 也会拿到 window_auto=1——用这张表做「系统窗口形态」白名单，避免误覆盖用户手工时段。
 SYSTEM_ASSIGNED_WINDOWS: frozenset[tuple[int, int]] = frozenset(
     set(PEAK_SEGMENT_ORDER)
     | {FULL_DAY_WINDOW, (8, 24), (0, 8)}
+    # v2.1.6：热门白天 / 冷门夜间的新时段形态也属于「系统分配过」，
+    # 否则老行会被 _is_system_managed_schedule 判成用户手工行而不再跟随刷新。
+    | set(CATEGORY_WINDOW_SEGMENTS)
 )
+
+
+# ---------------------------------------------------------------------------
+# v2.1.6：冲突处理策略（三档，真实生效）
+# ---------------------------------------------------------------------------
+# 用户口径：「冲突处理矛盾，应该改成 a、新上映优先；b、新入库优先；c、存量排期优先」
+# 旧值 pause_normal / prefer_new 语义重复，且**后端从未消费**（死配置）——
+# 存进 app_config 后对调度毫无影响，用户以为能控优先级其实不能。
+#
+# v2.1.6 把冲突处理落到**同一批次发布任务的排序**上：三档互斥、语义清晰，
+# 且都不改变任何配额上限（上限仍由周期计划管理统一约束）。
+#
+#   prefer_release —— 新上映优先：release_date 落在「近 N 天上映窗口」的作品先发。
+#   prefer_new     —— 新入库优先：刚扫描入库（scanned_at 最新）的作品先发。
+#   prefer_backlog —— 存量排期优先：已排期的存量作品先发，新入库的排到后面。
+#
+# 「新上映」的判定窗口 = 新品上映窗口天数（默认 30 天），与 TMDB release_date 比对。
+CONFLICT_POLICIES: tuple[str, ...] = ("prefer_release", "prefer_new", "prefer_backlog")
+CONFLICT_POLICY_LABELS: dict[str, str] = {
+    "prefer_release": "新上映优先",
+    "prefer_new": "新入库优先",
+    "prefer_backlog": "存量排期优先",
+}
+# 兼容旧值：v2.1.6 之前写过 pause_normal / prefer_new，读到时映射到新口径。
+# pause_normal（暂停普通排期优先上新）→ 新上映优先；prefer_new（上新优先）→ 新入库优先。
+CONFLICT_POLICY_ALIASES: dict[str, str] = {
+    "pause_normal": "prefer_release",
+    "prefer_new": "prefer_new",
+    "prefer_new_entry": "prefer_new",
+    "prefer_release_first": "prefer_release",
+    "backlog_first": "prefer_backlog",
+}
+# 新品上映判定窗口（天）：release_date 在最近 N 天内视为「新上映」。
+NEW_RELEASE_WINDOW_DAYS = 30
+
+
+def _normalize_conflict_policy(raw: str) -> str:
+    """把配置里的冲突策略值归一化为三档之一（非法值回落默认档）。"""
+    value = str(raw or "").strip().lower()
+    value = CONFLICT_POLICY_ALIASES.get(value, value)
+    return value if value in CONFLICT_POLICIES else "prefer_release"
 
 
 def _hour_segments() -> list[tuple[int, int]]:
     """全天 2 小时一段的 (起, 止) 列表，共 12 段。"""
     return [(h, h + HOUR_SEGMENT_HOURS) for h in range(0, 24, HOUR_SEGMENT_HOURS)]
+
+
+def _assign_category_windows(
+    prefs: list[dict[str, Any]],
+    quiet: tuple[int, int] | None = None,
+) -> dict[str, tuple[int, int]]:
+    """按偏好排名给分类分配 2 小时粒度的默认时段（热门白天、冷门夜间）。
+
+    v2.1.6：取代 v2.1.2 的「高峰优先」口径。
+    - 偏好排名靠前（热门）→ 先拿**白天**段；
+    - 排名靠后（冷门）→ 拿**夜间**段；
+    - 静默保护开启时，落进静默区间的段**整段跳过**（不分配给任何分类）；
+    - **段用完后（分类数 > 可用段数）剩余分类循环复用夜间段**，
+      绝不退回全天窗口 0-24。
+
+    与 v2.1.2 的差异是刻意的：v2.1.2 把第 1 名放在 20-22 黄金档（夜里），
+    v2.1.6 按用户口径把热门分类挪到白天、冷门挪到夜里。
+
+    v2.1.6 修正一：兜底窗口**不得与静默区间重叠**。
+    此前兜底用全天窗口 0-24，静默开启（如 0-7）时它必然覆盖静默区间——
+    等于「一键恢复默认」把分类排到永远推不出去的小时。
+    修正：兜底改为**静默区间之外的最大连续区间**；若全天都被静默占满，
+    退回首个可用段（宁可让多个分类共享一段，也不要排到推不出去的时间）。
+
+    v2.1.6 修正二：**每个分类都必须有 2 小时颗粒度的时段**。
+    用户口径「配置时段按分类观影习惯排默认时间表，默认两个小时为一个时间段」
+    +「推荐时段只推荐时间段（2 小时颗粒度）」——意味着**排期表里不能出现
+    00:00–24:00 这种全天窗口**。此前段用完后直接退化为全天窗口，
+    结果是 27 个分类里有 15 个的时段是全天，既不是 2 小时颗粒度，
+    又让长尾分类全天与热门分类抢同一批小时。
+    修正：段用完后**冷门优先循环复用夜间段**（复用而非独占），
+    语义仍是「冷门排夜间」，但每个分类拿到的都是实打实的 2 小时段。
+    """
+    if not prefs:
+        return {}
+    segments = list(CATEGORY_WINDOW_SEGMENTS)
+    if quiet:
+        segments = [seg for seg in segments
+                    if not _window_overlaps_quiet(seg, quiet)]
+    if not segments:
+        # 全天都被静默占满：退回首个段（此时任何时段都推不出去）
+        only = CATEGORY_WINDOW_SEGMENTS[0]
+        return {item["category_key"]: only for item in prefs}
+    day_set = set(CATEGORY_DAY_SEGMENTS)
+    night_set = set(CATEGORY_NIGHT_SEGMENTS)
+    day = [seg for seg in segments if seg in day_set]
+    night = [seg for seg in segments if seg in night_set]
+    # 热门先占白天段，其后占夜间段（夜间段序里 (22,24) 黄金深夜档排最前）。
+    primary = day + night
+    # 溢出池：冷门优先复用夜间段；夜间段被静默吃光时退回白天段。
+    overflow_pool = night or day or segments
+    out: dict[str, tuple[int, int]] = {}
+    for idx, item in enumerate(prefs):
+        key = item["category_key"]
+        if idx < len(primary):
+            out[key] = primary[idx]
+        else:
+            out[key] = overflow_pool[(idx - len(primary)) % len(overflow_pool)]
+    return out
+
+
+def _fallback_window(
+    quiet: tuple[int, int] | None,
+    segments: list[tuple[int, int]],
+) -> tuple[int, int]:
+    """段用完后的兜底时段——必须**不与静默区间重叠**。"""
+    if not quiet:
+        return FULL_DAY_WINDOW
+    # 静默区间之外的最大连续区间
+    hours = [h for h in range(24) if not _window_overlaps_quiet((h, h + 1), quiet)]
+    if not hours:
+        # 全天都在静默里：退回首个可用段（此时任何时段都推不出去）
+        return segments[0] if segments else FULL_DAY_WINDOW
+    best_start, best_len = hours[0], 1
+    cur_start, cur_len = hours[0], 1
+    for prev, cur in zip(hours, hours[1:]):
+        if cur == prev + 1:
+            cur_len += 1
+        else:
+            cur_start, cur_len = cur, 1
+        if cur_len > best_len:
+            best_start, best_len = cur_start, cur_len
+    return (best_start, min(24, best_start + best_len))
 
 
 def _looks_like_title(value: str) -> bool:
@@ -528,9 +692,23 @@ def sync_library_versions(db: Session) -> dict[str, int]:
     categories = 0
     for work_key, rows in grouped.items():
         ordered = sorted(rows, key=lambda r: (str(r.file_id or ""), int(r.size or 0), int(r.utime or 0)))
-        fingerprint_src = "|".join(
-            f"{r.file_id}:{r.size or 0}:{r.utime or 0}" for r in ordered
-        )
+        # v2.1.6 真实缺陷修复（泰迪熊2 双推·治触发源）：指纹**不含 utime**。
+        #
+        # 原指纹 = sha256(file_id:size:utime)。utime 是文件元数据的修改时间，
+        # 任何一次重扫/重同步/触碰都可能让它跳动，而**内容完全没变**：
+        # 真机证据——泰迪熊2 的文件 utime 1795345465→1795345530（+65 秒），
+        # size 完全不变，指纹却变了 → 生成新版本 v3 → 重建 first 任务 → 二次首推。
+        #
+        # 指纹只应反映**内容身份**：file_id（文件名+大小即内容身份）
+        # 与 size。utime 变化在 size 不变时一律视为伪变更，不生成新版本。
+        # （真实内容变化必然伴随 file_id 或 size 变化，仍能被正确识别。）
+        #
+        # 注：老库已有的旧式指纹行与新指纹不同，首次运行会各生成一个新版本——
+        # 这是**安全**的：首推幂等（已 sent 跳过）与 dedup 去指纹两道防线
+        # 会拦下重复投递，不会因此多发消息。
+        fingerprint_src = "|".join(sorted(
+            f"{r.file_id}:{r.size or 0}" for r in rows
+        ))
         fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()
         exists = db.scalar(
             select(SCLibraryVersion).where(SCLibraryVersion.work_key == work_key,
@@ -652,6 +830,20 @@ def _active_version(db: Session) -> SCSharePlanVersion | None:
         select(SCSharePlanVersion).where(SCSharePlanVersion.status == "active")
         .order_by(SCSharePlanVersion.id.desc())
     )
+
+
+def _cycle_plan_of(db: Session, version_id: int = 0) -> dict[str, Any]:
+    """取指定（或当前活动）版本的周期计划配置。
+
+    v2.1.6：默认时间表必须避开静默保护时段，而静默配置住在
+    计划版本的 cycle_plan 里——多处都要读它，故抽成公共函数，
+    避免各处重复解析 config_json。
+    """
+    version = db.get(SCSharePlanVersion, version_id) if version_id else _active_version(db)
+    if not version:
+        return {}
+    cfg = _jload(version.config_json, {})
+    return (cfg.get("cycle_plan") or {}) if isinstance(cfg, dict) else {}
 
 
 def _current_hour_window(db: Session, version: SCSharePlanVersion) -> SCHourWindow | None:
@@ -809,6 +1001,14 @@ def plan_engine(db: Session) -> dict[str, int]:
     sched_map = {s.category_key: s for s in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version.id,
                                          SCCategorySchedule.enabled.is_(True))).all()}
+    # v2.1.6：分类级「每小时上限 / 日上限」已从分类排期表移除，
+    # 速率统一由**周期计划管理**约束：
+    #   - 单分类每小时上限 = cycle.category_hour_max（此前是死配置，后端从未消费）；
+    #   - 单分类每日上限 = cycle.category_day_max（周期计划新增项，0=不限）。
+    # 分类排期行里残留的 hourly_limit / daily_limit 保留在库中（历史数据），
+    # 但**不再参与调度判定**——否则用户在前台看不到、却在后台限流，无法排查。
+    cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
+    cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
     def _sched_allows(key: str, per_category_count: int) -> bool:
         s = sched_map.get(key)
         if not s:
@@ -823,10 +1023,10 @@ def plan_engine(db: Session) -> dict[str, int]:
             in_win = True
         if not in_win:
             return False
-        hl, dl = int(s.hourly_limit or 0), int(s.daily_limit or 0)
-        if hl and per_category_count >= hl:
+        # v2.1.6：限流口径改为周期计划统一约束（分类行上的旧上限不再生效）
+        if cycle_hour_max and per_category_count >= cycle_hour_max:
             return False
-        if dl and _category_today_count(db, key) >= dl:
+        if cycle_day_max and _category_today_count(db, key) >= cycle_day_max:
             return False
         return True
 
@@ -877,9 +1077,34 @@ def plan_engine(db: Session) -> dict[str, int]:
         for lv in versions:
             for channel in channels:
                 target_type = "group" if str(channel.chat_id or "").startswith("-") else "channel"
-                dedup = f"{lv.work_key}:{lv.fingerprint}:{channel.id}"
+                # v2.1.6 真实缺陷修复（泰迪熊2 双推）：dedup **去掉 fingerprint**。
+                #
+                # 原 dedup = work_key:fingerprint:channel_id，而 fingerprint =
+                # sha256(file_id:size:utime)。utime 抖动（文件被重写/重同步，
+                # size 完全不变）就会生成新指纹 → 新 dedup → 绕过去重 →
+                # 同一作品被重建 first 任务 → 再次首推。
+                # 真机证据：泰迪熊2 的文件 utime 1795345465→1795345530（+65 秒），
+                # size 完全不变，却生成了新版本 v3 与新指纹 55f429…，
+                # 于是 12:25 又排了一批首推任务。
+                #
+                # 首推语义 = 「这个作品在这个渠道的第一次推送」——
+                # 一旦发生就锁定，不该因为任何元数据抖动而重新排一次。
+                # 更新推送（新集/新版本）走 source_kind=update 的独立事件，
+                # 不依赖这条首推 dedup。
+                chat_id = str(channel.chat_id or "")
+                dedup = f"{lv.work_key}:{channel.id}:first"[:255]
                 exists = db.scalar(select(SCPushListItem.id).where(SCPushListItem.dedup_key == dedup))
                 if exists:
+                    continue
+                # 历史兼容：老库的 first 项 dedup 是 work_key:fingerprint:channel_id，
+                # 格式变了但**语义不变**（同一作品同一渠道的首推只应有一条）。
+                # 只查新 dedup 会让老行全部失效 → 反而制造一次重复首推。
+                # 因此再按 (work_key, chat_id, source_kind=first) 兜底查一次。
+                legacy = db.scalar(select(SCPushListItem.id).where(
+                    SCPushListItem.work_key == lv.work_key,
+                    SCPushListItem.chat_id == chat_id,
+                    SCPushListItem.source_kind == "first").limit(1))
+                if legacy:
                     continue
                 item = SCPushListItem(
                     list_id=push_list.id, work_key=lv.work_key,
@@ -983,6 +1208,68 @@ class _RepResolver:
         return None, "资源版本快照缺少资源 id"
 
 
+def _conflict_sort_key(
+    db: Session,
+    task: SCPublishTask,
+    policy: str,
+    resolver: "_RepResolver",
+    release_cutoff: datetime,
+) -> tuple:
+    """按冲突处理策略给同一批待发任务排序（v2.1.6）。
+
+    旧实现里 conflict_policy 是**死配置**（只存不读），用户以为能控优先级
+    其实完全无效。v2.1.6 让三档策略真正决定**同批次内的先后顺序**：
+
+      prefer_release —— 新上映优先：release_date 在近 N 天上映窗口内的作品排前；
+      prefer_new     —— 新入库优先：scanned_at 最新的作品排前；
+      prefer_backlog —— 存量排期优先：已排期（scheduled_at 早）的存量作品排前，
+                        新入库的排到后面。
+
+    三档都**不改变任何配额上限**——上限仍由周期计划管理统一约束。
+
+    返回值是「越小越先发」的排序键；无法判定时给中性值，保持原有相对顺序。
+    """
+    base = (-int(task.priority or 0), int(task.id or 0))
+    if policy == "prefer_backlog":
+        # 存量优先：scheduled_at 早的先发（早 = 已排期更久 = 存量）。
+        scheduled = task.scheduled_at or task.created_at
+        stamp = scheduled.timestamp() if scheduled else 0.0
+        return (stamp,) + base
+    lv = None
+    try:
+        item = db.get(SCPushListItem, task.list_item_id)
+    except Exception:
+        item = None
+    if item is not None:
+        try:
+            lv = db.get(SCLibraryVersion, item.library_version_id)
+        except Exception:
+            lv = None
+    rep = None
+    if lv is not None:
+        try:
+            rep, _err = resolver.resolve(lv)
+        except Exception:
+            rep = None
+    if rep is None:
+        return (1, 0.0) + base
+    if policy == "prefer_new":
+        # 新入库优先：scanned_at 最新（时间戳大）排前 → 取负值使「越小越先」。
+        scanned = rep.scanned_at
+        stamp = scanned.timestamp() if scanned else 0.0
+        return (-stamp,) + base
+    # prefer_release：新上映优先——release_date 落在上映窗口内排前。
+    release = str(rep.release_date or "").strip()[:10]
+    is_new_release = False
+    if release:
+        try:
+            rel_dt = datetime.fromisoformat(release).replace(tzinfo=shanghai_tz())
+            is_new_release = rel_dt >= release_cutoff
+        except (TypeError, ValueError):
+            is_new_release = False
+    return (0 if is_new_release else 1,) + base
+
+
 async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
     """建分享并提交到分发队列；发送核心仍由 publisher 负责。
 
@@ -1029,11 +1316,28 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
              # v2.1.3：因单轮预算耗尽而留给下一轮的任务数（不算失败）
              "deferred": 0,
              # v2.1.3：回收的 building 僵尸数
-             "revived": int(revived)}
+             "revived": int(revived),
+             # v2.1.6：因「该资源在此渠道已推送过」而跳过重复投递的任务数
+             # （泰迪熊2 双推修复：已 sent 的队列行不得被复活）
+             "skipped": 0}
     # v2.1.3：单轮墙钟预算起点。
     round_started = time.monotonic()
-    # v2.1.1：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
+    # v2.1.3：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
     _rep_resolver = _RepResolver(db)
+    # v2.1.6：冲突处理策略真实消费——决定同一批待发任务的先后顺序。
+    # 旧实现里这个配置只存不读（死配置），用户以为能控优先级其实无效。
+    conflict_policy = _normalize_conflict_policy(
+        runtime_config.get(db, "sc_conflict_policy") or "prefer_release")
+    if tasks:
+        release_cutoff = datetime.now(shanghai_tz()) - timedelta(days=NEW_RELEASE_WINDOW_DAYS)
+        try:
+            tasks = sorted(
+                tasks,
+                key=lambda t: _conflict_sort_key(
+                    db, t, conflict_policy, _rep_resolver, release_cutoff))
+        except Exception as exc:
+            # 排序失败不阻断推送：保留数据库原顺序（priority desc, id）。
+            logger.warning("[share_center_v2] 冲突处理排序失败，沿用默认顺序：%s", exc)
     # v2.1.0：基础规则「上新即时推送每小时上限」真实消费。统计本自然小时已提交
     # (status=submitted 及以上) 的任务数，达上限则本轮不再提交新任务，留到下一小时。
     # 0/非法 = 不限；quick_publish_enabled=false 时也跳过该限流（保持旧行为）。
@@ -1090,6 +1394,45 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
             db.commit()
             stats["gated"] += 1
             continue
+        # item.bot_id 是目标 Bot，不是 Channel.id；用 chat_id 精确匹配目标频道/群。
+        # v2.1.6：目标渠道的解析**前移到建分享之前**——下面的幂等检查要用它，
+        # 而且「没有可用推送目标」这种问题也不该先白建一个分享链接才发现。
+        channel = db.scalar(select(Channel).where(Channel.chat_id == item.chat_id))
+        if not channel:
+            channel = db.scalar(select(Channel).where(Channel.enabled.is_(True)).limit(1))
+        if not channel:
+            task.status = "failed"
+            task.error = "无可用推送目标"
+            db.commit()
+            stats["failed"] += 1
+            continue
+        # v2.1.6 真实缺陷修复（泰迪熊2 双推）：**建分享之前**先做投递幂等检查。
+        #
+        # 原逻辑把「已 sent 的队列行」的重置放在建分享**之后**的 submit 阶段：
+        #   ① 队列行被无条件重置回 pending/attempts=0 → 旧队列「复活」；
+        #   ② publisher 每轮从 DB 重建的 sent_keys_by_channel 里不再有这一行
+        #      → v0.6.5 的「同作品整剧去重」保险被绕过 → 第二次真实投递。
+        # 真机证据：泰迪熊2（resource id=23）在 2026-11-22 11:06 与 12:26 各推一次，
+        # 频道+群共 4 条消息，而 push_queue 全表只有 2 行——同一条队列被发了两遍。
+        #
+        # 现在口径统一为：**已 sent = 已投递过，永不重发**。
+        # 检查前移到建分享之前，好处是「已投递过」的作品不会再白建一个
+        # 光鸭分享链接（建链接是真实副作用：会在网盘里多出一条分享记录）。
+        #
+        # 注：更新推送（有新集/新版本要再推）走独立事件与新队列行，
+        # 不依赖复活这条已 sent 的首推队列行；手动强制重推走 main 的独立通道。
+        existing_q = db.scalar(select(QueueItem).where(
+            QueueItem.resource_id == rep.id, QueueItem.channel_id == channel.id))
+        if existing_q is not None and str(existing_q.status or "") == "sent":
+            task.status = "skipped"
+            task.error = "该资源在此渠道已推送过，跳过重复投递"
+            db.add(SCPublishExecution(task_id=task.id, stage="submit", status="skipped",
+                                      started_at=utcnow(), finished_at=utcnow(),
+                                      response_json=_jdump({"reason": "already_sent",
+                                                            "queue_id": existing_q.id})))
+            db.commit()
+            stats["skipped"] += 1
+            continue
         task.status = "building"
         task.error = ""
         db.add(SCPublishExecution(task_id=task.id, stage="build", status="running",
@@ -1144,21 +1487,27 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
             db.commit()
             continue
 
-        # item.bot_id 是目标 Bot，不是 Channel.id；用 chat_id 精确匹配目标频道/群。
-        channel = db.scalar(select(Channel).where(Channel.chat_id == item.chat_id))
-        if not channel:
-            channel = db.scalar(select(Channel).where(Channel.enabled.is_(True)).limit(1))
-        if not channel:
-            task.status = "failed"
-            task.error = "无可用推送目标"
-            db.commit()
-            stats["failed"] += 1
-            continue
+        # 队列行复用：同一 (resource_id, channel_id) 只有一行（唯一约束
+        # uq_resource_channel）。上面已在建分享前拦掉「已 sent」的行，
+        # 到这里仍需再查一次——建分享期间可能有并发轮次把同一行投出去了，
+        # 这次重查是**并发兜底**，保证已投递的行永远不会被重置回 pending。
         q = db.scalar(select(QueueItem).where(QueueItem.resource_id == rep.id,
                                              QueueItem.channel_id == channel.id))
         if not q:
             q = QueueItem(resource_id=rep.id, channel_id=channel.id)
             db.add(q)
+        elif str(q.status or "") == "sent":
+            # 并发兜底：建分享这段时间里另一轮已把同一行投递出去。
+            # 同样按「已 sent = 永不重发」处理，绝不重置回 pending。
+            task.status = "skipped"
+            task.error = "该资源在此渠道已推送过，跳过重复投递"
+            db.add(SCPublishExecution(task_id=task.id, stage="submit", status="skipped",
+                                      started_at=utcnow(), finished_at=utcnow(),
+                                      response_json=_jdump({"reason": "already_sent",
+                                                            "queue_id": q.id})))
+            db.commit()
+            stats["skipped"] += 1
+            continue
         q.status = "pending"
         q.status_ext = "submitted"
         q.attempts = 0
@@ -1755,12 +2104,17 @@ def _assign_peak_windows(prefs: list[dict[str, Any]]) -> dict[str, tuple[int, in
 
 @router.get("/preference")
 def api_preference(db: Session = Depends(get_db)):
-    """分类偏好排名（真实派生）+ 按偏好应分配的高峰独占时段。
+    """分类偏好排名（真实派生）+ 按偏好应分配的默认时段。
 
-    前端用于展示「偏好高的分类排高峰时段」的分配依据，并提供一键按偏好重排时段。
+    前端用于展示「热门分类排白天、冷门分类排夜间」的分配依据。
+    v2.1.6：时段分配改用 2 小时粒度（热门白天 / 冷门夜间），
+    并在静默保护开启时避开静默区间。
     """
     prefs = _category_preference(db)
-    windows = _assign_peak_windows(prefs)
+    version = _active_version(db)
+    cycle = (_jload(version.config_json, {}) if version else {}).get("cycle_plan") or {}
+    quiet = _quiet_window(cycle)
+    windows = _assign_category_windows(prefs, quiet)
     items = []
     for idx, item in enumerate(prefs):
         ws, we = windows.get(item["category_key"], FULL_DAY_WINDOW)
@@ -1768,7 +2122,7 @@ def api_preference(db: Session = Depends(get_db)):
         data["window_start"] = ws
         data["window_end"] = we
         data["period"] = "peak" if (ws, we) != FULL_DAY_WINDOW else "full_day"
-        # 高峰序号：第几名的分类占用第几个高峰段（0 = 全天不限时段）
+        # 分配序号：第几名的分类占用第几个时段（0 = 全天不限时段）
         data["peak_rank"] = idx + 1 if data["period"] == "peak" else 0
         data["cross_midnight"] = ws > we
         # v2.1.4：中性引用名，供前端做键匹配（页面不出现后端字段名）
@@ -1776,9 +2130,12 @@ def api_preference(db: Session = Depends(get_db)):
         items.append(data)
     return {"items": items,
             "segments": _hour_segments(),
-            "peak_segments": [list(s) for s in PEAK_SEGMENT_ORDER],
+            "peak_segments": [list(s) for s in CATEGORY_WINDOW_SEGMENTS],
             "full_day_window": list(FULL_DAY_WINDOW),
             "segment_hours": HOUR_SEGMENT_HOURS,
+            "day_segments": [list(s) for s in CATEGORY_DAY_SEGMENTS],
+            "night_segments": [list(s) for s in CATEGORY_NIGHT_SEGMENTS],
+            "quiet_avoided": bool(quiet),
             "source": "分类字典人工优先级（主）+ 该分类已成功推送任务数（次）"}
 
 
@@ -1801,7 +2158,8 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
     prefs = _category_preference(db)
     if not prefs:
         return {"ok": False, "reason": "分类字典为空，无法按偏好分配"}
-    windows = _assign_peak_windows(prefs)
+    version_cfg = (_jload(version.config_json, {}) if version else {}).get("cycle_plan") or {}
+    windows = _assign_category_windows(prefs, _quiet_window(version_cfg))
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id)).all()}
@@ -2004,11 +2362,17 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200,
         info = channels.get(int(task.id)) or {}
         channel_names = info.get("channel_names") or []
         group_names = info.get("group_names") or []
+        # v2.1.6：结构化渠道条目（名称 + 标识）——页面按
+        # 「群:名称（群id或用户名）」「频道:名称（频道id或用户名）」展示。
+        channel_targets = info.get("channel_targets") or []
+        group_targets = info.get("group_targets") or []
         parts = []
-        if channel_names:
-            parts.append("频道 " + "、".join(channel_names))
-        if group_names:
-            parts.append("群 " + "、".join(group_names))
+        if channel_targets:
+            parts.append("频道：" + "、".join(
+                f"{t['label']}（{t['ref']}）" for t in channel_targets))
+        if group_targets:
+            parts.append("群：" + "、".join(
+                f"{t['label']}（{t['ref']}）" for t in group_targets))
         items.append({
             "id": task.id,
             "list_item_id": item.id,
@@ -2031,6 +2395,10 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200,
             # v2.1.4：推送渠道可读汇总（频道 / 群名称）
             "channel_names": channel_names,
             "group_names": group_names,
+            # v2.1.6：结构化渠道条目（名称 + 标识），供页面展示
+            # 「群:名称（群id或用户名）」「频道:名称（频道id或用户名）」。
+            "channel_targets": channel_targets,
+            "group_targets": group_targets,
             "target_summary": "；".join(parts),
             "error": data.get("error") or "",
             "created_at": data.get("created_at"),
@@ -2277,6 +2645,13 @@ def _task_channel_info(db: Session, task_ids: list[int]) -> dict[int, dict[str, 
 
     推送目标落在清单项上（SCPushListItem.chat_id / target_type / bot_id），
     任务通过 list_item_id 关联。渠道名称取 Channel 表（未登记的退化为群/频道 ID）。
+
+    v2.1.6：**渠道类型以 Channel 表登记的 kind 为准**，不再盲信清单项的
+    target_type。真机证据：channels 表把 -1003749901817 登记为 kind='channel'
+    （名称「订阅」），但推送清单项的 target_type 全写成 'group'——旧实现
+    「target_type 优先」会把频道误判成群，页面显示成「群 xxx」。
+    判定优先级改为：① Channel.kind（登记过就以登记为准）→ ② 清单项 target_type
+    → ③ chat_id 是否以 - 开头（-100… 是频道/超级群，数字正数是用户私聊）。
     """
     out: dict[int, dict[str, Any]] = {}
     if not task_ids:
@@ -2292,28 +2667,60 @@ def _task_channel_info(db: Session, task_ids: list[int]) -> dict[int, dict[str, 
     chat_ids = {str(r[1] or "") for r in rows if r[1]}
     names: dict[str, str] = {}
     kinds: dict[str, str] = {}
+    usernames: dict[str, str] = {}
     if chat_ids:
         for ch in db.scalars(select(Channel).where(Channel.chat_id.in_(chat_ids))).all():
-            names[str(ch.chat_id or "")] = str(ch.name or "")
-            kinds[str(ch.chat_id or "")] = str(ch.kind or "channel")
+            cid = str(ch.chat_id or "")
+            names[cid] = str(ch.name or "")
+            kinds[cid] = str(ch.kind or "channel")
+        # v2.1.6：真实群名/频道名 + @用户名（Bot 发现台账）
+        try:
+            for dc in db.scalars(select(DiscoveredChat).where(
+                    DiscoveredChat.chat_id.in_(chat_ids))).all():
+                cid = str(dc.chat_id or "")
+                title = str(dc.title or "").strip()
+                if title:
+                    names[cid] = title
+                uname = str(dc.username or "").strip()
+                if uname:
+                    usernames[cid] = uname
+        except Exception:
+            pass
     for task_id, chat_id, target_type, _bot_id in rows:
         cid = str(chat_id or "")
         info = out.setdefault(int(task_id), {"channels": [], "groups": [],
-                                             "channel_names": [], "group_names": []})
-        # target_type 优先；缺失时按 chat_id 是否以 - 开头判定（-100… 是群）
-        is_group = str(target_type or "") == "group" or (
-            not target_type and cid.startswith("-"))
-        label = names.get(cid) or cid or "未知目标"
+                                             "channel_names": [], "group_names": [],
+                                             "channel_targets": [], "group_targets": []})
+        # v2.1.6：登记过的渠道以 Channel.kind 为准（修正 target_type 写错导致的误判）
+        kind = kinds.get(cid, "")
+        if kind:
+            is_group = kind == "group"
+        else:
+            # 未登记：退回清单项声明的类型；再退回 chat_id 形态判定
+            is_group = str(target_type or "") == "group" or (
+                not target_type and cid.startswith("-"))
+        raw_name = str(names.get(cid) or "").strip()
+        # route: 前缀是路由自动补建 Channel 的内部标记，对用户无意义 → 退回 chat_id
+        if raw_name.startswith("route:"):
+            raw_name = ""
+        label = raw_name or cid or "未知目标"
+        # v2.1.6：结构化渠道条目（名称 + 标识），供页面展示
+        # 「群:名称（群id或用户名）」/「频道:名称（频道id或用户名）」。
+        entry = {"label": label, "ref": usernames.get(cid) or cid}
         if is_group:
             if label not in info["group_names"]:
                 info["group_names"].append(label)
             if cid not in info["groups"]:
                 info["groups"].append(cid)
+            if entry not in info["group_targets"]:
+                info["group_targets"].append(entry)
         else:
             if label not in info["channel_names"]:
                 info["channel_names"].append(label)
             if cid not in info["channels"]:
                 info["channels"].append(cid)
+            if entry not in info["channel_targets"]:
+                info["channel_targets"].append(entry)
     return out
 
 
@@ -2400,12 +2807,18 @@ def api_tasks(status: str = "", limit: int = 200,
         info = channels.get(int(row["id"])) or {}
         row["channel_names"] = info.get("channel_names") or []
         row["group_names"] = info.get("group_names") or []
+        # v2.1.6：结构化渠道条目（名称 + 标识），页面按
+        # 「群:名称（群id或用户名）」「频道:名称（频道id或用户名）」展示。
+        row["channel_targets"] = info.get("channel_targets") or []
+        row["group_targets"] = info.get("group_targets") or []
         # 汇总展示文案（频道 + 群），便于表格一列看清推送到哪
         parts = []
-        if row["channel_names"]:
-            parts.append("频道：" + "、".join(row["channel_names"]))
-        if row["group_names"]:
-            parts.append("群：" + "、".join(row["group_names"]))
+        if row["channel_targets"]:
+            parts.append("频道：" + "、".join(
+                f"{t['label']}（{t['ref']}）" for t in row["channel_targets"]))
+        if row["group_targets"]:
+            parts.append("群：" + "、".join(
+                f"{t['label']}（{t['ref']}）" for t in row["group_targets"]))
         row["target_summary"] = "；".join(parts)
         # 中性展示文案：建链状态直接给中文，页面不出现内部枚举名
         row["link_label"] = "已建链" if str(row.get("link_state") or "") == "active" else "待建链"
@@ -2430,11 +2843,16 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
     info = _task_channel_info(db, [int(task_id)]).get(int(task_id)) or {}
     item["channel_names"] = info.get("channel_names") or []
     item["group_names"] = info.get("group_names") or []
+    # v2.1.6：结构化渠道条目（名称 + 标识）
+    item["channel_targets"] = info.get("channel_targets") or []
+    item["group_targets"] = info.get("group_targets") or []
     parts = []
-    if item["channel_names"]:
-        parts.append("频道：" + "、".join(item["channel_names"]))
-    if item["group_names"]:
-        parts.append("群：" + "、".join(item["group_names"]))
+    if item["channel_targets"]:
+        parts.append("频道：" + "、".join(
+            f"{t['label']}（{t['ref']}）" for t in item["channel_targets"]))
+    if item["group_targets"]:
+        parts.append("群：" + "、".join(
+            f"{t['label']}（{t['ref']}）" for t in item["group_targets"]))
     item["target_summary"] = "；".join(parts)
     item["link_label"] = "已建链" if str(item.get("link_state") or "") == "active" else "待建链"
     item["ref"] = key
@@ -2578,10 +2996,15 @@ def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
 
 @router.post("/category-schedules/adopt-ai-all")
 def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
-    """批量采纳 AI 建议时段：对**有真实历史**的分类一次性写入建议窗口。
+    """批量采纳推荐时段：把建议窗口写入所选分类。
 
-    建议时段来自 `_ai_suggest_window`（按该分类已发布任务的小时分布派生），
-    无历史发布数据的分类返回 (0,0)，这类行**跳过**而不是编造时段。
+    v2.1.6：
+      - 单一时间段（2 小时颗粒度）口径，不再写周维度网格；
+      - **每个分类都有建议**（实测优先，无实测用默认时间表兜底），
+        不再出现「无建议跳过」导致采纳率极低；
+      - 支持传 category_keys 只处理勾选的分类；不传 = 全部。
+
+    静默保护开启时，落在静默区间的建议时段会被跳过（而不是强行写入冲突时段）。
     """
     p = body.payload or {}
     version = _active_version(db)
@@ -2591,17 +3014,29 @@ def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
     _ensure_schedules(db, version.id)
     rows = db.scalars(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version.id)).all()
+    # v2.1.6：只处理勾选的分类（不传 = 全部）。
+    wanted = {str(x).strip() for x in (p.get("category_keys") or []) if str(x).strip()}
+    if wanted:
+        rows = [r for r in rows if r.category_key in wanted]
+    quiet = _quiet_window(_cycle_plan_of(db, version.id))
+    fallback_map = _preference_windows(db, quiet)
     adopted = 0
     skipped = 0
     for row in rows:
-        ai_start, ai_end = _ai_suggest_window(db, row.category_key)
-        if not ai_start:
+        sug_start, sug_end, sug_source = _category_suggest_window(
+            db, row.category_key, fallback_map.get(row.category_key, FULL_DAY_WINDOW))
+        # v2.1.6：起点 0 合法，用来源标记判定有没有建议。
+        if not sug_source:
             skipped += 1
             continue
-        row.window_start, row.window_end = ai_start, ai_end
-        row.ai_window_start, row.ai_window_end = ai_start, ai_end
+        if quiet and _window_overlaps_quiet((sug_start, sug_end), quiet):
+            skipped += 1
+            continue
+        row.window_start, row.window_end = sug_start, sug_end
+        row.ai_window_start, row.ai_window_end = sug_start, sug_end
+        row.week_windows = ""
         row.ai_adopted = True
-        # 采纳 AI 建议是用户手工动作 → 该行不再被「按偏好分配时段」覆盖。
+        # 采纳是用户手工动作 → 该行不再被系统自动刷新覆盖。
         row.window_auto = False
         row.updated_at = utcnow()
         adopted += 1
@@ -2739,9 +3174,17 @@ def _default_schedule_for(media_type: str,
     return ws, we, hl, dl
 
 
-def _preference_windows(db: Session) -> dict[str, tuple[int, int]]:
-    """当前偏好排名对应的高峰独占时段窗口（分类 key → (起, 止)）。"""
-    return _assign_peak_windows(_category_preference(db))
+def _preference_windows(db: Session,
+                        quiet: tuple[int, int] | None = None) -> dict[str, tuple[int, int]]:
+    """当前偏好排名对应的分类默认时段窗口（分类 key → (起, 止)）。
+
+    v2.1.6：改用「热门白天 / 冷门夜间」的 2 小时粒度分配（见
+    _assign_category_windows），不再是 v2.1.2 的「高峰独占段」。
+
+    quiet 传入静默保护区间时，落进静默的段会被整段跳过——默认时间表
+    **必须避开静默时段**，否则「一键恢复默认」会把分类排到推不出去的小时。
+    """
+    return _assign_category_windows(_category_preference(db), quiet)
 
 
 def _is_untouched_schedule(row: SCCategorySchedule) -> bool:
@@ -2804,10 +3247,13 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
       ④ 系统托管行（window_auto=True）的时段归属随偏好分配刷新——
          上限已由系统回填的，只改时段不动上限；上限全 0 的（从未配置过）
          连同默认上限一起回填。
+
+    v2.1.6：偏好分配改为「热门白天 / 冷门夜间」的 2 小时粒度，
+    且**避开静默保护时段**（静默开启时落进静默的段不分配给任何分类）。
     """
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
-    windows = _preference_windows(db)
+    windows = _preference_windows(db, _quiet_window(_cycle_plan_of(db, version_id)))
     added = False
     changed = False
     for cat in _tmdb_genre_catalog():
@@ -2879,6 +3325,40 @@ def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
         return (0, 0)
     peak_hour = max(hours, key=lambda h: (hours[h], -h))
     return (peak_hour, min(24, peak_hour + 2))
+
+
+# ---------------------------------------------------------------------------
+# v2.1.6：分类推荐时段（档位偏好 + AI 建议合并，统一为「时间段」）
+# ---------------------------------------------------------------------------
+# 用户口径：「档位偏好和 ai 建议时段合并，只推荐时间段（尽量上 2 小时为颗粒度）
+# 不用到周维度」「采纳操作有的按钮是灰色的（每个分类都要匹配对应的 ai 建议）」。
+#
+# v2.1.4 的周维度建议有两处问题：
+#   ① 7 天网格信息量过大，用户要的是「一个推荐时间段」；
+#   ② 采纳按钮按「是否有实测数据」置灰 → 大部分分类无实测，按钮永远点不了。
+#
+# v2.1.6 改为**单一时间段**（2 小时颗粒度），且**每个分类都必有建议**：
+#   ① 真实优先——该分类已发布任务的小时分布，取最密集的连续 2 小时段；
+#   ② 观影习惯兜底——无实测时用该分类的**默认时间表时段**
+#      （热门白天 / 冷门夜间，已避开静默时段）。
+#      这是「通用作息 + 偏好排名」派生，不是编造的历史数据，来源标注为「习惯基线」。
+#
+# 返回 (起, 止, 来源)：来源 "history"=实测 / "habit"=习惯基线 / ""=无建议。
+# **起点 0 是合法值**（夜间段 00:00–02:00），不能用数值真伪判断有没有建议——
+# v2.1.6 之前 `if start:` 会把这类建议当成「无建议」丢掉，
+# 前端 `v-if="s.row.suggest_start"` 同样为假 → 采纳按钮置灰（用户实测反馈）。
+def _category_suggest_window(
+    db: Session,
+    category_key: str,
+    fallback: tuple[int, int] | None = None,
+) -> tuple[int, int, str]:
+    """该分类的推荐时间段（2 小时颗粒度）+ 来源标记。"""
+    start, end = _ai_suggest_window(db, category_key)
+    if end > start:
+        return (start, end, "history")
+    if fallback and fallback[0] != fallback[1]:
+        return (int(fallback[0]), int(fallback[1]), "habit")
+    return (0, 0, "")
 
 
 # ---------------------------------------------------------------------------
@@ -3045,15 +3525,21 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
     if not version:
         return {"ok": False, "reason": "无活动计划版本"}
     force = bool(p.get("force"))
+    # v2.1.6：支持只对**勾选的分类**应用默认（配合前端勾选语义：
+    # 未勾选或全勾选 = 全部）。
+    wanted = {str(x).strip() for x in (p.get("category_keys") or []) if str(x).strip()}
     # 先快照「从未配置过」的行（回填前取，否则指纹被回填动作抹掉）
     before = list(db.scalars(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version.id)).all())
     untouched_keys = {r.category_key for r in before if _is_untouched_schedule(r)}
     rows = _ensure_schedules(db, version.id)
-    windows = _preference_windows(db)
+    windows = _preference_windows(db, _quiet_window(_cycle_plan_of(db, version.id)))
     applied = 0
     updated = 0
     for row in rows:
+        # v2.1.6：只处理勾选的分类（不传 = 全部）。
+        if wanted and row.category_key not in wanted:
+            continue
         cat = next((c for c in _tmdb_genre_catalog()
                     if c["category_key"] == row.category_key), None)
         win = windows.get(row.category_key, FULL_DAY_WINDOW)
@@ -3062,13 +3548,12 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
             continue
         changed = (int(row.window_start or 0) != ws
                    or int(row.window_end or 0) != we
-                   or int(row.hourly_limit or 0) != hl
-                   or int(row.daily_limit or 0) != dl
                    or not row.enabled)
         row.window_start, row.window_end = ws, we
-        row.hourly_limit, row.daily_limit = hl, dl
+        # v2.1.6：分类级「每小时上限 / 日上限」已移除，统一由周期计划管理约束，
+        # 因此这里不再回写分类级上限。
         row.enabled = True
-        # v2.1.1：一键应用默认 = 系统托管 → 该行重新可被「按偏好分配时段」刷新。
+        # v2.1.1：一键应用默认 = 系统托管 → 该行重新可被系统自动刷新。
         row.window_auto = True
         row.updated_at = utcnow()
         applied += 1
@@ -3092,14 +3577,15 @@ def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get
     cat = next((c for c in _tmdb_genre_catalog()
                 if c["category_key"] == row.category_key), None)
     media_type = cat.get("media_type") if cat else ""
-    # v2.1.2：时段取偏好分配（高峰独占段），与「按偏好分配时段」口径一致。
-    win = _preference_windows(db).get(row.category_key, FULL_DAY_WINDOW)
+    # v2.1.6：时段取**默认时间表**（热门白天 / 冷门夜间，避开静默），
+    # 与「一键恢复默认」同一口径。
+    win = _preference_windows(db, _quiet_window(_cycle_plan_of(db))).get(
+        row.category_key, FULL_DAY_WINDOW)
     ws, we, hl, dl = _default_schedule_for(media_type, win)
     row.window_start, row.window_end = ws, we
-    row.hourly_limit, row.daily_limit = hl, dl
     row.ai_adopted = False
-    # v2.1.1：「恢复默认」= 交还系统托管 → 该行重新可被「按偏好分配时段」刷新。
-    row.window_auto = True
+    # v2.1.6：分类级上限已移除，统一由周期计划管理约束——
+    # 恢复默认只改时段，不回写分类级 hourly/daily。
     row.updated_at = utcnow()
     db.commit()
     return {"ok": True, "item": _model_dict(row)}
@@ -3107,7 +3593,12 @@ def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get
 
 @router.get("/category-schedules")
 def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
-    """分类-时间排期表：每分类一行，含 AI 建议时段（真实派生）。"""
+    """分类-时间排期表：每分类一行，含**合并后的推荐时间段**。
+
+    v2.1.6：档位偏好与 AI 建议合并为单一「推荐时间段」（2 小时颗粒度），
+    每个分类都必有建议（实测优先，无实测用默认时间表兜底），
+    不再输出周维度网格。
+    """
     version = _active_version(db) if not version_id else db.get(SCSharePlanVersion, version_id)
     if not version:
         return {"items": [], "version_id": 0, "reason": "无活动计划版本"}
@@ -3118,6 +3609,12 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
     # v2.1.4：静默保护区间（开启时用于校验配置时段是否冲突）
     cycle = _jload(version.config_json, {}).get("cycle_plan") or {}
     quiet = _quiet_window(cycle)
+    # v2.1.6：默认时间表（热门白天 / 冷门夜间）——推荐时段的兜底来源，
+    # 且已避开静默保护区间。
+    default_windows = _preference_windows(db, quiet)
+    # 偏好排名（档位）——与推荐时间段合并展示。
+    pref_rank = {p["category_key"]: p.get("rank")
+                 for p in _category_preference(db)}
     items = []
     for r in rows:
         d = _model_dict(r)
@@ -3126,14 +3623,19 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
         # 前端只用 ref 做键匹配，展示一律用 name。
         d["ref"] = r.category_key
         d["tmdb_genre_id"] = cat_map.get(r.category_key, {}).get("tmdb_genre_id", 0)
-        ai_start, ai_end = _ai_suggest_window(db, r.category_key)
+        # v2.1.6：合并后的推荐时间段（实测优先 → 默认时间表兜底）。
+        fallback = default_windows.get(r.category_key, FULL_DAY_WINDOW)
+        sug_start, sug_end, sug_source = _category_suggest_window(
+            db, r.category_key, fallback)
+        d["suggest_start"] = sug_start
+        d["suggest_end"] = sug_end
+        d["suggest_source"] = sug_source
+        # 兼容旧字段：AI 建议时段仍写 ai_window_start/end，前端过渡期可继续用。
         if not r.ai_adopted:
-            d["ai_window_start"], d["ai_window_end"] = ai_start, ai_end
-        # v2.1.4：周维度 AI 建议（真实历史优先，通用观影作息兜底）
-        week_ai = _ai_suggest_week_windows(db, r.category_key)
-        d["ai_week_windows"] = week_ai["windows"]
-        d["ai_week_source"] = week_ai["source"]
-        # v2.1.4：已采纳的周维度配置窗口（前端展示 + 调度消费）
+            d["ai_window_start"], d["ai_window_end"] = sug_start, sug_end
+        # v2.1.6：偏好档位（排名）并入推荐时段，不再单独占一列。
+        d["pref_rank"] = pref_rank.get(r.category_key, 0)
+        # v2.1.4：已采纳的周维度配置窗口（调度仍兼容读取）
         d["week_windows"] = _jload(r.week_windows, {}) if r.week_windows else {}
         # v2.1.4：静默冲突标记（前端据此提示，默认时段推荐也要避开静默区）
         conflict = False
@@ -3152,7 +3654,7 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
                     except (TypeError, ValueError):
                         continue
         d["quiet_conflict"] = conflict
-        # v2.1.1：补媒体类型，前端「周期维度」列据此区分默认档位（tv / movie）。
+        # v2.1.1：补媒体类型（前端不再展示「周期维度」列，仍随行下发备用）
         d["media_type"] = cat_map.get(r.category_key, {}).get("media_type", "")
         items.append(d)
     # v2.1.4：整表按**配置时间段**升序排列（0-2 → 2-4 → 4-6 …），
@@ -3216,8 +3718,14 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
         row.week_windows = _jdump(cleaned)
     elif "week_windows" in p:
         row.week_windows = ""
-    row.hourly_limit = max(0, int(p.get("hourly_limit") or 0))
-    row.daily_limit = max(0, int(p.get("daily_limit") or 0))
+    # v2.1.6：分类级「每小时上限 / 日上限」已从分类排期表移除，
+    # 速率统一由**周期计划管理**约束（category_hour_max / day_max）。
+    # 因此这里只在请求体**显式携带**时写入，缺失时保留库中原值——
+    # 否则前端不再传这两个字段会把它们静默清零（0=不限），等于放开限流。
+    if "hourly_limit" in p:
+        row.hourly_limit = max(0, int(p.get("hourly_limit") or 0))
+    if "daily_limit" in p:
+        row.daily_limit = max(0, int(p.get("daily_limit") or 0))
     row.ai_window_start = max(0, min(23, int(p.get("ai_window_start") or 0)))
     row.ai_window_end = max(row.ai_window_start + 1, min(24, int(p.get("ai_window_end") or 0))) if p.get("ai_window_end") else 0
     row.ai_adopted = bool(p.get("ai_adopted", False))
@@ -3230,7 +3738,9 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     # （含用户根本没碰过的行），于是点一次保存全部，全表都变成「手工设定」，
     # 此后「按偏好分配时段」对所有行永久失效——配置时段与偏好档位推荐值从此脱钩，
     # 这正是用户反馈「配置时间段默认值应该与偏好档位推荐值一样」的真正根因。
-    pref_win = _preference_windows(db).get(category_key, FULL_DAY_WINDOW)
+    # v2.1.6：比较基准必须用**与默认时间表同口径**的窗口（含静默避让），
+    # 否则用户保存的就是系统刚推的默认时段，却被判成「手工设定」。
+    pref_win = _preference_windows(db, quiet).get(category_key, FULL_DAY_WINDOW)
     if (ws, we) != tuple(pref_win):
         row.window_auto = False
     row.updated_at = utcnow()
@@ -3240,58 +3750,44 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
 
 @router.post("/category-schedules/adopt-ai")
 def api_adopt_schedule_ai(body: Payload, db: Session = Depends(get_db)):
-    """采纳 AI 建议时段：把真实派生的建议窗口写入当前配置并标记已采纳。
+    """采纳推荐时段：把建议窗口写入当前配置并标记已采纳。
 
-    v2.1.4：按**周维度**采纳——逐日写入 week_windows，调度引擎按当天星期取对应时段。
-    单时段字段（ai_window_start/end / window_start/end）同步写入「周一」的时段，
-    保持与旧逻辑兼容（前端仍会展示一个汇总值）。
+    v2.1.6：按**单一时间段**采纳（2 小时颗粒度），不再写周维度网格。
+    每个分类都必有建议，因此不再出现「按钮置灰点不了」：
+      ① 真实优先——该分类已发布任务的小时分布派生（来源：实测）；
+      ② 兜底——该分类的默认时间表时段（来源：习惯基线）。
+    兜底不是编造的历史数据，页面会明确标注来源。
 
-    采纳只认**真实历史**（source=history）的建议：该分类没有任何已发布记录时，
-    页面上的建议来自「通用观影作息基线」，那是作息规律而非本分类的实测数据，
-    采纳它等于把通用规律当成实测结论写进配置——不予采纳（返回可读原因）。
+    静默保护开启时，采纳的时段不得落在静默区间内。
     """
     p = body.payload
     row = db.get(SCCategorySchedule, int(p.get("id") or 0))
     if not row:
         return {"ok": False, "reason": "排期行不存在"}
-    week_ai = _ai_suggest_week_windows(db, row.category_key)
-    week_windows: dict[str, list[int]] = week_ai.get("windows") or {}
-    sources: dict[str, str] = week_ai.get("source") or {}
-    ai_start, ai_end = _ai_suggest_window(db, row.category_key)
-    # 只采纳真实历史派生出来的那些天
-    measured = {d: v for d, v in week_windows.items() if sources.get(d) == "history"}
-    if not measured and not ai_start:
-        return {"ok": False, "reason": "该分类暂无历史发布数据，无真实建议可采纳"}
-    if not measured:
-        # 有历史但都不在本周维度里（例如历史落在别的星期）→ 退回单时段口径
-        measured = {}
-    # v2.1.4：静默保护开启时，采纳的时段不得落在静默区间内
     version = db.get(SCSharePlanVersion, int(row.plan_version_id or 0))
     cycle = (_jload(version.config_json, {}) if version else {}).get("cycle_plan") or {}
     quiet = _quiet_window(cycle)
-    if quiet:
-        for day, pair in measured.items():
-            if _window_overlaps_quiet((int(pair[0]), int(pair[1])), quiet):
-                return {"ok": False,
-                        "reason": _quiet_conflict_reason((int(pair[0]), int(pair[1])), quiet)}
-    if measured:
-        row.week_windows = _jdump(measured)
-        # 汇总值取周一（工作日起点）的时段，与旧口径对齐
-        monday = measured.get("1") or next(iter(measured.values()))
-        row.window_start, row.window_end = int(monday[0]), int(monday[1])
-    else:
-        row.window_start, row.window_end = ai_start, ai_end
-        row.week_windows = ""
-    row.ai_window_start = ai_start or int(row.window_start or 0)
-    row.ai_window_end = ai_end or int(row.window_end or 0)
+    fallback = _preference_windows(db, quiet).get(row.category_key, FULL_DAY_WINDOW)
+    sug_start, sug_end, sug_source = _category_suggest_window(
+        db, row.category_key, fallback)
+    # v2.1.6：起点 0 是合法值（夜间段 00:00–02:00），不能用 `not sug_start` 判无建议。
+    if not sug_source:
+        return {"ok": False, "reason": "该分类暂无可用的推荐时段"}
+    if quiet and _window_overlaps_quiet((sug_start, sug_end), quiet):
+        return {"ok": False,
+                "reason": _quiet_conflict_reason((sug_start, sug_end), quiet)}
+    row.window_start, row.window_end = sug_start, sug_end
+    # v2.1.6：单一时间段口径，清掉历史周维度配置（否则调度仍按周维度走）。
+    row.week_windows = ""
+    row.ai_window_start = sug_start
+    row.ai_window_end = sug_end
     row.ai_adopted = True
-    # v2.1.1：采纳 AI 建议是用户手工动作 → 该行不再被「按偏好分配时段」覆盖。
+    # 采纳是用户手工动作 → 该行不再被系统自动刷新覆盖。
     row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
-    return {"ok": True, "window_start": int(row.window_start or 0),
-            "window_end": int(row.window_end or 0),
-            "week_windows": measured}
+    return {"ok": True, "window_start": sug_start, "window_end": sug_end,
+            "source": sug_source, "week_windows": {}}
 
 
 @router.post("/category-schedules/copy")
@@ -3365,6 +3861,9 @@ CYCLE_PLAN_DEFAULTS = {
     "quiet_enabled": False, "day_max": 180, "window_start": 0, "window_end": 24,
     "week_max": 1200, "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
     "month_max": 5000, "month_rest_enabled": False,
+    # v2.1.6：单分类每日上限——分类排期表移除「日上限」列后，
+    # 分类级日限流统一由周期计划约束（此前无处可配，分类级日限流是死配置）。
+    "category_day_max": 0,
 }
 
 @router.get("/cycle-plan")
@@ -3387,7 +3886,8 @@ def api_save_cycle_plan(body: Payload, db: Session = Depends(get_db)):
     saved = {k: body.payload.get(k, v) for k, v in CYCLE_PLAN_DEFAULTS.items() if k in body.payload}
     cycle = {**CYCLE_PLAN_DEFAULTS, **(cfg.get("cycle_plan") or {}), **saved}
     # 数值夹逼，防非法输入破坏调度
-    for k in ("hour_max", "category_hour_max", "day_max", "week_max", "month_max"):
+    for k in ("hour_max", "category_hour_max", "category_day_max",
+              "day_max", "week_max", "month_max"):
         cycle[k] = max(0, int(cycle.get(k) or 0))
     for k in ("quiet_start", "window_start", "week_rest_hour"):
         cycle[k] = max(0, min(23, int(cycle.get(k) or 0)))
@@ -3468,6 +3968,8 @@ def api_diagnostics(db: Session = Depends(get_db)):
         "rules_in_effect": {
             "quiet_enabled": bool(cycle.get("quiet_enabled")),
             "hour_max": int(cycle.get("hour_max") or 0),
+            "category_hour_max": int(cycle.get("category_hour_max") or 0),
+            "category_day_max": int(cycle.get("category_day_max") or 0),
             "day_max": int(cycle.get("day_max") or 0),
             "week_max": int(cycle.get("week_max") or 0),
             "month_max": int(cycle.get("month_max") or 0),

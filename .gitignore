@@ -10,6 +10,9 @@ logs/*
 .pytest_cache/
 *.db
 *.db-journal
+# SQLite 的 WAL / SHM 伴生文件（本地开发库运行时生成，同属本地数据，禁止入库）。
+*.db-wal
+*.db-shm
 .DS_Store
 
 # 浏览器抓包原始文件含登录凭证，禁止入库。

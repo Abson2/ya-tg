@@ -220,9 +220,12 @@ def test_apply_defaults_endpoint(env):
         untouched = db.scalar(select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id,
             SCCategorySchedule.category_key == untouched_key))
-        # v2.1.2：时段取**偏好分配**给出的窗口（前 12 名独占高峰段，其余全天 0-24）。
+        # v2.1.6：时段取**默认时间表**（热门白天 / 冷门夜间，2 小时一段）。
         u_ws, u_we = windows.get(untouched_key, sc2.FULL_DAY_WINDOW)
         assert (untouched.window_start, untouched.window_end) == (u_ws, u_we)
+        # v2.1.6：分类级「每小时上限 / 日上限」已从分类表移除，
+        # 速率统一由周期计划管理约束 → 一键应用**不回写**分类级上限；
+        # 库中残留值仍是 v2.1.1 回填的默认档（历史兼容，调度已不消费）。
         assert (untouched.hourly_limit, untouched.daily_limit) == (5, 30)
         assert untouched.enabled is True, "一键应用必须同时启用该行"
 
@@ -243,7 +246,8 @@ def test_apply_defaults_endpoint(env):
             SCCategorySchedule.category_key == custom_key))
         c_ws, c_we = windows.get(custom_key, sc2.FULL_DAY_WINDOW)
         assert (custom2.window_start, custom2.window_end) == (c_ws, c_we)
-        assert (custom2.hourly_limit, custom2.daily_limit) == (3, 20)
+        # v2.1.6：force 只覆盖**时段**，分类级上限不再被回写。
+        assert (custom2.hourly_limit, custom2.daily_limit) == (1, 4)
         assert custom2.enabled is True
 
 
@@ -263,10 +267,11 @@ def test_reset_default_endpoint_single_row(env):
         res = sc2.api_reset_category_schedule_default(sc2.Payload(payload={"id": row.id}), db)
         assert res["ok"] is True
         item = res["item"]
-        # v2.1.2：恢复默认的时段取偏好分配窗口，不是写死的 8-24。
+        # v2.1.6：恢复默认的时段取**默认时间表**窗口（热门白天 / 冷门夜间）。
         r_ws, r_we = sc2._preference_windows(db).get(row.category_key, sc2.FULL_DAY_WINDOW)
         assert (item["window_start"], item["window_end"]) == (r_ws, r_we)
-        assert (item["hourly_limit"], item["daily_limit"]) == (5, 30)
+        # v2.1.6：分类级上限已移除 → 恢复默认不改上限（原值保留）。
+        assert (item["hourly_limit"], item["daily_limit"]) == (99, 99)
         assert item["ai_adopted"] is False, "恢复默认应清除 AI 采纳标记"
 
         # 电影档单行恢复
@@ -279,7 +284,8 @@ def test_reset_default_endpoint_single_row(env):
             sc2.Payload(payload={"id": movie_row.id}), db)
         m_ws, m_we = sc2._preference_windows(db).get(movie_row.category_key, sc2.FULL_DAY_WINDOW)
         assert (res2["item"]["window_start"], res2["item"]["window_end"]) == (m_ws, m_we)
-        assert (res2["item"]["hourly_limit"], res2["item"]["daily_limit"]) == (3, 20)
+        # v2.1.6：分类级上限不再由恢复默认回写。
+        assert (res2["item"]["hourly_limit"], res2["item"]["daily_limit"]) == (99, 99)
 
 
 def test_upsert_schedule_keeps_enabled_when_absent(env):
@@ -639,20 +645,26 @@ def test_legacy_share_center_is_internal_helper_only():
 # ---------------------------------------------------------------------------
 
 def test_frontend_schedule_defaults_controls():
-    """前端有「一键应用默认建议」与单行「默认」入口，并说明默认档位。"""
+    """前端有「一键恢复默认」与单行「默认」入口，并说明默认时间表口径。
+
+    v2.1.6：语义由「一键应用默认建议（按媒体类型分档的速率上限）」改为
+    「一键恢复默认（按观影习惯的 2 小时时间段）」——分类级上限已从分类表移除，
+    速率统一由周期计划管理约束，页面不再出现「5 条每时 / 30 条每日」这类档位文案。
+    """
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     assert "scApplySchedDefaults" in app
     assert "/sc/category-schedules/apply-defaults" in app
     assert "scResetSchedDefault" in app
     assert "/sc/category-schedules/reset-default" in app
-    assert "一键应用默认建议" in app
-    assert "内置默认建议值" in app
-    # 默认档位文案必须写明电视/电影两档
-    assert "5 条每时" in app and "30 条每日" in app
-    assert "3 条每时" in app and "20 条每日" in app
-    # v2.1.2：默认时段不再是写死的 8-24，改由偏好分配给出高峰独占段
+    assert "一键恢复默认" in app
+    # v2.1.6：旧的「一键应用默认建议」语义下线
+    assert "一键应用默认建议" not in app
+    # v2.1.6：分类级速率档位文案下线（限流统一由周期计划管理约束）
+    assert "5 条每时" not in app and "30 条每日" not in app
+    assert "3 条每时" not in app and "20 条每日" not in app
+    # 默认时段不再是写死的 8-24，改由默认时间表（热门白天 / 冷门夜间）派生
     assert "8:00–24:00" not in app, "写死的 8:00–24:00 时段文案必须清掉"
-    assert "peak_segments" in app and "full_day_window" in app
+    assert "day_segments" in app and "night_segments" in app and "full_day_window" in app
     assert "批量采纳 AI 建议" in app
     assert "/sc/category-schedules/adopt-ai-all" in app
 

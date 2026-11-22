@@ -13,9 +13,27 @@ os.environ.setdefault("APP_SECRET", "t" * 40)
 os.environ.setdefault("ADMIN_PASSWORD", "testpass")
 os.environ.setdefault("GUANGYA_SHARE_AUTHORIZATION", "fake-web-session")
 os.environ.setdefault("GUANGYA_CLIENT_ID", "test-client")
-_db_path = os.path.join(tempfile.gettempdir(), "guangya_pytest.db")
-if os.path.exists(_db_path):
-    os.remove(_db_path)
+# SQLite 的 WAL / SHM 旁文件必须与主库**一起**删除。
+# 只删主库而留下孤立的 -wal / -shm，SQLite 会把旧 WAL 当成当前库的一部分，
+# 报 `database disk image is malformed` 或 `disk I/O error`——
+# 表现为大批量 ERROR + failed，且**单跑某个文件时完全正常**（因为那时库是干净的），
+# 极易被误判成代码回归。v2.1.6 发版前实测踩过：全量 473 errors / 81 failed，
+# 而在 v2.1.5 基线 worktree 上跑同样命令，失败模式与数量几乎完全一致，
+# 证明是**测试环境缺陷**而非产品代码回归。
+#
+# 另外：**库文件名带进程号**，避免两个 pytest 进程并发时互相删库 ——
+# 本仓库的测试共享同一个 DATABASE_URL，历史上并发跑（后台全量 + 前台单文件）
+# 会让后启动的进程在导入期删掉前一个正在用的库，前一个随即报 disk I/O error。
+# 进程级唯一名彻底消除这类竞态，也让并发跑全量成为安全操作。
+_db_path = os.path.join(tempfile.gettempdir(), f"guangya_pytest_{os.getpid()}.db")
+for _suffix in ("", "-wal", "-shm", "-journal"):
+    _side = _db_path + _suffix
+    if os.path.exists(_side):
+        try:
+            os.remove(_side)
+        except OSError:
+            # 旁文件被其他进程占用时不强删：删不掉主库也照样能建新库。
+            pass
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 
 

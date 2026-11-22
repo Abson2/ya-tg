@@ -150,10 +150,11 @@ def test_week_window_for_reads_json(env):
 # ---------------------------------------------------------------------------
 
 def test_adopt_ai_writes_week_windows(env):
-    """采纳建议写入周维度配置窗口，并标记已采纳。
+    """采纳建议 → **单一时间段**落库（v2.1.6 取代周维度网格）。
 
-    采纳只认**实测**建议（真实发布分布派生）——「通用习惯」是作息规律，
-    不是本分类的实测数据，采纳它等于把规律当结论写进配置。
+    v2.1.6 用户口径：「档位偏好和 ai 建议时段合并，只推荐时间段（尽量上 2 小时为
+    颗粒度）不用到周维度」——采纳写入的就是一个 2 小时段，
+    同时清空历史周维度配置（否则调度仍按周维度走）。
     """
     from app import share_center_v2 as sc2
     from app.models import SCCategorySchedule
@@ -164,24 +165,28 @@ def test_adopt_ai_writes_week_windows(env):
         rows = sc2._ensure_schedules(db, version.id)
         db.commit()
         row = next(r for r in rows if r.category_key == "genre:剧情")
-        # 造真实历史：周一 21 点、周六 11 点
+        # 造真实历史：周一 21 点（最密集小时 → 21-23）
         monday = datetime(2026, 1, 5, 21, 30, tzinfo=SHANGHAI)
-        saturday = datetime(2026, 1, 10, 11, 30, tzinfo=SHANGHAI)
-        _add_published_at(db, "genre:剧情", [monday, saturday])
+        _add_published_at(db, "genre:剧情", [monday, monday])
         res = sc2.api_adopt_schedule_ai(sc2.Payload(payload={"id": row.id}), db)
         assert res["ok"] is True
-        assert res["week_windows"], "采纳应返回周维度窗口"
-        # 只写入实测的那几天
-        assert set(res["week_windows"].keys()) == {"1", "6"}
+        assert res["source"] == "history", "有真实样本时来源标记为实测"
+        assert (res["window_start"], res["window_end"]) == (21, 23)
+        assert res["week_windows"] == {}, "v2.1.6：不再写周维度窗口"
         db.expire_all()
         again = db.scalar(select(SCCategorySchedule).where(SCCategorySchedule.id == row.id))
         assert again.ai_adopted is True
-        assert again.week_windows, "周维度配置窗口必须落库"
-        assert sc2._jload(again.week_windows, {}), "落库内容必须是可解析的 JSON"
+        assert (again.window_start, again.window_end) == (21, 23)
+        assert not again.week_windows, "历史周维度配置必须被清空"
 
 
 def test_adopt_ai_rejected_without_real_history(env):
-    """没有真实发布历史时不得采纳（通用习惯基线不可当实测结论）。"""
+    """无真实历史时改用**习惯基线**兜底并明确标注来源（v2.1.6）。
+
+    v2.1.4 的口径是「无实测就拒绝采纳」——用户反馈「采纳操作有的按钮是灰色的」，
+    因为大部分分类根本没有实测数据。v2.1.6 改为每个分类都必有建议：
+    实测优先，无实测用该分类的默认时间表时段兜底，来源标记「习惯基线」。
+    """
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
@@ -191,8 +196,9 @@ def test_adopt_ai_rejected_without_real_history(env):
         db.commit()
         row = next(r for r in rows if r.category_key == "genre:喜剧")
         res = sc2.api_adopt_schedule_ai(sc2.Payload(payload={"id": row.id}), db)
-        assert res["ok"] is False
-        assert "暂无历史发布数据" in res["reason"]
+        assert res["ok"] is True, "每个分类都必须有可采纳的建议"
+        assert res["source"] == "habit", "无实测时来源标记为习惯基线"
+        assert res["window_end"] - res["window_start"] == 2, "建议为 2 小时颗粒度"
 
 
 def test_plan_engine_uses_week_window_for_today(env):
@@ -605,13 +611,18 @@ def test_frontend_rule_page_is_full_width():
 
 
 def test_frontend_week_grid_shows_seven_days():
-    """AI 建议列按周维度展示 7 天。"""
+    """v2.1.6：周维度网格下线，改为单一「推荐时间段」列。"""
     app = APP_VUE.read_text(encoding="utf-8")
-    assert "sc-week-grid" in app, "缺少周维度网格"
-    assert "scWeekWindowOf" in app, "缺少周维度取值函数"
-    assert "ai_week_windows" in app, "前端未消费周维度建议字段"
-    assert "v-for=\"d in [1,2,3,4,5,6,7]\"" in app, "周维度必须覆盖周一至周日"
-    assert "AI 建议时间段（周维度）" in app, "列标题未体现周维度"
+    assert "sc-week-grid" not in app, "周维度网格已下线，不得残留"
+    assert "scWeekWindowOf" not in app, "周维度取值函数已下线"
+    assert "AI 建议时间段（周维度）" not in app, "周维度列标题已下线"
+    # 合并后的单一推荐时间段列
+    assert "推荐时间段" in app, "缺少合并后的推荐时间段列"
+    assert "suggest_start" in app and "suggest_end" in app
+    # 每个分类都必有建议 → 采纳按钮不因缺建议而置灰。
+    # v2.1.6：判定必须用 suggest_source（来源标记），不能用起点数值真伪——
+    # 夜间段 00:00–02:00 起点是 0，用 suggest_start 会让这类分类的采纳按钮变灰。
+    assert ':disabled="!s.row.suggest_source"' in app
 
 
 def test_frontend_quiet_hours_disabled():
@@ -647,6 +658,7 @@ def test_frontend_does_not_leak_backend_field_names():
     for banned in ("work_key", "link_state", "ai_week_windows", "week_windows",
                    "window_auto", "category_key", "ai_window_start", "ai_week_source"):
         assert banned not in block, f"发布规则页出现后端字段名：{banned}"
-    # 中性引用名与中文标签并存
-    assert "s.row.ref" in block, "应使用中性引用名而非后端字段名"
+    # 中性展示名与中文标签并存（v2.1.6 表格以中文分类名 + 中性建议字段呈现）
+    assert "s.row.name" in block, "应使用中性展示名而非后端字段名"
+    assert "s.row.suggest_start" in block
     assert "静默保护" in block

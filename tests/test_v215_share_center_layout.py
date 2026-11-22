@@ -144,22 +144,26 @@ def test_if_full_width_modifier_reintroduced_it_must_win_cascade():
 
 
 # ---------------------------------------------------------------------------
-# 4. 页内布局：发布规则页保留两列
+# 4. 页内布局：发布规则页改为竖排单列
 # ---------------------------------------------------------------------------
 
 def test_rule_page_keeps_inner_two_column_layout():
-    """发布规则页内部仍是两列（基础规则 / 周期计划并列 + 排期表整行）。
+    """发布规则页内部改为**单列竖排**（基础规则 / 周期计划上下依次 + 排期表整行）。
 
-    移出 Grid 后页宽恢复，这一层两列才恢复到设计稿的 1/2 页宽比例
-    （此前在半幅容器内只剩 1/4 页宽）。
+    v2.1.5 时是 2 列 Grid 并排；v2.1.6 改为单列竖排——真机反馈两卡并排时
+    宽度被压到半格、高度不齐，视觉上「不对齐」。单列后每张卡独占整行宽度，
+    两卡上下依次排布、高度自然对齐。
+
+    保留 ``.sc-rule-full{grid-column:1/-1}`` 这条：分类排期表在单列下
+    仍应显式声明独占整行，避免将来改回多列时排期表被塞进半格。
     """
     app = APP_VUE.read_text(encoding="utf-8")
-    assert ".sc-rule-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))" in app, \
-        "发布规则页内部两列布局缺失"
+    assert ".sc-rule-layout{display:grid;grid-template-columns:minmax(0,1fr)" in app, \
+        "发布规则页应为单列竖排"
     assert ".sc-rule-layout .sc-rule-full{grid-column:1/-1}" in app, \
         "分类排期表应独占整行"
-    assert "@media(max-width:1100px){.sc-rule-layout{grid-template-columns:1fr}}" in app, \
-        "窄屏应降级为单列"
+    assert "repeat(2,minmax(0,1fr))" not in app.split(".sc-rule-layout{")[1][:80], \
+        "发布规则页内部不应回退为两列并排"
 
 
 def test_share_and_task_pages_single_column():

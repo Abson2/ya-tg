@@ -371,16 +371,36 @@ def test_cleanup_share_records_removes_from_stats(env):
 # 5. 批量采纳 AI 建议
 # ---------------------------------------------------------------------------
 
-def test_adopt_ai_all_skips_rows_without_real_history(env):
-    """没有真实历史发布数据的分类跳过，不编造时段。"""
+def test_adopt_ai_all_marks_habit_fallback_rows(env):
+    """无真实历史数据的分类：v2.1.6 起用**习惯基线**兜底，不再跳过。
+
+    口径变化的原因：v2.1.4 的周维度建议按「有无实测样本」置灰采纳按钮，
+    导致大部分分类按钮永远点不了（用户实测反馈「有的按钮是灰色的」）。
+    v2.1.6 改为单一时间段 + 每分类必有建议，并**用来源字段区分**：
+    "history"=实测 / "habit"=习惯基线 —— 兜底不冒充实测，不编造历史数据。
+    """
     from app import share_center_v2 as sc2
     S, _ = env
     with S() as db:
         sc2.ensure_defaults(db)
         res = sc2.api_adopt_schedule_ai_all(sc2.Payload(payload={}), db)
         assert res["ok"] is True
-        assert res["adopted"] == 0, "无历史数据时不得采纳任何建议"
-        assert res["skipped"] == res["total"]
+        assert res["adopted"] > 0, "习惯基线兜底后应有分类被采纳"
+        assert res["adopted"] + res["skipped"] == res["total"]
+        # 每个分类的建议来源都必须是合法值：
+        # "history"=实测 / "habit"=习惯基线 / ""=无建议。
+        # 关键红线：**有实测就必须是 history**；无实测时可以是 habit（兜底），
+        # 但绝不能出现「无来源却给出时段」或 habit 冒充实测的情况。
+        rows = sc2.api_category_schedules(sc2._active_version(db).id, db)["items"]
+        for r in rows:
+            assert r.get("suggest_source") in ("history", "habit", ""), \
+                f"分类 {r.get('name')} 的建议来源标记非法：{r.get('suggest_source')}"
+            if r.get("suggest_source") == "habit":
+                assert r.get("suggest_start", 0) < r.get("suggest_end", 0), \
+                    f"分类 {r.get('name')} 的习惯基线时段必须非空"
+            if r.get("suggest_source") == "":
+                assert r.get("suggest_start", 0) == 0 and r.get("suggest_end", 0) == 0, \
+                    "无建议时不得给出时段"
 
 
 def test_adopt_ai_all_writes_real_suggestion(env):

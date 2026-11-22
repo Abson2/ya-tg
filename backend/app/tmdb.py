@@ -74,6 +74,15 @@ class TmdbRateLimited(RuntimeError):
     """场景限流触发：调用过于频繁，本次请求未发出。"""
 
 
+class TmdbNotFound(RuntimeError):
+    """TMDB 明确返回 404：该 ID 在**这个类型命名空间**里不存在。
+
+    v2.1.6 新增：这是「可以尝试另一种类型」的**唯一**正当理由。
+    与之相对，限流 / 网络错误 / HTTP 5xx 都是**瞬态失败**，
+    绝不能被当作「这个类型没有」而悄悄换到另一个命名空间。
+    """
+
+
 # ---------- v0.9.8：按场景独立限流（scan 资源库识别 / bot 私聊交互） ----------
 # 每个场景各自维护「上次调用时间 + 滑动窗口内的调用时间戳」。
 # bot 默认间隔久、频次低，防止 Bot 被恶意刷导致 TMDB 账号风控。
@@ -215,6 +224,12 @@ async def _get(path: str, params: dict, db: Session | None = None,
             f"TMDB 密钥无效或权限不足（HTTP {r.status_code}，当前按 {mode} 方式调用）。"
             "请确认：v3 API Key 是 32 位十六进制字符串；v4 Read Access Token 以 eyJ 开头。"
             "建议到「TMDB 设置」页重新粘贴正确的密钥并点「测试连接」。")
+    if r.status_code == 404:
+        # v2.1.6：404 = 「这个类型命名空间里没有这个 ID」，
+        # 与限流/网络错误/5xx 这类**瞬态失败**性质完全不同。
+        # 只有 404 才允许调用方换类型重试；其余错误必须向上抛，
+        # 绝不能被静默吞掉后回退到另一个命名空间（那是「银河护卫队2 → Indrani」的根因）。
+        raise TmdbNotFound(f"TMDB 无此资源（HTTP 404）：{path}")
     if r.status_code >= 400:
         raise RuntimeError(f"TMDB 请求失败 HTTP {r.status_code}：{r.text[:200]}")
     return r.json()
@@ -369,17 +384,57 @@ async def english_title(tmdb_id: int, media_type: str, db: Session | None = None
 
 async def detail_by_id_any(tmdb_id: int, preferred: str = "movie",
                            db: Session | None = None) -> tuple[dict | None, str]:
-    """ID 精确匹配：先试首选类型，再试另一类型（有些标记不带类型）。"""
+    """ID 精确匹配：先试首选类型，再试另一类型（有些标记不带类型）。
+
+    v2.1.6 真实缺陷修复（银河护卫队2 被识别成 Indrani）：
+    TMDB 的 **movie / tv 是两套完全独立的 ID 命名空间**，同一个数字在两个
+    空间里是完全不同的作品：
+        movie/283995 → 银河护卫队2 (2017)      ← 正确的
+        tv/283995    → Indrani (2022, 印度剧, 265 集)  ← 串台后的错值
+
+    原实现是「每个类型 try detail … except Exception: continue」——
+    **首选 movie 那次调用若抛任何异常（限流 / 网络超时 / HTTP 5xx），
+    异常被静默吞掉后自动回退到 tv/283995**，命中 Indrani 并以「剧集」写死。
+    真机证据：该 resource 11-21 曾被识别成「书剑恩仇录」，12:25 重扫变 Indrani，
+    识别结果反复漂移；容器内复跑同一输入却完全正确（说明是瞬态失败，非必然错误）。
+
+    修正后的语义：
+      ① **404**（该类型命名空间里没这个 ID）→ 允许换另一种类型继续试；
+      ② **限流 / 网络 / HTTP 5xx**（瞬态失败）→ 在**同一类型**上重试，
+         重试仍失败则**向上抛**，绝不换类型——宁可这次识别失败，
+         也不能把电影串成剧集写进库。
+      ③ 限流（TmdbRateLimited）直接抛出，由上层按「本次不识别」降级。
+    """
     order = [preferred, "tv" if preferred == "movie" else "movie"]
+    last_error: Exception | None = None
     for mt in order:
-        try:
-            d = await detail(tmdb_id, mt, db)
-            if d and d.get("tmdb_id"):
-                return d, mt
-        except TmdbAuthError:
-            raise
-        except Exception:
-            continue
+        # 瞬态失败时在同一类型上重试（最多 2 次尝试）。
+        for attempt in range(2):
+            try:
+                d = await detail(tmdb_id, mt, db)
+                if d and d.get("tmdb_id"):
+                    return d, mt
+                # 该类型下拿不到有效详情 → 视为「这个命名空间没有」，换类型试。
+                last_error = None
+                break
+            except TmdbNotFound:
+                # 404：正当的换类型理由。
+                last_error = None
+                break
+            except TmdbAuthError:
+                raise
+            except TmdbRateLimited:
+                # 限流是瞬态的，但换类型只会再撞一次限流 —— 直接上抛。
+                raise
+            except Exception as exc:
+                # 网络错误 / HTTP 5xx 等瞬态失败：同类型重试一次，
+                # 仍失败则记下错误并**继续在同类型**——绝不静默换类型。
+                last_error = exc
+                continue
+        if last_error is not None:
+            # 同类型重试后仍失败 → 抛出，让上层把本次识别标记为失败，
+            # 而不是拿另一个命名空间的作品冒充。
+            raise last_error
     return None, ""
 
 
@@ -470,7 +525,23 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
     # 1) ID 精确匹配（LitePan / TgtoDrive 目录里的 (tmdb-206484) 标记）
     if hint.get("tmdb_id"):
         preferred = "tv" if hint["type_hint"] == "tv" else "movie"
-        d, actual = await detail_by_id_any(hint["tmdb_id"], preferred, db)
+        # v2.1.6：类型**明确**时（如目录「电影/欧美电影」推出的 type_hint=movie）
+        # 绝不允许跨命名空间回退。
+        # TMDB 的 movie/tv 是两套独立 ID 空间，283995 在 movie 是《银河护卫队2》，
+        # 在 tv 是印度剧《Indrani》——一旦回退就是把电影串成剧集。
+        # 类型未知（type_hint=unknown）时才允许换类型试（老标记不带类型的情形）。
+        type_locked = hint["type_hint"] in ("movie", "tv")
+        if type_locked:
+            try:
+                d = await detail(hint["tmdb_id"], preferred, db)
+            except TmdbAuthError:
+                raise
+            except TmdbNotFound:
+                # 该类型命名空间里确实没有这个 ID → 本次不识别，不换类型。
+                d = None
+            actual = preferred if d else ""
+        else:
+            d, actual = await detail_by_id_any(hint["tmdb_id"], preferred, db)
         if d:
             d["score"] = 1.0
             return {"ok": True, "status": "identified", "source": "id",

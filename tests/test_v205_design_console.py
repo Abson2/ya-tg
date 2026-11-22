@@ -117,9 +117,13 @@ def test_category_schedule_crud_adopt_copy(env):
         row = next(r for r in sc2.api_category_schedules(vid, db)["items"]
                    if r["category_key"] == key_action)
         assert (row["window_start"], row["hourly_limit"]) == (9, 6)
-        # 无历史发布采纳应失败（不编造建议）
+        # 无历史发布时：v2.1.6 起**每个分类都必有建议**（习惯基线兜底），
+        # 但来源必须标记为 "habit"（通用作息基线），绝不能冒充实测历史。
         no_ai = sc2.api_adopt_schedule_ai(SimpleNamespace(payload={"id": row["id"]}), db)
-        assert not no_ai["ok"]
+        assert no_ai["ok"], "习惯基线兜底后应给出建议"
+        assert no_ai["source"] == "habit", \
+            "无实测历史时来源必须标记为习惯基线，不得冒充实测"
+        assert no_ai["window_start"] < no_ai["window_end"], "建议时段必须非空"
         # 造一条真实已发布任务 → AI 建议来自其真实小时分布
         pl = SCPushList(list_key="k", name="l", status="active")
         db.add(pl); db.flush()
@@ -132,6 +136,7 @@ def test_category_schedule_crud_adopt_copy(env):
         db.commit()
         adopted = sc2.api_adopt_schedule_ai(SimpleNamespace(payload={"id": row["id"]}), db)
         assert adopted["ok"] and 0 <= adopted["window_start"] <= 23
+        assert adopted["source"] == "history", "有实测历史时来源必须是实测"
         key_scifi = next(r for r in sc2.api_category_schedules(vid, db)["items"]
                          if r["name"] == "科幻")["category_key"]
         copied = sc2.api_copy_category_schedule(SimpleNamespace(payload={
