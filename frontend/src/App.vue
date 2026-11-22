@@ -89,6 +89,10 @@ const scFilteredTasks = computed(() => {
 const scShareRecords = ref([])
 // 分享管理统计卡：后端按「清单项 + 任务」真实聚合，口径与表格行数一致
 const scShareStats = computed(() => scOverview.value.share_stats || {})
+// v2.1.4：链接状态中文映射。
+// 分享管理页已改为消费后端下发的 `link_status_label` + `link_tone`
+// （后端翻译，唯一权威），此处保留脚本侧兜底映射作为回归锚点：
+// 任何入口拿到裸状态值都不得直接渲染，必须过这个函数。
 const scLinkStateLabel = (state) => ({
   active: '有效', unknown: '待校验', suspicious: '疑似失效',
   inactive: '已失效', cleaned: '已清理', manual_review: '待人工',
@@ -159,7 +163,7 @@ const scTaskViewRows = computed(() => {
   let rows = scTasks.value
   const s = scTaskSearch.value.trim().toLowerCase()
   if (s) rows = rows.filter(r => (r.title || '').toLowerCase().includes(s)
-    || (r.work_key || '').toLowerCase().includes(s))
+    || (r.ref || '').toLowerCase().includes(s))
   if (scTaskTypeFilter.value !== '全部') rows = rows.filter(r => r.kind === scTaskTypeFilter.value)
   // KPI / 统计条点击跳转筛选
   const f = scTaskStatusFilter.value
@@ -167,7 +171,22 @@ const scTaskViewRows = computed(() => {
   else if (f === 'inflight') rows = rows.filter(r => ['submitted', 'accepted', 'publishing', 'building'].includes(r.status))
   else if (f) rows = rows.filter(r => r.status === f)
   if (scLinkFilter.value) rows = rows.filter(r => (r.link_state || 'unknown') === scLinkFilter.value)
+  // v2.1.4：推送渠道筛选（全部 / 仅频道 / 仅群）
+  const c = scTaskChannelFilter.value
+  if (c === 'channel') rows = rows.filter(r => (r.channel_names || []).length > 0)
+  else if (c === 'group') rows = rows.filter(r => (r.group_names || []).length > 0)
   return rows
+})
+// v2.1.4：推送任务页的渠道筛选（全部 / 仅频道 / 仅群）
+const scTaskChannelFilter = ref('')
+// v2.1.4：任务状态筛选下拉的选项（中文标签，不暴露内部枚举名）
+const scTaskStatusOptions = computed(() => {
+  const counts = scOverview.value.status_counts || {}
+  const order = ['planned', 'ready', 'building', 'submitted', 'accepted',
+                 'publishing', 'published', 'failed', 'cancelled', 'cleaned']
+  return order
+    .filter(st => counts[st])
+    .map(st => ({ value: st, label: `${scTaskStatusLabel(st)}（${counts[st]}）` }))
 })
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
@@ -1252,18 +1271,25 @@ async function retryFailedFiles() {
 }
 // v0.9.6：清空「英文改名待处理」清单——把英文名为空的作品标记 ignored，
 // 从待处理清单消失；不改文件、不删映射，点「重新解析英文名并改名」可恢复。
+// v2.1.4：二次确认明确告知**后果**——此前文案只说「日后可恢复」，
+// 用户在真机上误以为「清空 = 永久不再翻译」，实测这批作品被永久拉黑。
+// 现在文案讲清三件事：① 只影响本轮跳过、不删任何东西；
+// ② A 库若出现新文件会自动恢复解析；③ 也可随时手动强制恢复。
 async function clearUntranslated() {
   const n = mirrorStatus.value.untranslated_works?.length || 0
   if (!n) { ElMessage.info('当前没有待处理项'); return }
   const ok = await confirmBox(
     `将把 ${n} 部「英文名为空」的作品标记为已忽略，从待处理清单移除。\n\n` +
-    '不删映射、不动文件、不影响入库与分享。若这些作品仍在 A 库且需要改名，' +
-    '日后点「重新解析英文名并改名」会清掉标记重新解析。')
+    '【会发生什么】这批作品在本轮同步中不再触发英文名解析，文件保持原中文名。\n' +
+    '【不会发生什么】不删映射、不动 A/B 库文件、不影响入库、分享与推送。\n' +
+    '【怎么恢复】① 若这些作品之后在 A 库出现新集，系统会自动恢复解析；' +
+    '② 也可随时点「重新解析英文名并改名」立即全部恢复。')
   if (!ok) return
   mirrorBusy.value = true
   try {
     const d = await api('/mirror/rename/untranslated/clear', { method: 'POST' })
-    ElMessage.success(`已清空 ${d.cleared || 0} 条待处理项`)
+    ElMessage.success(`已清空 ${d.cleared || 0} 条待处理项` +
+      (d.note ? `。${d.note}` : ''))
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -2097,13 +2123,15 @@ async function scSaveAllHourRows() {
 async function scSaveSchedRow(row) {
   try {
     const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
-      plan_version_id: scOverview.value.active_version_id, category_key: row.category_key,
+      plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
       window_start: row.window_start, window_end: row.window_end,
       hourly_limit: row.hourly_limit, daily_limit: row.daily_limit,
       ai_window_start: row.ai_window_start, ai_window_end: row.ai_window_end,
+      // v2.1.4：周维度配置窗口随保存一起写入（逐日生效）
+      week_windows: row.week_windows || {},
       ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '保存失败'); return }
-    ElMessage.success(`${row.name || row.category_key} 排期已保存`)
+    ElMessage.success(`${row.name || '分类'} 排期已保存`)
     await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
@@ -2111,13 +2139,15 @@ async function scSaveAllSchedRows() {
   scSchedSaving.value = true
   try {
     for (const row of scSchedRows.value) {
-      const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
-        plan_version_id: scOverview.value.active_version_id, category_key: row.category_key,
-        window_start: row.window_start, window_end: row.window_end,
-        hourly_limit: row.hourly_limit, daily_limit: row.daily_limit,
-        ai_window_start: row.ai_window_start, ai_window_end: row.ai_window_end,
-        ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
-      if (!d.ok) throw new Error(d.reason || '保存失败')
+const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
+          plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
+          window_start: row.window_start, window_end: row.window_end,
+          hourly_limit: row.hourly_limit, daily_limit: row.daily_limit,
+          ai_window_start: row.ai_window_start, ai_window_end: row.ai_window_end,
+          // v2.1.4：周维度配置窗口随保存一起写入（逐日生效）
+          week_windows: row.week_windows || {},
+          ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
+        if (!d.ok) throw new Error(d.reason || '保存失败')
     }
     ElMessage.success(`已保存 ${scSchedRows.value.length} 个分类排期`)
     await loadSc()
@@ -2171,10 +2201,11 @@ async function scAssignPreferenceWindows() {
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
   finally { scPrefAssigning.value = false }
 }
-// 偏好排名 → 分类 key 映射（真实派生，供表格展示排序与高峰档位）
+// 偏好排名 → 分类引用映射（真实派生，供表格展示排序与高峰档位）
+// v2.1.4：统一用后端下发的中性引用名 ref 作键，页面不出现后端字段名。
 const scPrefRank = computed(() => {
   const m = {}
-  for (const it of scPreference.value.items || []) m[it.category_key] = it
+  for (const it of scPreference.value.items || []) m[it.ref ?? it.category_key] = it
   return m
 })
 // v2.1.2：档位文案改为「高峰独占段 / 全天窗口」，不再用宽泛的白天/夜间
@@ -2188,12 +2219,70 @@ function scPrefLabel(key) {
   return { text, period }
 }
 function scPrefSortRows(rows) {
+  // v2.1.4：整表按**配置时间段**升序（0-2 → 2-4 → 4-6 …），
+  // 与用户巡检时「按时间顺序看每个时段」的直觉一致；
+  // 同起点的按止点升序，再按偏好排名、分类键稳定排序。
   const m = scPrefRank.value
   return [...rows].sort((a, b) => {
-    const ra = m[a.category_key]?.rank ?? 9999, rb = m[b.category_key]?.rank ?? 9999
+    const sa = Number(a.window_start ?? 0), sb = Number(b.window_start ?? 0)
+    if (sa !== sb) return sa - sb
+    const ea = Number(a.window_end ?? 0), eb = Number(b.window_end ?? 0)
+    if (ea !== eb) return ea - eb
+    const ra = m[a.ref]?.rank ?? 9999, rb = m[b.ref]?.rank ?? 9999
     if (ra !== rb) return ra - rb
-    return String(a.category_key).localeCompare(String(b.category_key))
+    return String(a.ref ?? '').localeCompare(String(b.ref ?? ''))
   })
+}
+
+// v2.1.4：静默保护开启时，配置时段不得选到静默区间内的小时。
+// 静默区间支持跨午夜（22:00–次日 6:00）。
+const scQuietHours = computed(() => {
+  const cp = scCyclePlan.value || {}
+  if (!cp.quiet_enabled) return new Set()
+  let qs = Number(cp.quiet_start ?? 0), qe = Number(cp.quiet_end ?? 0)
+  if (!Number.isFinite(qs) || !Number.isFinite(qe) || qs === qe) return new Set()
+  const set = new Set()
+  if (qs < qe) { for (let h = qs; h < qe; h++) set.add(h) }
+  else { for (let h = qs; h < 24; h++) set.add(h); for (let h = 0; h < qe; h++) set.add(h) }
+  return set
+})
+const scQuietOn = computed(() => scQuietHours.value.size > 0)
+// 起始小时候选（0-23）；止点候选（1-24）
+const scStartHourOptions = computed(() => Array.from({ length: 24 }, (_, i) => i))
+const scEndHourOptions = computed(() => Array.from({ length: 24 }, (_, i) => i + 1))
+const scHourDisabled = (h) => scQuietHours.value.has(Number(h))
+// 起止下拉的可用项：起始用 0-23，止点用 1-24（止点按「结束那一小时」判定是否落在静默）
+const scEndHourDisabled = (h) => scQuietHours.value.has((Number(h) - 1 + 24) % 24)
+
+// v2.1.4：周维度 AI 建议 / 已采纳的周维度配置窗口
+const scWeekdayNames = { 1: '周一', 2: '周二', 3: '周三', 4: '周四', 5: '周五', 6: '周六', 7: '周日' }
+// 取某行某天的时段：优先已采纳的配置，其次 AI 建议；返回 [start, end] 或 null
+function scWeekWindowOf(row, day) {
+  const cfg = row?.week_windows || {}
+  if (Array.isArray(cfg[day]) && cfg[day].length >= 2) return cfg[day]
+  const ai = row?.ai_week_windows || {}
+  if (Array.isArray(ai[day]) && ai[day].length >= 2) return ai[day]
+  return null
+}
+// 一行的周维度建议概览：有几天有建议
+function scWeekCoverage(row) {
+  let n = 0
+  for (let d = 1; d <= 7; d++) if (scWeekWindowOf(row, d)) n++
+  return n
+}
+// v2.1.4：只有**实测**（真实发布分布派生）的建议才可采纳——
+// 「通用习惯」是作息规律不是本分类的实测数据，采纳它等于把规律当结论。
+function scWeekMeasured(row) {
+  let n = 0
+  const src = row?.ai_week_source || {}
+  for (let d = 1; d <= 7; d++) if (src[String(d)] === 'history') n++
+  return n
+}
+const scWeekSourceLabel = (row, day) => {
+  const cfg = row?.week_windows || {}
+  if (Array.isArray(cfg[day]) && cfg[day].length >= 2) return '已采纳'
+  const src = row?.ai_week_source || {}
+  return src[day] === 'history' ? '实测' : '通用习惯'
 }
 async function scResetSchedDefault(row) {
   try {
@@ -2446,7 +2535,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.3 · Asia/Shanghai</span>
+          <span>v2.1.4 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -2788,6 +2877,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div class="mini-stat"><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div>
                 <div class="mini-stat"><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div>
                 <div class="mini-stat"><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div>
+                <!-- v2.1.4：被标记忽略的作品单独统计并透明展示，避免「清空后红字仍在」的错觉 -->
+                <div class="mini-stat"><small>已忽略解析</small><b :style="mirrorStatus.counts?.works_english_ignored ? 'color:#cf7f1c' : ''">{{ mirrorStatus.counts?.works_english_ignored || 0 }}</b></div>
               </div>
             </div>
             <div class="stat-group">
@@ -2860,8 +2951,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </el-table></div>
             <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>v0.9.17.2：勾选后点「批量重试选中」只对这些文件定向重发复制——只扫描其所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队</b>；也可等下一轮「立即同步」全量重试。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
           </div>
-          <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length" class="panel">
-            <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag><el-tag v-if="mirrorStatus.counts?.files_rename_skipped_legacy" type="info" size="small">历史不回刷 {{ mirrorStatus.counts.files_rename_skipped_legacy }} 个</el-tag></div>
+          <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length || mirrorStatus.counts?.works_english_ignored" class="panel">
+            <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag><el-tag v-if="mirrorStatus.counts?.works_english_ignored" type="info" size="small">已忽略 {{ mirrorStatus.counts.works_english_ignored }} 部</el-tag><el-tag v-if="mirrorStatus.counts?.files_rename_skipped_legacy" type="info" size="small">历史不回刷 {{ mirrorStatus.counts.files_rename_skipped_legacy }} 个</el-tag></div>
             <div v-if="mirrorStatus.untranslated_works?.length" class="table-scroll"><el-table :data="mirrorStatus.untranslated_works" size="small">
               <el-table-column prop="work" label="作品（A 库原名）" min-width="220"/>
               <el-table-column prop="reason" label="原因 / 处理建议" min-width="340"/>
@@ -2872,8 +2963,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="target" label="目标英文名" min-width="200"/>
               <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button><el-button v-if="mirrorStatus.untranslated_works?.length" :loading="mirrorBusy" :disabled="mirrorBusy" plain @click="clearUntranslated">清空待处理清单</el-button></div>
+            <!-- v2.1.4：按钮不再随清单为空自动消失——否则用户清空后就再也无法从界面
+                 手动恢复（只剩「重新解析英文名并改名」一条路）。清单为空时按钮禁用，
+                 并在下方提示已忽略作品数（A 库出现新集会自动恢复解析）。 -->
+            <div class="panel-foot"><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(true)">重新解析英文名并改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.untranslated_works?.length" plain @click="clearUntranslated">清空待处理清单</el-button></div>
             <p class="hint">英文剧名按 TMDB en-US 官方片名优先、<b>查不到就直接直译</b>（AI 直译 → 本地拼音兜底），<b>每部作品只解析一次并缓存</b>；点「重新解析英文名并改名」会清缓存重查。v0.9.6.1 按你的口径改为：<b>旧版只改文件夹、不改单集的历史条目不再回刷</b>，升级前未完成改名的行标记「历史不回刷」，只有升级后新同步的文件自动改英文名；确需处理历史行时点「重新解析英文名并改名」显式解除。改名失败通常是网盘拒绝了文件名字符或 B 库 fileId 失效，修正后点「按英文规范改名」重试即可；<b>不会重新复制文件、不会动 A 库，也不影响入库与分享</b>。</p>
+            <p v-if="mirrorStatus.counts?.works_english_ignored" class="hint" style="color:#cf7f1c"><b>有 {{ mirrorStatus.counts.works_english_ignored }} 部作品被标记为「已忽略」英文名解析</b>（此前点「清空待处理清单」所致）。它们<b>不会被永久拉黑</b>：一旦 A 库出现新集，同步会自动解除标记并重新解析；也可点上方「重新解析英文名并改名」立即全部恢复。</p>
           </div>
             </el-collapse-item>
             <el-collapse-item name="mappings">
@@ -3498,7 +3593,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </template>
 
               <!-- 其它子页卡片（按子导航显示） -->
-              <div class="sc-board" v-show="scSubNav !== '发布总览'">
+              <!-- v2.1.4：发布规则 / 分享管理 / 推送任务三页改为**整行满宽**——
+                   此前三者是 .sc-board（两列 Grid）里的单个格子，只占半幅，
+                   PC 端右侧大片留白、内容挤在左侧。现在这三页各自跨满两列。 -->
+              <div class="sc-board sc-board-full" v-show="scSubNav !== '发布总览'">
             <!-- 设计稿分享管理：搜索 + 状态筛选 + 批量 + 统计卡 + 记录表（详情为隐藏式弹窗） -->
             <div class="sc-share-layout" v-show="scSubNav === '分享管理'">
               <div class="sc-share-main">
@@ -3520,15 +3618,30 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <div class="sc-stat"><b>{{ scShareStats.history || 0 }}</b><small>历史记录</small></div>
                 </div>
                 <div class="sc-table-scroll">
-                <el-table :data="scShareViews" stripe size="small" max-height="380" @selection-change="s => scSelectedShares = s">
+                <el-table :data="scShareViews" stripe size="small" max-height="420" @selection-change="s => scSelectedShares = s">
                   <el-table-column type="selection" width="40"/>
-                  <el-table-column label="类型" width="76"><template #default="s"><span class="sc-mini-tag">{{ s.row.kind==='first'?'电影/剧':'追更' }}</span></template></el-table-column>
-                  <el-table-column prop="share_title" label="分享标题" min-width="150" show-overflow-tooltip/>
-                  <el-table-column prop="share_code" label="分享码" min-width="110" show-overflow-tooltip/>
+                  <!-- v2.1.4：首列改「作品」——展示 TMDB 海报缩略图 + 作品名 + 类型 -->
+                  <el-table-column label="作品" min-width="220">
+                    <template #default="s">
+                      <div class="sc-media-cell">
+                        <div class="sc-media-thumb">
+                          <el-image v-if="s.row.cover" :src="'https://image.tmdb.org/t/p/w185' + s.row.cover" fit="cover">
+                            <template #error><div class="sc-thumb-fallback">无封面</div></template>
+                          </el-image>
+                          <div v-else class="sc-thumb-fallback">无封面</div>
+                        </div>
+                        <div class="sc-media-text">
+                          <b>{{ s.row.share_title || '未命名作品' }}</b>
+                          <small>{{ s.row.kind==='first' ? '电影/剧' : '追更' }} · {{ s.row.category_name || '未分类' }}</small>
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="share_code" label="分享码" min-width="120" show-overflow-tooltip/>
                   <el-table-column label="发布时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
                   <el-table-column label="最后校验时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.last_checked_at) }}</template></el-table-column>
                   <el-table-column label="最近推送时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.last_pushed_at) }}</template></el-table-column>
-                  <el-table-column label="状态" width="88"><template #default="s"><span :class="['sc-dot-state', s.row.link_state]">{{ scLinkStateLabel(s.row.link_state) }}</span></template></el-table-column>
+                  <el-table-column label="链接状态" width="96"><template #default="s"><span :class="['sc-dot-state', s.row.link_tone]">{{ s.row.link_status_label }}</span></template></el-table-column>
                   <el-table-column label="操作" width="220"><template #default="s">
                     <el-button size="small" link type="primary" @click="scOpenShareDetail(s.row)">详情</el-button>
                     <el-button size="small" link @click="scCopyShareLink(s.row)">复制链接</el-button>
@@ -3543,18 +3656,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
             <!-- 分享详情隐藏式弹窗：点「详情」才弹出，不占常驻版面 -->
             <el-dialog v-model="scShareDetailVisible" title="分享详情" width="560px" append-to-body>
-              <div v-if="scSelectedDetail" class="sc-detail-kv">
+              <div v-if="scSelectedDetail">
+                <!-- v2.1.4：详情内页展示 TMDB 海报缩略图 -->
+                <div class="sc-share-poster">
+                  <el-image v-if="scSelectedDetail.cover" :src="'https://image.tmdb.org/t/p/w342' + scSelectedDetail.cover" fit="cover">
+                    <template #error><div class="sc-thumb-fallback">无封面</div></template>
+                  </el-image>
+                  <div v-else class="sc-thumb-fallback">无封面</div>
+                </div>
+                <div class="sc-detail-kv">
                 <div><span>作品</span><b>{{ scSelectedDetail.share_title || '—' }}</b></div>
                 <div><span>分享码</span><b>{{ scSelectedDetail.share_code || '—' }}</b></div>
                 <div><span>任务编号</span><b>#{{ scSelectedDetail.id }}</b></div>
                 <div><span>类型</span><b>{{ scSelectedDetail.kind==='first'?'首次':'追更' }}</b></div>
-                <div><span>当前状态</span><b>{{ scLinkStateLabel(scSelectedDetail.link_state) }}</b></div>
+                <div><span>所属分类</span><b>{{ scSelectedDetail.category_name || '未分类' }}</b></div>
+                <div><span>当前状态</span><b>{{ scSelectedDetail.link_status_label || '待校验' }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scSelectedDetail.share_url || '—' }}</b></div>
                 <div><span>创建时间</span><b>{{ fmtTime(scSelectedDetail.created_at, true) }}</b></div>
                 <div><span>最近校验</span><b>{{ fmtTime(scSelectedDetail.last_checked_at, true) }}</b></div>
                 <div><span>最近推送</span><b>{{ fmtTime(scSelectedDetail.last_pushed_at, true) }}</b></div>
-                <div><span>推送目标</span><b>{{ scSelectedDetail.chat_id || '—' }}</b></div>
+                <div><span>推送渠道</span><b>{{ scSelectedDetail.target_summary || '—' }}</b></div>
                 <div><span>错误</span><b style="word-break:break-all">{{ scSelectedDetail.error || '—' }}</b></div>
+                </div>
               </div>
               <template #footer>
                 <el-button size="small" type="primary" @click="scOpenTaskDetail(scSelectedDetail.id)">完整执行记录</el-button>
@@ -3570,11 +3693,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                  管理入口收敛到「发布规则」页的分类时间排期。 -->
 
             <!-- 设计稿发布规则：基础规则 / 分类时间排期 两个子 tab -->
+            <!-- v2.1.4：整页满宽（不再挤在 .sc-board 的半格子里）。
+                 基础规则与周期计划两卡并列一行，分类排期表独占整行。 -->
             <div v-show="scSubNav === '发布规则'">
               <div class="sc-subtabbar">
                 <button v-for="t in ['基础规则','分类时间排期']" :key="t" :class="['sc-subtab',{on: scRuleTab===t}]" @click="scRuleTab=t">{{ t }}</button>
               </div>
 
+              <div class="sc-rule-layout">
               <!-- 基础规则：上新即时推送 -->
               <div class="sc-card" v-show="scRuleTab==='基础规则'">
                 <div class="sc-card-head"><span class="sc-ico">⚡</span><div><h3>上新即时推送</h3><p>最近上架的影视有新变化立即推送；配置持久化于 app_config</p></div>
@@ -3623,7 +3749,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </div>
 
               <!-- 分类-时间排期配置：每分类一行（TMDB 官方分类） -->
-              <div class="sc-card sc-hour-card" v-show="scRuleTab==='分类时间排期'">
+              <div class="sc-card sc-hour-card sc-rule-full" v-show="scRuleTab==='分类时间排期'">
                 <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段与上限；内置默认建议值（电视 5 条每时 / 30 条每日，电影 3 条每时 / 20 条每日），共 {{ scSchedRows.length }} 类</p></div>
                   <el-button size="small" plain @click="scApplySchedDefaults">一键应用默认建议</el-button>
                   <el-button size="small" type="primary" :loading="scPrefAssigning" @click="scAssignPreferenceWindows">按偏好分配时段</el-button>
@@ -3633,13 +3759,38 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420">
                   <el-table-column label="TMDB 分类" width="120" fixed><template #default="s"><b>{{ s.row.name }}</b></template></el-table-column>
                   <el-table-column label="周期维度" width="86"><template #default="s"><span class="sc-mini-tag">{{ s.row.media_type === 'tv' ? '日' : '日/周/月' }}</span></template></el-table-column>
-                  <el-table-column label="偏好档位" min-width="190"><template #default="s"><span :class="['sc-dot-state', scPrefLabel(s.row.category_key).period === 'peak' ? 'active' : 'unknown']">{{ scPrefLabel(s.row.category_key).text }}</span></template></el-table-column>
-                  <el-table-column label="配置时间段" width="170"><template #default="s"><div class="sc-time-cell"><el-input-number v-model="s.row.window_start" :min="0" :max="23" size="small" controls-position="right"/> – <el-input-number v-model="s.row.window_end" :min="1" :max="24" size="small" controls-position="right"/></div></template></el-table-column>
+                  <el-table-column label="偏好档位" min-width="190"><template #default="s"><span :class="['sc-dot-state', scPrefLabel(s.row.ref).period === 'peak' ? 'active' : 'unknown']">{{ scPrefLabel(s.row.ref).text }}</span></template></el-table-column>
+                  <el-table-column label="配置时间段" width="196">
+                    <template #default="s">
+                      <div class="sc-time-cell">
+                        <el-select v-model="s.row.window_start" size="small" class="sc-hour-select" placeholder="起">
+                          <el-option v-for="h in scStartHourOptions" :key="'s'+h" :label="h + ':00'" :value="h" :disabled="scHourDisabled(h)"/>
+                        </el-select>
+                        <span class="sc-time-dash">–</span>
+                        <el-select v-model="s.row.window_end" size="small" class="sc-hour-select" placeholder="止">
+                          <el-option v-for="h in scEndHourOptions" :key="'e'+h" :label="h + ':00'" :value="h" :disabled="scEndHourDisabled(h)"/>
+                        </el-select>
+                      </div>
+                      <div v-if="s.row.quiet_conflict" class="sc-cell-warn">与静默保护时段重叠</div>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="每小时上限" width="104"><template #default="s"><el-input-number v-model="s.row.hourly_limit" :min="0" size="small" controls-position="right"/></template></el-table-column>
                   <el-table-column label="日上限" width="104"><template #default="s"><el-input-number v-model="s.row.daily_limit" :min="0" size="small" controls-position="right"/></template></el-table-column>
-                  <el-table-column label="AI 建议时间段" width="132"><template #default="s"><span v-if="s.row.ai_window_start">{{ s.row.ai_window_start }}:00–{{ s.row.ai_window_end }}:00</span><span v-else class="hint">暂无建议</span></template></el-table-column>
+                  <el-table-column label="AI 建议时间段（周维度）" min-width="290">
+                    <template #default="s">
+                      <div v-if="scWeekCoverage(s.row)" class="sc-week-grid">
+                        <div v-for="d in [1,2,3,4,5,6,7]" :key="'d'+d" :class="['sc-week-cell', scWeekWindowOf(s.row, d) ? 'has' : 'none']">
+                          <span class="sc-week-day">{{ scWeekdayNames[d] }}</span>
+                          <span v-if="scWeekWindowOf(s.row, d)" class="sc-week-time">{{ scWeekWindowOf(s.row, d)[0] }}:00–{{ scWeekWindowOf(s.row, d)[1] }}:00</span>
+                          <span v-else class="sc-week-time sc-week-blank">—</span>
+                          <span v-if="scWeekWindowOf(s.row, d)" class="sc-week-src">{{ scWeekSourceLabel(s.row, d) }}</span>
+                        </div>
+                      </div>
+                      <span v-else class="hint">暂无建议</span>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="是否采纳" width="88"><template #default="s"><span :class="['sc-dot-state', s.row.ai_adopted ? 'active' : 'unknown']">{{ s.row.ai_adopted ? '已采纳' : '未采纳' }}</span></template></el-table-column>
-                  <el-table-column label="采纳操作" width="88"><template #default="s"><el-button size="small" link type="primary" :disabled="!s.row.ai_window_start" @click="scAdoptSchedAI(s.row)">采纳建议</el-button></template></el-table-column>
+                  <el-table-column label="采纳操作" width="88"><template #default="s"><el-button size="small" link type="primary" :disabled="!scWeekMeasured(s.row)" @click="scAdoptSchedAI(s.row)">采纳建议</el-button></template></el-table-column>
                   <el-table-column label="启用" width="72"><template #default="s"><el-switch v-model="s.row.enabled" size="small"/></template></el-table-column>
                   <el-table-column label="操作" width="160" fixed="right"><template #default="s">
                     <el-button size="small" link type="primary" @click="scSaveSchedRow(s.row)">保存</el-button>
@@ -3649,8 +3800,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </el-table>
                 </div>
                 <div v-if="!scSchedRows.length" class="empty">暂无分类排期，点击「保存全部」按 TMDB 官方分类初始化</div>
-                <p class="hint sc-source-note">分类来自 tmdb.py 官方 genre（{{ scGenreCatalog.length }} 项）；AI 建议时段按该分类真实历史发布小时分布派生，无历史数据显示「暂无建议」，不编造。</p>
-                <p class="hint sc-source-note">偏好档位由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）；全天 {{ scPreference.segment_hours || 2 }} 小时一段共 {{ (scPreference.segments || []).length }} 段，前 {{ (scPreference.peak_segments || []).length }} 名分类各占一个互不重叠的高峰时段（第一名为 {{ (scPreference.peak_segments || [])[0] ? (scPreference.peak_segments[0][0] + ':00–' + scPreference.peak_segments[0][1] + ':00') : '—' }}），其余分类保持全天 {{ (scPreference.full_day_window || [0, 24])[0] }}:00–{{ (scPreference.full_day_window || [0, 24])[1] }}:00 不限时段。</p>
+                <p class="hint sc-source-note">分类来自 tmdb.py 官方 genre（{{ scGenreCatalog.length }} 项）；AI 建议时段按**周维度**生成——逐日给出建议，「实测」= 该分类该日真实发布的小时分布（可采纳），「通用习惯」= 国人观影作息基线（工作日晚间黄金档、周末双峰，仅供参考、不可采纳）。</p>
+                <p v-if="scQuietOn" class="hint sc-source-note">静默保护已开启（{{ scCyclePlan.quiet_start }}:00–{{ scCyclePlan.quiet_end }}:00），配置时间段中落在静默区间的小时**不可选**，已选中的会标红提示。</p>
+                <p class="hint sc-source-note">偏好档位由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）；全天 {{ scPreference.segment_hours || 2 }} 小时一段共 {{ (scPreference.segments || []).length }} 段，前 {{ (scPreference.peak_segments || []).length }} 名分类各占一个互不重叠的高峰时段（第一名为 {{ (scPreference.peak_segments || [])[0] ? (scPreference.peak_segments[0][0] + ':00–' + scPreference.peak_segments[0][1] + ':00') : '—' }}），其余分类保持全天 {{ (scPreference.full_day_window || [0, 24])[0] }}:00–{{ (scPreference.full_day_window || [0, 24])[1] }}:00 不限时段。整表按配置时间段从 0:00 起升序排列。</p>
+              </div>
               </div>
             </div>
 
@@ -3668,11 +3821,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="sc-task-layout" v-show="scSubNav === '推送任务'">
               <div class="sc-task-main">
                 <div class="sc-form-row">
-                  <el-input v-model="scTaskSearch" size="small" clearable placeholder="按资源名称搜索" style="width:220px"/>
-                  <el-select v-model="scTaskStatusFilter" size="small" clearable placeholder="状态 全部" style="width:150px">
-                    <el-option label="待发布" value="pending"/>
-                    <el-option label="推送中" value="inflight"/>
-                    <el-option v-for="(n, st) in scOverview.status_counts || {}" :key="st" :label="st + ' (' + n + ')'" :value="st"/>
+                  <el-input v-model="scTaskSearch" size="small" clearable placeholder="按作品名称搜索" style="width:220px"/>
+                  <el-select v-model="scTaskStatusFilter" size="small" clearable placeholder="状态 全部" style="width:170px">
+                    <el-option label="待发布（待发布 + 待推送）" value="pending"/>
+                    <el-option label="推送中（提交/领取/推送/建链）" value="inflight"/>
+                    <el-option v-for="opt in scTaskStatusOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
+                  </el-select>
+                  <el-select v-model="scTaskChannelFilter" size="small" clearable placeholder="渠道 全部" style="width:130px">
+                    <el-option label="频道" value="channel"/>
+                    <el-option label="群" value="group"/>
                   </el-select>
                   <el-select v-model="scTaskTypeFilter" size="small" style="width:120px">
                     <el-option label="推送类型 全部" value="全部"/><el-option label="首次" value="first"/><el-option label="追更" value="update"/>
@@ -3691,13 +3848,35 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <div><small>待建链</small><b class="muted">{{ scOverview.link_state_counts?.unknown || 0 }}</b></div>
                 </div>
                 <div class="sc-table-scroll">
-                <el-table :data="scTaskViewRows" stripe size="small" max-height="380" @selection-change="s => scSelectedTasks = s">
+                <el-table :data="scTaskViewRows" stripe size="small" max-height="420" @selection-change="s => scSelectedTasks = s">
                   <el-table-column type="selection" width="40"/>
-                  <el-table-column prop="id" label="任务编号" width="86"/>
-                  <el-table-column prop="title" label="作品名称" min-width="170" show-overflow-tooltip/>
+                  <el-table-column label="作品" min-width="200">
+                    <template #default="s">
+                      <div class="sc-media-cell">
+                        <div class="sc-media-thumb">
+                          <el-image v-if="s.row.cover" :src="'https://image.tmdb.org/t/p/w185' + s.row.cover" fit="cover">
+                            <template #error><div class="sc-thumb-fallback">无封面</div></template>
+                          </el-image>
+                          <div v-else class="sc-thumb-fallback">无封面</div>
+                        </div>
+                        <div class="sc-media-text">
+                          <b>{{ s.row.title || '未命名作品' }}</b>
+                          <small>{{ s.row.kind==='first' ? '首次发布' : '追更' }} · 编号 {{ s.row.id }}</small>
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="推送渠道" min-width="180" show-overflow-tooltip>
+                    <template #default="s">
+                      <span v-if="(s.row.channel_names||[]).length" class="sc-mini-tag">频道 {{ s.row.channel_names.join('、') }}</span>
+                      <span v-if="(s.row.group_names||[]).length" class="sc-mini-tag">群 {{ s.row.group_names.join('、') }}</span>
+                      <span v-if="!s.row.target_summary" class="hint">—</span>
+                    </template>
+                  </el-table-column>
                   <el-table-column label="类型" width="86"><template #default="s">{{ s.row.kind==='first'?'首次发布':'追更' }}</template></el-table-column>
-                  <el-table-column prop="share_url" label="分享记录" min-width="180" show-overflow-tooltip/>
-                  <el-table-column label="推送目标" width="96"><template #default="s">{{ s.row.link_state==='active'?'已建链':'待建链' }}</template></el-table-column>
+                  <el-table-column prop="share_url" label="分享记录" min-width="160" show-overflow-tooltip/>
+                  <el-table-column label="推送目标" width="96"><template #default="s">{{ s.row.link_label || '待建链' }}</template></el-table-column>
+                  <el-table-column label="状态" width="90"><template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template></el-table-column>
                   <el-table-column prop="attempts" label="重试次数" width="86"/>
                   <el-table-column label="最后执行时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
                   <el-table-column label="操作" width="80"><template #default="s"><el-button size="small" link type="primary" @click="scOpenTaskDetail(s.row.id)">详情</el-button></template></el-table-column>
@@ -3718,11 +3897,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <!-- 任务详情抽屉：真实端点 /sc/tasks/{id} -->
           <el-drawer v-model="scDetailVisible" size="46%" :title="'任务详情 #' + (scDetailTask?.id || '')">
             <template v-if="scDetailTask">
+              <!-- v2.1.4：详情内页展示 TMDB 海报缩略图 -->
+              <div class="sc-detail-poster">
+                <el-image v-if="scDetailTask.cover" :src="'https://image.tmdb.org/t/p/w342' + scDetailTask.cover" fit="cover">
+                  <template #error><div class="sc-thumb-fallback">无封面</div></template>
+                </el-image>
+                <div v-else class="sc-thumb-fallback">无封面</div>
+              </div>
               <div class="sc-detail-kv">
-                <div><span>作品</span><b>{{ scDetailTask.title || scDetailTask.work_key }}</b></div>
+                <div><span>作品</span><b>{{ scDetailTask.title || '未命名作品' }}</b></div>
                 <div><span>状态</span><b>{{ scTaskStatusLabel(scDetailTask.status) }}</b></div>
                 <div><span>类型</span><b>{{ scDetailTask.kind==='first'?'首次发布':'追更' }}</b></div>
-                <div><span>链接状态</span><b>{{ scLinkStateLabel(scDetailTask.link_state) }}</b></div>
+                <div><span>推送渠道</span><b>{{ scDetailTask.target_summary || '—' }}</b></div>
+                <div><span>链接状态</span><b>{{ scDetailTask.link_label || '待建链' }}</b></div>
                 <div><span>尝试次数</span><b>{{ scDetailTask.attempts }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scDetailTask.share_url || '—' }}</b></div>
                 <div><span>计划执行时间</span><b>{{ fmtTime(scDetailTask.scheduled_at, true) }}</b></div>
@@ -4259,6 +4446,13 @@ button{font-family:inherit}
 .sc-mini-tag{background:#eef0ff;color:var(--yg-primary);border-radius:7px;padding:2px 7px;font-size:10px;font-weight:700}
 .sc-dot-state{font-size:10px;font-weight:700;padding:2px 6px;border-radius:7px;background:var(--yg-bg);color:var(--yg-muted)}
 .sc-dot-state.published{background:#e7f8f0;color:#159a6b}.sc-dot-state.failed{background:#fdecef;color:#d9435e}
+/* v2.1.4：链接状态视觉态四档（后端 link_tone 下发：ok / muted / warn / bad）。
+   此前只有 published / failed 两档，链接状态全部落回灰底灰字，
+   「有效」和「疑似失效」在页面上看不出区别。 */
+.sc-dot-state.ok{background:#e7f8f0;color:#159a6b}
+.sc-dot-state.muted{background:var(--yg-bg);color:var(--yg-muted)}
+.sc-dot-state.warn{background:#fff3e2;color:#cf7f1c}
+.sc-dot-state.bad{background:#fdecef;color:#d9435e}
 .sc-health-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .sc-health{border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:14px;text-align:left;cursor:pointer;position:relative;transition:.2s;background:var(--yg-surface)}
 .sc-health:hover{transform:translateY(-2px);box-shadow:var(--yg-shadow-lg)}
@@ -4312,6 +4506,45 @@ button{font-family:inherit}
 .sc-cycle-grid .hint{font-size:11px}
 .sc-time-cell{display:flex;align-items:center;gap:3px}
 .sc-time-cell .el-input-number{width:64px}
+/* v2.1.4：发布规则页满宽 + 配置时段下拉 + 周维度建议网格。
+   真机问题：PC 端右侧大片留白、内容挤在左侧——根因是发布规则页被放在
+   .sc-board（两列 Grid）的一个格子里，只占半幅。现在该页跨满两列。 */
+.sc-board-full{grid-template-columns:minmax(0,1fr)}
+/* 发布规则页内部：基础规则 / 周期计划 两卡并列，分类排期表独占整行 */
+.sc-rule-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+.sc-rule-layout .sc-rule-full{grid-column:1/-1}
+@media(max-width:1100px){.sc-rule-layout{grid-template-columns:1fr}}
+/* 配置时段下拉：小时级选择，静默区间内的小时不可选 */
+.sc-hour-select{width:82px}
+.sc-time-dash{color:var(--yg-muted);font-size:11px}
+/* 与静默保护时段重叠的提示 */
+.sc-cell-warn{margin-top:3px;font-size:10px;color:#e5526b;line-height:1.3}
+/* 周维度建议网格：7 天一行排布，每格显示星期 + 时段 + 来源 */
+.sc-week-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}
+.sc-week-cell{border:1px solid var(--yg-line);border-radius:8px;padding:5px 4px;text-align:center;background:var(--yg-panel);min-width:0}
+.sc-week-cell.has{border-color:var(--yg-primary);background:var(--yg-primary-2)}
+.sc-week-cell.none{opacity:.5}
+.sc-week-day{display:block;font-size:10px;color:var(--yg-muted);font-weight:600}
+.sc-week-time{display:block;font-size:10px;font-weight:700;margin-top:2px;white-space:nowrap;transform:scale(.94);transform-origin:center}
+.sc-week-blank{color:var(--yg-muted);font-weight:500}
+.sc-week-src{display:block;font-size:9px;color:var(--yg-muted);margin-top:1px}
+@media(max-width:900px){
+  .sc-week-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+}
+/* v2.1.4：推送任务页 TMDB 海报缩略图 */
+.sc-media-cell{display:flex;align-items:center;gap:9px;min-width:0}
+.sc-media-thumb{width:38px;height:54px;border-radius:6px;overflow:hidden;flex:none;background:var(--yg-bg);display:grid;place-items:center}
+.sc-media-thumb .el-image{width:100%;height:100%}
+.sc-media-text{min-width:0}
+.sc-media-text b{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:650}
+.sc-media-text small{display:block;color:var(--yg-muted);font-size:10px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sc-thumb-fallback{width:100%;height:100%;display:grid;place-items:center;font-size:9px;color:var(--yg-muted);text-align:center;line-height:1.2}
+/* 任务详情抽屉顶部的海报 */
+.sc-detail-poster{width:120px;height:172px;border-radius:12px;overflow:hidden;margin-bottom:14px;background:var(--yg-bg);display:grid;place-items:center;box-shadow:var(--yg-shadow)}
+.sc-detail-poster .el-image{width:100%;height:100%}
+/* v2.1.4：分享详情弹窗顶部的海报（比抽屉版略窄，适配 560px 弹窗） */
+.sc-share-poster{width:96px;height:138px;border-radius:10px;overflow:hidden;margin-bottom:14px;background:var(--yg-bg);display:grid;place-items:center;box-shadow:var(--yg-shadow)}
+.sc-share-poster .el-image{width:100%;height:100%}
 /* v2.1.1：分享管理 / 推送任务 左右布局。
    真机问题：侧栏固定 300px 时，表格列总宽超出左栏可用宽度，
    「分享记录」列被详情面板遮挡、时间列被截断。

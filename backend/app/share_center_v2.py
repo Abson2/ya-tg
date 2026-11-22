@@ -803,6 +803,9 @@ def plan_engine(db: Session) -> dict[str, int]:
     # hourly/daily 上限过滤。此前整表只落库不被消费，前端配的排期不产生调度效果。
     # 某分类未启用排期行/配了窗口但当前小时不在窗口内 → 跳过该分类；上限 0 = 不限。
     sh_hour = datetime.now(shanghai_tz()).hour
+    # v2.1.4：周维度配置生效——按**当天星期**取该分类配置的那一天时段。
+    # 没有周维度配置的行走原来的单一 window_start/window_end 口径（向后兼容）。
+    iso_weekday = datetime.now(shanghai_tz()).isoweekday()
     sched_map = {s.category_key: s for s in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version.id,
                                          SCCategorySchedule.enabled.is_(True))).all()}
@@ -810,7 +813,8 @@ def plan_engine(db: Session) -> dict[str, int]:
         s = sched_map.get(key)
         if not s:
             return True  # 未配置排期行的分类保持原轮转行为（兼容存量）
-        ws, we = int(s.window_start or 0), int(s.window_end or 0)
+        day_window = _week_window_for(iso_weekday, s.week_windows or "")
+        ws, we = day_window if day_window else (int(s.window_start or 0), int(s.window_end or 0))
         if we > ws:
             in_win = ws <= sh_hour < we
         elif we < ws:
@@ -1767,6 +1771,8 @@ def api_preference(db: Session = Depends(get_db)):
         # 高峰序号：第几名的分类占用第几个高峰段（0 = 全天不限时段）
         data["peak_rank"] = idx + 1 if data["period"] == "peak" else 0
         data["cross_midnight"] = ws > we
+        # v2.1.4：中性引用名，供前端做键匹配（页面不出现后端字段名）
+        data["ref"] = item["category_key"]
         items.append(data)
     return {"items": items,
             "segments": _hour_segments(),
@@ -1801,15 +1807,19 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
             SCCategorySchedule.plan_version_id == version.id)).all()}
     changed = 0
     skipped = 0
+    # v2.1.4：新建行的上限档位按**媒体类型**取默认档（电视 5/30、电影 3/20），
+    # 此前一律用电影档，导致电视类新行上限偏低。
+    cat_media = {c["category_key"]: (c.get("media_type") or "")
+                 for c in _tmdb_genre_catalog()}
     for item in prefs:
         ws, we = windows.get(item["category_key"], FULL_DAY_WINDOW)
         row = rows.get(item["category_key"])
         if row is None:
+            hl, dl = _default_limits_for(cat_media.get(item["category_key"], ""))
             db.add(SCCategorySchedule(
                 plan_version_id=version.id, category_key=item["category_key"],
                 window_start=ws, window_end=we,
-                hourly_limit=DEFAULT_SCHEDULE_WINDOW_MOVIE[2],
-                daily_limit=DEFAULT_SCHEDULE_WINDOW_MOVIE[3],
+                hourly_limit=hl, daily_limit=dl,
                 ai_adopted=False, enabled=True, window_auto=True))
             changed += 1
             continue
@@ -1975,6 +1985,7 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200,
     last_checked_at（最后校验时间）、last_pushed_at（最近推送时间）。
     没有分享链接的记录不返回——分享管理管的是**已建链**的分享。
     v2.1.2：已归档（清理）的链接默认不返回，可用 include_archived=true 查回。
+    v2.1.4：补 TMDB 海报（cover，中性字段名）+ 推送渠道名称（target_summary）。
     """
     q = (select(SCPushListItem, SCPublishTask)
          .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
@@ -1984,24 +1995,43 @@ def api_share_records(db: Session = Depends(get_db), limit: int = 200,
     rows = db.execute(q.order_by(SCPublishTask.id.desc()).limit(min(limit, 500))).all()
     names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
     titles = _work_titles(db, [item.work_key for item, _ in rows])
+    posters = _work_posters(db, [item.work_key for item, _ in rows])
+    channels = _task_channel_info(db, [int(task.id) for _item, task in rows])
     items = []
     for item, task in rows:
         data = _model_dict(task)
         title = titles.get(str(item.work_key or ""), "")
+        info = channels.get(int(task.id)) or {}
+        channel_names = info.get("channel_names") or []
+        group_names = info.get("group_names") or []
+        parts = []
+        if channel_names:
+            parts.append("频道 " + "、".join(channel_names))
+        if group_names:
+            parts.append("群 " + "、".join(group_names))
         items.append({
             "id": task.id,
             "list_item_id": item.id,
             "work_key": item.work_key,
             "share_title": title,
+            # v2.1.4：TMDB 海报相对路径（中性名，不回显 poster_path 字段名）
+            "cover": posters.get(str(item.work_key or ""), ""),
             "kind": data.get("kind") or "first",
             "category_key": item.category_key,
             "category_name": _category_safe_name(item.category_key, names),
             "share_url": data.get("share_url") or "",
             "share_code": _share_code_from_url(data.get("share_url") or ""),
             "link_state": data.get("link_state") or "unknown",
+            # v2.1.4：建链状态中文标签 + 视觉态（页面不出现 link_state 取值）
+            "link_status_label": _link_status_label(data.get("link_state") or "unknown"),
+            "link_tone": _link_tone(data.get("link_state") or "unknown"),
             "status": data.get("status") or "",
             "chat_id": item.chat_id,
             "target_type": item.target_type,
+            # v2.1.4：推送渠道可读汇总（频道 / 群名称）
+            "channel_names": channel_names,
+            "group_names": group_names,
+            "target_summary": "；".join(parts),
             "error": data.get("error") or "",
             "created_at": data.get("created_at"),
             "last_checked_at": data.get("updated_at"),
@@ -2020,6 +2050,37 @@ def _share_code_from_url(url: str) -> str:
     if not tail or tail == text:
         return ""
     return tail.split("?", 1)[0].split("#", 1)[0]
+
+
+# v2.1.4：分享链接状态 → 中文标签 / 视觉态。
+# 页面不得直出内部枚举码（active / suspicious / cleaned …），
+# 这里在后端翻译成中性展示字段，前端只渲染 label 与 tone。
+LINK_STATUS_LABELS: dict[str, str] = {
+    "active": "有效",
+    "unknown": "待校验",
+    "suspicious": "疑似失效",
+    "inactive": "已失效",
+    "cleaned": "已清理",
+    "manual_review": "待人工确认",
+}
+LINK_STATUS_TONES: dict[str, str] = {
+    "active": "ok",
+    "unknown": "muted",
+    "suspicious": "warn",
+    "inactive": "bad",
+    "cleaned": "muted",
+    "manual_review": "warn",
+}
+
+
+def _link_status_label(state: str) -> str:
+    """链接状态 → 中文标签（未知态回落「待校验」，不暴露原始枚举）。"""
+    return LINK_STATUS_LABELS.get(str(state or "unknown"), "待校验")
+
+
+def _link_tone(state: str) -> str:
+    """链接状态 → 视觉态（ok / muted / warn / bad），供前端上色。"""
+    return LINK_STATUS_TONES.get(str(state or "unknown"), "muted")
 
 
 @router.post("/run")
@@ -2211,6 +2272,112 @@ def api_cursors(version_id: int = 0, db: Session = Depends(get_db)):
     return {"items": [_model_dict(r) for r in rows]}
 
 
+def _task_channel_info(db: Session, task_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """按任务 id 汇总**推送渠道**（频道 / 群）信息。
+
+    推送目标落在清单项上（SCPushListItem.chat_id / target_type / bot_id），
+    任务通过 list_item_id 关联。渠道名称取 Channel 表（未登记的退化为群/频道 ID）。
+    """
+    out: dict[int, dict[str, Any]] = {}
+    if not task_ids:
+        return out
+    rows = db.execute(
+        select(SCPublishTask.id, SCPushListItem.chat_id, SCPushListItem.target_type,
+               SCPushListItem.bot_id)
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.id.in_(task_ids))
+    ).all()
+    if not rows:
+        return out
+    chat_ids = {str(r[1] or "") for r in rows if r[1]}
+    names: dict[str, str] = {}
+    kinds: dict[str, str] = {}
+    if chat_ids:
+        for ch in db.scalars(select(Channel).where(Channel.chat_id.in_(chat_ids))).all():
+            names[str(ch.chat_id or "")] = str(ch.name or "")
+            kinds[str(ch.chat_id or "")] = str(ch.kind or "channel")
+    for task_id, chat_id, target_type, _bot_id in rows:
+        cid = str(chat_id or "")
+        info = out.setdefault(int(task_id), {"channels": [], "groups": [],
+                                             "channel_names": [], "group_names": []})
+        # target_type 优先；缺失时按 chat_id 是否以 - 开头判定（-100… 是群）
+        is_group = str(target_type or "") == "group" or (
+            not target_type and cid.startswith("-"))
+        label = names.get(cid) or cid or "未知目标"
+        if is_group:
+            if label not in info["group_names"]:
+                info["group_names"].append(label)
+            if cid not in info["groups"]:
+                info["groups"].append(cid)
+        else:
+            if label not in info["channel_names"]:
+                info["channel_names"].append(label)
+            if cid not in info["channels"]:
+                info["channels"].append(cid)
+    return out
+
+
+def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
+    """按作品聚合键取 TMDB 海报相对路径（供前端拼缩略图）。
+
+    与 _work_titles 同口径（资源库版本 → 实时 Resource 回查），
+    只取**第一条非空**海报，取不到返回空串（前端不渲染缩略图，不占位）。
+    """
+    out: dict[str, str] = {}
+    keys: list[str] = []
+    for raw in work_keys or []:
+        key = str(raw or "")
+        if not key or key in out:
+            continue
+        out[key] = ""
+        keys.append(key)
+    if not keys:
+        return out
+    # ① 资源库版本表登记的元数据
+    rows = db.execute(
+        select(SCLibraryVersion.work_key, SCLibraryVersion.version_no,
+               SCLibraryVersion.metadata_json)
+        .where(SCLibraryVersion.work_key.in_(keys))
+        .order_by(SCLibraryVersion.version_no.desc())).all()
+    seen: set[str] = set()
+    for wk, _ver, meta_json in rows:
+        if wk in seen or out.get(wk):
+            continue
+        seen.add(wk)
+        meta = _jload(meta_json, {})
+        if not isinstance(meta, dict):
+            continue
+        cand = str(meta.get("poster_path") or "").strip()
+        if cand:
+            out[wk] = cand
+    # ② 回查实时资源表
+    missing = [k for k, v in out.items() if not v]
+    if missing:
+        file_ids: list[str] = []
+        tmdb_ids: list[str] = []
+        for key in missing:
+            if key.startswith("tmdb:"):
+                tmdb_ids.append(key.split(":", 2)[-1] if key.count(":") >= 2 else "")
+            elif key.startswith("file:"):
+                file_ids.append(key.split(":", 1)[-1])
+        if file_ids:
+            for res in db.scalars(select(Resource).where(Resource.file_id.in_(file_ids))).all():
+                for key in missing:
+                    if key == f"file:{res.file_id}" and res.poster_path:
+                        out[key] = str(res.poster_path)
+        if tmdb_ids:
+            wanted = {t for t in tmdb_ids if t}
+            for res in db.scalars(select(Resource).where(
+                    Resource.tmdb_id.in_(wanted))).all() if wanted else []:
+                if not res.poster_path:
+                    continue
+                for key in missing:
+                    if key.startswith("tmdb:") and key.endswith(f":{res.tmdb_id}"):
+                        out[key] = str(res.poster_path)
+                        break
+    return out
+
+
 @router.get("/tasks")
 def api_tasks(status: str = "", limit: int = 200,
               include_archived: bool = False, db: Session = Depends(get_db)):
@@ -2223,8 +2390,27 @@ def api_tasks(status: str = "", limit: int = 200,
     rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(min(limit, 1000))).all()
     items = [_model_dict(r) for r in rows]
     titles = _work_titles(db, [r.get("work_key") for r in items])
+    # v2.1.4：补推送渠道与海报缩略图
+    channels = _task_channel_info(db, [int(r.id) for r in rows])
+    posters = _work_posters(db, [r.get("work_key") for r in items])
     for row in items:
-        row["title"] = titles.get(str(row.get("work_key") or ""), "")
+        key = str(row.get("work_key") or "")
+        row["title"] = titles.get(key, "")
+        row["cover"] = posters.get(key, "")
+        info = channels.get(int(row["id"])) or {}
+        row["channel_names"] = info.get("channel_names") or []
+        row["group_names"] = info.get("group_names") or []
+        # 汇总展示文案（频道 + 群），便于表格一列看清推送到哪
+        parts = []
+        if row["channel_names"]:
+            parts.append("频道：" + "、".join(row["channel_names"]))
+        if row["group_names"]:
+            parts.append("群：" + "、".join(row["group_names"]))
+        row["target_summary"] = "；".join(parts)
+        # 中性展示文案：建链状态直接给中文，页面不出现内部枚举名
+        row["link_label"] = "已建链" if str(row.get("link_state") or "") == "active" else "待建链"
+        # 中性引用名（页面不出现后端字段名）
+        row["ref"] = key
     return {"items": items}
 
 
@@ -2237,7 +2423,21 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
         SCPublishExecution.task_id == task_id).order_by(SCPublishExecution.id)).all()
     item = _model_dict(task)
     titles = _work_titles(db, [item.get("work_key")])
-    item["title"] = titles.get(str(item.get("work_key") or ""), "")
+    key = str(item.get("work_key") or "")
+    item["title"] = titles.get(key, "")
+    # v2.1.4：详情内页同样展示海报与渠道
+    item["cover"] = _work_posters(db, [key]).get(key, "")
+    info = _task_channel_info(db, [int(task_id)]).get(int(task_id)) or {}
+    item["channel_names"] = info.get("channel_names") or []
+    item["group_names"] = info.get("group_names") or []
+    parts = []
+    if item["channel_names"]:
+        parts.append("频道：" + "、".join(item["channel_names"]))
+    if item["group_names"]:
+        parts.append("群：" + "、".join(item["group_names"]))
+    item["target_summary"] = "；".join(parts)
+    item["link_label"] = "已建链" if str(item.get("link_state") or "") == "active" else "待建链"
+    item["ref"] = key
     return {"item": item, "executions": [_model_dict(x) for x in executions]}
 
 
@@ -2567,20 +2767,25 @@ def _is_untouched_schedule(row: SCCategorySchedule) -> bool:
     return (int(row.window_start or 0), int(row.window_end or 0)) in SYSTEM_ASSIGNED_WINDOWS
 
 
-def _is_system_managed_schedule(row: SCCategorySchedule, media_type: str) -> bool:
+def _is_system_managed_schedule(row: SCCategorySchedule) -> bool:
     """判断一行的时段是否仍**归系统托管**（可被偏好分配刷新）。
 
     v2.1.2：光看 window_auto 不够——
       - window_auto 列是 v2.1.1 才加的，老库 ALTER 补列时 DEFAULT 1，
         **v2.1.0 时代用户手工改过的行也会拿到 window_auto=1**；
-      - 因此追加一道「上限指纹」：系统回填过的行，上限恰好是媒体类型默认档
-        （电视 5/30、电影 3/20）；用户自己配过上限的行不是这个值。
-    两个条件同时成立才视为系统托管，否则一律按「用户手工设定」保护，不刷新时段。
+      - 因此追加一道「时段形态」闸：系统分配过的时段必定落在
+        SYSTEM_ASSIGNED_WINDOWS（12 段高峰 + 全天 + v2.1.1 昼夜两档）之内，
+        而用户手工设的任意时段（如 21:00–23:00）不在其中。
+
+    v2.1.4：原判据是「上限恰为媒体类型默认档」，v2.1.4 改为「时段形态」——
+    用户口径「配置时间段默认值应该与偏好档位推荐值一样」要求**时段**始终跟随
+    偏好推荐，而**上限是否被用户改过与时段归属是两件事**，不该互相牵连：
+    用户把上限从 5/30 改成 3/15，时段仍应是系统托管的、跟随偏好推荐值。
+    「时段形态」这道闸精确覆盖了「老库手工行被误刷」的风险，且不牵连上限。
     """
     if not bool(row.window_auto):
         return False
-    hl, dl = _default_limits_for(media_type)
-    return (int(row.hourly_limit or 0), int(row.daily_limit or 0)) == (hl, dl)
+    return (int(row.window_start or 0), int(row.window_end or 0)) in SYSTEM_ASSIGNED_WINDOWS
 
 
 def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
@@ -2636,9 +2841,12 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
                 existing.updated_at = utcnow()
                 changed = True
             continue
-        # 系统托管且上限已回填：只刷新时段归属（高峰独占段），不动用户可见的上限。
-        # v2.1.2：必须同时满足「上限仍是系统默认档」——否则视为用户手工设定，保护不动。
-        if not _is_system_managed_schedule(existing, cat.get("media_type") or ""):
+        # 系统托管行：只刷新时段归属（偏好档位推荐值），不动用户可见的上限。
+        # v2.1.4：闸门从「上限恰为默认档」换成「时段形态仍在系统窗口集合内」——
+        # 老库 ALTER 补 window_auto 时 DEFAULT 1，用户手工设的时段（如 21-23）
+        # 不在 SYSTEM_ASSIGNED_WINDOWS 内，因此不会被误刷；而系统托管的行
+        # 无论上限是否被用户改过，时段都始终跟随偏好档位推荐值。
+        if not _is_system_managed_schedule(existing):
             continue
         if (int(existing.window_start or 0) != ws
                 or int(existing.window_end or 0) != we):
@@ -2671,6 +2879,152 @@ def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
         return (0, 0)
     peak_hour = max(hours, key=lambda h: (hours[h], -h))
     return (peak_hour, min(24, peak_hour + 2))
+
+
+# ---------------------------------------------------------------------------
+# v2.1.4：周维度 AI 建议时段
+# ---------------------------------------------------------------------------
+# 用户口径：「AI 建议时间段按照国人观影时间习惯**周维度**生成」。
+# 单一小时窗口无法表达工作日与周末的差异——工作日晚间是主力观影窗口，
+# 周末白天同样有可观流量，而同一个分类的观影高峰在一周之内并不同步。
+#
+# 生成口径（两级，都不编造）：
+#   ① **真实优先**：该分类在该星期几已发布任务的真实小时分布，
+#      取最密集的连续 2 小时段。数据说话。
+#   ② **习惯兜底**：该星期几没有真实样本时，用「国人观影作息」基线兜底
+#      （周一至周五晚间黄金档、周六日白天+晚间双峰）。基线是**通用作息规律**，
+#      不是编造的「本分类历史数据」——页面上明确标注来源，避免被误读为实测。
+#
+# 无任何真实样本且基线也不适用时返回空 dict → 前端显示「暂无建议」。
+#
+# ISO 星期：1=周一 … 7=周日（datetime.isoweekday()）。
+WEEKDAY_NAMES: dict[int, str] = {
+    1: "周一", 2: "周二", 3: "周三", 4: "周四",
+    5: "周五", 6: "周六", 7: "周日",
+}
+# 国人观影作息基线（周一至周五 / 周末分开）。
+# 工作日：晚间通勤后到睡前的连续观影窗口，主峰 20:00–22:00。
+# 周末：白天（10:00–12:00）与晚间（20:00–22:00）双峰。
+WEEKDAY_HABIT_BASELINE: dict[int, list[tuple[int, int]]] = {
+    1: [(20, 22), (19, 21), (21, 23)],
+    2: [(20, 22), (19, 21), (21, 23)],
+    3: [(20, 22), (19, 21), (21, 23)],
+    4: [(20, 22), (19, 21), (21, 23)],
+    5: [(20, 22), (21, 23), (19, 21)],
+    6: [(20, 22), (10, 12), (14, 16)],
+    7: [(20, 22), (10, 12), (14, 16)],
+}
+
+
+def _week_windows_from_hours(hours: dict[int, int]) -> tuple[int, int]:
+    """从「小时 → 次数」分布取最密集的连续 2 小时段（真实派生）。"""
+    if not hours:
+        return (0, 0)
+    peak_hour = max(hours, key=lambda h: (hours[h], -h))
+    return (peak_hour, min(24, peak_hour + 2))
+
+
+def _ai_suggest_week_windows(db: Session, category_key: str) -> dict[str, Any]:
+    """周维度 AI 建议时段：真实历史优先，通用观影作息兜底。
+
+    返回形如：
+        {"windows": {"1": [20, 22], ...}, "source": {"1": "history", ...}}
+    - windows：ISO 星期 → [起, 止)
+    - source ：每一天的来源（"history"=真实发布分布 / "habit"=通用作息基线）
+
+    完全没有样本的星期几不出现在 windows 里——**不编造**。
+    """
+    rows = db.execute(
+        select(SCPublishTask.published_at)
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.status == "published",
+               SCPushListItem.category_key == category_key)
+    ).all()
+    # 真实样本按「ISO 星期 → 小时分布」分组
+    by_weekday: dict[int, dict[int, int]] = {}
+    for (moment,) in rows:
+        if not moment:
+            continue
+        local = moment.astimezone(shanghai_tz())
+        bucket = by_weekday.setdefault(local.isoweekday(), {})
+        bucket[local.hour] = bucket.get(local.hour, 0) + 1
+
+    windows: dict[str, list[int]] = {}
+    source: dict[str, str] = {}
+    for weekday in range(1, 8):
+        hours = by_weekday.get(weekday) or {}
+        if hours:
+            start, end = _week_windows_from_hours(hours)
+            if start:
+                windows[str(weekday)] = [start, end]
+                source[str(weekday)] = "history"
+                continue
+        # 该星期几无真实样本 → 用通用观影作息基线兜底（明确标注来源）
+        baseline = WEEKDAY_HABIT_BASELINE.get(weekday) or []
+        if baseline:
+            start, end = baseline[0]
+            windows[str(weekday)] = [start, end]
+            source[str(weekday)] = "habit"
+    return {"windows": windows, "source": source}
+
+
+def _week_window_for(weekday: int, raw: str) -> tuple[int, int] | None:
+    """从周维度 JSON 里取某一天的配置时段；没有则返回 None。"""
+    data = _jload(raw, {}) if raw else {}
+    if not isinstance(data, dict):
+        return None
+    item = data.get(str(weekday))
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+        return None
+    try:
+        start = int(item[0])
+        end = int(item[1])
+    except (TypeError, ValueError):
+        return None
+    if start == end:
+        return None
+    return (start, end)
+
+
+def _quiet_window(cycle: dict[str, Any]) -> tuple[int, int] | None:
+    """静默保护区间（起, 止）；未启用或配置无效时返回 None。
+
+    支持跨午夜：quiet_start=22 / quiet_end=6 表示 22:00–次日 6:00。
+    """
+    if not cycle.get("quiet_enabled"):
+        return None
+    try:
+        start = int(cycle.get("quiet_start") or 0)
+        end = int(cycle.get("quiet_end") or 0)
+    except (TypeError, ValueError):
+        return None
+    if start == end:
+        return None
+    return (start, end)
+
+
+def _window_overlaps_quiet(window: tuple[int, int], quiet: tuple[int, int]) -> bool:
+    """配置的时段是否与静默区间有重叠。
+
+    两个区间都支持跨午夜（止 < 起 表示跨午夜）。
+    """
+    ws, we = window
+    qs, qe = quiet
+
+    def _hours(win: tuple[int, int]) -> set[int]:
+        s, e = win
+        if s < e:
+            return set(range(s, e))
+        return set(range(s, 24)) | set(range(0, e))
+
+    return bool(_hours((ws, we)) & _hours((qs, qe)))
+
+
+def _quiet_conflict_reason(window: tuple[int, int], quiet: tuple[int, int]) -> str:
+    """静默冲突的可读原因（中文，不出现任何后端字段名）。"""
+    qs, qe = quiet
+    return (f"配置时段 {window[0]}:00–{window[1]}:00 与静默保护时段 "
+            f"{qs}:00–{qe}:00 重叠，静默保护开启期间不推送，请调整配置时段")
 
 
 @router.post("/category-schedules/apply-defaults")
@@ -2761,19 +3115,56 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
     db.commit()
     names = {c.category_key: c.name for c in db.scalars(select(SCCategory)).all()}
     cat_map = {c["category_key"]: c for c in _tmdb_genre_catalog()}
+    # v2.1.4：静默保护区间（开启时用于校验配置时段是否冲突）
+    cycle = _jload(version.config_json, {}).get("cycle_plan") or {}
+    quiet = _quiet_window(cycle)
     items = []
     for r in rows:
         d = _model_dict(r)
         d["name"] = _category_safe_name(r.category_key, names)
+        # v2.1.4：给前端一个**中性引用名**（ref），避免页面源码里出现后端字段名。
+        # 前端只用 ref 做键匹配，展示一律用 name。
+        d["ref"] = r.category_key
         d["tmdb_genre_id"] = cat_map.get(r.category_key, {}).get("tmdb_genre_id", 0)
         ai_start, ai_end = _ai_suggest_window(db, r.category_key)
         if not r.ai_adopted:
             d["ai_window_start"], d["ai_window_end"] = ai_start, ai_end
+        # v2.1.4：周维度 AI 建议（真实历史优先，通用观影作息兜底）
+        week_ai = _ai_suggest_week_windows(db, r.category_key)
+        d["ai_week_windows"] = week_ai["windows"]
+        d["ai_week_source"] = week_ai["source"]
+        # v2.1.4：已采纳的周维度配置窗口（前端展示 + 调度消费）
+        d["week_windows"] = _jload(r.week_windows, {}) if r.week_windows else {}
+        # v2.1.4：静默冲突标记（前端据此提示，默认时段推荐也要避开静默区）
+        conflict = False
+        if quiet:
+            ws, we = int(r.window_start or 0), int(r.window_end or 0)
+            if ws != we and _window_overlaps_quiet((ws, we), quiet):
+                conflict = True
+            ww = d["week_windows"] if isinstance(d["week_windows"], dict) else {}
+            for day, pair in ww.items():
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    try:
+                        if int(pair[0]) != int(pair[1]) and _window_overlaps_quiet(
+                                (int(pair[0]), int(pair[1])), quiet):
+                            conflict = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+        d["quiet_conflict"] = conflict
         # v2.1.1：补媒体类型，前端「周期维度」列据此区分默认档位（tv / movie）。
         d["media_type"] = cat_map.get(r.category_key, {}).get("media_type", "")
         items.append(d)
-    items.sort(key=lambda x: (x.get("tmdb_genre_id") or 0))
-    return {"items": items, "version_id": version.id}
+    # v2.1.4：整表按**配置时间段**升序排列（0-2 → 2-4 → 4-6 …），
+    # 同起点的按止点升序，再按分类键稳定排序。原先按 TMDB genre id 排，
+    # 与用户看表时「按时间顺序巡检每个时段」的直觉不一致。
+    items.sort(key=lambda x: (int(x.get("window_start") or 0),
+                              int(x.get("window_end") or 0),
+                              str(x.get("category_key") or "")))
+    return {"items": items, "version_id": version.id,
+            "quiet_enabled": bool(quiet),
+            "quiet_start": quiet[0] if quiet else 0,
+            "quiet_end": quiet[1] if quiet else 0}
 
 
 @router.post("/category-schedules")
@@ -2784,14 +3175,47 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     category_key = str(p.get("category_key") or "").strip()
     if not version_id or not category_key:
         return {"ok": False, "reason": "plan_version_id 与 category_key 必填"}
+    ws = max(0, min(23, int(p.get("window_start") or 0)))
+    we = max(ws + 1, min(24, int(p.get("window_end") or 24)))
+    # v2.1.4：静默保护开启时，配置时段不得与静默区间重叠
+    # （否则该分类在静默时段被推送，与「静默保护」的语义直接矛盾）。
+    # **校验必须先于任何写库动作**——否则拒绝路径上残留的待提交行
+    # （session autoflush=False，后续查询看不到它）会在下一次提交时
+    # 触发唯一约束冲突。
+    version = db.get(SCSharePlanVersion, version_id)
+    cycle = (_jload(version.config_json, {}) if version else {}).get("cycle_plan") or {}
+    quiet = _quiet_window(cycle)
+    if quiet and _window_overlaps_quiet((ws, we), quiet):
+        return {"ok": False, "reason": _quiet_conflict_reason((ws, we), quiet)}
+    # v2.1.4：周维度配置窗口（采纳后写入，逐日生效）
+    cleaned: dict[str, list[int]] | None = None
+    week_windows = p.get("week_windows")
+    if isinstance(week_windows, dict):
+        cleaned = {}
+        for day, pair in week_windows.items():
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            try:
+                d_start = max(0, min(23, int(pair[0])))
+                d_end = max(d_start + 1, min(24, int(pair[1])))
+            except (TypeError, ValueError):
+                continue
+            if quiet and _window_overlaps_quiet((d_start, d_end), quiet):
+                return {"ok": False,
+                        "reason": _quiet_conflict_reason((d_start, d_end), quiet)}
+            cleaned[str(int(day))] = [d_start, d_end]
     row = db.scalar(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version_id,
         SCCategorySchedule.category_key == category_key))
     if not row:
         row = SCCategorySchedule(plan_version_id=version_id, category_key=category_key)
         db.add(row)
-    row.window_start = max(0, min(23, int(p.get("window_start") or 0)))
-    row.window_end = max(row.window_start + 1, min(24, int(p.get("window_end") or 24)))
+    row.window_start = ws
+    row.window_end = we
+    if cleaned is not None:
+        row.week_windows = _jdump(cleaned)
+    elif "week_windows" in p:
+        row.week_windows = ""
     row.hourly_limit = max(0, int(p.get("hourly_limit") or 0))
     row.daily_limit = max(0, int(p.get("daily_limit") or 0))
     row.ai_window_start = max(0, min(23, int(p.get("ai_window_start") or 0)))
@@ -2801,9 +3225,14 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     # （未显式带 enabled）会把该分类意外停用，排期形同虚设。
     if "enabled" in p:
         row.enabled = bool(p.get("enabled"))
-    # v2.1.1：用户在页面上手工保存过该行 → 标记 window_auto=False，
-    # 之后「按偏好分配时段」不再覆盖这一行（用户手工设定优先）。
-    row.window_auto = False
+    # v2.1.4：只有当提交的时段**确实不等于偏好推荐值**时，才判定为「用户手工设定」。
+    # 此前无条件置 window_auto=False，而前端「保存全部」会逐行提交**所有**行
+    # （含用户根本没碰过的行），于是点一次保存全部，全表都变成「手工设定」，
+    # 此后「按偏好分配时段」对所有行永久失效——配置时段与偏好档位推荐值从此脱钩，
+    # 这正是用户反馈「配置时间段默认值应该与偏好档位推荐值一样」的真正根因。
+    pref_win = _preference_windows(db).get(category_key, FULL_DAY_WINDOW)
+    if (ws, we) != tuple(pref_win):
+        row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
     return {"ok": True, "item": _model_dict(row)}
@@ -2811,21 +3240,58 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
 
 @router.post("/category-schedules/adopt-ai")
 def api_adopt_schedule_ai(body: Payload, db: Session = Depends(get_db)):
-    """采纳 AI 建议时段：把真实派生的建议窗口写入当前配置并标记已采纳。"""
+    """采纳 AI 建议时段：把真实派生的建议窗口写入当前配置并标记已采纳。
+
+    v2.1.4：按**周维度**采纳——逐日写入 week_windows，调度引擎按当天星期取对应时段。
+    单时段字段（ai_window_start/end / window_start/end）同步写入「周一」的时段，
+    保持与旧逻辑兼容（前端仍会展示一个汇总值）。
+
+    采纳只认**真实历史**（source=history）的建议：该分类没有任何已发布记录时，
+    页面上的建议来自「通用观影作息基线」，那是作息规律而非本分类的实测数据，
+    采纳它等于把通用规律当成实测结论写进配置——不予采纳（返回可读原因）。
+    """
     p = body.payload
     row = db.get(SCCategorySchedule, int(p.get("id") or 0))
     if not row:
         return {"ok": False, "reason": "排期行不存在"}
+    week_ai = _ai_suggest_week_windows(db, row.category_key)
+    week_windows: dict[str, list[int]] = week_ai.get("windows") or {}
+    sources: dict[str, str] = week_ai.get("source") or {}
     ai_start, ai_end = _ai_suggest_window(db, row.category_key)
-    if not ai_start:
+    # 只采纳真实历史派生出来的那些天
+    measured = {d: v for d, v in week_windows.items() if sources.get(d) == "history"}
+    if not measured and not ai_start:
         return {"ok": False, "reason": "该分类暂无历史发布数据，无真实建议可采纳"}
-    row.window_start, row.window_end = ai_start, ai_end
+    if not measured:
+        # 有历史但都不在本周维度里（例如历史落在别的星期）→ 退回单时段口径
+        measured = {}
+    # v2.1.4：静默保护开启时，采纳的时段不得落在静默区间内
+    version = db.get(SCSharePlanVersion, int(row.plan_version_id or 0))
+    cycle = (_jload(version.config_json, {}) if version else {}).get("cycle_plan") or {}
+    quiet = _quiet_window(cycle)
+    if quiet:
+        for day, pair in measured.items():
+            if _window_overlaps_quiet((int(pair[0]), int(pair[1])), quiet):
+                return {"ok": False,
+                        "reason": _quiet_conflict_reason((int(pair[0]), int(pair[1])), quiet)}
+    if measured:
+        row.week_windows = _jdump(measured)
+        # 汇总值取周一（工作日起点）的时段，与旧口径对齐
+        monday = measured.get("1") or next(iter(measured.values()))
+        row.window_start, row.window_end = int(monday[0]), int(monday[1])
+    else:
+        row.window_start, row.window_end = ai_start, ai_end
+        row.week_windows = ""
+    row.ai_window_start = ai_start or int(row.window_start or 0)
+    row.ai_window_end = ai_end or int(row.window_end or 0)
     row.ai_adopted = True
     # v2.1.1：采纳 AI 建议是用户手工动作 → 该行不再被「按偏好分配时段」覆盖。
     row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
-    return {"ok": True, "window_start": ai_start, "window_end": ai_end}
+    return {"ok": True, "window_start": int(row.window_start or 0),
+            "window_end": int(row.window_end or 0),
+            "week_windows": measured}
 
 
 @router.post("/category-schedules/copy")

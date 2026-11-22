@@ -820,6 +820,15 @@ class SCCategorySchedule(Base):
     ai_window_start: Mapped[int] = mapped_column(Integer, default=0)   # AI 建议时段（真实发布分布派生）
     ai_window_end: Mapped[int] = mapped_column(Integer, default=0)
     ai_adopted: Mapped[bool] = mapped_column(Boolean, default=False)   # 是否已采纳 AI 建议
+    # v2.1.4：周维度建议窗口（JSON）。
+    # 形如 {"1": [20, 22], "2": [20, 22], ...}，键为 ISO 星期（1=周一 … 7=周日），
+    # 值为该天的建议时段 [起, 止)。用户口径：AI 建议时段按**周维度**生成——
+    # 工作日晚间与周末白天的观影习惯不同，用单一小时窗口无法表达。
+    # 空串 = 该行没有周维度建议（走 ai_window_start/end 的单时段口径）。
+    ai_week_windows: Mapped[str] = mapped_column(Text, default="")
+    # v2.1.4：已采纳的周维度配置窗口（JSON，格式同 ai_week_windows）。
+    # 采纳后真实生效：调度引擎按当天星期取该天的配置时段判定是否允许推送。
+    week_windows: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # v2.1.1：该行时段是否由系统按用户偏好自动分配（1=自动，0=用户手工设定）。
     # 自动分配的行可被「按偏好分配时段」刷新；手工设定的行永不被覆盖。

@@ -145,6 +145,9 @@ _COLUMNS = {
         "ai_window_start": "INTEGER DEFAULT 0",
         "ai_window_end": "INTEGER DEFAULT 0",
         "ai_adopted": "BOOLEAN DEFAULT 0",
+        # v2.1.4：周维度建议窗口 / 已采纳的周维度配置窗口（JSON 文本）
+        "ai_week_windows": "TEXT DEFAULT ''",
+        "week_windows": "TEXT DEFAULT ''",
         "enabled": "BOOLEAN DEFAULT 1",
         # v2.1.1：时段是否由系统按用户偏好自动分配（1=自动，可被刷新；0=用户手工设定）
         "window_auto": "BOOLEAN DEFAULT 1",

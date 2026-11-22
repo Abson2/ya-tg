@@ -720,7 +720,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.3", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.4", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -728,7 +728,7 @@ app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.3", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.4", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1654,9 +1654,21 @@ def mirror_clear_untranslated(db: Session = Depends(get_db)):
 
     这些行多是已不在 A 库 / 已停止追更的历史映射，英文名为空却每次同步都进待处理清单，
     看着像「过期没清」。本端点不删映射、不动文件，只置 english_source=ignored 让其从
-    清单消失；日后点「重新解析英文名并改名」(force=True) 会清掉标记重新解析，可随时恢复。
+    清单消失。
+
+    v2.1.4 真机修复（用户反馈：清空后这 10 部作品**永远不再翻译**）：
+      - **加 rule_id 过滤**：此前查全表 MirrorMedia，多规则场景会误清别的规则的作品；
+      - **ignored 不再是永久拉黑**：标记语义收敛为「该作品没有新内容时跳过解析」。
+        同步侧一旦发现 A 库又出现新文件，会自动解除该标记并重新解析英文名
+        （见 mirror.py sync_rule 的 has_new_source_file 分支），
+        所以「清空清单」不会让这些作品永久失去英文名。
+      - 仍可随时点「重新解析英文名并改名」(force=True) 立即全部恢复解析。
     """
+    rule = _mirror_rule(db)
+    if not rule:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
     rows = list(db.scalars(select(MirrorMedia).where(
+        MirrorMedia.rule_id == rule.id,
         or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == ""),
         or_(MirrorMedia.english_source.is_(None), MirrorMedia.english_source != "ignored")
     )).all())
@@ -1667,7 +1679,9 @@ def mirror_clear_untranslated(db: Session = Depends(get_db)):
         add_audit(db, "mirror_untranslated_cleared", target_type="mirror",
                   detail=json_dumps({"cleared": cleared}))
     db.commit()
-    return {"ok": True, "cleared": cleared}
+    return {"ok": True, "cleared": cleared,
+            "note": "已标记忽略的作品若后续在 A 库出现新文件，会自动恢复英文名解析；"
+                    "也可点「重新解析英文名并改名」立即恢复"}
 
 
 async def _do_mirror_poll_tasks(db: Session) -> dict:
@@ -2061,9 +2075,20 @@ def mirror_status(db: Session = Depends(get_db)):
             # v0.9.6.1：历史条目不回刷的单集改名行，默认不参与任何自动改名
             "files_rename_skipped_legacy": db.query(MirrorFile).filter(
                 MirrorFile.rename_status == "skipped_legacy").count(),
+            # v2.1.4：口径与「英文改名待处理」清单保持一致——排除已被用户标记忽略
+            # （english_source='ignored'）的作品。此前这里不排除，导致用户点完
+            # 「清空待处理清单」后清单已空、红字「待翻译作品」却仍显示旧数字，
+            # 让人误以为「清了但没生效 / 翻译再也不会发生」。
             "works_without_english": db.query(MirrorMedia).filter(
                 or_(MirrorMedia.english_title.is_(None),
-                    MirrorMedia.english_title == "")).count(),
+                    MirrorMedia.english_title == ""),
+                or_(MirrorMedia.english_source.is_(None),
+                    MirrorMedia.english_source != "ignored")).count(),
+            # 被标记忽略的作品数（透明可见，避免「静默丢弃」错觉）
+            "works_english_ignored": db.query(MirrorMedia).filter(
+                or_(MirrorMedia.english_title.is_(None),
+                    MirrorMedia.english_title == ""),
+                MirrorMedia.english_source == "ignored").count(),
             "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
             "tasks_failed": db.query(MirrorTask).filter(MirrorTask.status == "failed").count(),
             "scan_batches": db.query(ResourceScanBatch).count(),

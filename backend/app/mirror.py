@@ -1410,6 +1410,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             db.commit()
         sub_cache: dict[str, str] = {}
         copy_jobs: list[tuple[MirrorFile, str, str]] = []
+        # v2.1.4：本轮是否在 A 库发现了「指纹未命中的新文件」。
+        # 用于在作品级解除 english_source='ignored' 标记（见下方解除逻辑）。
+        has_new_source_file = False
         for container, item in _media_files(work, nodes):
             fid = str(item.get("fileId") or "")
             fname = _dir_name(item)
@@ -1419,6 +1422,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             if (fid, fp) in synced_rows:
                 stats["unchanged"] += 1
                 continue
+            # v2.1.4：A 库出现了本轮的新内容（指纹未命中）——即便这部作品曾被
+            # 「清空待处理清单」标记为 ignored，也必须解除标记、重新解析英文名，
+            # 否则它会永远停留在「永不翻译」状态，新集数也永远改不成英文名。
+            has_new_source_file = True
             row = retry_rows.pop((fid, fp), None)
             if row is not None:
                 # 复用旧记录重新复制，不新建行：避免唯一键冲突与历史留痕膨胀
@@ -1473,6 +1480,31 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             else:
                 stats["retries"] += 1
             copy_jobs.append((row, fid, target_parent))
+
+        # v2.1.4：本轮 A 库有新文件 → 解除该作品的 ignored 标记，恢复英文名解析。
+        #
+        # 根因（用户真机反馈）：「清空待处理清单」把英文名为空的作品批量置
+        # english_source='ignored'，而 _resolve_english_title 对 ignored 直接短路
+        # （force=False 时 return "", "ignored"），导致这些作品**永远不再翻译**——
+        # 即使 A 库后来又出了新集，改名链路也不会再启动，且 push_gate 的
+        # 「文件名已翻译为英文」门禁永远不通过 → 该作品再也进不了推送队列。
+        #
+        # 修法：ignored 的语义收敛为「**本轮没有新内容时**跳过解析」，
+        # 而不是「永久拉黑」。只要 A 库又出现新文件，就解除标记、重新解析。
+        # 用 Core UPDATE + 立即 commit（不污染 ORM 对象，避免 flush 时把读快照
+        # 升级为写事务——这正是 mirror.py 里反复出现 database is locked 的根因）。
+        if has_new_source_file and str(getattr(media, "english_source", "") or "") == "ignored":
+            try:
+                db.execute(update(MirrorMedia).where(MirrorMedia.id == media.id)
+                          .values(english_source=""))
+                db.commit()
+                media.english_source = ""
+                stats["unignored"] = int(stats.get("unignored", 0) or 0) + 1
+                logger.info("[mirror] 作品 %s 出现新文件，解除忽略标记、重新解析英文名",
+                            title)
+            except Exception as exc:
+                db.rollback()
+                logger.warning("[mirror] 解除忽略标记失败 media=%s：%s", media.id, exc)
 
         if not copy_jobs:
             # v0.8.4：还有未成功的文件记录时绝不标 synced，
@@ -1763,7 +1795,10 @@ async def _resolve_english_title(db: Session, media: MirrorMedia, *,
     src_existing = str(getattr(media, "english_source", "") or "").strip()
     # v0.9.6：用户点「清空待处理清单」后会置 english_source=ignored。非强制解析时
     # 尊重该标记、直接跳过（否则每轮同步又把历史垃圾解析一遍，清单永远清不干净）；
-    # 只有 force=True（点「重新解析英文名并改名」）才清掉标记、重新走解析链路。
+    # v2.1.4：ignored 的语义收敛为「**没有新内容时**跳过」，不是永久拉黑——
+    # 同步侧一旦发现 A 库又出现新文件，会先解除该标记（见 sync_rule 的
+    # has_new_source_file 分支），此处只是兜底：即便标记还在，也只在
+    # 「该作品本轮确实没有新文件」时跳过。
     if src_existing == "ignored" and not force:
         return "", "ignored"
     if cached and not force:
