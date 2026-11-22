@@ -6,8 +6,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -21,6 +25,7 @@ from sqlalchemy.orm import Session
 from . import runtime_config, utils
 from .db import get_db
 from .guangya import GuangYaShareClient, create_share_parsed
+from .push_gate import evaluate_push_gate
 from .models import (
     Channel,
     QueueItem,
@@ -47,6 +52,8 @@ from .models import (
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 OFFICIAL_MIN_SECONDS = {"channel": 1.0, "private": 1.0, "group": 3.0}
 DEFAULT_INTERVAL_SECONDS = {"channel": 2.0, "private": 2.0, "group": 4.0}
 # v2.1.1：每分钟上限与抖动的内置默认。旧默认 0/0.0 = 不限 + 无错峰，
@@ -58,6 +65,56 @@ DEFAULT_MAX_PER_MINUTE = {"channel": 30, "private": 30, "group": 20}
 DEFAULT_JITTER_SECONDS = {"channel": 0.0, "private": 0.0, "group": 1.0}
 ACTIVE_TASK_STATUS = {"planned", "building", "ready", "submitted", "accepted", "publishing"}
 TERMINAL_TASK_STATUS = {"published", "failed", "cancelled"}
+
+# v2.1.3 推送门禁：门禁未过的任务不建分享、不入队，等条件齐了再排期。
+# 重试间隔取 60s——改名 / 补齐后最长等一分钟就能自动放行，不会「永远卡住」。
+GATE_RETRY_SECONDS = 60
+
+# ---------------------------------------------------------------------------
+# v2.1.3 真机死锁根治（2026-11-22 黑豹2 事故后端修复）
+#
+# 事故现象：_job_share_center（5s 周期）与 process_queue（60s 周期）持续 24 小时
+# 报 "maximum number of running instances reached (1)"，队列停滞但容器 healthy，
+# 同时英文名解析链路整体停摆（07:23 后 56 部作品集体无英文名）。
+#
+# 根因链（源码逐环验证）：
+#   1) 分享中心周期有**两个驱动入口**——main._job_share_center 与
+#      publisher._process_queue_impl——两者都在独立线程里 asyncio.run 同一轮
+#      run_cycle。无单飞锁时它们并发写同一批任务（**重复 dispatch**）并互抢
+#      SQLite 写锁。
+#   2) run_cycle 的前三步是同步写库（commit），第四步 dispatch 里有**网络 await**。
+#      两个入口并发时，一个线程在等写锁、另一个线程在等网络，写锁持有时间被放大。
+#   3) 单轮 dispatch 原本**没有任何时间预算**：一个建分享最坏 3 次重试 ×
+#      (20s 超时 + 退避) ≈ 63s，limit=20 → 单轮最长 21 分钟。而 _job_share_center
+#      周期只有 5 秒且 max_instances=1 → **上一轮永不结束**，之后每 5 秒都打
+#      "maximum number of running instances reached"。这就是那条刷了 24 小时的日志。
+#   4) publisher._process_queue_impl 在**主协程线程**里做同步 db.commit()，撞上
+#      分享中心周期线程持有的写锁 → busy_timeout 30 秒**冻结整个 event loop**
+#      → APScheduler 所有 job 一起饿死 → 定时镜像 / 后台改名复查全部不执行
+#      → 新作品没有英文名、改名集体停摆（与 A-07 注释描述的是同一类故障）。
+#
+# 三道防线，缺一不可：
+#   A. 进程级单飞锁：同一时刻只允许一轮 run_cycle，第二个入口直接跳过。
+#   B. 单轮时间预算：建分享网络硬超时 + 整轮墙钟预算，单轮时长有界。
+#   C. building 僵尸回收：建分享阶段卡死会让任务永远停在 building——dispatch 的
+#      候选集不含 building，等于永久漏推（真机「推送停滞但容器 healthy」）。
+# ---------------------------------------------------------------------------
+
+# A. 进程级单飞锁。跨线程使用（两个入口各自在线程里跑），故用 threading.Lock
+# 而非 asyncio.Lock——asyncio.Lock 绑定具体事件循环，跨循环会抛 RuntimeError。
+_CYCLE_LOCK = threading.Lock()
+
+# B. 单个建分享的网络硬超时（含 guangya.post 内部 3 次重试与退避）。
+SHARE_BUILD_TIMEOUT_SECONDS = 45
+
+# B. 单轮 dispatch 的墙钟预算：超预算就把剩余任务留到下一轮（它们仍是
+# planned/ready，下一轮自然被捞起），绝不让一轮跑到十几分钟。
+DISPATCH_ROUND_BUDGET_SECONDS = 60
+
+# C. building 僵尸回收阈值（秒）。建分享阶段进程被杀 / 网络半开会让任务永远
+# 停在 building，而 dispatch 候选集只含 planned/ready/failed → 永久漏推。
+BUILDING_STALE_SECONDS = 600
+
 # v2.1.2：归档态（清理后置位）。**不物理删除行**——任务与分享记录是推送历史与
 # 链接生命周期的真相源，删除会连带毁掉执行记录与统计口径。归档后：
 #   任务   → status='cleaned'
@@ -864,6 +921,7 @@ class _RepResolver:
     def __init__(self, db: Session):
         self.db = db
         self._by_key: dict[str, Resource] | None = None
+        self._members: dict[str, list[Resource]] | None = None
 
     def _build(self) -> None:
         grouped: dict[str, list[Resource]] = {}
@@ -875,6 +933,32 @@ class _RepResolver:
             if ordered:
                 table[wk] = ordered[0]
         self._by_key = table
+        self._members = grouped
+
+    def work_members(self, lv: SCLibraryVersion) -> list[Resource]:
+        """取作品的全部成员资源（推送门禁的作品级判定用）。
+
+        优先用快照里的资源 id（那是建快照那一刻的真实成员）；快照失效时退回
+        实时分组（与 sync_library_versions 同口径）。拿不到成员时退回代表资源
+        单条——门禁仍能判定「至少这一条满足前三项」，不会凭空判失败。
+        """
+        out: list[Resource] = []
+        for rid in _jload(lv.resource_ids_json, []) or []:
+            try:
+                res = self.db.get(Resource, int(rid))
+            except (TypeError, ValueError):
+                res = None
+            if res is not None:
+                out.append(res)
+        if out:
+            return out
+        if self._members is None:
+            self._build()
+        live = list((self._members or {}).get(str(lv.work_key or "")) or [])
+        if live:
+            return live
+        rep, _ = self.resolve(lv)
+        return [rep] if rep is not None else []
 
     def resolve(self, lv: SCLibraryVersion) -> tuple[Resource | None, str]:
         """返回 (代表资源, 失败原因)。失败原因为空表示解析成功。"""
@@ -896,17 +980,54 @@ class _RepResolver:
 
 
 async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
-    """建分享并提交到分发队列；发送核心仍由 publisher 负责。"""
+    """建分享并提交到分发队列；发送核心仍由 publisher 负责。
+
+    v2.1.3 真机死锁根治：单轮 dispatch 必须**时长有界**。
+    原来一个建分享最坏 3 次重试 × (20s 超时 + 退避) ≈ 63s，limit=20 → 单轮最长
+    21 分钟；而 _job_share_center 周期只有 5 秒且 max_instances=1 → 上一轮永不
+    结束，之后每 5 秒都打 "maximum number of running instances reached"。现在：
+      - 建分享有网络硬超时（SHARE_BUILD_TIMEOUT_SECONDS）；
+      - 整轮有墙钟预算（DISPATCH_ROUND_BUDGET_SECONDS），超预算就把剩余任务
+        留到下一轮（它们仍是 planned/ready，下轮自然被捞起）；
+      - 开跑前先回收 building 僵尸（建分享阶段卡死 → 永久漏推）。
+    """
     if str(runtime_config.get(db, "publish_paused") or "false").lower() in ("1", "true", "yes", "on"):
         return {"built": 0, "submitted": 0, "failed": 0, "paused": 1}
     now = utcnow()
+    # v2.1.3：回收 building 僵尸。dispatch 的候选集只含 planned/ready/failed，
+    # 一旦任务卡在 building（进程被杀 / 网络半开 / 旧版本崩溃）就**永远不会被
+    # 再次捞起**——真机表现就是「推送停滞但容器 healthy」。这里把超过阈值的
+    # building 任务放回 planned，让它重新走一轮（分享链接本来就没建成，
+    # 放回 planned 是正确归位，不是重复推送）。
+    stale_building = now - timedelta(seconds=BUILDING_STALE_SECONDS)
+    try:
+        revived = db.execute(
+            update(SCPublishTask)
+            .where(SCPublishTask.status == "building",
+                   SCPublishTask.updated_at < stale_building)
+            .values(status="planned", error="建分享阶段中断，已重新排期",
+                    next_retry_at=now)).rowcount or 0
+    except Exception:
+        db.rollback()
+        revived = 0
+    if revived:
+        db.commit()
+        logger.warning("[share_center_v2] 回收卡在「建链中」的僵尸任务 %s 条", revived)
     tasks = list(db.scalars(
         select(SCPublishTask).where(SCPublishTask.status.in_({"planned", "ready", "failed"}))
         .where(or_(SCPublishTask.scheduled_at.is_(None), SCPublishTask.scheduled_at <= now))
         .where(or_(SCPublishTask.next_retry_at.is_(None), SCPublishTask.next_retry_at <= now))
         .order_by(SCPublishTask.priority.desc(), SCPublishTask.id).limit(limit)
     ).all())
-    stats = {"built": 0, "submitted": 0, "failed": 0, "paused": 0, "throttled": 0}
+    stats = {"built": 0, "submitted": 0, "failed": 0, "paused": 0, "throttled": 0,
+             # v2.1.3：被推送门禁拦下的任务数（不算失败，等条件齐了自动重试）
+             "gated": 0,
+             # v2.1.3：因单轮预算耗尽而留给下一轮的任务数（不算失败）
+             "deferred": 0,
+             # v2.1.3：回收的 building 僵尸数
+             "revived": int(revived)}
+    # v2.1.3：单轮墙钟预算起点。
+    round_started = time.monotonic()
     # v2.1.1：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
     _rep_resolver = _RepResolver(db)
     # v2.1.0：基础规则「上新即时推送每小时上限」真实消费。统计本自然小时已提交
@@ -925,7 +1046,14 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
             SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
             SCPublishTask.scheduled_at >= hour_start)) or 0)
-    for task in tasks:
+    for task_index, task in enumerate(tasks):
+        # v2.1.3：单轮墙钟预算。超预算就把剩余任务留给下一轮（它们仍是
+        # planned/ready，下一轮自然被捞起）——绝不让一轮跑到十几分钟，
+        # 否则 _job_share_center（5s 周期 + max_instances=1）会永远卡在
+        # "上一轮未结束"，持续刷 maximum number of running instances reached。
+        if time.monotonic() - round_started > DISPATCH_ROUND_BUDGET_SECONDS:
+            stats["deferred"] = len(tasks) - task_index
+            break
         if hourly_cap and submitted_this_hour >= hourly_cap:
             stats["throttled"] += 1
             break
@@ -945,6 +1073,19 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
             db.commit()
             stats["failed"] += 1
             continue
+        # v2.1.3 推送门禁（真机 2026-11-22 黑豹2 事故的直接成因）：建分享之前
+        # 必须逐项核验「海报 / 资料 / 识别成功 / 目录已整理 / 文件名已英文」。
+        # 门禁未过的任务**不建分享、不入队、不算失败**——它只是「还没准备好」，
+        # 保持 planned + 下轮重试，等改名 / 补齐后再由计划引擎重新排期。
+        # 中文原因写进 task.error（页面只展示中文，不出现任何后端字段名）。
+        gate = evaluate_push_gate(db, str(task.work_key or ""), _rep_resolver.work_members(lv))
+        if not gate["passed"]:
+            task.status = "planned"
+            task.error = gate["reason"]
+            task.next_retry_at = now + timedelta(seconds=GATE_RETRY_SECONDS)
+            db.commit()
+            stats["gated"] += 1
+            continue
         task.status = "building"
         task.error = ""
         db.add(SCPublishExecution(task_id=task.id, stage="build", status="running",
@@ -952,14 +1093,38 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         db.commit()
         try:
             client = GuangYaShareClient(db)
-            share_id, share_url = await create_share_parsed(
-                client, str(metadata.get("share_dir_id") or rep.file_id),
-                str(metadata.get("title") or task.work_key), 0,
+            # v2.1.3：建分享网络硬超时。guangya.post 内部 3 次重试 + 退避最坏
+            # ≈63s；20 个任务串起来 = 单轮 21 分钟 → 5 秒周期的 job 永远
+            # "上一轮未结束"（真机刷了 24 小时的 maximum number of running
+            # instances reached）。这里给单次建分享封顶 45s，超时按失败处理
+            # （任务回到 planned，下轮重试），不再拖住整轮。
+            share_id, share_url = await asyncio.wait_for(
+                create_share_parsed(
+                    client, str(metadata.get("share_dir_id") or rep.file_id),
+                    str(metadata.get("title") or task.work_key), 0,
+                ),
+                timeout=SHARE_BUILD_TIMEOUT_SECONDS,
             )
             task.share_url = share_url
             task.link_state = "active"
             task.status = "ready"
             stats["built"] += 1
+        except asyncio.TimeoutError:
+            # 超时不算业务失败：链接本来就没建成，放回 planned 等下一轮重试。
+            task.status = "planned"
+            task.error = "建分享超时，已重新排期"
+            task.next_retry_at = now + timedelta(seconds=GATE_RETRY_SECONDS)
+            stats["deferred"] += 1
+            execution = db.scalar(select(SCPublishExecution).where(
+                SCPublishExecution.task_id == task.id,
+                SCPublishExecution.stage == "build",
+                SCPublishExecution.status == "running").order_by(SCPublishExecution.id.desc()))
+            if execution:
+                execution.status = "failed"
+                execution.error = "建分享超时"
+                execution.finished_at = utcnow()
+            db.commit()
+            continue
         except Exception as exc:
             task.status = "failed"
             task.error = str(exc)[:500]
@@ -1011,17 +1176,41 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
 
 
 async def run_cycle(db: Session, limit: int = 20) -> dict[str, Any]:
+    """分享中心主周期：sync → plan → dispatch。
+
+    v2.1.3 真机死锁根治：**进程级单飞**。
+    本周期有两个驱动入口——main._job_share_center（5 秒一次）与
+    publisher._process_queue_impl（队列 worker，每次也驱动一轮）——两者都在
+    各自的线程里 asyncio.run 本函数。没有单飞锁时它们会：
+
+      1) **重复 dispatch**：两个线程各自 select 同一批 planned 任务，都去建
+         分享、都写 QueueItem —— 同一作品被建两次链接、入队两条；
+      2) **互抢 SQLite 写锁**：一个线程持写锁时另一个在 busy_timeout 里等，
+         写锁持有时间被放大，publisher 主协程的 db.commit() 撞上就冻结整个
+         event loop → APScheduler 所有 job 饿死 → 英文名解析链路整体停摆。
+
+    这里用**非阻塞**获取：拿不到锁就直接跳过本轮（返回 skipped），绝不让
+    第二个入口排队等锁——排队等待就是真机"两轮同时跑、互相拖死"的成因。
+    锁在 finally 里释放，异常路径也不会漏锁。
+    """
     if not is_enabled(db):
         return {"enabled": False}
-    ensure_defaults(db)
-    result: dict[str, Any] = {
-        "enabled": True,
-        "library": sync_library_versions(db),
-        "update": merge_update_windows(db),
-        "plan": plan_engine(db),
-    }
-    result["dispatch"] = await dispatch_ready_tasks(db, limit=limit)
-    return result
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        # 上一轮还没跑完 → 本轮直接跳过（这是正常背压，不是故障）。
+        return {"enabled": True, "skipped": True,
+                "reason": "上一轮分享中心周期尚未结束，本轮跳过"}
+    try:
+        ensure_defaults(db)
+        result: dict[str, Any] = {
+            "enabled": True,
+            "library": sync_library_versions(db),
+            "update": merge_update_windows(db),
+            "plan": plan_engine(db),
+        }
+        result["dispatch"] = await dispatch_ready_tasks(db, limit=limit)
+        return result
+    finally:
+        _CYCLE_LOCK.release()
 
 
 def claim_tasks(db: Session, worker: str, limit: int = 20) -> list[SCPublishTask]:
@@ -2744,12 +2933,31 @@ def api_save_cycle_plan(body: Payload, db: Session = Depends(get_db)):
     return {"ok": True, "cycle_plan": cycle}
 
 
+def _display_time(value: datetime | None) -> str:
+    """把库里的时间转成**给人看的**简洁字符串（v2.1.3）。
+
+    真机问题：`_model_dict` 原先直接 `value.isoformat()`，输出
+    `2026-11-22T01:00:17.123456` —— ①中间那个 `T` 是用户完全看不懂的"未知字符"；
+    ②带微秒 + 偏移后缀，长度顶满表格列宽；③SQLite 读回的是 **naive UTC**，
+    浏览器若直接 `new Date()` 会当本地时间解析，整体偏 8 小时。
+
+    现在统一输出 **`YYYY-MM-DD HH:mm:ss`（Asia/Shanghai 本地时间）**：
+      - naive 值按 UTC 解读（SQLite 的实际存法），再转上海时区；
+      - 不带 `T`、不带微秒、不带 `+08:00` 后缀，列宽友好；
+      - 空值返回空串，前端统一渲染为「—」。
+    """
+    dt = utils.as_utc(value)
+    if dt is None:
+        return ""
+    return dt.astimezone(shanghai_tz()).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _model_dict(row) -> dict[str, Any]:
     data = {}
     for column in row.__table__.columns:
         value = getattr(row, column.name)
         if isinstance(value, datetime):
-            value = value.isoformat()
+            value = _display_time(value)
         data[column.name] = value
     return data
 

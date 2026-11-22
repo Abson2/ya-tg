@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import timedelta
 
 import httpx
@@ -22,6 +23,13 @@ from .utils import (backoff_seconds, is_video_file, parse_media_name, parse_tech
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
 logger = logging.getLogger(__name__)
+
+# v2.1.3 真机死锁根治：单轮发送的墙钟预算（秒）。
+# 一轮最坏 = 20 条 × (节流间隔 + 建分享 + 发 TG)。真机上单轮可达数分钟，
+# 而 queue_worker 的调度周期是 30~60s 且 max_instances=1 → 上一轮永不结束 →
+# 每轮都打 "maximum number of running instances reached"。这里给单轮封顶，
+# 超预算就把剩余条目留给下一轮（它们仍是 pending/retry，下轮自然被捞起）。
+SEND_ROUND_BUDGET_SECONDS = 120
 
 
 def human_size(size: int) -> str:
@@ -436,9 +444,49 @@ def _run_share_center_in_thread(limit: int = 20) -> None:
             logger.warning("[publisher] 分享中心周期异常（线程内已隔离）", exc_info=True)
 
 
+def _process_queue_in_thread(limit: int = 20) -> dict:
+    """v2.1.3 真机死锁根治：整轮队列处理挪到工作线程。
+
+    真机 2026-11-22：`_process_queue_impl` 原来在**主协程线程**里做同步
+    `db.commit()`（含 `_sc.claim_tasks` 的条件 UPDATE），撞上分享中心周期线程
+    持有的 SQLite 写锁 → `busy_timeout=30000` **冻结整个 event loop** →
+    APScheduler 所有 job 一起饿死 → 定时镜像 / 后台改名复查全部不执行
+    （真机 `_job_share_center` 与 `process_queue` 双双 24 小时报
+    "maximum number of running instances reached"）。
+
+    这里把整轮处理挪到工作线程：线程内自建 Session（独立连接）与独立事件循环
+    （`asyncio.run`），主线程只 `await asyncio.to_thread(...)`，**零写库、零阻塞**。
+    与 `_run_share_center_v2_in_thread` / `_consume_resource_events_in_thread` 同款
+    （第六、七次死锁的既定根治模式）。
+    """
+    with SessionLocal() as db:
+        try:
+            return asyncio.run(_process_queue_core(db, limit=limit))
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning("[publisher] 队列处理异常（线程内已隔离）", exc_info=True)
+            return {"sent": 0, "failed": 0, "shares_created": 0,
+                    "error": True, "reason": "队列处理异常，本轮跳过"}
+
+
 async def _process_queue_impl(limit: int = 20) -> dict:
-    db: Session = SessionLocal()
+    """队列处理入口（对外契约不变）。
+
+    v2.1.3：真正的实现搬到了 `_process_queue_core` + `_process_queue_in_thread`
+    （工作线程 + 独立 Session + 独立事件循环），这里只做线程调度。
+    保留本函数为 async 且签名只带 `limit`，是因为：
+      - `process_queue` 必须 `await _process_queue_impl(limit=limit)`（进程内互斥契约）；
+      - 既有测试直接替换 `_process_queue_impl` 来验证互斥语义。
+    """
+    return await asyncio.to_thread(_process_queue_in_thread, limit)
+
+
+async def _process_queue_core(db: Session, limit: int = 20) -> dict:
     sent = failed = shared = 0
+
     # v0.6.5：逐条发送节流，避免一次轮询连发多条触发 Telegram 风控
     try:
         delay = max(0, min(int(runtime_config.get(db, "telegram_send_delay") or 2), 60))
@@ -531,7 +579,16 @@ async def _process_queue_impl(limit: int = 20) -> dict:
                 sres = db.get(Resource, srid)
                 if sres:
                     sent_keys_by_channel.setdefault(int(sch), {})[_work_group_key(sres)] = int(sid)
+        # v2.1.3：单轮发送墙钟预算起点。超预算即停止本轮，剩余条目留给下一轮。
+        round_started = time.monotonic()
         for idx, q in enumerate(rows):
+            # v2.1.3：单轮时长有界。剩余条目仍是 pending/retry，下轮自然被捞起，
+            # 绝不因为「这一轮想全发完」而把 queue_worker 拖成几分钟一轮
+            # （那会让 max_instances=1 永久 skipped，真机 24 小时队列停滞）。
+            if time.monotonic() - round_started > SEND_ROUND_BUDGET_SECONDS:
+                logger.info("[publisher] 本轮发送达到时长预算，剩余 %s 条留待下一轮",
+                            len(rows) - idx)
+                break
             # v0.9.10：进入每条前先落盘上一条的写——绝不让未提交写事务跨下面的
             # asyncio.sleep / ensure_share(光鸭网络) / _send_telegram(TG 网络) await。
             # 真机根因：此前整轮 for 只在本末尾 commit 一次，20 条 × (2s 间隔 + 建分享 +

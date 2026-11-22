@@ -509,15 +509,25 @@ def test_quiet_protection_disabled_by_default(env):
         assert plan["window_start"] == 0 and plan["window_end"] == 24
 
 
-def test_night_hour_plan_engine_not_blocked_by_quiet(env):
-    """凌晨 0-7 点不因静默保护而整轮空转。"""
+def test_night_hour_plan_engine_not_blocked_by_quiet(env, monkeypatch):
+    """凌晨 0-7 点不因静默保护而整轮空转。
+
+    v2.1.3：这条用例原先依赖**真实墙钟**——它把小时窗口换成 0-8，然后断言
+    「当前小时命中该窗口」。但当前小时是真实上海时间，只有 UTC 16:00–23:00
+    （即上海 0-8 点）跑才成立，其余时段必然假红（本次全量回归就在上海 12 点
+    撞上）。这是**测试写法缺陷**，不是生产行为问题。
+
+    修法：把被测函数的「当前小时」固定成凌晨 2 点（monkeypatch
+    `_current_hour_window` 依赖的 `datetime.now`），断言才与运行时刻无关。
+    生产代码一行未动。
+    """
     from app import share_center_v2 as sc2
+    from app.models import SCHourWindow
     S, _ = env
     with S() as db:
         sc2.ensure_defaults(db)
         version = sc2._active_version(db)
         # 把版本小时窗口放到 0-8（凌晨段），模拟凌晨调度
-        from app.models import SCHourWindow
         for r in db.scalars(select(SCHourWindow).where(
                 SCHourWindow.plan_version_id == version.id)).all():
             db.delete(r)
@@ -525,6 +535,17 @@ def test_night_hour_plan_engine_not_blocked_by_quiet(env):
         db.add(SCHourWindow(plan_version_id=version.id, start_hour=0, end_hour=8,
                             category_key="", quota=0, enabled=True))
         db.commit()
+        # 固定「当前小时」为上海凌晨 2 点 → 落在 0-8 窗口内
+        import datetime as _dt
+        real_datetime = sc2.datetime
+
+        class _FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 1, 1, 2, 0, 0,
+                                     tzinfo=tz or real_datetime.now().tzinfo)
+
+        monkeypatch.setattr(sc2, "datetime", _FixedDatetime)
         assert sc2._current_hour_allowed(db, version) is True
 
 

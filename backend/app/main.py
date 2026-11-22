@@ -164,6 +164,17 @@ class _TimedMirrorLock:
 
 _mirror_lock = _TimedMirrorLock()
 
+# v2.1.3 真机死锁根治：改名专用互斥锁。
+# 原来「后台改名复查」与「定时镜像 / 立即同步」抢同一把 _mirror_lock，真机
+# 2026-11-22 上镜像长跑 119 部作品 → 改名复查每 120 秒都抢不到锁直接 return
+# → 英文名解析链路整体停摆（56 部作品集体无英文名）。
+# 复制（动文件流向）与改名（只改 B 库文件名）互不冲突，拆成两把锁后：
+#   - _mirror_lock：复制 / 建目录 / 映射维护（长任务）
+#   - _rename_lock：改名（只改 B 库已有文件的名称）
+# 两者可以并行；真正的互斥只发生在「两个改名任务同时改同一批文件」上。
+# 同样非阻塞获取：抢不到就跳过本轮，不排队堆积。
+_rename_lock = threading.Lock()
+
 
 # 阶段四 B-11：审计日志脱敏。异常 str(exc) 可能带 token / 签名 URL 片段，
 # 原样落 audit_logs 会长期留存敏感信息。只替换明确的敏感 kv，不破坏诊断上下文。
@@ -428,10 +439,21 @@ async def _job_rename_pending():
     复制任务完成后网盘文件可见可能有秒级延迟。改名只认只读列目录命中的 fileId，
     每次仍走 file_idle_seconds 风控间隔与 rename 预算；拿不到镜像互斥锁就跳过，
     不与「立即同步 / 手动改名」抢 SQLite 写锁。
+
+    v2.1.3 真机死锁根治（2026-11-22）：原来本 job 与「定时镜像 / 立即同步」抢**同一把**
+    `_mirror_lock`。真机上镜像同步（119 部作品的大轮次）长时间持锁 → 本 job 每 120 秒
+    都 `acquire(blocking=False)` 失败直接 return → 英文名解析链路整体停摆（07:23 后
+    56 部作品集体无英文名、rename_status 56 条为空）。而「复制」与「改名」是两类
+    互不冲突的操作（复制动 A→B 文件流向，改名只改 B 库已有文件的名称），本就不该
+    用同一把锁互相饿死。
+
+    现在改名用**独立的 `_rename_lock`**：
+      - 与镜像同步锁解耦 → 镜像长跑时改名复查照样推进（英文名不再停摆）；
+      - 仍与「手动改名 / 改名单文件」互斥（同一批文件不能被两个改名任务同时改）；
+      - 非阻塞获取，拿不到就跳过本轮，绝不排队堆积。
     """
-    if not _mirror_lock.acquire(blocking=False):
+    if not _rename_lock.acquire(blocking=False):
         return
-    _mirror_lock.set_owner("后台改名复查")
     try:
         with SessionLocal() as db:
             r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
@@ -453,10 +475,13 @@ async def _job_rename_pending():
             if out.get("renamed") or out.get("waiting_visible"):
                 logger.info("[mirror] 待改名复查：改名 %s / 仍待可见 %s",
                             out.get("renamed", 0), out.get("waiting_visible", 0))
+            # v2.1.3：改名完成后，之前被推送门禁挡下的作品可能已经满足「文件名已
+            # 翻译为英文」——立即重新入队，避免门禁把它们永久拦下（漏推）。
+            _recheck_gated_push(db)
     except Exception as exc:
         logger.warning("[mirror] 待改名复查失败：%s", exc)
     finally:
-        _mirror_lock.release()
+        _rename_lock.release()
 
 
 def _queue_trigger(db: Session):
@@ -695,7 +720,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.2", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.3", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -703,7 +728,7 @@ app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.2", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.3", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2650,6 +2675,15 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     by_id = {x.id: x for x in rows}  # 阶段三 A-08：复用已取资源，避免筛选时逐条 db.get
     # 阶段六资源卡角标：一次性预加载「已推送资源集合」与「作品→链接状态」，
     # 避免逐卡查询（N+1）。两者均来自本地库，失败降级为空不阻断列表。
+    #
+    # v2.1.3：「已分享」与「已推送」标签同步（用户口径：这两块应该同步进行）。
+    # 根因：此前「已分享」只看 legacy `Resource.share_status`，而**分享中心 v2
+    # 建链从不回写该字段**——v2 建好的链接只落在 `sc_publish_tasks.share_url`，
+    # 于是资源库卡片上会出现「已推」但没有「已分享」的矛盾状态。
+    # 现在以**同一份真相**判定：
+    #   - 已分享：任一成员有 share_url，或 v2 分享任务里存在已建链（active）且有链接；
+    #   - 已推送：任一成员有实际发送记录（sent_at 非空），或 v2 任务已 published。
+    # 两个标签由同一组数据派生，天然同步。
     try:
         from .models import ShareRecord as _SR
         sent_ids = {r[0] for r in db.execute(select(QueueItem.resource_id).where(
@@ -2658,6 +2692,25 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             select(_SR).where(_SR.current_flag == 1)).all()}
     except Exception:
         sent_ids, link_by_key = set(), {}
+    # v2 分享中心：作品 → (是否已建链有链接, 是否已推送)
+    try:
+        from .models import SCPublishTask as _SPT
+        v2_shared: set[str] = set()
+        v2_pushed: set[str] = set()
+        v2_url_by_key: dict[str, str] = {}
+        for t in db.scalars(select(_SPT)).all():
+            wk = str(t.work_key or "")
+            if not wk:
+                continue
+            url = str(t.share_url or "").strip()
+            if url and str(t.link_state or "") == "active":
+                v2_shared.add(wk)
+                if url not in v2_url_by_key.get(wk, ""):
+                    v2_url_by_key[wk] = url
+            if str(t.status or "") == "published":
+                v2_pushed.add(wk)
+    except Exception:
+        v2_shared, v2_pushed, v2_url_by_key = set(), set(), {}
     groups: dict[str, dict] = {}
     for x in rows:
         key = _series_group_key(x)
@@ -2738,8 +2791,23 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         g["episode_label"] = label
         g["season_count"] = len(seasons)
         # 阶段六资源卡角标：是否已推送（任一成员有 sent 记录）+ 当前链接状态（本地推断）
-        g["pushed"] = any(i in sent_ids for i in g["ids"])
-        g["link_state"] = link_by_key.get(g["key"], "")
+        #
+        # v2.1.3：「已推送」与「已分享」由**同一份真相**派生，两者天然同步：
+        #   - 已推送 = 任一成员有实际发送记录，或 v2 分享任务已 published；
+        #   - 已分享 = 任一成员有 share_url，或 v2 分享任务已建链（active）且有链接。
+        # v2 链建链**不回写** legacy Resource.share_status，所以必须显式合并，
+        # 否则会出现「已推」标签亮着、却没有「已分享」的矛盾状态。
+        g["pushed"] = any(i in sent_ids for i in g["ids"]) or (g["key"] in v2_pushed)
+        v2_linked = g["key"] in v2_shared
+        if v2_linked:
+            g["share_status"] = "active"
+            if not g["share_url"]:
+                # v2 的链接挂在任务上，资源行可能还没回写；这里给出可点开的链接
+                g["share_url"] = v2_url_by_key.get(g["key"], "")
+        g["link_state"] = link_by_key.get(g["key"], "") or ("active" if v2_linked else "")
+        # 「已推送」必然经过建链 → 分享状态至少是 active（消除「已推但未分享」的矛盾）
+        if g["pushed"] and not str(g["share_url"] or "").strip():
+            g["share_status"] = g["share_status"] if g["share_status"] != "not_created" else "active"
         # 筛选：标题/文件名关键词
         if q and q.lower() not in (str(g["title"]) + " " + " ".join(str(i) for i in g["ids"])).lower():
             # 关键词也匹配成员文件名
@@ -3101,14 +3169,44 @@ def _work_key(x: Resource) -> str:
     return _series_group_key(x)
 
 
+def _push_gate_passed(db: Session, x: Resource) -> bool:
+    """推送门禁判定（旧链入队用）。True = 五项前置条件全部满足。
+
+    门禁规则见 `push_gate.evaluate_push_gate`：海报 / 影片资料 / 识别成功 /
+    影视目录已按命名约定整理 / 单文件已译为英文。判定是**作品级**的——推送的
+    粒度是「一部作品一条推送」，因此按作品的全部成员判定，而不是只看当前这一集。
+
+    这里把作品成员一次性取齐（同一作品键的所有 Resource），避免逐集重复全表扫。
+    """
+    from .push_gate import evaluate_push_gate
+    key = _work_key(x)
+    members = [s for s in db.scalars(select(Resource)).all() if _work_key(s) == key]
+    if not members:
+        members = [x]
+    gate = evaluate_push_gate(db, key, members)
+    return bool(gate.get("passed"))
+
+
 def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     """v0.6.5：把「已识别 + 有海报」的资源按规则入队，同一作品同一频道只入一条。
 
     返回是否新增。扫描/识别/加规则三条路径都走这里，保证「一张卡 = 一条推送」
     在任何入口都成立。注意 Session 是 autoflush=False，入队后必须显式 flush，
     否则 identify_all 批量识别时前一条队列项对后续同剧单集不可见，36 集会全部入队。
+
+    v2.1.3 推送门禁（真机 2026-11-22 黑豹2 事故）：在既有「识别成功 + 有海报」
+    之外，补齐「影片资料 / 影视目录已整理 / 单文件已译为英文」三项，缺一不入队。
+    门禁判定收敛在 `push_gate.evaluate_push_gate`，与分享中心 v2 的 dispatch 路径
+    **共用同一处实现**，杜绝两条路径各写各的、其中一条漏检。
+
+    门禁未过时返回 False（不入队）。这里不抛错、不写失败状态——被门禁拦下只是
+    「还没准备好」，等镜像改名 / 补齐元数据后由 `recheck_gated_push` 重新入队，
+    不会永久漏推。
     """
     if x.identify_status != "identified" or not (x.poster_path or "").strip():
+        return False
+    # v2.1.3 推送门禁：作品级判定，与 v2 dispatch 完全同一套规则。
+    if not _push_gate_passed(db, x):
         return False
     # v0.8.1：旧数据（含电影）可能缺 share_dir_id，入队前现场补算作品目录，
     # 确保推送走整目录分享而非单文件。
@@ -3429,6 +3527,81 @@ def _enqueue_after_identify(db: Session, x: Resource, diag: dict | None = None) 
     if added:
         bump("enqueued", added)
     return added
+
+
+def _recheck_gated_push(db: Session) -> int:
+    """推送门禁补偿：改名完成后，把被门禁挡下、现已满足条件的作品重新入队。
+
+    v2.1.3（真机 2026-11-22 黑豹2 事故）：`_enqueue_ready` 的门禁未过时**直接不入队**，
+    而「单文件改名为英文」这件事只有镜像改名 job 会做——改名完成后若不补这一跳，
+    作品就永久停在门禁之外（漏推）。本函数由 `_job_rename_pending` 在改名完成后调用，
+    是门禁与改名链路之间的**闭环回边**。
+
+    只走**旧链**入队（`_enqueue_after_identify`）：解耦开关（resource_decoupled_enabled）
+    开启时推送由分享中心 v2 负责，其 `dispatch_ready_tasks` 在门禁未过时把任务留在
+    `planned` 并设 `next_retry_at`，**每分钟自动重试**——这里再补事件反而有重复建任务、
+    造成重复推送的风险，故直接跳过。
+
+    判定口径与 `_enqueue_ready` 完全一致（作品级、同一作品同一频道只入一条）：
+      - 已有 QueueItem 的作品 → 跳过（已推过，绝不重复推）；
+      - 未识别 / 无海报 → 跳过（那是识别链的职责，不是改名链能解决的）；
+      - 门禁未过 → 跳过（继续等下一轮改名）；
+      - 门禁已过 → 重新入队。
+
+    本函数**绝不抛异常**：调用方 `_job_rename_pending` 的 except 会把改名成功误报为
+    失败。异常一律记日志后吞掉——补偿失败只是少推一次，下轮 120 秒还会再来。
+
+    返回重新入队的作品数。
+    """
+    try:
+        from .push_gate import evaluate_push_gate
+        decoupled = str(runtime_config.get(db, "resource_decoupled_enabled") or "false").lower() in (
+            "1", "true", "yes", "on")
+        if decoupled:
+            # 分享中心 v2 自带按分钟重试，这里不重复入队。
+            return 0
+        rows = list(db.scalars(select(Resource)).all())
+        if not rows:
+            return 0
+        groups: dict[str, list[Resource]] = {}
+        for res in rows:
+            groups.setdefault(_work_key(res), []).append(res)
+        # 已入队的作品一律跳过（QueueItem 存在即视为已进推送流程，含已取消的——
+        # 用户主动取消过的不该被补偿重新推出去）。
+        queued_ids = {int(i) for i in db.scalars(select(QueueItem.resource_id)).all() if i}
+        enqueued = 0
+        for wk, members in groups.items():
+            if any(int(getattr(m, "id", 0) or 0) in queued_ids for m in members):
+                continue
+            # 代表资源：必须已识别且有海报（与 _enqueue_ready 的前置一致）。
+            rep = None
+            for m in members:
+                if m.identify_status == "identified" and (m.poster_path or "").strip():
+                    rep = m
+                    break
+            if rep is None:
+                continue
+            gate = evaluate_push_gate(db, wk, members)
+            if not gate.get("passed"):
+                continue
+            try:
+                added = _enqueue_after_identify(db, rep)
+            except Exception as exc:
+                logger.warning("[push-gate] 门禁补偿入队失败 work_key=%s：%s", wk, exc)
+                continue
+            if added:
+                enqueued += 1
+                queued_ids.update(int(getattr(m, "id", 0) or 0) for m in members)
+        if enqueued:
+            # 必须在这里 commit：调用方 `_job_rename_pending` 用的是
+            # `with SessionLocal() as db:`，会话退出时 close() 会回滚未提交的写入，
+            # 而 `_enqueue_ready` 只做 db.flush()。不提交则补偿等于没做。
+            db.commit()
+            logger.info("[push-gate] 改名后补偿入队 %s 部作品", enqueued)
+        return enqueued
+    except Exception as exc:
+        logger.warning("[push-gate] 门禁补偿异常：%s", exc)
+        return 0
 
 
 def _clear_identification(x: Resource, status: str = "none", source: str = "manual",

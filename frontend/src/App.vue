@@ -93,12 +93,54 @@ const scLinkStateLabel = (state) => ({
   active: '有效', unknown: '待校验', suspicious: '疑似失效',
   inactive: '已失效', cleaned: '已清理', manual_review: '待人工',
 }[state || 'unknown'] || '未知')
+// v2.1.3：资源库卡片的分享状态 / 链接状态中文化。
+// 红线：页面不得出现后端字段名或状态码（此前这里直接渲染 `link_state` 原值，
+// 会把「链接suspicious」「链接cleaned」这种内部码露给用户）。
+const mediaShareLabel = (status) => ({
+  active: '已分享', not_created: '未分享', failed: '分享失败',
+  cancelled: '已取消', expired: '已过期',
+}[status || 'not_created'] || '未分享')
+const mediaLinkLabel = (state) => ({
+  suspicious: '链接疑似失效', inactive: '链接已失效',
+  cleaned: '链接已清理', retired: '链接已退役', manual_review: '链接待人工',
+}[state || ''] || '')
 // 推送任务状态中文化（界面上不暴露内部枚举名）
 const scTaskStatusLabel = (status) => ({
   planned: '待发布', ready: '待推送', building: '建链中',
   submitted: '已提交', accepted: '已领取', publishing: '推送中',
   published: '已成功', failed: '失败', cancelled: '已取消',
 }[status || ''] || status || '—')
+// v2.1.3：时间显示统一简化。
+// 真机问题：后端原先直接吐 ISO 串 `2026-11-22T01:00:17.123456+00:00`——
+//  ①中间的 `T` 是用户完全看不懂的「未知字符」；②带微秒与时区后缀，列宽被顶满；
+//  ③SQLite 存的是 UTC，浏览器按本地时区解读会整体偏移。
+// 现在后端统一给上海本地时间的 `YYYY-MM-DD HH:mm:ss`，这里再收敛到分钟精度
+// （表格友好），并兼容其它端点仍在返回的 ISO 串。
+const fmtTime = (value, withSeconds = false) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return '—'
+  const pad = n => String(n).padStart(2, '0')
+  // 已是「YYYY-MM-DD HH:mm[:ss]」（后端已转本地时区）→ 直接用
+  const m = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?/)
+  if (m) return withSeconds ? `${m[1]} ${m[2]}:${m[3] || '00'}` : `${m[1]} ${m[2]}`
+  // 仍是 ISO：带偏移按浏览器本地时区展示；无偏移的按 UTC 处理（后端 SQLite 存 UTC）
+  let iso = raw
+  if (!/[Zz]|[+-]\d{2}:?\d{2}$/.test(iso)) iso += 'Z'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return raw
+  const base = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return withSeconds ? `${base}:${pad(d.getSeconds())}` : base
+}
+// v2.1.3：耗时毫秒 → 人类可读（页面不出现「耗时(ms)」这种工程口径）。
+const fmtDuration = (ms) => {
+  const n = Number(ms)
+  if (!Number.isFinite(n) || n <= 0) return '—'
+  if (n < 1000) return `${Math.round(n)} 毫秒`
+  const s = n / 1000
+  if (s < 60) return `${s.toFixed(1)} 秒`
+  const m = Math.floor(s / 60)
+  return `${m} 分 ${Math.round(s - m * 60)} 秒`
+}
 const scShareViews = computed(() => {
   let rows = [...(scShareRecords.value || [])]
   const s = scShareSearch.value.trim().toLowerCase()
@@ -1949,7 +1991,7 @@ function scExportTasks() {
   const body = rows.map(r => [
     r.id, r.title || r.work_key || '', r.kind === 'first' ? '首次发布' : '追更',
     r.status || '', r.link_state || '', r.share_url || '',
-    r.attempts ?? 0, r.updated_at || '', r.error || '',
+    r.attempts ?? 0, fmtTime(r.updated_at, true), r.error || '',
   ].map(esc).join(','))
   const csv = '﻿' + [head.map(esc).join(','), ...body].join('\n')
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
@@ -2404,7 +2446,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.2 · Asia/Shanghai</span>
+          <span>v2.1.3 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -2979,7 +3021,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column label="成员状态" width="100"><template #default="{row}"><el-tag size="small" :type="memberTagType(row)">{{ row.member_label || MEMBER_LABEL[row.member_status] || '未知' }}</el-tag></template></el-table-column>
               <el-table-column label="权限" width="96"><template #default="{row}"><el-tag size="small" :type="permTagType(row)">{{ permLabel(row) }}</el-tag></template></el-table-column>
               <el-table-column label="白名单" width="76" align="center"><template #default="{row}"><el-switch :model-value="!!row.in_whitelist" @change="v => toggleDiscoverWhitelist(row, v)"/></template></el-table-column>
-              <el-table-column label="最后活动" min-width="130"><template #default="{row}"><span class="disc-sub">{{ row.last_seen_at || row.updated_at || '—' }}</span></template></el-table-column>
+              <el-table-column label="最后活动" min-width="130"><template #default="{row}"><span class="disc-sub">{{ fmtTime(row.last_seen_at || row.updated_at) }}</span></template></el-table-column>
               <el-table-column label="操作" width="230" fixed="right">
                 <template #default="{row}">
                   <el-button size="small" text :loading="discoverChecking===row.id" @click="checkDiscoverPerm(row)">检查权限</el-button>
@@ -3196,7 +3238,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="asyncScanRunning" @click="scan">立即扫描</el-button><el-button size="small" :loading="asyncScanRunning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已创建" value="active"/><el-option label="未创建" value="not_created"/><el-option label="失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="asyncScanRunning" @click="scan">立即扫描</el-button><el-button size="small" :loading="asyncScanRunning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已分享" value="active"/><el-option label="未分享" value="not_created"/><el-option label="分享失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">
@@ -3252,9 +3294,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ mediaLabel(g.media_type) || 'MEDIA' }}</span></div>
                 <input type="checkbox" class="card-check" :checked="selectedSeries.includes(g.key)" @click.stop="toggleSelect(g.key)"/>
                 <span v-if="g.share_status === 'active'" class="scrape-ok">✓</span>
-                <span class="media-badge" :class="'badge-'+g.share_status">{{ g.share_status === 'active' ? '已分享' : (g.share_status === 'not_created' ? '未分享' : g.share_status) }}</span>
-                <span v-if="g.pushed" class="push-badge" title="已推送到 Telegram">已推</span>
-                <span v-if="g.link_state && ['suspicious','inactive','cleaned','retired','manual_review'].includes(g.link_state)" class="link-badge" :title="'链接状态（本地推断）：'+g.link_state">链接{{ g.link_state }}</span>
+                <span class="media-badge" :class="'badge-'+g.share_status">{{ mediaShareLabel(g.share_status) }}</span>
+                <span v-if="g.pushed" class="push-badge" title="已推送到 Telegram">已推送</span>
+                <span v-if="g.link_state && mediaLinkLabel(g.link_state)" class="link-badge" :title="mediaLinkLabel(g.link_state)">{{ mediaLinkLabel(g.link_state) }}</span>
                 <span v-if="g.finish_status==='ended'" class="finish-badge fin-ended">完结<span v-if="g.finish_locked">·手动</span></span>
                 <span v-else-if="g.finish_status==='returning'" class="finish-badge fin-returning">追更<span v-if="g.finish_locked">·手动</span></span>
                 <span v-if="g.share_duration" class="dur-badge">{{ durLabel(g.share_duration) }}</span>
@@ -3420,7 +3462,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>推送历史</h3><p>已成功推送的记录</p></div></div>
                       <el-table :data="scOverview.views?.history || []" stripe size="small" max-height="300">
-                        <el-table-column prop="published_at" label="时间" min-width="130" show-overflow-tooltip/>
+                        <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.published_at) }}</template></el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
                         <el-table-column label="分类" width="80"><template #default="s">{{ s.row.kind === 'first' ? '首次' : '追更' }}</template></el-table-column>
                         <el-table-column label="结果" width="76"><template #default="s"><span class="sc-dot-state published">成功</span></template></el-table-column>
@@ -3430,7 +3472,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>正在排队或推送中的记录</p></div></div>
                       <el-table :data="scOverview.views?.queue || []" stripe size="small" max-height="300">
-                        <el-table-column prop="created_at" label="时间" min-width="130" show-overflow-tooltip/>
+                        <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
                         <el-table-column label="类型" width="76"><template #default="s">{{ s.row.kind === 'first' ? '首次' : '追更' }}</template></el-table-column>
                         <el-table-column label="状态" width="100"><template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template></el-table-column>
@@ -3440,7 +3482,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">✕</span><div><h3>推送失败</h3><p>推送失败的记录，可逐条重试</p></div></div>
                       <el-table :data="scOverview.views?.failed || []" stripe size="small" max-height="300">
-                        <el-table-column prop="updated_at" label="时间" min-width="120" show-overflow-tooltip/>
+                        <el-table-column label="时间" min-width="120" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="120" show-overflow-tooltip/>
                         <el-table-column prop="error" label="失败原因" min-width="120" show-overflow-tooltip/>
                         <el-table-column label="操作" width="66"><template #default="s"><button class="sc-link-btn" @click="scTaskAction(s.row.id, 'retry')">重试</button></template></el-table-column>
@@ -3483,9 +3525,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-table-column label="类型" width="76"><template #default="s"><span class="sc-mini-tag">{{ s.row.kind==='first'?'电影/剧':'追更' }}</span></template></el-table-column>
                   <el-table-column prop="share_title" label="分享标题" min-width="150" show-overflow-tooltip/>
                   <el-table-column prop="share_code" label="分享码" min-width="110" show-overflow-tooltip/>
-                  <el-table-column prop="created_at" label="发布时间" min-width="160" show-overflow-tooltip/>
-                  <el-table-column prop="last_checked_at" label="最后校验时间" min-width="160" show-overflow-tooltip/>
-                  <el-table-column prop="last_pushed_at" label="最近推送时间" min-width="160" show-overflow-tooltip/>
+                  <el-table-column label="发布时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
+                  <el-table-column label="最后校验时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.last_checked_at) }}</template></el-table-column>
+                  <el-table-column label="最近推送时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.last_pushed_at) }}</template></el-table-column>
                   <el-table-column label="状态" width="88"><template #default="s"><span :class="['sc-dot-state', s.row.link_state]">{{ scLinkStateLabel(s.row.link_state) }}</span></template></el-table-column>
                   <el-table-column label="操作" width="220"><template #default="s">
                     <el-button size="small" link type="primary" @click="scOpenShareDetail(s.row)">详情</el-button>
@@ -3508,9 +3550,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div><span>类型</span><b>{{ scSelectedDetail.kind==='first'?'首次':'追更' }}</b></div>
                 <div><span>当前状态</span><b>{{ scLinkStateLabel(scSelectedDetail.link_state) }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scSelectedDetail.share_url || '—' }}</b></div>
-                <div><span>创建时间</span><b>{{ scSelectedDetail.created_at || '—' }}</b></div>
-                <div><span>最近校验</span><b>{{ scSelectedDetail.last_checked_at || '—' }}</b></div>
-                <div><span>最近推送</span><b>{{ scSelectedDetail.last_pushed_at || '—' }}</b></div>
+                <div><span>创建时间</span><b>{{ fmtTime(scSelectedDetail.created_at, true) }}</b></div>
+                <div><span>最近校验</span><b>{{ fmtTime(scSelectedDetail.last_checked_at, true) }}</b></div>
+                <div><span>最近推送</span><b>{{ fmtTime(scSelectedDetail.last_pushed_at, true) }}</b></div>
                 <div><span>推送目标</span><b>{{ scSelectedDetail.chat_id || '—' }}</b></div>
                 <div><span>错误</span><b style="word-break:break-all">{{ scSelectedDetail.error || '—' }}</b></div>
               </div>
@@ -3657,7 +3699,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-table-column prop="share_url" label="分享记录" min-width="180" show-overflow-tooltip/>
                   <el-table-column label="推送目标" width="96"><template #default="s">{{ s.row.link_state==='active'?'已建链':'待建链' }}</template></el-table-column>
                   <el-table-column prop="attempts" label="重试次数" width="86"/>
-                  <el-table-column prop="updated_at" label="最后执行时间" min-width="160" show-overflow-tooltip/>
+                  <el-table-column label="最后执行时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
                   <el-table-column label="操作" width="80"><template #default="s"><el-button size="small" link type="primary" @click="scOpenTaskDetail(s.row.id)">详情</el-button></template></el-table-column>
                 </el-table>
                 </div>
@@ -3683,8 +3725,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div><span>链接状态</span><b>{{ scLinkStateLabel(scDetailTask.link_state) }}</b></div>
                 <div><span>尝试次数</span><b>{{ scDetailTask.attempts }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scDetailTask.share_url || '—' }}</b></div>
-                <div><span>计划执行时间</span><b>{{ scDetailTask.scheduled_at || '—' }}</b></div>
-                <div><span>发布时间</span><b>{{ scDetailTask.published_at || '—' }}</b></div>
+                <div><span>计划执行时间</span><b>{{ fmtTime(scDetailTask.scheduled_at, true) }}</b></div>
+                <div><span>发布时间</span><b>{{ fmtTime(scDetailTask.published_at, true) }}</b></div>
                 <div><span>错误</span><b style="word-break:break-all">{{ scDetailTask.error || '—' }}</b></div>
               </div>
               <div class="sc-form-row" style="margin-top:12px">
@@ -3696,9 +3738,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <el-table-column prop="id" label="ID" width="60"/>
                 <el-table-column prop="stage" label="阶段" width="110"/>
                 <el-table-column prop="status" label="状态" width="90"/>
-                <el-table-column prop="duration_ms" label="耗时(ms)" width="90"/>
-                <el-table-column prop="error" label="错误" min-width="160" show-overflow-tooltip/>
-                <el-table-column prop="started_at" label="开始" width="150" show-overflow-tooltip/>
+                <el-table-column label="耗时" width="90"><template #default="s">{{ fmtDuration(s.row.duration_ms) }}</template></el-table-column>
+                <el-table-column label="错误" min-width="160" show-overflow-tooltip><template #default="s">{{ s.row.error || '—' }}</template></el-table-column>
+                <el-table-column label="开始" width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.started_at, true) }}</template></el-table-column>
               </el-table>
               <div v-if="!scDetailExecutions.length" class="empty">该任务暂无执行记录</div>
             </template>
