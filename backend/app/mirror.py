@@ -69,11 +69,13 @@ from . import ai_assist, mirror_batch, runtime_config, tmdb
 from .db import SessionLocal
 from .file_naming import (english_file_name, pinyin_title, sanitize_english_title,
                           with_conflict_suffix, work_core_title)
-from .guangya import GuangYaWebFiles, WebFileError
+from .guangya import (GuangYaWebFiles, TRANSIENT_FAULT_MARK, WebFileError,
+                      is_auth_expired_guangya, is_transient_guangya_fault)
 from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask, Resource
 from .utils import (NAME_MARK, VIDEO_EXTS, looks_like_name_exists,
                    media_identity, normalize_work_name,
-                    parse_media_name, standard_media_name, star_media_name, strip_tmdb_tag,
+                    parse_media_name, scrub_upstream_internals,
+                    standard_media_name, star_media_name, strip_tmdb_tag,
                     utcnow)
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,52 @@ RENAME_RATE_LIMIT_MARK = "@RATE_LIMIT_127@"  # 内层失败结果的限流标记
 COPY_RATE_LIMIT_MAX_RETRIES = 5          # 单次 copy_file 最多退避重试 5 次（1/2/4/8/8）
 COPY_RATE_LIMIT_BACKOFF_BASE = 1.0       # 退避基数秒
 COPY_RATE_LIMIT_BACKOFF_CAP = 8.0        # 退避上限秒
+
+# v2.1.12 #295：上游**瞬时故障**（服务端 RPC 超时 / 5xx / 429 / 网络抖动）独立标记。
+#
+# 真机报障（2026-11-23）：网页端 /userres/v1/file/rename 失败
+#   msg=rpc timeout: timeout=6s, to=nd.svcuserres.s, method=CheckSafeBoxAccessToken
+#
+# 这条是**上游服务内部调用超时**（服务端 6s RPC 超时），不是登录态失效。
+# 旧代码在鉴权启发式里用裸子串 "token" 判掉登录 → 命中上游方法名
+# CheckSafeBoxAccessToken → 直接放弃、零重试 → 单次失败即算「真实失败」，
+# 5 次连续失败就把整轮改名熔断（这正是 #295 的病灶）。
+#
+# 现在与 127（风控限流）、160（名已存）严格区分成三类：
+#   127 = 网盘主动限流 → 退避重试，耗尽后落 failed（真·限流）；
+#   160 = 目标名已存在 → 不可重试，靠幂等收敛；
+#   瞬时 = 上游服务抖动 → **不计熔断**、不计真失败，落「待处理」等下一轮自动重试。
+#
+# v2.1.12 #295：瞬时标记改为**显式**打标（guangya.TRANSIENT_FAULT_MARK），
+# 不再靠错误文案里的关键词猜测 —— 上游一句没特征的 msg 会让真失败被误判成
+# 可重试（反之亦然），一次抖动即把整轮改名熔断。
+RENAME_TRANSIENT_MARK = TRANSIENT_FAULT_MARK  # 内层失败结果的瞬时故障标记
+# v2.1.12 #295：瞬时故障在**改名层**的额外重试次数。
+# 底层 guangya._post_web 已按官方 retryable 语义退避重试 3 次（1+2+4 秒），
+# 覆盖了「上游短暂抖动」的绝大多数情形；改名层只再给 1 次机会，
+# 覆盖「刚好在最后一次底层重试之后恢复」的小概率窗口。
+# 这里**刻意不放大**：底层 3 次 × 改名层 2 次 = 6 次请求 × 每次 6 秒 ≈ 36 秒，
+# 单文件就能吃掉一整轮改名预算；放大重试并不让成功率线性提升，只让整轮更慢。
+RENAME_TRANSIENT_MAX_RETRIES = 1
+# 改名层瞬时故障的退避基数（底层已退避过，这里只等一小会儿）。
+RENAME_TRANSIENT_BACKOFF_BASE = 1.0
+RENAME_TRANSIENT_BACKOFF_CAP = 2.0
+# 瞬时故障的中性说明文案（页面与 DB 共用同一句，不含任何上游内部标识）。
+RENAME_TRANSIENT_LABEL = "网盘服务暂时不可用（上游响应超时，已自动退避重试，下一轮自动继续）"
+
+
+def _is_transient_fault(exc: BaseException) -> bool:
+    """识别上游瞬时故障（服务端 RPC 超时 / 5xx / 429 / 网络抖动）。
+
+    与 `_is_rate_limit_error`（127）、`_is_name_exists_error`（160）严格分开：
+    这三类的处置完全不同（退避重试 / 幂等收敛 / 不计失败等下一轮）。
+    判定只认**明确的**服务端超时与网络故障特征，绝不把普通文案里的
+    "timeout" 一律当瞬时故障——宁可多重试一次，也别把真失败无限重试。
+    """
+    code = getattr(exc, "code", None)
+    if code in (GUANGYA_RATE_LIMIT_CODE, GUANGYA_NAME_EXISTS_CODE):
+        return False
+    return is_transient_guangya_fault(str(exc))
 
 
 async def _copy_file_with_backoff(api: "GuangYaWebFiles", fids: list[str],
@@ -193,19 +241,36 @@ def rename_error_label(text: str) -> str:
     红线：页面不得体现后端代码名词。原始报错里带「code=160」「code=127」这类
     后端口径，直接透给用户等于泄露内部契约，而且「160 是什么意思」用户根本看不懂。
     这里统一翻成人话；真正的原始文本仍留在数据库里供排查，页面只显示标签。
+
+    v2.1.12 #295：新增瞬时故障分支，并**屏蔽上游内部标识**。
+    真机原文（rpc timeout）带 `nd.svcuserres.s` / `CheckSafeBoxAccessToken` /
+    `/userres/v1/file/rename` —— 这些是上游服务内部契约，用户看不懂也不该看到，
+    统一走 utils.scrub_upstream_internals 洗掉。
     """
     raw = str(text or "")
     low = raw.lower()
+    # v2.1.12 #295：显式标记优先判定。
+    # 打标后正文可能**不含任何可识别关键词**（如上游只回 `msg=internal error`），
+    # 靠 is_transient_guangya_fault 的文案匹配会漏判 → 掉进兜底分支被洗成残句。
+    # 标记是权威信号，先剥标记再判。
+    if raw.startswith(RENAME_TRANSIENT_MARK):
+        return RENAME_TRANSIENT_LABEL
     if looks_like_name_exists(raw):
         return "目标英文名已被占用（多为重复改名，系统会自动核对并重试）"
     if ("127" in low or "操作过于频繁" in raw or "too many requests" in low
             or "rate limit" in low):
         return "网盘请求过于频繁（已自动退避重试）"
+    if is_transient_guangya_fault(raw):
+        # v2.1.12 #295：上游服务抖动（服务端 RPC 超时 / 5xx / 网络抖动）。
+        # 这类故障下一轮会自动重试，不是「改名失败」，页面不该把它算成失败。
+        return RENAME_TRANSIENT_LABEL
     if "locked" in low or "busy" in low:
         return "存储繁忙（已自动重试）"
     if not raw.strip():
         return "未记录原因"
     cleaned = re.sub(r"code\s*=\s*\d+", "", raw, flags=re.I)
+    # v2.1.12 #295：屏蔽上游内部标识（服务名 / RPC 方法名 / 接口路径 / 业务码）。
+    cleaned = scrub_upstream_internals(cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return (cleaned[:120] or "未记录原因")
 
@@ -266,11 +331,16 @@ _SEASON_DIR = re.compile(
 
 # ---------- v0.8.1：分类目录识别与 1:1 路径镜像 ----------
 def natural_key(name: str) -> tuple:
-    """阶段二路线B C2：确定性自然排序键。S02 排在 S10 前、E9 排在 E10 前。
+    """确定性自然排序键。S02 排在 S10 前、E9 排在 E10 前。
 
     返回由 (类型标记, 数值, 文本) 三元组组成的元组，保证任意片段可比较
-    （纯 int/str 混排在 Python3 会 TypeError）。仅用于决定遍历/处理顺序，
-    不参与身份、指纹、唯一键或映射语义。
+    （纯 int/str 混排在 Python3 会 TypeError）。
+
+    v2.1.12 #296：镜像处理顺序改为**完全按光鸭网盘自身的返回顺序**
+    （请求侧已固定 orderBy=3 / sortType=1，即网页端的文件名升序）。
+    本函数不再参与遍历/处理顺序，只保留给仍需要自然序的调用方（如展示层排序）。
+    理由：用户口径是「顺序固定按网盘自身的文件名排序升序」——本地再排一次，
+    等于用我们自己的规则覆盖网盘顺序，两边一旦不一致就变成「看到的和处理的不是一个序」。
     """
     parts = re.split(r"(\d+)", str(name or ""))
     key: list[tuple[int, int, str]] = []
@@ -316,10 +386,9 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
     cache: dict[str, bool] = {}
     out: list[tuple[dict, list[tuple[str, str]]]] = []
     root_node = nodes.get(root) or {"children": []}
-    # 阶段二路线B C2：根子目录按自然序反序入栈，stack.pop() 得到稳定正序。
-    root_children = sorted(root_node.get("children") or [],
-                           key=lambda cid: natural_key(nodes.get(cid, {}).get("name", "")))
-    stack = [(cid, []) for cid in reversed(root_children)]
+    # v2.1.12 #296：不再本地重排。栈按 children 原序反序入栈，
+    # stack.pop() 得到的就是网盘返回的顺序（与网页端看到的顺序一致）。
+    stack = [(cid, []) for cid in reversed(root_node.get("children") or [])]
     while stack:
         did, cats = stack.pop()
         node = nodes.get(did)
@@ -337,10 +406,8 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
             out.append((node, cats))
             continue
         if (hint and node.get("children")) or (not _has_video(node) and not _looks_like_work(node["name"])):
-            # C2：分类目录下探同样按自然序反序入栈，保持 DFS 稳定
-            kids = sorted(node.get("children") or [],
-                          key=lambda cid: natural_key(nodes.get(cid, {}).get("name", "")))
-            for child in reversed(kids):
+            # v2.1.12 #296：分类目录下探同样按 children 原序反序入栈，不本地重排。
+            for child in reversed(node.get("children") or []):
                 stack.append((child, cats + [(node["name"], did)]))
             continue
         out.append((node, cats))
@@ -799,6 +866,26 @@ async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRul
                             seq_start: int = 0) -> int:
     """v1.4 目录级批量严格顺序复制执行核心。
 
+    【v2.1.12 #296/#297 结论：这部分**不能整块删**】
+    用户问过「顺序固定按网盘文件名升序后，严格顺序引擎是不是可以不要了」。
+    核实结果：它在 #296 之后**只剩顺序职责是多余的**，另外两块职责无可替代：
+
+      ① 顺序职责（已多余）：本地逐文件 sequence 占位 + `cursor_sequence` 续跑游标，
+         目的是让「处理顺序」可确定、可续。现已由请求侧 `LIST_ORDER_BY/SORT_TYPE`
+         + 取消本地重排统一负责，这一层确实不再需要。
+      ② 控制职责（不可去）：`mirror_batch.consume_control` **全项目唯一调用点**就在这里，
+         pause / resume / skip / cancel 四个按钮只有走 strict 才真正生效。
+         删掉等于删功能，与「按钮一个不删」红线冲突。
+      ③ 崩溃续跑职责（不可去）：`start_batch` / `finish_batch` / `rule.cursor_sequence`
+         让长任务中断后能从上次的位置继续，非 strict 路径是「一次性提交 + 统一轮询」，
+         没有续跑锚点。
+
+    所以结论是**保留**，不做「控制检查点下沉到公共路径」的改造——
+    那个改造要动默认复制路径（生产实际走的就是这条），收益只是少一个开关，
+    风险却是把 1400+ 回归里 strict/非 strict 两条路径的用例全打乱，不划算。
+
+    v1.4 目录级批量严格顺序复制执行核心。
+
     sequence 顺序记录、批次控制、崩溃续跑、确认后推进的语义全部保留；
     v1.4 把网络层从「逐文件 copy_file + 逐文件轮询」升级为
     「按 B 库目标目录分桶 → 每桶一次 copy_file(fids[], parent) →
@@ -1053,11 +1140,21 @@ async def _list_dir(api: GuangYaWebFiles, parent_id: str) -> tuple[list[dict], b
     items: list[dict] = []
     page = 0
     fetched = 0
+    seen_ids: set[str] = set()
     while page < 100:  # 单目录最多 5000 条，防接口异常造成死循环
         data = await api.list_files(parent_id, page, LIST_PAGE_SIZE)
         batch = list(data.get("list") or [])
         fetched += len(batch)
-        items.extend(batch)
+        # v2.1.12 #296：顺序完全交给网盘，这里必须防「翻页期间顺序变动」造成重复。
+        # 之前本地重排会掩盖这个问题（重排后重复项相邻，指纹去重能兜住）；
+        # 现在按返回序直用，重复项会变成同一文件被提交两次复制/改名 → 必须先按 fileId 去重。
+        for it in batch:
+            fid = str(it.get("fileId") or "")
+            if fid and fid in seen_ids:
+                continue
+            if fid:
+                seen_ids.add(fid)
+            items.append(it)
         total = int(data.get("total", 0) or 0)
         page += 1
         if not batch:
@@ -1098,11 +1195,10 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         node = {"id": did, "name": name, "parent": parent, "path": display,
                 "files": [], "children": []}
         nodes[did] = node
-        # 阶段二路线B C2：确定性排序。先按 natural_key 排序再反序入栈，
-        # 使 stack.pop() 按自然序访问；files 同理保持自然序。仅为顺序，不改语义。
-        ordered = sorted(items, key=lambda it: natural_key(_dir_name(it)))
+        # v2.1.12 #296：完全按网盘返回顺序写入（不再按 natural_key 重排）。
+        # 顺序职责收敛到一处 —— 请求侧 orderBy/sortType，见 guangya.LIST_ORDER_BY 注释。
         dirs_to_push: list[tuple[str, str, str, str]] = []
-        for it in ordered:
+        for it in items:
             fid = str(it.get("fileId") or "")
             if not fid:
                 continue
@@ -1156,8 +1252,8 @@ def _media_files(work: dict, nodes: dict[str, dict]) -> list[tuple[dict, dict]]:
     """从影视主目录出发 BFS，收集所有 (所属目录节点, 文件条目)，兼容未整理/Season 两种层级。"""
     out: list[tuple[dict, dict]] = []
     seen: set[str] = set()
-    # 阶段二路线B C2：确定性排序——父目录先、子目录按自然序，文件按自然序。
-    # 用递归 DFS 保证"目录整体先于其子树"的稳定顺序，避免栈序受网盘返回顺序影响。
+    # v2.1.12 #296：目录先于子树、文件与子目录都按**网盘返回顺序**（不再本地重排）。
+    # 递归 DFS 保证「父目录先、其子树随后」，栈内顺序直接沿用 nodes[..]["children"]。
     def visit(did: str) -> None:
         if did in seen:
             return
@@ -1165,10 +1261,9 @@ def _media_files(work: dict, nodes: dict[str, dict]) -> list[tuple[dict, dict]]:
         node = nodes.get(did)
         if not node:
             return
-        for it in sorted(node["files"], key=lambda f: natural_key(_dir_name(f))):
+        for it in node["files"]:
             out.append((node, it))
-        for cid in sorted(node["children"],
-                          key=lambda x: natural_key(nodes.get(x, {}).get("name", ""))):
+        for cid in node["children"]:
             visit(cid)
 
     visit(work["id"])
@@ -2221,28 +2316,44 @@ def _persist_english_title(db: Session, media_id: int, eng: str, source: str) ->
 
 async def _rename_one_with_backoff(api: "GuangYaWebFiles", fid: str,
                                    final: str) -> tuple[bool, str]:
-    """v1.4.1：单文件改名，遇光鸭 code=127 限流则指数退避 + 自动重试该集。
+    """v1.4.1 + v2.1.12 #295：单文件改名，遇可恢复故障则退避重试。
 
-    - 仅对 127 限流重试（1/2/4/8/8 秒封顶），真实失败立即返回不重试；
-    - 纯网络，绝不碰 db；重试耗尽仍失败时在 err 前加 RENAME_RATE_LIMIT_MARK，
-      供主循环区别对待（不计入熔断、本轮尾部再排一次队列）；
-    - 成功即返回 (True, "")，调用方无需感知重试次数。
+    三类故障严格分开（v2.1.12 #295）：
+      - **127 限流**：指数退避重试（1/2/4/8/8 秒封顶），耗尽打 RATE_LIMIT_MARK，
+        主循环据此不计入熔断、本轮尾部再排一次队列；
+      - **160 名已存**：**不可重试**（重试仍是占用），打 NAME_EXISTS_MARK，
+        主循环据此做幂等收敛；
+      - **瞬时故障**（服务端 RPC 超时 / 5xx / 429 / 网络抖动）：退避重试，
+        耗尽打 TRANSIENT_MARK，主循环据此**不计熔断、不计真失败**，
+        落「待处理」等下一轮自动重试。
+
+    旧版只认 127，瞬时故障直接返回失败 → 单次抖动即算「真实失败」，
+    5 次连续就把整轮改名熔断（这正是 #295 的病灶）。
     """
     delay = RENAME_RATE_LIMIT_BACKOFF_BASE
+    t_delay = RENAME_TRANSIENT_BACKOFF_BASE
     for attempt in range(RENAME_RATE_LIMIT_MAX_RETRIES + 1):
         try:
             await api.rename_file(fid, final)
             return True, ""
         except Exception as exc:
+            msg = str(exc)[:300]
+            # v2.1.10：160「文件名已存」打独立标记 —— 它不是限流（不可退避重试，
+            # 重试仍是占用），但必须能被主循环识别出来做幂等收敛，
+            # 否则会被当成真实失败标 failed，把「其实已改名成功」误报成永久失败。
+            if _is_name_exists_error(exc):
+                return False, f"{RENAME_NAME_EXISTS_MARK}{msg}"
+            # v2.1.12 #295：上游瞬时故障（服务端 RPC 超时 / 5xx / 网络抖动）——
+            # 可重试，退避后再来一次；耗尽则打 TRANSIENT_MARK 交主循环处理。
+            if _is_transient_fault(exc):
+                if attempt < RENAME_TRANSIENT_MAX_RETRIES:
+                    await asyncio.sleep(t_delay)
+                    t_delay = min(t_delay * 2, RENAME_TRANSIENT_BACKOFF_CAP)
+                    continue
+                return False, f"{RENAME_TRANSIENT_MARK}{msg}"
             if not _is_rate_limit_error(exc) or attempt >= RENAME_RATE_LIMIT_MAX_RETRIES:
-                msg = str(exc)[:300]
                 if _is_rate_limit_error(exc):
                     msg = f"{RENAME_RATE_LIMIT_MARK}{msg}"
-                # v2.1.10：160「文件名已存」打独立标记 —— 它不是限流（不可退避重试，
-                # 重试仍是占用），但必须能被主循环识别出来做幂等收敛，
-                # 否则会被当成真实失败标 failed，把「其实已改名成功」误报成永久失败。
-                elif _is_name_exists_error(exc):
-                    msg = f"{RENAME_NAME_EXISTS_MARK}{msg}"
                 return False, msg
             await asyncio.sleep(delay)
             delay = min(delay * 2, RENAME_RATE_LIMIT_BACKOFF_CAP)
@@ -2345,6 +2456,10 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
              # v2.1.10：160「名已存」统计。recovered = 核对后确认「其实已改名成功」，
              # 纠回完成态（不再算失败）；conflict = 目标名真被别的文件占用，下轮加序号重试。
              "name_exists_recovered": 0, "name_exists_conflict": 0,
+             # v2.1.12 #295：上游瞬时故障（RPC 超时 / 5xx / 网络抖动）统计。
+             # 瞬时故障**不是改名失败** —— 不计 failed、不计熔断、不进失败清单，
+             # 只把文件退回「待处理」，下一轮自动重试。
+             "transient": 0,
              # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
@@ -2659,8 +2774,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                             stats.get("name_exists_conflict", 0) + 1)
                         failed_works.add(str(media.title_standard or ""))
                         stats["errors"].append(
-                            f"{media.title_standard}/{fname}：目标英文名已被其他文件占用"
-                            f"（{clean_160[:120]}），下轮将改用带序号的名字")
+                            f"{media.title_standard}/{fname}：目标英文名已被其他文件占用，"
+                            "下轮将改用带序号的名字")
                         logger.warning(
                             "[mirror] rename 160 真冲突 %s/%s：目标名 %s 已被占用",
                             media.title_standard, fname, final)
@@ -2669,6 +2784,31 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                             row.rename_status = "pending_visible"
                             row.rename_error = (
                                 "目标英文名已被其他文件占用，下轮改用带序号的名字重试")
+                            db.commit()
+                        except Exception:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            stop_reason = "db_error"
+                            break
+                        continue
+                    # v2.1.12 #295：瞬时故障（上游 RPC 超时 / 5xx / 网络抖动）**单列一路**。
+                    # 真机报障原文：rename 接口 6 秒 RPC 超时，被旧逻辑当成「鉴权失效」→ 零重试，
+                    # 连续 5 次即熔断整轮，用户看到的就是「整轮改名全废、看板数字一动不动」。
+                    # 这类故障不是改名失败：不计 failed、不计熔断、不进失败清单，
+                    # 只把文件退回「待处理」（rename_status=""），下一轮自动重试。
+                    transient = errmsg.startswith(RENAME_TRANSIENT_MARK)
+                    if transient:
+                        stats["transient"] += 1
+                        logger.warning(
+                            "[mirror] rename 上游瞬时故障，本轮退回待处理 %s/%s：%s",
+                            media.title_standard, fname,
+                            errmsg[len(RENAME_TRANSIENT_MARK):][:200])
+                        try:
+                            db.rollback()
+                            row.rename_status = ""
+                            row.rename_error = RENAME_TRANSIENT_LABEL
                             db.commit()
                         except Exception:
                             try:
@@ -2690,8 +2830,12 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                         requeue_rate_limited.append((row, fid, final, fname))
                     else:
                         consecutive_failures += 1
+                    # v2.1.12 #295：`errors` 会一路透到前端 toast 与 last_message，
+                    # 因此这里就换成中性标签，绝不把上游内部标识（服务名 / RPC 方法 /
+                    # 接口路径 / 业务码）带到页面。原始文本仍写进 DB 的 rename_error 供排查。
+                    err_label = rename_error_label(errmsg)
                     stats["errors"].append(
-                        f"{media.title_standard}/{fname}：改名失败 {clean_err[:160]}")
+                        f"{media.title_standard}/{fname}：改名失败 {err_label}")
                     logger.warning("[mirror] rename 失败 %s/%s：%s",
                                    media.title_standard, fname, clean_err)
                     try:
@@ -2749,8 +2893,17 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     stats["renamed"] += 1
                     stats["rate_limit_recovered"] += 1
                     _mark_rename_done(row, fid, final)
+                elif errmsg.startswith(RENAME_TRANSIENT_MARK):
+                    # v2.1.12 #295：二次排队时撞上瞬时故障 —— 与主循环同口径，
+                    # 把先前计入的 failed 退回来，退回「待处理」等下一轮。
+                    stats["failed"] = max(0, stats["failed"] - 1)
+                    stats["transient"] += 1
+                    row.rename_status = ""
+                    row.rename_error = RENAME_TRANSIENT_LABEL
                 else:
-                    stats["errors"].append(f"{fname}：限流二次排队仍失败 {clean_err[:120]}")
+                    # v2.1.12 #295：同上，errors 会透到页面 → 走中性标签，不漏接口路径。
+                    stats["errors"].append(
+                        f"{fname}：限流二次排队仍失败 {rename_error_label(errmsg)}")
                     row.rename_status, row.rename_error = "failed", clean_err
                     failed_works.add(str(media.title_standard or ""))
                 try:
@@ -2764,6 +2917,12 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     break
     # v2.1.10：本轮改名没成功的作品清单（供上层把门禁收敛到作品级）。
     stats["failed_works"] = sorted(w for w in failed_works if w)[:50]
+    # v2.1.12 #295：瞬时故障走 notices（不是错误），前端才不会把它当失败报 warning。
+    # 用一条聚合提示，逐文件刷屏没有意义 —— 用户只需要知道「这不是失败，下一轮会继续」。
+    if stats["transient"]:
+        stats["notices"].append(
+            f"本轮有 {stats['transient']} 个文件遇到网盘服务临时不可用，"
+            "已退回待处理，下一轮会自动重试，不计为改名失败")
     if stop_reason:
         # v0.8.9：一次性统计全局剩余（含本轮完全没触及的后续作品），只给一条
         # 明确提示。旧写法逐部累加还会在空 rows 时误用上一轮的 idx。

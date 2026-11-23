@@ -140,6 +140,37 @@ def looks_like_name_exists(text: str) -> bool:
             or "文件名已存在" in raw or "name already exists" in low)
 
 
+# v2.1.12 #295：上游内部标识清洗。上游接口路径 / 服务名 / RPC 方法名 / 业务码
+# 一律不进页面（详见 scrub_upstream_internals）。
+_UPSTREAM_INTERNAL_RE = re.compile(
+    r"(?:"
+    r"/userres/v1/[A-Za-z0-9_/\-]*"
+    r"|\bto\s*=\s*[A-Za-z0-9_.\-]+"
+    r"|\bmethod\s*=\s*[A-Za-z0-9_.\-]+"
+    r"|\b[A-Za-z0-9_]*AccessToken\b"
+    r"|\bnd\.[A-Za-z0-9_.\-]+"
+    r"|\bcode\s*=\s*[A-Za-z0-9_\-]+"
+    r")", re.I)
+
+
+def scrub_upstream_internals(text: str) -> str:
+    """把上游服务的内部标识从「要展示给用户的文本」里抹掉。
+
+    v2.1.12 #295：真机报错原文长这样——
+      `网页端 /userres/v1/file/rename 失败 code=None msg=rpc timeout: timeout=6s,
+       to=nd.svcuserres.s, method=CheckSafeBoxAccessToken`
+    其中接口路径、上游服务名、RPC 方法名、业务码都是**上游内部契约**：
+      - 用户看不懂（"nd.svcuserres.s" 对用户毫无意义）；
+      - 违反「页面不得体现后端代码名词」的红线。
+
+    这里集中清洗一次，展示层（错误标签 / 错误清单 / 提示文案）调用即可。
+    只删标识、保留可读信息，不整段丢弃——排查仍需要看得出「哪一步失败」。
+    """
+    out = _UPSTREAM_INTERNAL_RE.sub(" ", str(text or ""))
+    out = re.sub(r"\s{2,}", " ", out)
+    return out.strip(" ,;·、，：:")
+
+
 def strip_tmdb_tag(text: str) -> str:
     """去掉名称里的 TMDB 标记，保留其余内容（含年份）。
 

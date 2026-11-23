@@ -29,6 +29,7 @@ from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
                       WebFileError, create_share_parsed)
+from .identify_batch import count_pending, mark_attempted, select_identify_batch
 from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, DiscoveredChat,
                      DistributionEvent, MediaRequest, MessageTemplate, MirrorDir, MirrorFile,
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
@@ -39,8 +40,8 @@ from .security import decrypt_secret, encrypt_secret, mask_secret
 logger = logging.getLogger(__name__)
 
 from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name,
-                    retry_after_seconds, source_query_hint, standard_media_name,
-                    star_media_name, strip_tmdb_tag, utcnow,
+                    retry_after_seconds, scrub_upstream_internals, source_query_hint,
+                    standard_media_name, star_media_name, strip_tmdb_tag, utcnow,
                     work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
@@ -1093,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.11", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.12", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1104,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.11", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.12", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1893,7 +1894,9 @@ async def _safe_rename(db: Session, r: MirrorRule, **kwargs) -> dict:
         return await mirror.rename_mirror_files(db, r, **kwargs)
     except Exception as exc:
         logger.warning("[mirror] 文件改名整体失败，不阻断同步：%s", exc)
-        msg = f"{type(exc).__name__}: {exc}"[:300]
+        # v2.1.12 #295：这条 errors 会透到前端 toast 与 last_message，
+        # 先洗掉上游内部标识（服务名 / RPC 方法 / 接口路径 / 业务码）再拼文案。
+        msg = f"{type(exc).__name__}: {scrub_upstream_internals(str(exc))}"[:300]
         return {"works": 0, "renamed": 0, "skipped": 0, "ascii": 0,
                 "untranslated": 0, "failed": 0, "no_rows": 0,
                 "literal_ai": 0, "literal_pinyin": 0,
@@ -2116,6 +2119,14 @@ async def _do_mirror_rename_files(force: bool, db: Session) -> dict:
         raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
     try:
         out = await mirror.rename_mirror_files(db, r, force=force)
+        # v2.1.12 #295：手动改名的数量此前**从不进看板**。
+        # 「本轮改名」读的是 last_pipeline_json.renamed，而写快照的只有
+        # 立即同步 / 定时同步 / 手动扫描三条路径，手动改名一条都没写 →
+        # 用户手动改完 50 项，任务中心还停在上一轮镜像同步的数字，看起来像「没生效」。
+        # 这里补写一轮「只改名」快照，让看板如实反映这一轮。
+        _write_pipeline_snapshot(
+            db, r, mode="手动改名", stage="manual_rename", running=False,
+            renamed=int(out.get("renamed") or 0))
         add_audit(db, "mirror_files_renamed", target_type="mirror",
                   detail=json_dumps({"renamed": out["renamed"], "failed": out["failed"],
                                      "untranslated": out["untranslated"], "force": force}))
@@ -2123,10 +2134,12 @@ async def _do_mirror_rename_files(force: bool, db: Session) -> dict:
         return out
     except WebFileError as exc:
         db.rollback()
-        raise HTTPException(400, str(exc))
+        # v2.1.12 #295：异常文案会直接进前端提示，转成中性标签（不带上游服务名/方法名）。
+        raise HTTPException(400, mirror.rename_error_label(str(exc)))
     except Exception as exc:
         db.rollback()
-        raise HTTPException(502, f"文件改名失败：{type(exc).__name__}: {exc}")
+        raise HTTPException(
+            502, f"文件改名失败：{type(exc).__name__}: {scrub_upstream_internals(str(exc))}")
 
 
 @app.post("/api/mirror/rename", dependencies=ADMIN)
@@ -2871,6 +2884,11 @@ def mirror_status(db: Session = Depends(get_db)):
     works_progress_label = ""
     if works_progress_total:
         works_progress_label = f"本轮已整理 {works_progress_done}/{works_progress_total} 部"
+    elif has_snap and stage == "manual_rename":
+        # v2.1.12 #295：只改名的轮次（手动「按英文规范改名」）。
+        # 这一轮根本没有复制/识别节点，套「本轮复制 0 项 · 识别 0 部」会读成
+        # 「什么都没干」，而用户实际改了 N 项 —— 按改名口径如实表达。
+        works_progress_label = f"本轮改名 {renamed} 项"
     elif has_snap and not legacy:
         # 无部数口径（手动扫描 / 不写 works_total 的路径）：退回条数口径，
         # 仍与 percent 同一来源，不出现「一条口径算 percent、另一条算文字」。
@@ -2913,6 +2931,11 @@ def mirror_status(db: Session = Depends(get_db)):
         progress = 0.0
     elif legacy:
         progress = round(copied / snap_files * 100, 1) if snap_files else 0.0
+    elif stage == "manual_rename":
+        # v2.1.12 #295：只改名轮次。这一轮没有复制/识别节点，套五节点综合百分比
+        # 会被稀释成 20%，读起来像「只干了两成」；按该轮自身成败算。
+        # 分享/推送还有待处理时沿用既有口径压到 99，不谎报全流程完成。
+        progress = (99.0 if queue_pending else 100.0) if renamed else 0.0
     elif works_progress_total:
         progress = round(min(works_progress_done / works_progress_total, 1.0) * 100, 1)
         if progress >= 100 and (running or queue_pending):
@@ -3224,12 +3247,13 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
              # 供进度看板显示「剧集 N 部 / 电影 M 部」而非集数。
              "identified_work_keys": set(), "queued_work_keys": set()}
     diag = stats["enqueue_diag"]
-    # v2.1.9：待识别集合加入 rate_limited（限流待重试）。
-    # 限流是瞬时状态，只要下一轮还有额度就该再试一次——写死 failed 等于永久放弃。
-    pending = list(db.scalars(select(Resource).where(
-        Resource.identify_status.in_(
-            ["unidentified", "ambiguous", "failed", "none", "", "rate_limited"])
-    ).order_by(Resource.id.desc()).limit(min(limit, 500))).all())
+    # v2.1.12：批次选取改为「按作品分散 + 轮次推进」（与手动「按目录重识别」同一套）。
+    # 旧实现是 `order_by(id.desc()).limit(500)` 的固定窗口——真机上最新 500 条恰好
+    # 全属同一部剧，窗口每次都被它的集数占满，其它剧从来没被自动识别过
+    # （用户报障：只有手动重试的那部剧被识别了）。现在一批里按作品分散取，
+    # 作品内部新内容优先；每条记一个识别轮次号，跨轮自动推进到没轮到过的那批。
+    pending, batch_info = select_identify_batch(
+        db, limit=min(limit, 500), force=False, prefer_new=True)
     for idx, x in enumerate(pending):
         try:
             # v2.1.9：分帧排队——发请求前先看配额还差多少。
@@ -3245,6 +3269,11 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
                 break
             if wait > 0:
                 await asyncio.sleep(min(wait, IDENTIFY_RATE_LIMIT_WAIT_MAX))
+            # v2.1.12：即将真正尝试识别 → 记一次参与轮次。
+            # 记在这里（而不是循环末尾）是为了保证：**任何**发过请求的行都算参与过，
+            # 成功/失败/限流一视同仁；而配额不足直接中止时、根本没发请求的行不记，
+            # 下一轮照样排前面。轮次因此是「尝试次数」，天然公平轮转。
+            mark_attempted(x)
             r = await identify_with_a_source_fallback(x.name, x, db)
             if r.get("ok") and r.get("best"):
                 _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
@@ -4984,27 +5013,44 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
     """按目录名批量重识别。升级到 v0.6.1 后旧资源缺 path_hint，先重新扫描一次补全线索。
 
     force=true 会连已经识别过的资源一起重算（用于修正「寂静之噪」这类误配）。
+
+    v2.1.12：批次选取改为「按作品分散 + 轮次推进」（`identify_batch.select_identify_batch`）。
+    旧实现是 `order_by(id.desc()).limit(N)` 的固定窗口——真机上最新 50 条恰好全属
+    同一部剧（封神英雄榜），窗口每次都被它的集数占满，其余 1215 条从未被覆盖，
+    看起来就像「按目录识别没生效」。现在：
+      ① 一批里按作品分散取（每部作品先出 1 条），窗口不被单部剧吃满；
+      ② 每条记一个识别轮次号，跨轮自动推进到还没轮到过的那批；
+      ③ 发请求前先看配额，超阈值就中止本轮，剩下的留到下一轮（不写成失败）。
     """
-    stmt = select(Resource).order_by(Resource.id.desc()).limit(min(limit, 200))
-    if not force:
-        # v2.1.9：加入 rate_limited（限流待重试）——限流是瞬时状态，下一轮该再试。
-        stmt = stmt.where(Resource.identify_status.in_(
-            ["unidentified", "ambiguous", "failed", "none", "", "rate_limited"]))
-    rows = list(db.scalars(stmt).all())
+    limit = max(1, min(int(limit or 1), 200))
+    rows, info = select_identify_batch(db, limit=limit, force=force,
+                                       prefer_new=False)
     done = pending = queued = 0
+    deferred = 0
     for x in rows:
+        # v2.1.12：发请求前先满足 TMDB 的**最小调用间隔**。
+        # 此前手动路径完全没等，于是上一条请求刚发出、下一条立刻打过去，
+        # 客户端按间隔判定直接限流 → 真机上 40 条资源被一次性标成「待重试」，
+        # 看起来像「这批剧全都识别不出来」。
+        wait = tmdb.rate_limit_wait_seconds(db, tmdb.SCAN)
+        if wait > 0:
+            await asyncio.sleep(min(wait, IDENTIFY_RATE_LIMIT_WAIT_MAX))
+        # v2.1.12：即将真正尝试识别 → 记一次参与轮次（成功/失败/限流一视同仁）。
+        mark_attempted(x)
         try:
             # v2.1.11：批量重识别同样走「映射回 A 库」线索；手动触发**绕过缓存**。
             r = await _identify_with_source_hints(x.name, x, db)
             if r["ok"] and r.get("best"):
-                _apply_identification(x, r["best"], source=r["source"],
-                                      note=r["reason"], hint=r["hint"])
+                # v2.1.12：字段一律用 .get() 取——上游少给一个键不该把
+                # 「识别成功」变成「识别失败」（KeyError 会落进 except 分支）。
+                _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
+                                      note=r.get("reason") or "", hint=r.get("hint"))
                 queued += _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
                 done += 1
             else:
-                x.identify_status = r["status"]
-                x.identify_source = r["source"]
-                x.identify_note = r["reason"]
+                x.identify_status = r.get("status") or "none"
+                x.identify_source = r.get("source") or ""
+                x.identify_note = r.get("reason") or ""
                 pending += 1
         except Exception as exc:
             # v2.1.9：限流单独标记为「待重试」，不写死 failed（口径同 _post_scan_identify）。
@@ -5012,16 +5058,164 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
                 x.identify_status = "rate_limited"
                 x.identify_note = str(exc)[:500]
                 pending += 1
-                continue
+                # v2.1.12：限流即**中止本轮**，不再继续往下打。
+                # 此前是 continue —— 配额已耗尽还继续发请求，
+                # 后面每一条都被判限流、整批被写成「待重试」，
+                # 真正的原因（配额窗口没到）反而被淹没在结果里。
+                # 中止后剩余条目保持原状，下一轮（有额度时）自动继续。
+                deferred = len(rows) - (done + pending)
+                break
             x.identify_status = "failed"
             x.identify_note = str(exc)[:500]
             pending += 1
     add_audit(db, "identify_all", target_type="resource",
               detail=json_dumps({"scanned": len(rows), "identified": done,
-                                 "pending": pending, "force": force, "queued": queued}))
+                                 "pending": pending, "force": force, "queued": queued,
+                                 "works": int(info.get("works") or 0),
+                                 "deferred": deferred}))
     db.commit()
+    # 配额恢复还需要的秒数：前端「连续补跑」据此决定等多久再发起下一轮，
+    # 而不是盲目重试把剩余资源全打成待重试。
+    retry_after = round(tmdb.rate_limit_wait_seconds(db, tmdb.SCAN), 1) if deferred else 0.0
     return {"ok": True, "scanned": len(rows), "identified": done, "pending": pending,
-            "queued": queued}
+            "queued": queued,
+            # v2.1.12：如实回报批次口径——覆盖了几部作品、本轮因配额推迟了多少、
+            # 库里还剩多少没认出来（前端要显示，避免用户误以为「已全库重识别」）。
+            "works": int(info.get("works") or 0),
+            "deferred": deferred,
+            "remaining": count_pending(db),
+            "retry_after": retry_after}
+
+
+# ---------- v2.1.12：批量重识别（后台补跑全库） ----------
+# 真机诉求：「想快速补跑全库：分批调高 limit 并对未识别资源按作品遍历，
+# 同时把 tmdb_scan_max_calls 分批控制好，避免 again 触发限流。」
+#
+# 同步端点一次只跑一批（200 条），用户要自己反复点。这里做后台任务：
+# 循环「取一批 → 识别 → 提交」，直到待识别存量清零或触发 TMDB 限流闸门。
+# 关键点：
+#   ① 每批仍走 select_identify_batch（按作品分散 + 轮次推进），
+#      跨批自动覆盖到没轮到过的那批，不会反复命中同一部剧；
+#   ② 限流不是失败：等 rate_limit_wait_seconds 给出的窗口再继续，
+#      被推迟的条目保持原状，下一批自然轮到它们；
+#   ③ 全程独立 Session + 每批提交，绝不跨 await 持写事务。
+_identify_all_state: dict = {"running": False, "started_at": None, "finished_at": None,
+                              "rounds": 0, "scanned": 0, "identified": 0,
+                              "pending": 0, "queued": 0, "works": 0,
+                              "remaining": 0, "stage": "", "error": ""}
+_identify_all_task: asyncio.Task | None = None
+
+# 每批条数：一次请求的合理上限（TMDB 单次搜索也要走配额，批太大反而容易撞限流）
+IDENTIFY_ALL_BATCH = 200
+# 单轮任务最多跑多少批（安全阀，避免极端情况下无限跑）
+IDENTIFY_ALL_MAX_ROUNDS = 200
+# 限流时最长等待多少秒再继续（超出则本轮收工，剩余交给下一次触发）
+IDENTIFY_ALL_MAX_WAIT = 60.0
+
+
+async def _run_identify_all_async(force: bool) -> None:
+    """后台循环补跑：按作品分散分批识别，直到存量清零或限流闸门拦下。"""
+    global _identify_all_task
+    try:
+        with SessionLocal() as db:
+            _identify_all_state["stage"] = "识别中"
+            while _identify_all_state["rounds"] < IDENTIFY_ALL_MAX_ROUNDS:
+                # 限流闸门：配额不够就先等窗口，避免继续发请求把资源打成「待重试」
+                wait = tmdb.rate_limit_wait_seconds(db, tmdb.SCAN)
+                if wait > IDENTIFY_ALL_MAX_WAIT:
+                    _identify_all_state["stage"] = (
+                        f"访问频次受限，约 {int(wait)} 秒后可继续（已处理部分保留）")
+                    break
+                if wait > 0:
+                    _identify_all_state["stage"] = f"等待访问间隔 {wait:.1f} 秒"
+                    await asyncio.sleep(min(wait, IDENTIFY_ALL_MAX_WAIT))
+                rows, info = select_identify_batch(db, limit=IDENTIFY_ALL_BATCH,
+                                                   force=force, prefer_new=False)
+                if not rows:
+                    _identify_all_state["stage"] = "没有待识别的资源"
+                    break
+                done = pending = queued = 0
+                stopped = False
+                for x in rows:
+                    w = tmdb.rate_limit_wait_seconds(db, tmdb.SCAN)
+                    if w > IDENTIFY_ALL_MAX_WAIT:
+                        stopped = True
+                        break
+                    if w > 0:
+                        await asyncio.sleep(min(w, IDENTIFY_ALL_MAX_WAIT))
+                    mark_attempted(x)
+                    try:
+                        r = await _identify_with_source_hints(x.name, x, db)
+                        if r.get("ok") and r.get("best"):
+                            _apply_identification(x, r["best"],
+                                                  source=r.get("source") or "tmdb",
+                                                  note=r.get("reason") or "",
+                                                  hint=r.get("hint"))
+                            queued += _after_identify_dispatch(db, x)
+                            done += 1
+                        else:
+                            x.identify_status = r.get("status") or "none"
+                            x.identify_source = r.get("source") or ""
+                            x.identify_note = r.get("reason") or ""
+                            pending += 1
+                    except Exception as exc:
+                        if tmdb.is_rate_limited(exc):
+                            x.identify_status = "rate_limited"
+                            x.identify_note = str(exc)[:300]
+                            pending += 1
+                            stopped = True
+                        else:
+                            x.identify_status = "failed"
+                            x.identify_note = str(exc)[:300]
+                            pending += 1
+                # 每批独立提交：绝不跨 await 持写事务，也不怕中途崩掉丢进度
+                db.commit()
+                st = _identify_all_state
+                st["rounds"] += 1
+                st["scanned"] += len(rows)
+                st["identified"] += done
+                st["pending"] += pending
+                st["queued"] += queued
+                st["works"] = int(info.get("works") or 0)
+                st["remaining"] = count_pending(db)
+                st["stage"] = f"第 {st['rounds']} 批完成（覆盖 {st['works']} 部作品）"
+                if stopped:
+                    w = tmdb.rate_limit_wait_seconds(db, tmdb.SCAN)
+                    if w > IDENTIFY_ALL_MAX_WAIT:
+                        st["stage"] = (
+                            f"访问频次受限，约 {int(w)} 秒后可继续（已处理部分保留）")
+                        break
+                if st["remaining"] <= 0:
+                    st["stage"] = "全部识别完成"
+                    break
+    except Exception as exc:
+        logger.exception("[identify-all] 后台补跑失败")
+        _identify_all_state["error"] = f"{type(exc).__name__}: {exc}"[:1000]
+        _identify_all_state["stage"] = "失败"
+    finally:
+        _identify_all_state["running"] = False
+        _identify_all_state["finished_at"] = utcnow().isoformat()
+        _identify_all_task = None
+
+
+@app.post("/api/resources/identify-all/async", dependencies=ADMIN)
+async def identify_all_async(force: bool = True):
+    """启动后台批量重识别，立即返回；前端轮询 /api/resources/identify-all/async。"""
+    global _identify_all_task
+    if _identify_all_state.get("running"):
+        raise HTTPException(409, "已有批量重识别任务在运行，请等待完成")
+    _identify_all_state.update({
+        "running": True, "started_at": utcnow().isoformat(), "finished_at": None,
+        "rounds": 0, "scanned": 0, "identified": 0, "pending": 0, "queued": 0,
+        "works": 0, "remaining": 0, "stage": "启动", "error": ""})
+    _identify_all_task = asyncio.create_task(_run_identify_all_async(force))
+    return {"started": True}
+
+
+@app.get("/api/resources/identify-all/async", dependencies=ADMIN)
+def identify_all_async_status():
+    """轮询后台批量重识别状态。"""
+    return dict(_identify_all_state)
 
 
 # ---------- AI 辅助识别（OpenAI 兼容接口，可选） ----------

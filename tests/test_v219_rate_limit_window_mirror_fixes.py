@@ -157,7 +157,9 @@ def test_identify_loop_marks_rate_limited_and_stops_round(env):
         db.expire_all()
         rows = list(db.scalars(select(Resource).order_by(Resource.id)).all())
         assert calls["n"] == 1, f"限流后必须中止本轮，实际调用 {calls['n']} 次"
-        # 待识别集合按 id.desc() 排序，先处理最后一条；限流的那一条是 rate_limited
+        # v2.1.12：待识别集合改为「按作品分散 + 轮次推进」（identify_batch.select_identify_batch），
+        # 不再是 id.desc() 固定窗口。本用例的 3 条资源分属 3 部作品（file_id 各异），
+        # 自动管线优先新内容 → 先处理 id 最大的那条；限流的那一条是 rate_limited。
         limited = [r for r in rows if r.identify_status == "rate_limited"]
         assert len(limited) == 1, f"应有且仅有 1 条标为待重试，实际 {len(limited)}"
         assert limited[0].identify_status != "failed"

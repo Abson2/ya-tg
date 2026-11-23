@@ -96,6 +96,17 @@ class Resource(Base):
     identify_status: Mapped[str] = mapped_column(String(24), default="unidentified")
     identify_source: Mapped[str] = mapped_column(String(24), default="")  # id/tmdb/ai/manual/none
     identify_note: Mapped[str] = mapped_column(Text, default="")
+    # v2.1.12：识别轮次号（0 = 从未参与过识别批次）。
+    #
+    # 用途：让「按目录重识别」这类**跨轮**动作能依次覆盖全库，而不是永远只命中
+    # id 最大的那批固定窗口。真机：库里 1215 条未识别资源从没被批量重识别碰过，
+    # 因为候选按 id 倒序取固定窗口，且 force 模式连状态过滤都不加——
+    # 已识别的行一直占着窗口，每轮都在同一部剧上打转。
+    #
+    # 口径：轮次号取 max(identify_round)+1（单调递增，非时间戳）；
+    # 候选按 (identify_round, id) 升序取 → 越久没被识别过的越靠前；
+    # 每真正尝试一条就盖上本轮轮次号 → 下一轮自动排到后面，天然形成轮转推进。
+    identify_round: Mapped[int] = mapped_column(Integer, default=0)
     # v0.7.0：完结/追更状态（来自 TMDB status），用于资源库角标与一级状态栏筛选
     finish_status: Mapped[str] = mapped_column(String(16), default="")  # ended/returning/""
     # v0.8.0：用户在资源库手动修正完结/追更后锁定，禁止 TMDB 自动回填覆盖人工判断

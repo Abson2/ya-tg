@@ -30,6 +30,74 @@ class GuangYaError(RuntimeError):
         self.code = code
 
 
+# ---------- v2.1.12 #295：瞬时故障分类（服务端 RPC 超时 / 5xx / 429 / 408 / 499） ----------
+# 真机报障：网页端 /userres/v1/file/rename 失败
+#   msg=rpc timeout: timeout=6s, to=nd.svcuserres.s, method=CheckSafeBoxAccessToken
+#
+# 根因：`_post_web` 的鉴权启发式用裸子串 "token" 判登录态失效，
+# 而上游方法名 `CheckSafeBoxAccessToken` 里正好含 "token" →
+# 一个**服务端内部 RPC 超时**被误判成「登录态失效」，直接 raise、零重试。
+# 连带三处后果：
+#   ① 单次改名失败即算「真实失败」，计入 5 次连续失败熔断 → 整轮改名停摆；
+#   ② 报错原文（上游服务名 + 方法名）直接透到页面，违反「页面不体现后端名词」红线；
+#   ③ 用户手动重试后数量不进同步看板，因为那一轮压根没改名成功。
+#
+# 口径（对齐官方技能包 api-client.mjs 的 retryable 语义）：
+#   - API_TIMEOUT / 服务端 RPC 超时 / 网络失败 / HTTP 429 / 5xx / 408 / 499 → **可重试**；
+#   - HTTP 401/403、业务码 116/117、以及明确的登录/未授权文案 → 才是登录态失效。
+# 服务端 6 秒 RPC 超时是**上游内部调用超时**，我们的 HTTP 超时是 20 秒，
+# 属于典型的「重试就能成」的瞬时故障，必须退避重试而不是判死。
+_TRANSIENT_FAULT_MARKS = (
+    "rpc timeout", "timeout=6s", "request timeout", "read timeout",
+    "timed out", "etimedout", "econnreset", "econnrefused", "epipe",
+    "server error", "bad gateway", "service unavailable", "gateway timeout",
+)
+
+# v2.1.12 #295：瞬时故障的**显式标记**。
+#
+# 旧做法：上层靠错误文案里的关键词（timeout / server error…）猜「这是抖动还是真失败」。
+# 文案不可靠 —— 上游一句 `msg=internal error` 就会被判成真失败，一次抖动即熔断整轮。
+# 现在由本模块在**瞬时重试耗尽**的那一刻显式打标，上层只认标记，不猜文案。
+#
+# 标记只落在异常 message 开头，DB 里保留原文供排查；页面展示层会先翻译成中文标签。
+TRANSIENT_FAULT_MARK = "@TRANSIENT_FAULT@"
+
+
+def is_transient_guangya_fault(msg: str) -> bool:
+    """判断报错是否为「可重试的瞬时故障」（服务端超时 / 5xx / 限流 / 网络抖动）。
+
+    注意：只认**明确的服务端超时特征**，绝不把普通文案里的 "timeout" 一律当瞬时故障——
+    判定要保守：宁可多重试一次，也别把真失败当瞬时故障无限重试。
+    """
+    low = str(msg or "").lower()
+    if not low:
+        return False
+    return any(mark in low for mark in _TRANSIENT_FAULT_MARKS)
+
+
+# 登录态失效的**明确**特征。刻意不用裸 "token"——
+# 上游方法名 CheckSafeBoxAccessToken / 网关头里都会出现 "token" 字样，
+# 裸子串匹配会把服务端内部超时误判成掉登录。
+_AUTH_EXPIRED_MARKS = (
+    "unauthorized", "未授权", "登录已失效", "登录过期", "请重新登录",
+    "login required", "invalid token", "token expired", "token已过期",
+    "not logged in", "会话已失效",
+)
+
+
+def is_auth_expired_guangya(msg: str) -> bool:
+    """判断报错是否为**明确的登录态失效**。
+
+    v2.1.12 #295：收紧判定。旧版裸子串 "token" 会命中
+    `method=CheckSafeBoxAccessToken` 这类上游方法名，把服务端 RPC 超时
+    误判成掉登录 → 直接放弃、零重试。
+    """
+    low = str(msg or "").lower()
+    if not low:
+        return False
+    return any(mark in low for mark in _AUTH_EXPIRED_MARKS)
+
+
 class GuangYaOpenAPI:
     """业务接口统一入口：x-client-id + Bearer Token，117 自动刷新重试一次。"""
 
@@ -119,9 +187,20 @@ class WebFileError(RuntimeError):
         self.code = code
 
 
+# ---------- v2.1.12 #296：列目录顺序的唯一真源 ----------
+# 用户口径：「顺序固定按光鸭网盘自身的文件名排序升序」。
+# [事实] w.har 抓包：网页端 get_file_list 固定带 orderBy=3 / sortType=1。
+# [事实] 官方技能包 api-client.mjs 的 list()：根目录或带 file_types 过滤用 3/1，
+#        普通子目录用 0/0（默认序）。
+# [推断] 3 = 按文件名、1 = 升序 —— 依据参数命名与网页端默认列表表现，
+#        **尚未在真机逐条比对**。若核对结果不同，只改这两个常量即可：
+#        mirror 侧已不再本地重排，顺序只由请求参数决定。
+LIST_ORDER_BY = 3
+LIST_SORT_TYPE = 1
+
+
 class GuangYaWebFiles:
     """网页端文件列表客户端：复用短信登录凭证（Bearer + did + dt），无需开放平台 client_id。
-
     接口来自光鸭网页前端：POST https://api.guangyapan.com/userres/v1/file/get_file_list
     body {page,pageSize,parentId,...}；根目录 parentId 为 "*"。返回 data.list / data.total。
     这样普通用户只需短信登录即可扫描，不必申请开放平台应用。
@@ -223,15 +302,26 @@ class GuangYaWebFiles:
     async def list_files(self, parent_id: str = "", page: int = 0, page_size: int = 100) -> dict:
         # v0.8.4：与 w.har 中网页端真实请求体对齐。旧版自造的 needSubFolderStat
         # 不是抓包字段；网页端固定带 orderBy=3 / sortType=1，page 从 0 开始。
+        #
+        # v2.1.12 #296：这两个参数成为**全项目唯一的顺序真源**。
+        #   [事实] w.har 抓包：网页端 get_file_list 固定带 orderBy=3 / sortType=1；
+        #   [事实] 官方技能包 api-client.mjs 的 list()：根目录或带 file_types 过滤时
+        #          用 3/1，普通子目录用 0/0（默认顺序）；
+        #   [推断] 3 = 按文件名、1 = 升序 —— 依据是参数命名与网页端默认列表表现，
+        #          **未在真机逐条比对过**。若真机核对发现 3/1 不是「文件名升序」，
+        #          只需改这两个常量，不必再动 mirror 侧（那边已不再本地重排）。
+        # 之所以所有层级统一用 3/1（而非照搬官方客户端的 0/0）：本系统要的是
+        # 「固定按文件名升序」这一确定顺序，不能随子目录退回服务端默认序。
         body = {
             "page": page,
             "pageSize": page_size,
             "parentId": parent_id or "*",  # 网页端根目录标识为 "*"
-            "orderBy": 3,
-            "sortType": 1,
+            "orderBy": LIST_ORDER_BY,
+            "sortType": LIST_SORT_TYPE,
         }
         last_error = ""
         refreshed = False
+        last_transient = False
         for attempt in range(3):
             headers = self._fresh_headers()  # v0.9.15 #267：每请求重建，避开 token 快照
             async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
@@ -251,13 +341,26 @@ class GuangYaWebFiles:
                 except Exception:
                     pass  # 刷新失败继续重试循环，下一轮 _fresh_headers 取当前库内 token
                 continue
-            # 其它登录态失效：不再重试，交由上层提示重新登录
-            if code in (401, 116, 117) or any(k in msg.lower() for k in ("login", "登录", "unauthor", "token")):
+            # v2.1.12 #295：登录态失效判定收紧——只认业务码与**明确**的登录文案。
+            # 旧版裸子串 "token" 会命中上游方法名 CheckSafeBoxAccessToken，
+            # 把服务端 RPC 超时误判成掉登录 → 直接放弃、零重试。
+            # 117 保留在这里：上面的「刷新一次」分支已用掉 refreshed 机会，
+            # 走到这里说明刷新后依旧无效 → 必须带 code 抛，让上层提示重新登录。
+            if code in (401, 116, 117) or is_auth_expired_guangya(msg):
                 raise WebFileError(last_error, code)
-            if r.status_code >= 500 or r.status_code == 429:
+            # v2.1.12 #295：瞬时故障（服务端 RPC 超时 / 5xx / 429 / 408 / 499）走退避重试，
+            # 不当真实失败处理。对齐官方客户端 retryable 语义。
+            if (r.status_code >= 500 or r.status_code in (429, 408, 499)
+                    or is_transient_guangya_fault(msg)):
+                last_transient = True
                 await asyncio.sleep(2 ** attempt)
                 continue
+            last_transient = False
             break
+        # v2.1.12 #295：瞬时重试耗尽 → 显式打标，让上层能区分「抖动」与「真失败」，
+        # 不再靠文案关键词猜测（一次抖动即被判真失败 → 5 次连续失败熔断整轮）。
+        if last_transient:
+            raise WebFileError(f"{TRANSIENT_FAULT_MARK}{last_error}")
         raise WebFileError(last_error)
 
     async def _post_web(self, path: str, body: dict, *,
@@ -270,6 +373,7 @@ class GuangYaWebFiles:
         """
         last_error = ""
         refreshed = False
+        last_transient = False
         for attempt in range(3):
             headers = self._fresh_headers()
             async with httpx.AsyncClient(timeout=settings.guangya_timeout) as client:
@@ -294,13 +398,26 @@ class GuangYaWebFiles:
             # 127 不是鉴权失效也不是 5xx，立即抛出、不做 token 刷新/网络重试。
             if code == 127:
                 raise WebFileError(last_error, code)
-            if code in (401, 116, 117) or any(k in msg.lower() for k in
-                                             ("login", "登录", "unauthor", "token")):
+            # v2.1.12 #295：登录态失效判定收紧——只认业务码与**明确**的登录文案。
+            # 旧版裸子串 "token" 会命中上游方法名 CheckSafeBoxAccessToken，
+            # 把服务端 RPC 超时误判成掉登录 → 直接放弃、零重试。
+            # 117 同理保留：刷新一次后仍无效必须带 code 抛出。
+            if code in (401, 116, 117) or is_auth_expired_guangya(msg):
                 raise WebFileError(last_error, code)
-            if r.status_code >= 500 or r.status_code == 429:
+            # v2.1.12 #295：瞬时故障（服务端 RPC 超时 / 5xx / 429 / 408 / 499）走退避重试。
+            # 真机 msg=rpc timeout: timeout=6s, to=nd.svcuserres.s, method=CheckSafeBoxAccessToken
+            # 属于服务端内部调用超时 —— 我们的 HTTP 超时是 20 秒，重试就能成，
+            # 必须当瞬时故障退避重试，不能当真实失败（更不能当掉登录）。
+            if (r.status_code >= 500 or r.status_code in (429, 408, 499)
+                    or is_transient_guangya_fault(msg)):
+                last_transient = True
                 await asyncio.sleep(2 ** attempt)
                 continue
+            last_transient = False
             break
+        # v2.1.12 #295：瞬时重试耗尽 → 显式打标（见 list_files 同处说明）。
+        if last_transient:
+            raise WebFileError(f"{TRANSIENT_FAULT_MARK}{last_error}")
         raise WebFileError(last_error)
 
     async def create_dir(self, parent_id: str, dir_name: str) -> dict:

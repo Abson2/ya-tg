@@ -1843,14 +1843,31 @@ async function publishResource(row) {
 async function reidentifyAll() {
   try {
     await ElMessageBox.confirm(
-      '按目录剧名重新识别库中资源（含已识别项，用于修正误配）。升级后请先到「资源库」执行一次「立即扫描」补全目录线索。',
+      '按目录剧名重新识别库中资源（含已识别项，用于修正误配）。系统按作品分散分批处理，连续执行可依次覆盖整个资源库，不会一直只处理同一部剧。升级后请先到「资源库」执行一次「立即扫描」补全目录线索。',
       '按目录重识别', { confirmButtonText: '开始', cancelButtonText: '取消', type: 'warning' })
   } catch (e) { return }
   reidentifying.value = true
   try {
-    const d = await api('/resources/identify-all?force=true&limit=50', { method: 'POST' })
-    ElMessage.success(`已重扫 ${d.scanned} 项：识别 ${d.identified} 项，需人工确认 ${d.pending} 项`)
-    await load()
+    // v2.1.12：改为后台补跑全库（按作品分散 + 轮次推进），前端轮询进度。
+    // 提示必须写清「处理了多少 / 还剩多少」，不能让用户以为一次就跑遍了整个库。
+    await api('/resources/identify-all/async?force=true', { method: 'POST' })
+    ElMessage.info('批量重识别已在后台开始，完成后自动刷新资源库')
+    let ticks = 0
+    while (true) {
+      await new Promise(r => setTimeout(r, 1500))
+      const s = await api('/resources/identify-all/async')
+      if (!s.running) {
+        if (s.error) { ElMessage.error(`批量重识别失败：${s.error}`); break }
+        const parts = [`本次处理 ${s.scanned} 项（覆盖 ${s.works} 部作品）`,
+          `识别 ${s.identified} 项`, `需人工确认 ${s.pending} 项`]
+        if (s.remaining > 0) parts.push(`资源库还有 ${s.remaining} 项未识别`)
+        else parts.push('资源库已全部识别')
+        ElMessage.success(parts.join(' · '))
+        await load()
+        break
+      }
+      if (++ticks > 2400) { ElMessage.warning('批量重识别耗时较长，仍在后台运行，请稍后刷新查看'); break }
+    }
   } catch (e) { ElMessage.error(e.message) }
   finally { reidentifying.value = false }
 }
@@ -2842,7 +2859,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.11 · Asia/Shanghai</span>
+          <span>v2.1.12 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

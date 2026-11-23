@@ -258,6 +258,9 @@ _COLUMNS = {
         "share_scope": "TEXT DEFAULT 'file'",
         "share_dir_id": "TEXT DEFAULT ''",
         "share_dir_name": "TEXT DEFAULT ''",
+        # v2.1.12：识别轮次号（0 = 从未参与过识别批次）——批量重识别按它升序取候选，
+        # 让跨轮动作依次覆盖全库，而不是反复命中 id 最大的固定窗口。
+        "identify_round": "INTEGER DEFAULT 0",
         # v2.1.10：A 库映射（正确作品名 + TMDB 影视号 + 类型）。
         # 资源库识别与展示改用 A 库口径；类型必须与影视号同时存在，
         # 否则 movie/tv 两套 ID 空间会串台。
