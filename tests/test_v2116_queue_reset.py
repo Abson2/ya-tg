@@ -191,9 +191,13 @@ def test_published_but_work_removed_releases_slot(env):
 # ② 旧推送队列的历史：看队列行自身是否仍有效
 # ---------------------------------------------------------------------------
 
-def _legacy(db, res, ch, *, clean_state="", share_status="active"):
+def _legacy(db, res, ch, *, clean_state="", share_status="active",
+            share_url="https://t.me/c/1/2"):
     from app.models import AuditLog, QueueItem
     res.share_status = share_status
+    # v2.1.17：判据收紧为「active 且确实还有链接」——真实数据里 active 必然有
+    # URL（publisher 写 `"active" if share_url else "failed"`），这里如实还原。
+    res.share_url = share_url
     q = QueueItem(resource_id=res.id, channel_id=ch.id, status="sent",
                   clean_state=clean_state)
     db.add(q)
@@ -210,6 +214,41 @@ def test_legacy_push_with_live_queue_row_blocks(env):
         res, ch = _one(db)
         _legacy(db, res, ch)
         assert _plan(db, res, ch) == ("skip", None)
+
+
+def test_legacy_push_not_created_releases(env):
+    """v2.1.17 核心反证：分享已归零（清空 B 库 / 清理过）→ 历史推送作废。
+
+    这是线上「资源库有影视，推送任务一个都没有」的直接成因：`share_status`
+    停在 not_created，旧队列判据却把这条历史 `push_sent` 当成「推送仍生效」，
+    名额被永久占死，作品永远排不进队列。
+    """
+    S, _ = env
+    with S() as db:
+        res, ch = _one(db)
+        _legacy(db, res, ch, share_status="not_created", share_url="")
+        action, _ = _plan(db, res, ch)
+        assert action == "create", "分享已不存在，名额必须回收"
+
+
+def test_legacy_push_failed_share_releases(env):
+    """建链失败（share_status=failed）同样意味着没有可用分享，不得占名额。"""
+    S, _ = env
+    with S() as db:
+        res, ch = _one(db)
+        _legacy(db, res, ch, share_status="failed", share_url="")
+        action, _ = _plan(db, res, ch)
+        assert action == "create"
+
+
+def test_legacy_push_active_but_empty_link_releases(env):
+    """状态是 active 但链接为空 → 仍视为无效（判据看的是链接在不在）。"""
+    S, _ = env
+    with S() as db:
+        res, ch = _one(db)
+        _legacy(db, res, ch, share_status="active", share_url="")
+        action, _ = _plan(db, res, ch)
+        assert action == "create"
 
 
 def test_legacy_push_archived_queue_row_releases(env):

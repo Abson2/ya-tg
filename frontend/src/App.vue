@@ -1554,7 +1554,7 @@ async function restructureBLibrary() {
     '· 镜像映射：文件映射重置为待同步（保留 A 库文件名与指纹），目录映射标记待重建\n' +
     '· 复制任务：未完成的复制任务终止\n' +
     '· 资源库与推送队列：相关记录归档（历史保留，不再显示在面板上）\n' +
-    '· 分享中心：未完成的分享任务取消、失效分享链接作废\n\n' +
+    '· 分享中心：未完成的分享任务取消、失效分享链接作废；推送任务中还没推完的一律置为「无效推送」，已推过的记录保留但链接标记为失效，队列从头重扫\n\n' +
     '不会删除任何历史记录；A 库全程只读。\n' +
     '本次操作**不会触发镜像同步**，重建由下一次定时镜像同步任务自然开始。')
   if (!ok) return
@@ -1567,13 +1567,15 @@ async function restructureBLibrary() {
       '将要重整：\n' +
       `· 影视映射 ${p.media || 0} 部 · 文件映射 ${p.files || 0} 个 · 目录映射 ${p.dirs || 0} 个\n` +
       `· 资源库记录 ${p.resources || 0} 条 · 推送队列 ${p.queue || 0} 条\n` +
-      `· 分享任务 ${p.share_tasks || 0} 个 · 分享链接 ${p.share_records || 0} 条\n\n` +
+      `· 分享任务 ${p.share_tasks || 0} 个 · 分享链接 ${p.share_records || 0} 条\n` +
+      `· 推送任务 ${p.sc_v2_tasks || 0} 个将置为「无效推送」· ${p.sc_v2_cursors || 0} 个分类队列从头重扫\n\n` +
       '确认执行？（本次不触发镜像同步）')
     if (!ok2) return
     const d = await api('/mirror/restructure', { method: 'POST', body: JSON.stringify({ scope: 'library', dry_run: false }) })
     ElMessage.success(
       `已重整：影视 ${d.media || 0} 部 · 文件映射 ${d.files || 0} 个 · 目录映射 ${d.dirs || 0} 个 · ` +
-      `资源 ${d.resources || 0} 条 · 队列 ${d.queue || 0} 条 · 分享任务 ${d.share_tasks || 0} 个`)
+      `资源 ${d.resources || 0} 条 · 队列 ${d.queue || 0} 条 · 分享任务 ${d.share_tasks || 0} 个 · ` +
+      `推送任务作废 ${d.sc_v2_tasks || 0} 个、链接失效 ${d.sc_v2_links || 0} 条、队列重扫 ${d.sc_v2_cursors || 0} 个`)
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -2363,12 +2365,15 @@ function scOpenShareDetail(row) {
 async function scCleanupTasks() {
   try {
     await ElMessageBox.confirm(
-      '清理无效任务？只归档「已取消」以及「资源已从资源库移除、重试也不会成功」的失败任务；历史记录与执行日志保留，不会删除数据。',
+      '清理无效任务？只归档「已取消」以及「资源已从资源库移除、重试也不会成功」的失败任务。\n\n同时会把这些作品身上的「已分享」标记一并清掉——否则它们会被历史记录一直判成「已经推过」，清完列表也排不进推送队列。历史记录与执行日志保留，不会删除数据。',
       '清理无效任务', { type: 'warning' })
     scCleaningTasks.value = true
     const d = await api('/sc/tasks/cleanup', { method: 'POST', body: JSON.stringify({ payload: {} }) })
     if (!d.ok) { ElMessage.warning(d.reason || '清理失败'); return }
-    ElMessage.success(`已清理 ${d.cleaned || 0} 个无效任务${d.skipped ? `，跳过 ${d.skipped} 个仍可重试的任务` : ''}`)
+    ElMessage.success(
+      `已清理 ${d.cleaned || 0} 个无效任务` +
+      `${d.marks_reset ? `，同步清除 ${d.marks_reset} 条作品的已分享标记` : ''}` +
+      `${d.skipped ? `，跳过 ${d.skipped} 个仍可重试的任务` : ''}`)
     await loadSc()
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
   finally { scCleaningTasks.value = false }
@@ -2940,7 +2945,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.16 · Asia/Shanghai</span>
+          <span>v2.1.17 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

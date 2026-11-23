@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.16", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.17", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.16", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.17", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2348,11 +2348,25 @@ def _restructure_preview(db: Session, r: MirrorRule, scope: str,
         if scope == "library" or str(sr.work_key or "") in work_keys:
             if int(sr.current_flag or 0) == 1:
                 sr_hit.append(sr)
+    # v2.1.17：v2 分享中心里会被一并作废的在途任务与游标。
+    # 以前这里只统计旧版 ShareTask / ShareRecord，用户预览时完全看不到
+    # v2 侧还有几百条任务会被留在原地继续重试——那正是「清空 B 库之后
+    # 仍然一直在建链接失败」的存量来源。
+    from . import share_center_v2 as _scv2
+    v2_stmt = select(_scv2.SCPublishTask).where(
+        _scv2.SCPublishTask.status.notin_(
+            ("published", "cancelled", _scv2.INVALID_TASK_STATUS)))
+    if scope != "library":
+        v2_stmt = v2_stmt.where(_scv2.SCPublishTask.work_key.in_(list(work_keys) or [""]))
+    v2_tasks = len(list(db.scalars(v2_stmt).all()))
+    v2_cursors = sum(1 for c in db.scalars(select(_scv2.SCCategoryCursor)).all()
+                     if int(c.last_library_version_id or 0) != 0)
     return {
         "media": len(g["medias"]), "files": len(g["files"]), "dirs": len(g["dirs"]),
         "tasks": len(tasks), "resources": len(g["res_hit"]),
         "queue": len(g["q_rows"]), "share_tasks": len(st_hit),
         "share_records": len(sr_hit),
+        "sc_v2_tasks": v2_tasks, "sc_v2_cursors": v2_cursors,
         "media_titles": [m.title_standard for m in g["medias"][:10]],
     }
 
@@ -2390,6 +2404,12 @@ def mirror_restructure(p: MirrorRestructureInput, db: Session = Depends(get_db))
 
       ④ 分享中心层：未终结的分享任务置为已取消，当前有效分享记录作废
          （保留历史行）。——避免下一轮推送复用一个已失效的分享链接。
+
+      ④b v2 分享中心层（**v2.1.17 补上，勿删**）：未终结的推送任务置为
+         「无效推送」、已失效的分享链接标记作废、分类游标归零。
+         ——此前这一段只覆盖旧版分享中心，而用户在用的是 v2 分享中心，
+         于是清空 B 库后 v2 侧仍留着一批任务反复去建链接、反复因
+         「文件不存在」失败，把每轮调度名额占满。
 
     ⑤ 日志层：镜像规则的 last_status / last_message / last_pipeline_json
          归零，进度条与状态标签回到「尚未同步」，不再显示上一轮的陈旧结果。
@@ -2504,6 +2524,25 @@ def mirror_restructure(p: MirrorRestructureInput, db: Session = Depends(get_db))
     except Exception as exc:
         logger.exception("[mirror] 重整分享中心层失败：%s", exc)
 
+    # ---- ④b v2 分享中心层：在途推送作废 + 链接置废 + 游标归零 ----
+    # v2.1.17：上一段只覆盖**旧版**分享中心（ShareTask / ShareRecord）。用户实际在用的
+    # 是 v2 分享中心，它自己的四张表（快照 / 清单项 / 任务 / 游标）完全没被联动——
+    # 于是 B 库清空后 v2 这边仍留着几百条 planned/building 任务，dispatch 继续逐条
+    # 去建分享链接、逐条因「文件不存在」失败，把每轮名额占满、拖慢真正能推的任务。
+    # 这里补上联动：只改状态不删行，已 published 的保持历史（仅把失效链接标出来）。
+    sc_v2 = {"tasks_invalidated": 0, "links_cleaned": 0, "cursors_reset": 0}
+    try:
+        from . import share_center_v2 as _scv2
+        sc_v2 = _scv2.invalidate_for_works(
+            db,
+            None if scope == "library" else set(work_keys),
+            reason="B 库内容已被手动清理，本次推送作废；镜像重建后重新入库再推送",
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.exception("[mirror] 重整 v2 分享中心层失败：%s", exc)
+
     # ---- ⑤ 日志层：镜像规则的状态与进度归零 ----
     r.last_status = "never"
     r.last_message = ""
@@ -2520,12 +2559,18 @@ def mirror_restructure(p: MirrorRestructureInput, db: Session = Depends(get_db))
                                  "dirs": len(dirs), "tasks": task_done,
                                  "resources": len(res_hit), "queue": len(q_rows),
                                  "share_tasks": st_cancelled,
-                                 "share_records": sr_retired}))
+                                 "share_records": sr_retired,
+                                 # v2.1.17：v2 分享中心的联动作废计数
+                                 "sc_v2": sc_v2}))
     db.commit()
     return {"ok": True, "dry_run": False, "scope": scope,
             "media": len(medias), "files": len(files), "dirs": len(dirs),
             "tasks": task_done, "resources": len(res_hit), "queue": len(q_rows),
             "share_tasks": st_cancelled, "share_records": sr_retired,
+            # v2.1.17：v2 分享中心被一并作废的在途任务 / 失效链接 / 归零游标
+            "sc_v2_tasks": sc_v2["tasks_invalidated"],
+            "sc_v2_links": sc_v2["links_cleaned"],
+            "sc_v2_cursors": sc_v2["cursors_reset"],
             "note": "已重置镜像映射、资源库与分享中心状态；"
                     "重建将由下一次定时镜像同步任务自然开始（本次清理不触发同步）"}
 

@@ -1119,11 +1119,19 @@ def _valid_legacy_push_pairs(db: Session) -> set[tuple[str, str]]:
 
     现在改为看这条队列行**自身是否还有效**（审计只用来还原「资源 ↔ 渠道」关系）：
       ① `push_queue` 行未被归档（clean_state != 'cleaned'）；
-      ② 该资源的分享未被取消（`Resource.share_status != 'cancelled'`）；
+      ② 该资源的分享**仍是 active 且确实还有链接**；
       ③ 资源与渠道都还存在。
     任一不满足 → 这条历史推送已作废，名额回收、允许重推。
-    归属仍按 `resource_id → work_group_key`、`channel_id → chat_id` 精确还原；
-    缺字段 / 解析失败 / 归属不出的行**跳过不冒充**。
+
+    v2.1.17 判据收紧（**勿退回 `!= 'cancelled'`**）
+    --------------------------------------------
+    之前只排除 `cancelled`，于是 `not_created`（从没建过 / B 库清空后归零 /
+    被清理过）与 `failed`（建链失败）都被当成「推送仍生效」。线上后果：
+    资源库里明明有这部作品、分享也早就没了，名额却被这条历史记录**永久占着**，
+    作品永远排不进队列 —— 用户看到的就是「资源库有影视，推送任务一个都没有」。
+    真正决定「这条推送还有效吗」的是**分享链接还在不在**：状态必须 `active`
+    且 `share_url` 非空。清空 B 库会把 share_status 归一为 not_created，
+    于是这些历史记录自动作废，作品重新可排。
     """
     details = list(db.scalars(select(AuditLog.detail).where(
         AuditLog.action == "push_sent")).all())
@@ -1166,7 +1174,12 @@ def _valid_legacy_push_pairs(db: Session) -> set[tuple[str, str]]:
             continue
         if clean_map.get((rid, cid)) == "cleaned":
             continue
-        if str(getattr(res, "share_status", "") or "") == "cancelled":
+        # v2.1.17：只有「分享仍 active 且确实还有链接」才算这条历史推送还在生效。
+        # 只排除 cancelled 是不够的——not_created / failed / 空链接同样意味着
+        # 这条推送已经没有可用的分享，占着名额就等于把作品永久锁死。
+        if str(getattr(res, "share_status", "") or "") != "active":
+            continue
+        if not str(getattr(res, "share_url", "") or "").strip():
             continue
         out.add((utils.work_group_key(res), str(ch.chat_id or "")))
     return out
@@ -3398,6 +3411,156 @@ def rewind_cursor_for_work(db: Session, work_key: str) -> int:
     return moved
 
 
+def reset_share_marks_for_works(db: Session, work_keys: set[str], *,
+                                reason: str = "") -> int:
+    """把指定作品的资源行上的**已分享标记**归零，返回受影响行数。
+
+    用户口径（原话）：「让清理推送任务等不只是清空列表，而是真正将任务和
+    推送标记一并清理了」。
+
+    「推送标记」实际分散在三处，此前 cleanup 只清了第一处：
+
+      ① `SCPublishTask.status`   —— 清理端点已处理
+      ② `SCPushListItem.status`  —— v2.1.14 起已联动
+      ③ `Resource.share_status` / `share_id` / `share_url` —— **一直没清**
+
+    第 ③ 处不清的后果：旧队列判据（`_valid_legacy_push_pairs`）看的就是它，
+    `share_status` 停在 `active` 就认为「这条推送还生效」，名额释放了也排不回来。
+    所以清理完必须把这里一并归零，否则用户看到的就是「清了列表还是没任务」。
+
+    只改标记：不动 B 库文件、不删任何行（红线）。历史靠 `SCPublishTask`
+    上保留的 `share_url` 与执行记录追溯，不受影响。
+    """
+    keys = {str(k) for k in work_keys if str(k)}
+    if not keys:
+        return 0
+    touched = 0
+    # 默认查询自动排除归档资源行，正好——已归档的作品不需要再动标记。
+    for res in db.scalars(select(Resource)).all():
+        if utils.work_group_key(res) not in keys:
+            continue
+        already_clean = (str(res.share_status or "") == "not_created"
+                         and not str(res.share_id or "").strip()
+                         and not str(res.share_url or "").strip())
+        if already_clean:
+            continue
+        res.share_status = "not_created"
+        res.share_id = ""
+        res.share_url = ""
+        touched += 1
+    if touched:
+        db.flush()
+    return touched
+
+
+def invalidate_for_works(
+    db: Session,
+    work_keys: set[str] | None = None,
+    *,
+    reason: str = "",
+    reset_cursors: bool = True,
+) -> dict[str, int]:
+    """v2.1.17：B 库被清空 / 重整时，**联动作废**分享中心里在途的推送。
+
+    为什么需要它
+    ------------
+    `/api/mirror/restructure`（v2.1.11）只联动了**旧版**分享中心
+    （`ShareTask` / `ShareRecord`），完全没有碰 v2 的这四张表。于是 B 库清空之后，
+    v2 这边还留着一批 planned / building 的任务 —— dispatch 会继续把它们捞起来，
+    逐条去建分享链接，每一条都因「B 库文件不存在」失败。
+
+    有了 v2.1.16 的 30 分钟退避，至少不再每 3 秒刷屏；但**存量任务仍会一波一波
+    白跑**，把 dispatch 每轮那几个名额占满，真正能推的任务被挤到后面。这就是
+    「有推送任务却不建链接」的最后一环。
+
+    做法（**只改状态，绝不物理删除任何行**）
+    ------------------------------------
+      ① 未终结的任务（planned/building/ready/failed/…）→ `invalid`（无效推送）；
+         有 `share_url` 的一律置 `link_state=cleaned`（链接确实坏了，页面要如实显示）。
+         已经 `invalid` 的保留原状态与原失败原因，但**清掉退避与租约**——它们的退避
+         理由是「建链暂时失败」，B 库清空后这个理由已不成立；不清会让 `_SlotIndex`
+         判成「冷却中」继续占名额。
+      ② 已 `published` 的**状态保持不动**（那是历史事实，「已推送」里还要看得到），
+         但同样把 `link_state` 置 `cleaned` —— 它的分享指向的文件已经没了。
+      ③ 已 `cancelled` 的跳过：那是用户主动取消，语义要留着。
+      ④ 清单项**不动**：`_SlotIndex` 会把「有历史行但无一有效」判成 `SLOT_INVALID`，
+         名额自动回收，作品恢复后走 revive 复用旧行。
+      ⑤ 分类游标归零，让下一轮从队头完整重扫。重建时 `plan_engine` 的
+         `live_keys` 会挡住「已从资源库移除」的作品，不会又造一批僵尸任务。
+
+    `work_keys=None` = 全量（整个 B 库被清空）；`scope=dir` 时传受影响的作品键集合。
+    返回各计数，供审计与页面回显。
+    """
+    now = utcnow()
+    reason_text = (reason or "B 库内容已被手动清理，本次推送作废")[:300]
+
+    stmt = select(SCPublishTask).where(
+        SCPublishTask.status.notin_(("published", "cancelled")))
+    if work_keys is not None:
+        keys = [str(k) for k in work_keys if str(k)]
+        if not keys:
+            return {"tasks_invalidated": 0, "links_cleaned": 0,
+                    "cursors_reset": 0, "marks_reset": 0}
+        stmt = stmt.where(SCPublishTask.work_key.in_(keys))
+    tasks = list(db.scalars(stmt).all())
+
+    tasks_invalidated = 0
+    links_cleaned = 0
+    for task in tasks:
+        if (str(task.share_url or "").strip()
+                and str(task.link_state or "") != CLEANED_LINK_STATE):
+            task.link_state = CLEANED_LINK_STATE
+            links_cleaned += 1
+        if str(task.status or "") != INVALID_TASK_STATUS:
+            # 只在状态真的变化时改，`invalid` 的保留它原本的失败原因（可追溯）
+            task.status = INVALID_TASK_STATUS
+            task.error = reason_text
+            tasks_invalidated += 1
+        # 已经 invalid 的也要清退避与租约：它们的退避理由是「建链暂时失败」，
+        # 而 B 库清空后这个理由已经不成立。留着未来的 next_retry_at 会让
+        # _SlotIndex 判成「冷却中」继续占名额，作品恢复后还要白等一个窗口。
+        task.next_retry_at = None
+        task.lease_owner = ""
+        task.lease_expires_at = None
+        task.updated_at = now
+
+    # published 的任务单独处理：状态不动，只把已失效的链接标出来。
+    published_stmt = select(SCPublishTask).where(
+        SCPublishTask.status == "published",
+        SCPublishTask.share_url != "")
+    if work_keys is not None:
+        keys = [str(k) for k in work_keys if str(k)]
+        if keys:
+            published_stmt = published_stmt.where(SCPublishTask.work_key.in_(keys))
+    for task in db.scalars(published_stmt).all():
+        if str(task.link_state or "") != CLEANED_LINK_STATE:
+            task.link_state = CLEANED_LINK_STATE
+            task.updated_at = now
+            links_cleaned += 1
+
+    cursors_reset = 0
+    if reset_cursors:
+        for c in db.scalars(select(SCCategoryCursor)).all():
+            if int(c.last_library_version_id or 0) != 0:
+                c.last_library_version_id = 0
+                c.last_work_key = ""
+                c.status = "idle"
+                c.updated_at = now
+                cursors_reset += 1
+
+    # 资源行上的「已分享」标记也要一并归零：旧队列判据看的就是它，
+    # 留着 active 就等于把作品继续判成「已推送过」，名额释放了也排不回来。
+    affected = {str(t.work_key or "") for t in tasks if str(t.work_key or "")}
+    if work_keys is not None:
+        affected |= {str(k) for k in work_keys if str(k)}
+    marks_reset = reset_share_marks_for_works(db, affected)
+
+    if tasks_invalidated or links_cleaned or cursors_reset or marks_reset:
+        db.flush()
+    return {"tasks_invalidated": tasks_invalidated, "links_cleaned": links_cleaned,
+            "cursors_reset": cursors_reset, "marks_reset": marks_reset}
+
+
 def _is_permanent_error(error: str) -> bool:
     """错误文案是否表明**重试也不会成功**（资源已不存在一类）。"""
     text = str(error or "")
@@ -3469,10 +3632,15 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
         if it is not None:
             it.status = CLEANED_TASK_STATUS
     # v2.1.16：清理掉的作品名额已释放 → 回退游标，让它下一轮优先回到队列。
+    # v2.1.17：资源行上的「已分享」标记也一并归零。只清任务不清标记的话，
+    # 旧队列判据仍把作品当成「已推送过」，名额释放了照样排不回来 ——
+    # 用户说的「清了列表还是没任务」就是这一条。
+    marks_reset = reset_share_marks_for_works(db, cleaned_works)
     for wk in sorted(cleaned_works):
         rewind_cursor_for_work(db, wk)
     db.commit()
-    return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
+    return {"ok": True, "cleaned": cleaned, "skipped": skipped,
+            "marks_reset": marks_reset, "items": details}
 
 
 def reset_plan_cursors(db: Session, version_id: int) -> int:
@@ -3619,10 +3787,13 @@ def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
             affected_works.add(wk)
         details.append({"id": task.id, "reason": reason})
     # v2.1.16：链接作废后名额已回收 → 回退游标，让作品下一轮优先回到队列。
+    # v2.1.17：资源行的「已分享」标记同步归零，否则旧队列判据仍认为推送生效。
+    marks_reset = reset_share_marks_for_works(db, affected_works)
     for wk in sorted(affected_works):
         rewind_cursor_for_work(db, wk)
     db.commit()
-    return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
+    return {"ok": True, "cleaned": cleaned, "skipped": skipped,
+            "marks_reset": marks_reset, "items": details}
 
 
 @router.post("/category-schedules/adopt-ai-all")
