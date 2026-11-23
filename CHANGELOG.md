@@ -8,6 +8,86 @@
 
 ---
 
+## v2.1.16 (2026-11-24)
+
+> 本版推翻 v2.1.14/15 的一条底层假设：**「已推送」被当成永久历史闸**。旧的 `_ever_published()` 一旦命中，该作品在该渠道就**永不重排**——取消推送任务不算、取消分享链接也不算、连作品从资源库删掉再放回来都不算。结果是「资源库里有影视，队列里却没有它」，只能靠人工点重建。
+>
+> 改为**状态可回收**模型：名额占不占，取决于「此刻是否还有一条有效的推送」；推送作废（取消 / 清理 / 链接失效 / 资源移除）名额立刻释放，并在下一轮优先补排。同时把队列生成从「水位游标 + 环形轮转」改成**有序队列 + 写时回退游标**，让用户看到的先后顺序始终等于「分类优先序 → 分类内入库先后」。另修一个把 TgtoDrive OpenAPI 打死在 401 的凭证掩码回写缺陷。回滚 `IMAGE_TAG=v2.1.15`。
+
+### ① 名额语义：从「永久历史闸」改为四态可回收
+
+- **病根**：`_ever_published()` 只看「历史上是否推成功过」，且判据是两个**永久**来源——分享中心 `published` 任务 + 旧队列 233 条 `push_sent` 审计。于是「取消任务」「取消分享链接」「清理记录」「资源移出资源库」这些用户主动作废的动作，**一个都不释放名额**，作品永远排不回来。
+- **修法**：删掉 `_ever_published()` / `_item_still_owns_first()` / `_pushed_pairs_from_audit()`，新增 `_SlotIndex` 索引类，把「是否占用首推名额」判成四态：
+  - `active` —— 任务在途（`queued/building/ready/pushing`，以及 `failed`：dispatch 候选集含 `failed`，会在原地重试，不占位就会另建一条重复任务）；
+  - `valid` —— 已推成功 **且** `link_state` 不在 `{cleaned, invalid}` **且** 作品仍在资源库；或旧推送队列里仍生效的记录；
+  - `invalid` —— 有历史行但无一有效（取消 / 清理 / 链接作废 / 资源移除）→ **名额可回收**；
+  - `none` —— 从未建过。
+- `invalid` 走 **revive 旧行**而不是新建：`dedup_key` 有唯一约束，另插会撞键，且必然重复首推。`first_dedup_plan()` 保留原签名，内部改为对 `_SlotIndex` 薄封装，老调用点不用改。
+- **老库兼容**：v2.1 之前写过「清单项 `status=published` 但完全没有任务行」的形态。这种项虽无任务、却确实推过，判 `valid` 不重推；项无任务且状态非 `published`（如 `planned`）则落到 `invalid` 回收。
+
+### ② 旧推送队列 233 条：从「一律算推过」改为「看队列行自身是否仍有效」
+
+- v2.1.15 为防重复首推，把这 233 条 `push_sent` 审计**一律**算作推过。副作用是同一条永久闸：作品在旧队列里被清理过、分享被取消过，仍然永远不再排。
+- 本版 `_valid_legacy_push_pairs()` 只把审计当**关系还原**用（`resource_id → 作品`、`channel_id → 渠道 chat_id`），是否仍有效**看队列行自己**：`QueueItem.clean_state != 'cleaned'` 且 `Resource.share_status != 'cancelled'`。读取归档行需 `with include_archived():`，否则清理过的行查不到、会被误判成「仍有效」。
+- 解析不出归属的审计行继续跳过，不冒充结论。
+
+### ③ 队列生成：有序队列 + 队尾自愈，游标降级为「队头进度」
+
+- **候选顺序**：分类之间 `priority desc → id`（外层循环），分类内部 `SCLibraryVersion.id asc`（= 入库先后）；每部作品只取**最新快照**（`select(max(id)).group_by(work_key)` 子查询）。
+- **游标语义变更**：`last_library_version_id` 从「水位线（越过永不回头）」改为「**队头已消化到哪儿**」。正常推进时前移；`id > 游标` 取空时**从队头补扫一批做自愈**，但**只有真建出任务才前移游标**（`built_in_batch`），全是被去重跳过时原地不动——否则每轮空转都会把游标乱推，等于又造一条水位线。
+- **为什么不选环形轮转**：纯轮转的下一个位置完全由游标停在哪里决定，取消一部作品后要等转完一整圈才补得上，用户看到的顺序说不清。有序队列 + 队尾自愈两者兼得：顺序恒定，且失效作品不需要等一圈。
+- **性能**：`_live_work_keys()` 改为只取 `file_id/path_hint/share_dir_name/media_title/tmdb_id/media_type` 六列 Row，不再全量加载实体（`overview`/`genres`/`dir_chain_json` 是大文本）。该函数每 5 秒一轮必跑。
+
+### ④ 写时回退游标：让「归到初始状态」真的立刻生效
+
+新增 `rewind_cursor_for_work(db, work_key)`：把游标回退到 `min(该作品所有快照 id) - 1`。
+
+只释放名额是不够的——游标可能早已越过这部作品，光靠队尾自愈要等很久才被捡起。回退后它下一轮就**优先补排**。接入三个入口：
+
+1. `POST /sc/tasks/{id}/cancel`：`status=cancelled`，若有 `share_url` 则 `link_state=cleaned`（旧消息不撤回，但链接失效），随后 rewind。
+2. `POST /sc/tasks/cleanup`：候选集加 `invalid`；`reason` 增「无效推送」分支；收集受影响作品后逐个 rewind。
+3. `POST /sc/share-records/cleanup`：同上，`reason` 增「无效推送」分支；作品键取 `task.work_key or item.work_key` 后 rewind。
+
+### ⑤ 推送执行：复用仍有效的链接，建链失败落「无效推送」
+
+- **复用**：`share_url` 非空且 `link_state` 不在 `{cleaned, invalid}` 时直接 `status=ready`、`stats.reused += 1`，**不再调** `create_share_parsed`。旧实现每次 dispatch 都重建链接，在网盘侧反复刷废分享。
+- **无效推送**：建链抛错 → `status=invalid`、`link_state=invalid`、`share_url=""`、`next_retry_at = now + 30 分钟`（`INVALID_RETRY_SECONDS`）、`stats.invalid += 1`。清单项 / 资源版本 / 代表资源缺失同样落 `invalid`，不再留在 `building` 僵死。
+- 新增 `_is_future(now, value)` 容忍 SQLite 取出的 naive datetime——aware/naive 直接比较会抛 `TypeError`，把整轮 dispatch 打断。
+
+### ⑥ 手动扫描即触发推送队列
+
+`_refresh_library_from_b()`（顶部刷新 / 立即扫描 / 重新扫描库三个入口共用）末尾 `db.commit()` 后 `await asyncio.to_thread(_run_share_center_v2_cycle_in_thread)`，结果写入 `out["share_cycle"]`。
+
+必须走线程 + 独立 Session：`run_cycle` 内含同步 commit，在主协程跑会冻结事件循环。先 commit 结束本会话的写事务，避免两个会话抢 SQLite 写锁。
+
+### ⑦ TgtoDrive OpenAPI 恒 401：凭证掩码被当真值写回（根治）
+
+- **事故链**（2026-11-23 线上实测）：后端 GET 用 `runtime_config.masked()` 把 `mask_secret()` 的产物当字段值回显 → `mask_secret` 规则是 `value[:4] + 6 个星号 + value[-4:]`，真 token 被回显成 `tgto******4ifI`（14 字符）→ 前端只判「非空」就提交（`if (c.tgto_api_key)`，输入框 label 写的是「留空保持原值」，设计本意就是别回显）→ `set_many()` 把掩码加密落库 → TgtoDrive 查不到该凭据，恒 401。**「每次升级完就出问题」= 升级后打开配置页顺手保存了一次配置，把掩码固化了。**
+- **三层防线**：
+  1. `security.is_masked_secret()`——整串星号或含连续 6 星即判掩码，全仓库唯一判据；
+  2. GET 对凭证 key **一律返回空串**，只给 `*_configured` / `*_needs_reset` 状态；
+  3. POST 丢弃任何形如掩码的提交（旧前端 / 浏览器缓存旧 JS / 手工调 API 同样拦住），响应与审计带 `ignored_masked`。
+- **自愈检测**：已被污染的库按 `configured=false / needs_reset=true` 上报，页面用红字直说「当前存的不是真 Token（是历史掩码），TgtoDrive 会一直 401」。否则页面显示「已配置」，用户永远不知道该重填。
+- 401 文案补一句「保存成功后输入框会重新变空属正常，不要在看不到 Token 时重复保存」。
+- **影响面**：遍历 `runtime_config.DEFAULTS` 全部键、按 `\*{4,}` 检测，仅 `tgto_api_key` 1 个中招，范围收敛到单点。
+
+### ⑧ 前端
+
+- 任务状态新增「无效推送」（`invalid`），筛选下拉、统计条、清理原因同步。
+- 取消推送任务的确认文案如实说明：名额立即释放、回到待推送、排期轮到时会重新生成分享链接再推一次、已发旧消息不撤回但链接将失效、历史记录与执行日志全部保留。
+- 凭证输入框改三态提示（已配置不回显 / 存的是掩码需重填 / 尚未配置），不回显这件事在界面上说清楚。
+- 页面仍不出现任何后端代码名词（有源码级守卫用例）。
+
+### ⑨ 回归
+
+- 新增 `tests/test_v2116_queue_reset.py`（20 项）：名额回收五种路径 / 旧队列三种有效性 / **游标已越过仍能建任务（反证 v2.1.15 第三道锁已根除）** / `work_limit=1` 两轮覆盖全部作品 / 资源移出库不排 / 取消端点作废链接且可 revive / dispatch 复用与失败落 invalid / 手动扫描触发周期 / 前端文案不泄后端名词。
+- 新增 `tests/test_v2116_credential_masking.py`（12 项）：掩码形态与线上假值逐字符一致 / GET 零回显 / 污染库判 needs_reset / POST 丢弃掩码且不动原值 / 真值正常写入 / 前端剔除与三态提示 / 401 文案。
+- 重写 `tests/test_v2115_rebuild_first.py`：随名额语义调整，「已推送且链接有效才跳过」；第三道锁的反证迁至 `test_v2116_queue_reset.py`。
+- `tests/test_v2114_pagination_and_dedup.py` 一项语义更新：无任务行的清单项改为 revive 而非保守阻断。
+- 全量回归 `1510 passed / 0 failed`。
+
+---
+
 ## v2.1.15 (2026-11-23)
 
 > 复查发现 v2.1.14 之后仍不出任务，45 分钟零变化——不是「还没到时间」，而是还有**第三道锁**没解：`plan_engine` 只取 `SCLibraryVersion.id > 游标`，而分类游标在卡死那段时间里**已经被推进到全部快照之后**。去重就算修好，也永远不再回头看那批历史快照，所以「等一等」不会自愈。

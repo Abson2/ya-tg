@@ -72,6 +72,11 @@ TERMINAL_TASK_STATUS = {"published", "failed", "cancelled"}
 # 重试间隔取 60s——改名 / 补齐后最长等一分钟就能自动放行，不会「永远卡住」。
 GATE_RETRY_SECONDS = 60
 
+# v2.1.16：建分享失败 → 任务落「无效推送」。此时名额会回收、作品回到待推送，
+# 但绝不能每 5 秒就重建一次链接（会在网盘里刷出一堆废分享）。给一个退避窗口：
+# 窗口内该作品的名额按「占用」处理，不重排；过了窗口才允许再试一次。
+INVALID_RETRY_SECONDS = 30 * 60
+
 # ---------------------------------------------------------------------------
 # v2.1.3 真机死锁根治（2026-11-22 黑豹2 事故后端修复）
 #
@@ -133,6 +138,32 @@ PERMANENT_ERROR_MARKERS = (
     "代表资源不存在",
     "清单项或资源版本不存在",
 )
+
+# ---------------------------------------------------------------------------
+# v2.1.16 推送记录有效性（把「已首推」从永久历史改为可回收状态）
+#
+# 用户口径：推送队列 = 资源库作品经发布规则处理后的队列。资源库有影视就该有队列；
+# 重建资源库 / 清理资源库 / 取消推送任务 / 取消分享链接，都必须把对应任务归到
+# 初始状态，**而不是一直在后台记着「已经首推过」**。
+#
+# 因此名额判定从「历史是否推过」改为「当前是否存在仍生效的推送记录」：
+#   active  在途（planned/building/ready/submitted/…） → 占用名额，防重复建任务
+#   valid   已推成功 且 分享链接仍有效 且 作品仍在资源库 → 占用名额，防重复首推
+#   invalid 有历史行但无一生效（取消 / 清理 / 链接作废 / 资源已移除）→ 名额可回收
+#   none    从未建过 → 新建
+#
+# 关键：永久闸（旧队列 push_sent 审计一律算「推过」）已被撤销——它会让「取消分享
+# 链接」这种用户主动作废的动作永远无法恢复。旧队列的历史推送改为**看它自己的
+# 队列行是否还有效**（未被归档、且分享未被取消），见 `_valid_legacy_push_pairs`。
+# ---------------------------------------------------------------------------
+INVALID_TASK_STATUS = "invalid"        # 无效推送：链接作废 / 建链失败 / 资源已移除
+# 视为「链接已作废」的状态：记录仍在，但那份分享已经不能用了。
+INVALID_LINK_STATES = frozenset({CLEANED_LINK_STATE, INVALID_TASK_STATUS})
+# 名额判定的三态取值
+SLOT_ACTIVE = "active"
+SLOT_VALID = "valid"
+SLOT_INVALID = "invalid"
+SLOT_NONE = "none"
 
 # v2.0.5：TMDB 官方 genre 全集为影视分类唯一权威（源 tmdb.py::TMDB_GENRES，27 项）。
 # 设计稿原写「连续剧/院线电影/综艺」，但那不是 TMDB 官方 genre 概念；按用户决策改为
@@ -1078,35 +1109,21 @@ def _prune_empty_push_lists(db: Session) -> int:
     return len(doomed)
 
 
-def _item_still_owns_first(db: Session, item: SCPushListItem) -> bool:
-    """这条首推清单项是否仍「占用」该作品在该渠道的首推名额。
+def _valid_legacy_push_pairs(db: Session) -> set[tuple[str, str]]:
+    """旧推送队列中**仍然生效**的推送记录 → `{(work_key, chat_id)}`。
 
-    v2.1.14 修的真机死锁：清理无效任务只把 `SCPublishTask` 标成 `cleaned`，
-    对应的 `SCPushListItem` 仍是 `planned`；而建任务时的两道 dedup 都**不看任务状态**，
-    于是系统永远认为「这个作品的首推已存在」→ 新入库作品再也建不出推送任务。
-    真机实测：227 个最新作品快照被这种已清理旧项挡住。
-    """
-    statuses = list(db.scalars(select(SCPublishTask.status).where(
-        SCPublishTask.list_item_id == item.id)).all())
-    if not statuses:
-        # 清单项没有任何任务：无法判断它是否推过，**保守视为仍占用**，
-        # 宁可少建也不能造成重复首推。
-        return True
-    return any(str(s or "") != CLEANED_TASK_STATUS for s in statuses)
+    v2.1.16：本函数取代 v2.1.15 的 `_pushed_pairs_from_audit`。
+    旧版把历史 `push_sent` 一律当作「已推送过」，是一座**永久闸**——用户取消分享
+    链接后那条记录也无法作废，作品从此永远不能重推，与用户口径「取消分享链接 =
+    该推送记录判为无效」直接冲突。
 
-
-def _pushed_pairs_from_audit(db: Session) -> set[tuple[str, str]]:
-    """从历史推送审计还原「(作品, 渠道 chat_id) 已经推送过」集合。
-
-    为什么不能只看 `SCPublishTask.status='published'`：分享中心 v2 自己推送成功会写
-    published，但**旧的推送队列**（publisher.py）成功时只写
-    `audit_logs(action='push_sent', detail={resource_id, channel_id, message_id})`。
-    真机库里有 233 条这类历史推送——只查 published 会漏掉它们，重建首推时就会把
-    早已推过的作品再推一遍（正是用户明确担心的重复首推）。
-
-    这里按 `resource_id → work_key`、`channel_id → chat_id` **精确归属**，
-    不做「一律当作推过」的粗判：同一作品推到别的渠道不算重复。
-    detail 解析不了或缺字段的行跳过（无法归属就不冒充结论），由调用方如实计数。
+    现在改为看这条队列行**自身是否还有效**（审计只用来还原「资源 ↔ 渠道」关系）：
+      ① `push_queue` 行未被归档（clean_state != 'cleaned'）；
+      ② 该资源的分享未被取消（`Resource.share_status != 'cancelled'`）；
+      ③ 资源与渠道都还存在。
+    任一不满足 → 这条历史推送已作废，名额回收、允许重推。
+    归属仍按 `resource_id → work_group_key`、`channel_id → chat_id` 精确还原；
+    缺字段 / 解析失败 / 归属不出的行**跳过不冒充**。
     """
     details = list(db.scalars(select(AuditLog.detail).where(
         AuditLog.action == "push_sent")).all())
@@ -1129,73 +1146,160 @@ def _pushed_pairs_from_audit(db: Session) -> set[tuple[str, str]]:
         return set()
     res_ids = {rid for rid, _ in parsed}
     ch_ids = {cid for _, cid in parsed}
-    res_map = {r.id: utils.work_group_key(r)
-               for r in db.scalars(select(Resource).where(Resource.id.in_(res_ids))).all()}
-    ch_map = {c.id: str(c.chat_id or "")
-              for c in db.scalars(select(Channel).where(Channel.id.in_(ch_ids))).all()}
-    return {(res_map[rid], ch_map[cid]) for rid, cid in parsed
-            if rid in res_map and cid in ch_map}
+    res_map = {r.id: r for r in db.scalars(
+        select(Resource).where(Resource.id.in_(res_ids))).all()}
+    ch_map = {c.id: c for c in db.scalars(
+        select(Channel).where(Channel.id.in_(ch_ids))).all()}
+    # 队列行的归档态是「这条推送记录已作废」的直接证据；归档行在默认查询里不可见，
+    # 这里必须显式放开才能读到，否则「已归档」会被误当成「仍有效」。
+    from .models import include_archived
+    clean_map: dict[tuple[int, int], str] = {}
+    with include_archived():
+        q_rows = db.scalars(select(QueueItem).where(
+            QueueItem.resource_id.in_(res_ids))).all()
+    for q in q_rows:
+        clean_map[(int(q.resource_id), int(q.channel_id))] = str(q.clean_state or "")
+    out: set[tuple[str, str]] = set()
+    for rid, cid in parsed:
+        res, ch = res_map.get(rid), ch_map.get(cid)
+        if res is None or ch is None:
+            continue
+        if clean_map.get((rid, cid)) == "cleaned":
+            continue
+        if str(getattr(res, "share_status", "") or "") == "cancelled":
+            continue
+        out.add((utils.work_group_key(res), str(ch.chat_id or "")))
+    return out
 
 
-def _ever_published(db: Session, *, work_key: str, chat_id: str,
-                    pushed_pairs: set[tuple[str, str]] | None = None) -> bool:
-    """该作品在该渠道是否曾**真正推送成功**。
+def _is_future(now: datetime, value: datetime | None) -> bool:
+    """`value` 是否晚于 `now`（容忍 SQLite 取出的 naive datetime）。
 
-    两个来源都要看（缺一不可）：
-      ① 分享中心 v2 自己的任务：`SCPublishTask.status == 'published'`；
-      ② 旧推送队列的历史：`audit_logs` 里的 `push_sent`（见 `_pushed_pairs_from_audit`）。
-
-    这是「清理后重建首推」的防重复闸：清理只挑 `failed`/`cancelled`，理论上不会
-    命中已推成功的；但历史数据里确实存在「任务被判失败、其实消息已送达」的情况，
-    所以两道都查，宁可少推也不重复推。
-    `pushed_pairs` 可由调用方预先算好传入，避免逐作品重复扫审计表。
+    SQLite 的 `DateTime(timezone=True)` 实际只存不带时区的字符串，读回来可能是
+    naive——直接与 `utcnow()` 的 aware 值比较会抛 TypeError。这里统一降级成 naive
+    比较，宁可少判一次「已到点」也不能让整轮计划崩掉。
     """
-    row = db.scalar(
-        select(SCPublishTask.id)
-        .join(SCPushListItem, SCPushListItem.id == SCPublishTask.list_item_id)
-        .where(SCPublishTask.work_key == work_key)
-        .where(SCPushListItem.chat_id == chat_id)
-        .where(SCPublishTask.status == "published")
-        .limit(1))
-    if row is not None:
-        return True
-    if pushed_pairs is None:
-        pushed_pairs = _pushed_pairs_from_audit(db)
-    return (work_key, chat_id) in pushed_pairs
+    if value is None:
+        return False
+    try:
+        return value > now
+    except TypeError:
+        try:
+            return value.replace(tzinfo=None) > now.replace(tzinfo=None)
+        except Exception:
+            return False
+
+
+class _SlotIndex:
+    """推送名额索引（v2.1.16）：把「已首推」从永久历史改成可回收状态。
+
+    判定单位是 `(作品, 渠道)`——一个作品在一个渠道的名额相互独立。
+    整轮只载入一次，避免 plan_engine 里「逐作品 × 逐渠道」反复查表
+    （真机 486 部 × N 渠道、每 5 秒一轮，逐条查会把 SQLite 拖死）。
+
+    四态（见模块顶部常量注释）：
+      active  在途任务占用名额 → 不重复建任务；
+      valid   已推成功且链接仍有效、作品仍在库 → 不重复首推；
+      invalid 历史行全部作废 → 名额可回收，复活旧行重排；
+      none    从未建过 → 新建。
+    """
+
+    def __init__(self, db: Session, *, live_keys: set[str] | None = None,
+                 legacy_pairs: set[tuple[str, str]] | None = None) -> None:
+        self.live_keys = live_keys
+        self._now = utcnow()
+        self.legacy_pairs = (
+            legacy_pairs if legacy_pairs is not None
+            else _valid_legacy_push_pairs(db))
+        rows = db.execute(
+            select(SCPushListItem, SCPublishTask)
+            .outerjoin(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+            .where(SCPushListItem.source_kind == "first")
+        ).all()
+        self._items: dict[tuple[str, str], dict[int, SCPushListItem]] = {}
+        self._states: dict[int, list[tuple[str, str, datetime | None]]] = {}
+        for item, task in rows:
+            key = (str(item.work_key or ""), str(item.chat_id or ""))
+            self._items.setdefault(key, {})[int(item.id)] = item
+            if task is not None:
+                self._states.setdefault(int(item.id), []).append(
+                    (str(task.status or ""), str(task.link_state or ""),
+                     task.next_retry_at))
+
+    def state(self, work_key: str, chat_id: str,
+              dedup: str = "") -> tuple[str, SCPushListItem | None]:
+        key = (str(work_key or ""), str(chat_id or ""))
+        items = self._items.get(key) or {}
+        statuses: list[str] = []
+        link_ok = False
+        cooling = False
+        for iid in items:
+            for status, link, retry in self._states.get(iid, ()):
+                statuses.append(status)
+                # 「已推成功」只有在分享链接仍有效时才算数——链接被取消/作废后，
+                # 群里那条消息已经点不开了，这条记录按用户口径判为无效。
+                if status == "published" and link not in INVALID_LINK_STATES:
+                    link_ok = True
+                # 「无效推送」刚失败过、退避还没到点 → 按占用处理，
+                # 否则每 5 秒重建一次链接、在网盘里刷出一堆废分享。
+                elif status == INVALID_TASK_STATUS and _is_future(self._now, retry):
+                    cooling = True
+        # ① 在途优先：还有任务在跑，绝不重复建（否则每轮都新插一条）。
+        #    `failed` 也算占用：dispatch 的候选集包含 failed（会原地重试），
+        #    如果这里不占位，plan_engine 会另建一条新任务 → 同一作品两条在跑。
+        if cooling or any(s in ACTIVE_TASK_STATUS or s == "failed" for s in statuses):
+            return SLOT_ACTIVE, None
+        # ② 已推成功且链接有效、作品仍在库 → 名额仍被占用。
+        if link_ok and (self.live_keys is None or key[0] in self.live_keys):
+            return SLOT_VALID, None
+        # ③ 旧推送队列里仍生效的记录同样占用名额。
+        if key in self.legacy_pairs:
+            return SLOT_VALID, None
+        # ③b 老库遗留：清单项自身带 published、但还没有对应任务行（v2.1 之前的写法）。
+        #     按项状态判为有效，避免把「早已推过」的又推一遍。
+        #     项上没有任务、状态也不是 published（如 planned）→ 说明从未真正推送过，
+        #     落到下面的 invalid 分支，名额回收。
+        if items and not statuses and any(
+                str(c.status or "") == "published" for c in items.values()):
+            return SLOT_VALID, None
+        # ④ 有历史行但无一有效 → 作废，名额可回收。
+        if items:
+            ordered = [items[i] for i in sorted(items)]
+            reuse = next((c for c in ordered if c.dedup_key == dedup), ordered[0])
+            return SLOT_INVALID, reuse
+        return SLOT_NONE, None
 
 
 def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
                      dedup: str,
                      pushed_pairs: set[tuple[str, str]] | None = None,
+                     index: "_SlotIndex | None" = None,
+                     live_keys: set[str] | None = None,
                      ) -> tuple[str, SCPushListItem | None]:
     """首推去重决策。返回 `(action, 可复用的旧清单项)`。
 
-      - `"skip"`   ：已有仍有效的首推，或该作品在此渠道曾真正推送成功 → 不建任务；
-      - `"revive"` ：旧首推项的任务**全部已清理** → 复活同一行再建任务；
-      - `"create"` ：从来没有首推项 → 新建。
+      - `"skip"`   ：名额仍被占用（有在途任务，或已推成功且链接仍有效）→ 不建任务；
+      - `"revive"` ：历史记录已作废（取消 / 清理 / 链接作废 / 资源已移除）→ 复活旧行；
+      - `"create"` ：从未建过 → 新建。
+
+    v2.1.16：判据从「历史是否推过」改为「当前是否存在仍生效的推送记录」。
+    用户口径：取消推送任务 / 取消分享链接 / 清理资源库 / 重建资源库，都必须让该
+    作品回到初始状态、可重新排队，而不是被永久记成「已经首推过」。
+    具体四态判定见 `_SlotIndex`。
 
     为什么 revive 而不是新插一行：`SCPushListItem.dedup_key` 是**唯一约束**，
     旧行还在，直接按同一 dedup 另插一条会撞唯一键、整轮计划失败。
     复活只更新清单项本身，历史任务行与执行记录一条不动。
     """
-    # 本项目 Session 是 autoflush=False：同一轮里刚建/刚改的任务状态必须先落库，
-    # 否则下面的状态判定读到的是旧值（与 api_cleanup_tasks 处同一条坑）。
-    db.flush()
-    candidates = list(db.scalars(
-        select(SCPushListItem)
-        .where(or_(SCPushListItem.dedup_key == dedup,
-                   (SCPushListItem.work_key == work_key)
-                   & (SCPushListItem.chat_id == chat_id)
-                   & (SCPushListItem.source_kind == "first")))
-        .order_by(SCPushListItem.id)).all())
-    if any(_item_still_owns_first(db, c) for c in candidates):
+    if index is None:
+        # 本项目 Session 是 autoflush=False：刚改的任务状态必须先落库，
+        # 否则建索引时读到的仍是旧值（与 api_cleanup_tasks 处同一条坑）。
+        db.flush()
+        index = _SlotIndex(db, live_keys=live_keys, legacy_pairs=pushed_pairs)
+    state, reuse = index.state(work_key, chat_id, dedup)
+    if state in (SLOT_ACTIVE, SLOT_VALID):
         return "skip", None
-    if _ever_published(db, work_key=work_key, chat_id=chat_id,
-                       pushed_pairs=pushed_pairs):
-        return "skip", None
-    if candidates:
-        # 优先复用「新格式 dedup」那一行，其次才是历史格式行
-        reuse = next((c for c in candidates if c.dedup_key == dedup), candidates[0])
+    if state == SLOT_INVALID:
         return "revive", reuse
     return "create", None
 
@@ -1227,8 +1331,13 @@ def plan_engine(db: Session) -> dict[str, int]:
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
     if not channels:
         return {"lists": 0, "items": 0, "tasks": 0}
-    # v2.1.15：历史推送审计只扫一次，供本轮所有作品复用（避免逐作品重复查表）。
-    pushed_pairs = _pushed_pairs_from_audit(db)
+    # v2.1.16：名额索引整轮只建一次。包含「作品×渠道」的当前推送状态
+    # （在途 / 已推且链接有效 / 已作废 / 从未建过），以及旧队列里仍生效的历史推送。
+    # 逐作品 × 逐渠道 → 一次性载入，避免每 5 秒一轮把 SQLite 拖死。
+    live_keys = _live_work_keys(db)
+    slots = _SlotIndex(db, live_keys=live_keys)
+    # 环形轮转：本轮已经处理过的作品不再重复处理（回绕时可能二次命中）。
+    seen_works: set[str] = set()
 
     categories = list(db.scalars(
         select(SCCategory).where(SCCategory.enabled.is_(True))
@@ -1317,14 +1426,55 @@ def plan_engine(db: Session) -> dict[str, int]:
                                       category_key=category.category_key)
             db.add(cursor)
             db.flush()
+        # v2.1.16：候选 = 「按分类顺序排列的有序队列，依次生成」。
+        #
+        # 队列顺序：分类之间按 category.priority desc → category.id（外层循环），
+        # 分类内部按 SCLibraryVersion.id 升序（= 作品入库/首次成为快照的先后）。
+        # 每轮从游标位置往后续取 work_limit 部，建满就停——这就是「按发布规则限制的
+        # 日 + 小时队列依次生成」：配额的夹逼在上面 `_sched_allows`（分类日/小时上限）
+        # 与 `hour_max`（单轮上限）里，队列本身只负责**顺序**。
+        #
+        # 与「环形轮转」的区别（选型结论）：
+        #   环形轮转每轮从「上次停的地方」开始，顺序由游标位置决定 —— 取消/清理释放
+        #   出来的作品要等转完一圈才补得上，用户看到的顺序也说不清（有时推第 300 部、
+        #   有时推第 20 部）。
+        #   有序队列的游标只表示「队头已经消化到哪儿」，**不是水位线**：任何让作品失效
+        #   的动作（取消任务 / 取消链接 / 清理任务 / 清理资源库）都会把它**回退**到该
+        #   作品之前（见 `rewind_cursor_for_work`），于是它立刻回到队头优先补排 ——
+        #   这才是用户要的「归到初始状态」。
+        #
+        # 只取**每部作品的最新快照**：同一作品有多个版本时，旧版本不该各占一个候选位。
+        latest_ids = (select(func.max(SCLibraryVersion.id))
+                      .group_by(SCLibraryVersion.work_key))
+        base_q = (select(SCLibraryVersion)
+                  .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
+                  .where(SCWorkCategory.category_key == category.category_key)
+                  .where(SCLibraryVersion.id.in_(latest_ids)))
         versions = list(db.scalars(
-            select(SCLibraryVersion)
-            .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
-            .where(SCWorkCategory.category_key == category.category_key)
-            .where(SCLibraryVersion.id > cursor.last_library_version_id)
-            .order_by(SCLibraryVersion.id).limit(work_limit)
-        ).all())
+            base_q.where(SCLibraryVersion.id > cursor.last_library_version_id)
+            .order_by(SCLibraryVersion.id).limit(work_limit)).all())
+        from_head = False
+        if not versions:
+            # 队尾已消化完 → 从队头补扫一批做**自愈**。
+            # 兜住不经过 rewind 的失效（外部删库、库被整体搬迁、旧版本遗留数据）：
+            # 这批里全是「已完成」时不会建任何任务，游标原地不动，不产生抖动。
+            versions = list(db.scalars(
+                base_q.order_by(SCLibraryVersion.id).limit(work_limit)).all())
+            from_head = True
+        last_pos = cursor.last_library_version_id
+        built_in_batch = 0
         for lv in versions:
+            work_key = str(lv.work_key or "")
+            # 自愈补扫时同一作品可能二次命中；本轮已处理过就不再重复。
+            if work_key in seen_works:
+                continue
+            seen_works.add(work_key)
+            if not from_head:
+                last_pos = lv.id
+            # v2.1.16：作品已从资源库移除（重建 / 手动清理）→ 不建队列。
+            # 队列的事实依据是「资源库里当前有这部作品」，而不是历史快照还在不在。
+            if work_key not in live_keys:
+                continue
             for channel in channels:
                 target_type = "group" if str(channel.chat_id or "").startswith("-") else "channel"
                 # v2.1.6 真实缺陷修复（泰迪熊2 双推）：dedup **去掉 fingerprint**。
@@ -1342,14 +1492,11 @@ def plan_engine(db: Session) -> dict[str, int]:
                 # 更新推送（新集/新版本）走 source_kind=update 的独立事件，
                 # 不依赖这条首推 dedup。
                 chat_id = str(channel.chat_id or "")
-                dedup = f"{lv.work_key}:{channel.id}:first"[:255]
-                # v2.1.14：两道 dedup 合并成一次「看任务状态」的决策。
-                # 旧写法是 dedup_key 查一次 + (work_key, chat_id, first) 兜底查一次，
-                # 两次都**不看任务状态**——已清理（cleaned）的旧首推项把名额永久占死，
-                # 新入库作品因此建不出任何推送任务（真机 227 个快照被挡）。
+                dedup = f"{work_key}:{channel.id}:first"[:255]
+                # v2.1.16：名额判定改为「当前是否仍有效」四态（见 _SlotIndex）。
+                # 已推且链接有效 / 在途 → 跳过；取消·清理·链接作废 → 复活重排。
                 action, reuse = first_dedup_plan(
-                    db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup,
-                    pushed_pairs=pushed_pairs)
+                    db, work_key=work_key, chat_id=chat_id, dedup=dedup, index=slots)
                 if action == "skip":
                     continue
                 if action == "revive" and reuse is not None:
@@ -1365,7 +1512,7 @@ def plan_engine(db: Session) -> dict[str, int]:
                     db.flush()
                 else:
                     item = SCPushListItem(
-                        list_id=push_list.id, work_key=lv.work_key,
+                        list_id=push_list.id, work_key=work_key,
                         library_version_id=lv.id, category_key=category.category_key,
                         target_type=target_type, bot_id=channel.bot_id or 0,
                         chat_id=str(channel.chat_id or ""), dedup_key=dedup,
@@ -1375,20 +1522,30 @@ def plan_engine(db: Session) -> dict[str, int]:
                     db.flush()
                 item_count += 1
                 task = SCPublishTask(
-                    list_item_id=item.id, work_key=lv.work_key,
+                    list_item_id=item.id, work_key=work_key,
                     plan_version_id=version.id, kind="first", status="planned",
                     priority=category.priority, scheduled_at=utcnow(),
                 )
                 db.add(task)
+                db.flush()
                 task_count += 1
+                built_in_batch += 1
+                cursor.last_success_at = utcnow()
                 category_task_counts[category.category_key] = category_task_counts.get(
                     category.category_key, 0) + 1
-            cursor.last_library_version_id = lv.id
-            cursor.last_work_key = lv.work_key
-            cursor.last_success_at = utcnow()
-            cursor.status = "idle"
             if hour_max and task_count >= hour_max:
                 break
+        # 游标 = 「队头已消化到哪儿」。正常推进时前移；自愈补扫（from_head）只有在
+        # 真的建出任务时才前移——全是「已完成」时原地不动，避免每轮空转抖动。
+        # 注意它不是水位线：任何让作品失效的动作都会把它回退（rewind_cursor_for_work）。
+        if last_pos != cursor.last_library_version_id:
+            cursor.last_library_version_id = last_pos
+            cursor.last_work_key = str(versions[-1].work_key if versions else "")
+            cursor.status = "idle"
+        elif from_head and built_in_batch:
+            cursor.last_library_version_id = max(int(lv.id) for lv in versions)
+            cursor.last_work_key = str(versions[-1].work_key if versions else "")
+            cursor.status = "idle"
         if hour_max and task_count >= hour_max:
             break
     db.commit()
@@ -1577,7 +1734,11 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
              "revived": int(revived),
              # v2.1.6：因「该资源在此渠道已推送过」而跳过重复投递的任务数
              # （泰迪熊2 双推修复：已 sent 的队列行不得被复活）
-             "skipped": 0}
+             "skipped": 0,
+             # v2.1.16：复用已有有效分享链接的任务数（不重建链接，避免网盘堆废分享）
+             "reused": 0,
+             # v2.1.16：建分享失败 → 标记为「无效推送」的任务数
+             "invalid": 0}
     # v2.1.3：单轮墙钟预算起点。
     round_started = time.monotonic()
     # v2.1.3：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
@@ -1626,18 +1787,21 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         item = db.get(SCPushListItem, task.list_item_id)
         lv = db.get(SCLibraryVersion, item.library_version_id) if item else None
         if not item or not lv:
-            task.status = "failed"
+            # v2.1.16：这类失败重试也不会成功（快照/清单项都没了），按用户口径
+            # 落「无效推送」而不是普通失败——名额随之回收，作品回到待推送。
+            task.status = INVALID_TASK_STATUS
             task.error = "清单项或资源版本不存在"
             db.commit()
-            stats["failed"] += 1
+            stats["invalid"] += 1
             continue
         metadata = _jload(lv.metadata_json, {})
         rep, rep_err = _rep_resolver.resolve(lv)
         if not rep:
-            task.status = "failed"
+            # 资源库已无该作品的文件 → 这次推送无效（用户口径：校验资源库有文件）。
+            task.status = INVALID_TASK_STATUS
             task.error = rep_err or "代表资源不存在"
             db.commit()
-            stats["failed"] += 1
+            stats["invalid"] += 1
             continue
         # v2.1.3 推送门禁（真机 2026-11-22 黑豹2 事故的直接成因）：建分享之前
         # 必须逐项核验「海报 / 资料 / 识别成功 / 目录已整理 / 文件名已英文」。
@@ -1691,59 +1855,80 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
             db.commit()
             stats["skipped"] += 1
             continue
-        task.status = "building"
-        task.error = ""
-        db.add(SCPublishExecution(task_id=task.id, stage="build", status="running",
-                                  started_at=utcnow(), request_json=_jdump({"work_key": task.work_key})))
-        db.commit()
-        try:
-            client = GuangYaShareClient(db)
-            # v2.1.3：建分享网络硬超时。guangya.post 内部 3 次重试 + 退避最坏
-            # ≈63s；20 个任务串起来 = 单轮 21 分钟 → 5 秒周期的 job 永远
-            # "上一轮未结束"（真机刷了 24 小时的 maximum number of running
-            # instances reached）。这里给单次建分享封顶 45s，超时按失败处理
-            # （任务回到 planned，下轮重试），不再拖住整轮。
-            share_id, share_url = await asyncio.wait_for(
-                create_share_parsed(
-                    client, str(metadata.get("share_dir_id") or rep.file_id),
-                    str(metadata.get("title") or task.work_key), 0,
-                ),
-                timeout=SHARE_BUILD_TIMEOUT_SECONDS,
-            )
-            task.share_url = share_url
-            task.link_state = "active"
+        # v2.1.16：有仍有效的分享链接就**复用**，不再重建。
+        #
+        # 旧实现每次 dispatch 都调 create_share_parsed：重试一次就在网盘里多一条
+        # 分享记录；而旧链接一旦作废，群里那条消息仍然指向它，等于白发一条。
+        # 用户口径：「待推送时**若无推送链接**才重新触发分享链接」。
+        # 判定「有链接」= share_url 非空 且 link_state 不是 cleaned/invalid。
+        reuse_link = (str(task.share_url or "").strip()
+                      and str(task.link_state or "") not in INVALID_LINK_STATES)
+        if reuse_link:
             task.status = "ready"
-            stats["built"] += 1
-        except asyncio.TimeoutError:
-            # 超时不算业务失败：链接本来就没建成，放回 planned 等下一轮重试。
-            task.status = "planned"
-            task.error = "建分享超时，已重新排期"
-            task.next_retry_at = now + timedelta(seconds=GATE_RETRY_SECONDS)
-            stats["deferred"] += 1
-            execution = db.scalar(select(SCPublishExecution).where(
-                SCPublishExecution.task_id == task.id,
-                SCPublishExecution.stage == "build",
-                SCPublishExecution.status == "running").order_by(SCPublishExecution.id.desc()))
-            if execution:
-                execution.status = "failed"
-                execution.error = "建分享超时"
-                execution.finished_at = utcnow()
+            task.error = ""
+            stats["reused"] += 1
             db.commit()
-            continue
-        except Exception as exc:
-            task.status = "failed"
-            task.error = str(exc)[:500]
-            stats["failed"] += 1
-            execution = db.scalar(select(SCPublishExecution).where(
-                SCPublishExecution.task_id == task.id,
-                SCPublishExecution.stage == "build",
-                SCPublishExecution.status == "running").order_by(SCPublishExecution.id.desc()))
-            if execution:
-                execution.status = "failed"
-                execution.error = str(exc)[:1000]
-                execution.finished_at = utcnow()
+        else:
+            task.status = "building"
+            task.error = ""
+            db.add(SCPublishExecution(task_id=task.id, stage="build", status="running",
+                                      started_at=utcnow(),
+                                      request_json=_jdump({"work_key": task.work_key})))
             db.commit()
-            continue
+            try:
+                client = GuangYaShareClient(db)
+                # v2.1.3：建分享网络硬超时。guangya.post 内部 3 次重试 + 退避最坏
+                # ≈63s；20 个任务串起来 = 单轮 21 分钟 → 5 秒周期的 job 永远
+                # "上一轮未结束"（真机刷了 24 小时的 maximum number of running
+                # instances reached）。这里给单次建分享封顶 45s，超时按失败处理
+                # （任务回到 planned，下轮重试），不再拖住整轮。
+                share_id, share_url = await asyncio.wait_for(
+                    create_share_parsed(
+                        client, str(metadata.get("share_dir_id") or rep.file_id),
+                        str(metadata.get("title") or task.work_key), 0,
+                    ),
+                    timeout=SHARE_BUILD_TIMEOUT_SECONDS,
+                )
+                task.share_url = share_url
+                task.link_state = "active"
+                task.status = "ready"
+                stats["built"] += 1
+            except asyncio.TimeoutError:
+                # 超时不算业务失败：链接本来就没建成，放回 planned 等下一轮重试。
+                task.status = "planned"
+                task.error = "建分享超时，已重新排期"
+                task.next_retry_at = now + timedelta(seconds=GATE_RETRY_SECONDS)
+                stats["deferred"] += 1
+                execution = db.scalar(select(SCPublishExecution).where(
+                    SCPublishExecution.task_id == task.id,
+                    SCPublishExecution.stage == "build",
+                    SCPublishExecution.status == "running").order_by(SCPublishExecution.id.desc()))
+                if execution:
+                    execution.status = "failed"
+                    execution.error = "建分享超时"
+                    execution.finished_at = utcnow()
+                db.commit()
+                continue
+            except Exception as exc:
+                # v2.1.16：建分享失败 → 该次推送判为**无效推送**（用户口径「若分享
+                # 不成功则标记无效推送」）。名额随之回收，作品回到待推送；但给一个
+                # 退避窗口，避免每 5 秒重建一次链接把网盘刷满废分享。
+                task.status = INVALID_TASK_STATUS
+                task.link_state = INVALID_TASK_STATUS
+                task.share_url = ""
+                task.error = f"分享链接创建失败：{str(exc)[:300]}"
+                task.next_retry_at = now + timedelta(seconds=INVALID_RETRY_SECONDS)
+                stats["invalid"] += 1
+                execution = db.scalar(select(SCPublishExecution).where(
+                    SCPublishExecution.task_id == task.id,
+                    SCPublishExecution.stage == "build",
+                    SCPublishExecution.status == "running").order_by(SCPublishExecution.id.desc()))
+                if execution:
+                    execution.status = "failed"
+                    execution.error = str(exc)[:1000]
+                    execution.finished_at = utcnow()
+                db.commit()
+                continue
 
         # 队列行复用：同一 (resource_id, channel_id) 只有一行（唯一约束
         # uq_resource_channel）。上面已在建分享前拦掉「已 sent」的行，
@@ -3138,14 +3323,33 @@ def api_task_retry(task_id: int, db: Session = Depends(get_db)):
 
 @router.post("/tasks/{task_id}/cancel")
 def api_task_cancel(task_id: int, db: Session = Depends(get_db)):
+    """取消推送任务 / 取消分享链接：作废这一次推送，并**释放首推名额**。
+
+    v2.1.16：此处以前只把 `status` 改成 `cancelled`，`link_state` 仍是
+    `active`，`share_url` 也留着——于是名额判定照旧认为「已推成功、链接还有效」，
+    作品从此再也排不进队列。用户口径是「取消推送任务 / 取消分享链接，就应该把
+    对应任务归到初始状态，而不是一直在后台记着已经首推」。
+
+    现在一并作废链接态：`link_state='cleaned'`（历史行与 share_url 保留，供追溯）。
+    该次推送因此判为无效，名额回收；作品按排期轮到它时重新进队列（不是立刻原地
+    重排——取消后 5 秒又冒出来等于没取消）。
+    """
     task = db.get(SCPublishTask, task_id)
     if not task:
         return {"ok": False, "reason": "任务不存在"}
     task.status = "cancelled"
+    # 这一份分享已被用户作废：群里那条消息指向的链接不再可用，记录判为无效。
+    if str(task.share_url or "").strip():
+        task.link_state = CLEANED_LINK_STATE
+    task.next_retry_at = None
     task.lease_owner = ""
     task.lease_expires_at = None
+    # 名额已释放 → 把队列游标回退到这部作品之前，让它下一轮优先补排
+    # （否则取消要等自愈补扫才回来，用户看到的就是「取消了不生效」）。
+    rewind_cursor_for_work(db, str(task.work_key or ""))
     db.commit()
-    return {"ok": True, "status": task.status}
+    return {"ok": True, "status": task.status,
+            "note": "该次推送已作废，名额已释放；作品会在下一轮排期轮到它时重新进队列。"}
 
 
 def _live_work_keys(db: Session) -> set[str]:
@@ -3153,11 +3357,45 @@ def _live_work_keys(db: Session) -> set[str]:
 
     用于判断一条历史任务/分享链接背后的作品是否已从资源库移除——
     这是「无效」判定的唯一事实依据，不依赖任何人工标记或示例值。
+
+    v2.1.16：只取 `work_group_key` 真正用到的 6 个窄列，不加载整行实体。
+    本函数每个调度周期（5 秒）都会跑一次，实体全量加载会把 overview / genres /
+    dir_chain_json 这些大文本字段白白读进内存。
     """
+    rows = db.execute(select(
+        Resource.file_id, Resource.path_hint, Resource.share_dir_name,
+        Resource.media_title, Resource.tmdb_id, Resource.media_type)).all()
     keys: set[str] = set()
-    for res in db.scalars(select(Resource)).all():
-        keys.add(utils.work_group_key(res))
+    for row in rows:
+        keys.add(utils.work_group_key(row))
     return keys
+
+
+def rewind_cursor_for_work(db: Session, work_key: str) -> int:
+    """把队列游标回退到 `work_key` 这部作品之前，让它在下一轮**优先补排**。
+
+    v2.1.16 的关键一环。队列是按 `SCLibraryVersion.id` 升序依次生成的，游标记录
+    「队头已消化到哪儿」。如果用户取消任务 / 取消分享链接 / 清理了这部作品，
+    名额虽然被释放（见 `_SlotIndex`），但游标已经越过它 —— 不主动回退的话，
+    它要等很久才会被「自愈补扫」重新捡起，用户看到的现象就是「取消了也不回来」。
+
+    回退到 `min(该作品所有快照 id) - 1`：下一轮 `id > 游标` 正好从它开始。
+    只动游标，**不删任何记录**。
+    """
+    ids = list(db.scalars(select(SCLibraryVersion.id).where(
+        SCLibraryVersion.work_key == work_key)).all())
+    if not ids:
+        return 0
+    target = max(0, min(int(i) for i in ids) - 1)
+    moved = 0
+    for c in db.scalars(select(SCCategoryCursor)).all():
+        if int(c.last_library_version_id or 0) > target:
+            c.last_library_version_id = target
+            c.updated_at = utcnow()
+            moved += 1
+    if moved:
+        db.flush()
+    return moved
 
 
 def _is_permanent_error(error: str) -> bool:
@@ -3172,9 +3410,9 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
 
     「无效」判据（全部实时派生，不编造）：
       ① 任务已被用户取消（cancelled）——调度器不再捡起它；
-      ② 任务失败，且失败原因表明**资源已从资源库移除**
-         （重试也永远不会成功）；
-      ③ 任务失败，且它背后的作品在当前资源库已查无此物。
+      ② 任务已被判为「无效推送」（invalid：建链失败 / 资源已移除 / 快照缺失）；
+      ③ 任务失败，且失败原因表明**资源已从资源库移除**（重试也永远不会成功）；
+      ④ 任务失败，且它背后的作品在当前资源库已查无此物。
 
     归档后默认列表不再展示（`include_archived=true` 可查回），
     历史行与执行记录保留，不影响推送历史与统计口径。
@@ -3182,18 +3420,21 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
     p = body.payload or {}
     only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
     live = _live_work_keys(db)
-    q = select(SCPublishTask).where(
-        SCPublishTask.status.in_({"failed", "cancelled"}))
+    q = select(SCPublishTask).where(SCPublishTask.status.in_(
+        {"failed", "cancelled", INVALID_TASK_STATUS}))
     if only_ids:
         q = q.where(SCPublishTask.id.in_(only_ids))
     rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
     cleaned = 0
     skipped = 0
     details = []
+    cleaned_works: set[str] = set()
     for task in rows:
         reason = ""
         if str(task.status or "") == "cancelled":
             reason = "已取消"
+        elif str(task.status or "") == INVALID_TASK_STATUS:
+            reason = "无效推送"
         elif _is_permanent_error(task.error):
             reason = "资源已从资源库移除"
         elif str(task.work_key or "") not in live:
@@ -3207,6 +3448,8 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
         task.lease_expires_at = None
         task.updated_at = utcnow()
         cleaned += 1
+        if task.work_key:
+            cleaned_works.add(str(task.work_key))
         details.append({"id": task.id, "reason": reason})
     # v2.1.14：清单项状态跟着任务走。此前只把任务标 cleaned、清单项留 planned，
     # 「发布清单」里因此仍挂着一排「待推送」，首推名额也被这些僵尸项占死
@@ -3225,17 +3468,21 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
         it = db.get(SCPushListItem, iid)
         if it is not None:
             it.status = CLEANED_TASK_STATUS
+    # v2.1.16：清理掉的作品名额已释放 → 回退游标，让它下一轮优先回到队列。
+    for wk in sorted(cleaned_works):
+        rewind_cursor_for_work(db, wk)
     db.commit()
     return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
 
 
 def reset_plan_cursors(db: Session, version_id: int) -> int:
-    """把该计划版本下所有分类轮转游标归零，让 plan_engine 重新扫一遍历史快照。
+    """把该计划版本下所有分类的队列游标归零，让队列从队头重新消化一遍。
 
-    v2.1.15：这是「第三道锁」的恢复通道。plan_engine 只取
-    `SCLibraryVersion.id > cursor.last_library_version_id`，而游标在去重被卡死的那段
-    时间里已经推进到**全部快照之后**——即使去重修好，也永远不再回头看那批快照。
-    归零**不删任何数据**，也不放宽去重：已推送过 / 仍在途的作品照样被挡。
+    v2.1.16 起游标是「队头已消化到哪儿」，不是水位线：让作品失效的动作都会主动
+    回退它（`rewind_cursor_for_work`），所以正常情况下不需要手动归零。
+    本函数保留为**显式兜底**——用于兜住不经过那些入口的失效（外部删库、旧版本遗留
+    数据、批量导入老片后想按入库顺序重排一次）。
+    归零**不删任何数据**，也不放宽判定：已推且链接仍有效 / 仍在途的作品照样被挡。
     """
     cursors = list(db.scalars(select(SCCategoryCursor).where(
         SCCategoryCursor.plan_version_id == version_id)).all())
@@ -3250,8 +3497,14 @@ def reset_plan_cursors(db: Session, version_id: int) -> int:
 def preview_first_rebuild(db: Session) -> dict[str, Any]:
     """预演「重建首推」会怎么走：完全不写库，只按裁决计数。
 
-    逐作品 × 逐渠道调用 `first_dedup_plan`（与 plan_engine 同一条裁决），
+    逐作品 × 逐渠道调用同一个 `_SlotIndex.state()`（与 plan_engine 同一条裁决），
     因此这里给出的数字与真实执行后的结果同源，不是估算。
+
+    v2.1.16：口径随名额判定一起改——
+      - `blocked_active`  ← 名额被**在途**任务占用（正在推送，本轮不该重排）；
+      - `blocked_pushed`  ← 已推成功且分享链接仍有效（重排会重复首推）；
+      - `would_create` ← 从未建过；
+      - `would_revive` ← 历史记录已作废（取消 / 清理 / 链接作废 / 资源移除），可重排。
     """
     version = _active_version(db)
     if not version:
@@ -3259,9 +3512,14 @@ def preview_first_rebuild(db: Session) -> dict[str, Any]:
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
     if not channels:
         return {"ok": False, "reason": "还没有启用中的推送渠道"}
-    pushed_pairs = _pushed_pairs_from_audit(db)
-    versions = list(db.scalars(
-        select(SCLibraryVersion).order_by(SCLibraryVersion.id)).all())
+    db.flush()
+    live_keys = _live_work_keys(db)
+    slots = _SlotIndex(db, live_keys=live_keys)
+    # 只统计**当前仍在资源库**的作品：已重建/已清理的作品不在候选池里，
+    # 把它们算进「可重排」会让预演数字与真实执行结果对不上。
+    versions = [lv for lv in db.scalars(
+        select(SCLibraryVersion).order_by(SCLibraryVersion.id)).all()
+        if str(lv.work_key or "") in live_keys]
     out: dict[str, Any] = {"ok": True, "works": len(versions), "channels": len(channels),
                            "would_create": 0, "would_revive": 0,
                            "blocked_active": 0, "blocked_pushed": 0}
@@ -3269,20 +3527,15 @@ def preview_first_rebuild(db: Session) -> dict[str, Any]:
         for channel in channels:
             chat_id = str(channel.chat_id or "")
             dedup = f"{lv.work_key}:{channel.id}:first"[:255]
-            action, _reuse = first_dedup_plan(
-                db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup,
-                pushed_pairs=pushed_pairs)
-            if action == "create":
+            state, _reuse = slots.state(str(lv.work_key or ""), chat_id, dedup)
+            if state == SLOT_NONE:
                 out["would_create"] += 1
-            elif action == "revive":
+            elif state == SLOT_INVALID:
                 out["would_revive"] += 1
+            elif state == SLOT_ACTIVE:
+                out["blocked_active"] += 1
             else:
-                # 再判一次「是已推过还是仍在途」，只用于如实分类展示
-                if _ever_published(db, work_key=lv.work_key, chat_id=chat_id,
-                                   pushed_pairs=pushed_pairs):
-                    out["blocked_pushed"] += 1
-                else:
-                    out["blocked_active"] += 1
+                out["blocked_pushed"] += 1
     # 当前时段口径如实回报：未命中时段的分类到点才会建任务（不是缺陷）
     win = _current_hour_window(db, version)
     key = str(getattr(win, "category_key", "") or "")
@@ -3341,11 +3594,15 @@ def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
     cleaned = 0
     skipped = 0
     details = []
+    affected_works: set[str] = set()
     for item, task in rows:
         state = str(task.link_state or "unknown")
         reason = ""
         if state in ("suspicious", "inactive"):
             reason = "链接已判失效"
+        elif state == INVALID_TASK_STATUS:
+            # v2.1.16：已被判为无效推送（建链失败 / 链接作废），一并归档。
+            reason = "无效推送"
         elif _is_permanent_error(task.error):
             reason = "资源已从资源库移除"
         elif str(task.work_key or item.work_key or "") not in live:
@@ -3353,10 +3610,17 @@ def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
         if not reason:
             skipped += 1
             continue
+        # 作废链接态 → 该次推送判为无效、名额回收，作品可重新排队。
         task.link_state = CLEANED_LINK_STATE
         task.updated_at = utcnow()
         cleaned += 1
+        wk = str(task.work_key or item.work_key or "")
+        if wk:
+            affected_works.add(wk)
         details.append({"id": task.id, "reason": reason})
+    # v2.1.16：链接作废后名额已回收 → 回退游标，让作品下一轮优先回到队列。
+    for wk in sorted(affected_works):
+        rewind_cursor_for_work(db, wk)
     db.commit()
     return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
 

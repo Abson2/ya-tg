@@ -110,9 +110,17 @@ def test_failed_but_not_cleaned_still_blocks(db):
     assert _plan(db) == ("skip", None)
 
 
-def test_item_without_tasks_blocks_conservatively(db):
-    _item(db)
-    assert _plan(db) == ("skip", None), "无任务的残留项保守视为占用，避免重复首推"
+def test_item_without_tasks_revives_instead_of_blocking(db):
+    """v2.1.16 语义调整：无任务的残留项不再永久占位。
+
+    v2.1.14 时按「保守视为占用」处理（宁可少建不重复推）。但用户口径明确：
+    名额不该被后台记录永久占死，资源库有作品就该有队列。清单项下没有任何任务，
+    说明从未真正推送过 → 判为可重排，复活同一行建任务（dedup_key 唯一，不能另插）。
+    """
+    it = _item(db)
+    action, reuse = _plan(db)
+    assert action == "revive", action
+    assert reuse is not None and reuse.id == it.id
 
 
 def test_legacy_dedup_format_revives_legacy_row(db):

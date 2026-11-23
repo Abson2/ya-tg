@@ -1,15 +1,12 @@
-"""v2.1.15 验收：轮转游标锁死恢复 + 历史推送防重复首推。
+"""v2.1.15 验收（v2.1.16 已随名额语义调整）：重建首推的恢复通道。
 
-真机事实（2026-11-23 23:21 复查，两道锁之外还有第三道）：
-  - 分类游标 `last_library_version_id` 已被推进到**全部快照之后**，
-    plan_engine 只取 `SCLibraryVersion.id > 游标` → 即使去重修好，也永远不再回头看
-    那 486 个快照。这是「等 45 分钟也不会自愈」的直接原因。
-  - 库里 233 条历史 push_sent 属于**旧推送队列**（只写审计，不写
-    SCPublishTask.status='published'）→ 若只按 published 判重，重建首推会把早已
-    推过的作品再推一遍。
+端点 `POST /sc/plan/rebuild-first` 仍然保留，语义变为「把轮转位置归零 + 立刻跑一轮」。
+v2.1.16 起 plan_engine 候选改为**环形轮转**，所以「游标越过历史快照」不再造成永久
+卡死（那条反证已迁到 test_v2116_queue_reset.py 的环形轮转用例）。本文件继续锁：
 
-本文件锁定：① 审计精确归属（作品 + 渠道）；② 预演数字与执行同源；
-③ 游标归零后存量能被重扫；④ 已推送过绝不重复首推；⑤ 不删任何历史行。
+  ① 预演默认 dry_run，且数字与真实执行同源；
+  ② 执行只归零游标，**绝不删除**任何清单项 / 任务 / 执行记录；
+  ③ 名额仍被有效推送占用时，重建也不会重复首推。
 """
 import json
 import os
@@ -71,15 +68,6 @@ def _work_key(db, res):
     return utils.work_group_key(res)
 
 
-def _audit_push(db, resource_id, channel_id):
-    from app.models import AuditLog
-    db.add(AuditLog(action="push_sent", target_type="queue", target_id="1",
-                    detail=json.dumps({"resource_id": resource_id,
-                                       "channel_id": channel_id,
-                                       "message_id": "99"})))
-    db.commit()
-
-
 def _ready(db):
     """建资源 + 快照 + 渠道 + 整日窗口，让 plan_engine 与运行时刻无关。"""
     from app import share_center_v2 as sc2
@@ -98,102 +86,39 @@ def _work_category(db):
     return row.category_key if row else ""
 
 
-# ---------- ① 历史推送审计的精确归属 ----------
-
-def test_audit_push_blocks_only_that_channel(env):
-    from app import share_center_v2 as sc2
-    S, _ = env
-    with S() as db:
-        res, ch_a = _ready(db)
-        ch_b = _channel(db, "-1002")
-        _audit_push(db, res.id, ch_a.id)
-        wk = _work_key(db, res)
-        assert sc2._ever_published(db, work_key=wk, chat_id=str(ch_a.chat_id)) is True
-        assert sc2._ever_published(db, work_key=wk, chat_id=str(ch_b.chat_id)) is False
-
-
-def test_audit_without_attribution_is_ignored(env):
-    """detail 缺 resource_id/channel_id → 无法归属，不冒充结论。"""
-    from app import share_center_v2 as sc2
-    from app.models import AuditLog
-    S, _ = env
-    with S() as db:
-        _ready(db)
-        db.add(AuditLog(action="push_sent", target_type="queue", target_id="1",
-                        detail=json.dumps({"message_id": "1"})))
-        db.add(AuditLog(action="push_sent", target_type="queue", target_id="2", detail="not-json"))
-        db.commit()
-        assert sc2._pushed_pairs_from_audit(db) == set()
-
-
-def test_published_task_also_blocks(env):
-    from app import share_center_v2 as sc2
+def _published_item(db, res, ch, *, status="published", link_state="active"):
+    """造一条首推清单项 + 任务（默认「已推成功且链接有效」）。"""
     from app.models import SCPublishTask, SCPushListItem
+    wk = _work_key(db, res)
+    it = SCPushListItem(list_id=1, work_key=wk, chat_id=str(ch.chat_id),
+                        dedup_key=f"{wk}:{ch.id}:first", source_kind="first",
+                        status="planned")
+    db.add(it)
+    db.flush()
+    task = SCPublishTask(list_item_id=it.id, work_key=wk, kind="first",
+                         status=status, link_state=link_state,
+                         share_url="https://example/s/1" if link_state == "active" else "")
+    db.add(task)
+    db.commit()
+    return it, task
+
+
+# ---------- ① 有效推送占用名额 → 重建也不重复首推 ----------
+
+def test_published_task_with_live_link_blocks_rebuild(env):
+    from app import share_center_v2 as sc2
+    from app.models import SCPublishTask
     S, _ = env
     with S() as db:
         res, ch = _ready(db)
-        wk = _work_key(db, res)
-        it = SCPushListItem(list_id=1, work_key=wk, chat_id=str(ch.chat_id),
-                            dedup_key=f"{wk}:{ch.id}:first", source_kind="first",
-                            status="planned")
-        db.add(it)
-        db.flush()
-        db.add(SCPublishTask(list_item_id=it.id, work_key=wk, kind="first", status="published"))
-        db.commit()
-        assert sc2._ever_published(db, work_key=wk, chat_id=str(ch.chat_id)) is True
-        action, _ = sc2.first_dedup_plan(db, work_key=wk, chat_id=str(ch.chat_id),
-                                        dedup=f"{wk}:{ch.id}:first")
-        assert action == "skip"
-
-
-# ---------- ② 第三道锁：游标越过 → 归零后可重扫 ----------
-
-def test_cursor_past_snapshots_yields_zero_tasks(env):
-    """反证第三道锁：游标越过全部快照时，plan_engine 一条任务都建不出来。"""
-    from app import share_center_v2 as sc2
-    from app.models import SCCategoryCursor
-    S, _ = env
-    with S() as db:
-        _ready(db)
-        version = sc2._active_version(db)
-        cat = _work_category(db)
-        assert cat, "作品必须有分类，否则用例前提不成立"
-        db.add(SCCategoryCursor(plan_version_id=version.id, category_key=cat,
-                                last_library_version_id=999999))
-        db.commit()
-        out = sc2.plan_engine(db)
-        assert out["tasks"] == 0, out
-
-
-def test_rebuild_resets_cursor_and_creates_tasks(env):
-    from app import share_center_v2 as sc2
-    from app.models import SCCategoryCursor, SCPublishTask
-    S, _ = env
-    with S() as db:
-        res, ch = _ready(db)
-        version = sc2._active_version(db)
-        # 造出与真机一致的卡死现场：游标已越过全部快照
-        cat = _work_category(db)
-        db.add(SCCategoryCursor(plan_version_id=version.id, category_key=cat,
-                                last_library_version_id=999999))
-        db.commit()
-        assert sc2.plan_engine(db)["tasks"] == 0, "游标越过全部快照时应一条都建不出"
-
-        # 预演：应报「可重排 1 条」，且不写库
+        _published_item(db, res, ch, status="published", link_state="active")
         pre = sc2.preview_first_rebuild(db)
         assert pre["ok"] is True
-        assert pre["would_create"] + pre["would_revive"] >= 1, pre
-        assert not list(db.scalars(select(SCPublishTask)).all()), "预演不得写库"
-
+        assert pre["blocked_pushed"] >= 1, pre
+        assert pre["would_create"] == 0 and pre["would_revive"] == 0, pre
         out = sc2.api_rebuild_first(sc2.Payload(payload={"dry_run": False}), db)
-        assert out["ok"] and out["cursors_reset"] >= 1, out
-        # 游标归零后，plan_engine 真的能重扫历史快照并建出任务
-        assert out["plan"]["tasks"] >= 1, out
-        cursors = list(db.scalars(select(SCCategoryCursor)).all())
-        # 归零后本轮又把该分类推进到了真实快照位置（1），不再停在 999999
-        assert all(c.last_library_version_id < 999999 for c in cursors), \
-            [c.last_library_version_id for c in cursors]
-        assert any(c.last_library_version_id == 1 for c in cursors)
+        assert out["plan"]["tasks"] == 0, out
+        assert len(list(db.scalars(select(SCPublishTask)).all())) == 1, "只应保留原任务"
 
 
 def test_rebuild_preview_is_dry_by_default(env):
@@ -207,38 +132,15 @@ def test_rebuild_preview_is_dry_by_default(env):
         assert not list(db.scalars(select(SCPublishTask)).all())
 
 
-# ---------- ③ 已推送过的不重复首推 ----------
-
-def test_rebuild_skips_work_already_pushed(env):
-    from app import share_center_v2 as sc2
-    from app.models import SCPublishTask
-    S, _ = env
-    with S() as db:
-        res, ch = _ready(db)
-        _audit_push(db, res.id, ch.id)
-        pre = sc2.preview_first_rebuild(db)
-        assert pre["blocked_pushed"] >= 1, pre
-        assert pre["would_create"] == 0 and pre["would_revive"] == 0, pre
-        out = sc2.api_rebuild_first(sc2.Payload(payload={"dry_run": False}), db)
-        assert out["plan"]["tasks"] == 0, out
-        assert not list(db.scalars(select(SCPublishTask)).all())
-
+# ---------- ② 执行只归零游标，不删任何历史行 ----------
 
 def test_rebuild_keeps_all_history_rows(env):
-    """重建只归零游标，绝不物理删除清单项与任务行。"""
     from app import share_center_v2 as sc2
     from app.models import SCPublishTask, SCPushListItem
     S, _ = env
     with S() as db:
         res, ch = _ready(db)
-        wk = _work_key(db, res)
-        it = SCPushListItem(list_id=1, work_key=wk, chat_id=str(ch.chat_id),
-                            dedup_key=f"{wk}:{ch.id}:first", source_kind="first",
-                            status="cleaned")
-        db.add(it)
-        db.flush()
-        db.add(SCPublishTask(list_item_id=it.id, work_key=wk, kind="first", status="cleaned"))
-        db.commit()
+        _published_item(db, res, ch, status="cleaned", link_state="cleaned")
         before_items = len(list(db.scalars(select(SCPushListItem)).all()))
         before_tasks = len(list(db.scalars(select(SCPublishTask)).all()))
         sc2.api_rebuild_first(sc2.Payload(payload={"dry_run": False}), db)
@@ -246,14 +148,33 @@ def test_rebuild_keeps_all_history_rows(env):
         assert len(list(db.scalars(select(SCPublishTask)).all())) >= before_tasks
 
 
-# ---------- ④ 前端入口 ----------
+def test_rebuild_resets_cursor(env):
+    from app import share_center_v2 as sc2
+    from app.models import SCCategoryCursor
+    S, _ = env
+    with S() as db:
+        _ready(db)
+        version = sc2._active_version(db)
+        cat = _work_category(db)
+        assert cat, "作品必须有分类，否则用例前提不成立"
+        db.add(SCCategoryCursor(plan_version_id=version.id, category_key=cat,
+                                last_library_version_id=999999))
+        db.commit()
+        out = sc2.api_rebuild_first(sc2.Payload(payload={"dry_run": False}), db)
+        assert out["ok"] and out["cursors_reset"] >= 1, out
+        cursors = list(db.scalars(select(SCCategoryCursor)).all())
+        assert all(c.last_library_version_id < 999999 for c in cursors), \
+            [c.last_library_version_id for c in cursors]
+
+
+# ---------- ③ 前端入口 ----------
 
 def test_frontend_has_rebuild_button_and_dry_run_first():
     assert "重建首推任务" in APP
     assert "scRebuildFirst" in APP
     assert "/sc/plan/rebuild-first" in APP
     assert "dry_run: true" in APP and "dry_run: false" in APP, "必须先预演再执行"
-    assert "已推送过而跳过" in APP, "确认框必须如实报出被跳过的条数"
+    assert "已推送且分享链接仍有效而跳过" in APP, "确认框必须如实报出被跳过的条数"
 
 
 def test_frontend_does_not_leak_backend_terms():

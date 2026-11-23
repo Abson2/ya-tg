@@ -57,3 +57,24 @@ def mask_secret(value: str) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}{'*' * 6}{value[-4:]}"
+
+
+# v2.1.16：掩码回写事故的唯一判据。
+# 事故链（2026-11-23 线上实测）：GET /api/interaction/config 曾把 mask_secret() 的
+# 回显值（形如 tgto******4ifI，14 字符）当作字段值返回 → 前端只判「非空」就提交 →
+# set_many() 把掩码加密写库 → TgtoDrive OpenAPI 一直 401，且重启/重新生成 Token 都无效。
+# 只要写入路径上有这个判断，掩码就再也进不了库。
+_MASK_MARK = "*" * 6
+
+
+def is_masked_secret(value: str) -> bool:
+    """判断一个凭证串是否为 mask_secret() 产出的回显掩码（不是真凭证）。
+
+    真 Token 不会连续出现 6 个 `*`，也不会整串都是 `*`；命中即视为掩码。
+    """
+    text = (value or "").strip()
+    if not text:
+        return False
+    if not text.strip("*"):
+        return True
+    return _MASK_MARK in text

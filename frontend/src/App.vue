@@ -146,6 +146,9 @@ const scTaskStatusLabel = (status) => ({
   submitted: '已提交', accepted: '已领取', publishing: '推送中',
   published: '已成功', failed: '失败', cancelled: '已取消',
   skipped: '已跳过投递',
+  // v2.1.16：建分享失败 / 链接作废 / 资源已移除 → 这次推送无效。
+  // 名额随之释放，作品按排期重新进队列（不是「失败」，失败是还会原地重试）。
+  invalid: '无效推送',
 }[status || ''] || status || '—')
 // v2.1.6：执行记录里的「阶段 / 状态」同样中文化，页面不得直出内部枚举名。
 const scExecStageLabel = (stage) => ({
@@ -236,7 +239,8 @@ function scChannelTargetLines(row) {
 const scTaskStatusOptions = computed(() => {
   const counts = scOverview.value.status_counts || {}
   const order = ['planned', 'ready', 'building', 'submitted', 'accepted',
-                 'publishing', 'published', 'failed', 'cancelled', 'skipped', 'cleaned']
+                 'publishing', 'published', 'failed', 'cancelled', 'skipped',
+                 'invalid', 'cleaned']
   return order
     .filter(st => counts[st])
     .map(st => ({ value: st, label: `${scTaskStatusLabel(st)}（${counts[st]}）` }))
@@ -1672,9 +1676,20 @@ async function postInteractionConfig() {
     tg_bot_link: c.tg_bot_link || '',
     // 自定义指令不含内置四项，内置由后端固定注入
     bot_commands: (c.bot_commands || []).filter(x => !x.builtin).map(x => ({ command: x.command, description: x.description, reply: x.reply })) }
-  // 密钥字段只有用户实际输入才提交，避免把返回后的掩码写回凭证
-  if (c.tgto_api_key) body.tgto_api_key = c.tgto_api_key
-  await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
+  // v2.1.16：密钥字段只有用户**实际输入真值**才提交。
+  // 只判空不够——旧版后端 GET 会把掩码（value[:4] + 6 个星号 + value[-4:]）回显进输入框，
+  // 只要非空就提交，掩码就被当凭证写回，导致 TgtoDrive OpenAPI 恒 401 且越存越错。
+  // 这里把形如掩码的串（整串星号，或含 6 个连续星号）一律剔除，不提交。
+  const looksMasked = (v) => {
+    const s = String(v || '').trim()
+    return !!s && (!s.replace(/\*/g, '') || s.includes('******'))
+  }
+  if (c.tgto_api_key && !looksMasked(c.tgto_api_key)) body.tgto_api_key = c.tgto_api_key
+  const d = await api('/interaction/config', { method: 'POST', body: JSON.stringify(body) })
+  if ((d?.ignored_masked || []).length) {
+    ElMessage.warning('检测到提交的是掩码而非真 Token，已忽略未保存；请粘贴 TgtoDrive 里的完整明文 Token')
+  }
+  return d
 }
 async function sendBroadcastNotice() {
   // 管理员侧群发通知：只发目录路由表里的频道 / 群聊，不私聊用户、不进队列。
@@ -2304,9 +2319,24 @@ async function scRejectAI(id) {
   try { await api(`/sc/ai/suggestions/${id}/reject`, { method: 'POST' }); ElMessage.success('已忽略该建议'); await loadSc() }
   catch (e) { ElMessage.error(String(e?.message || e)) }
 }
+// v2.1.16：取消推送任务 / 取消分享链接 = 作废这一次推送并**释放首推名额**。
+// 因此取消前必须如实说明后果：名额释放、作品回到待推送，之后会重新建链再推一次。
 async function scTaskAction(id, action) {
-  try { await api(`/sc/tasks/${id}/${action}`, { method: 'POST' }); ElMessage.success(action === 'retry' ? '已重试' : '已取消'); await loadSc() }
-  catch (e) { ElMessage.error(String(e?.message || e)) }
+  try {
+    if (action === 'cancel') {
+      await ElMessageBox.confirm(
+        '取消这次推送并作废它的分享链接？\n' +
+        '取消后该作品的首推名额立即释放、回到待推送，排期轮到它时会重新生成分享链接再推送一次。\n' +
+        '已发到 Telegram 的旧消息不会撤回，但其中的链接将失效。历史记录与执行日志全部保留。',
+        '取消分享', { confirmButtonText: '确认取消', cancelButtonText: '返回', type: 'warning' })
+    }
+    await api(`/sc/tasks/${id}/${action}`, { method: 'POST' })
+    ElMessage.success(action === 'retry' ? '已重试' : '已取消，名额已释放')
+    await loadSc()
+  } catch (e) {
+    if (e === 'cancel' || e?.message === 'cancel') return
+    ElMessage.error(String(e?.message || e))
+  }
 }
 // KPI / 链接健康点击 → 切到发布队列并按真实状态/链接态筛选
 function scFilterQueue(status, linkState) {
@@ -2352,7 +2382,7 @@ async function scRebuildFirst() {
     if (!pre.ok) { ElMessage.warning(pre.reason || '预演失败'); return }
     const can = (pre.would_create || 0) + (pre.would_revive || 0)
     if (!can) {
-      ElMessage.info(`没有可重排的首推：${pre.works || 0} 部作品中，已推送过 ${pre.blocked_pushed || 0} 部、仍在处理中 ${pre.blocked_active || 0} 部。`)
+      ElMessage.info(`没有可重排的首推：${pre.works || 0} 部作品中，已推送且链接仍有效 ${pre.blocked_pushed || 0} 部、仍在处理中 ${pre.blocked_active || 0} 部。`)
       return
     }
     let extra = ''
@@ -2360,8 +2390,9 @@ async function scRebuildFirst() {
     else if (pre.hour_category) extra = `\n当前时段仅排「${pre.hour_category}」分类，其余分类到各自时段自动继续。`
     await ElMessageBox.confirm(
       `${pre.works || 0} 部作品 × ${pre.channels || 0} 个渠道中，可重排首推 ${can} 条（其中复用历史清单项 ${pre.would_revive || 0} 条）；` +
-      `已推送过而跳过 ${pre.blocked_pushed || 0} 条，仍在处理中而跳过 ${pre.blocked_active || 0} 条。\n` +
-      `执行后会把各分类的轮转位置归零并重新扫描历史作品，只归档不删除任何记录，已成功推送过的作品不会重复推送。${extra}`,
+      `已推送且分享链接仍有效而跳过 ${pre.blocked_pushed || 0} 条，仍在处理中而跳过 ${pre.blocked_active || 0} 条。\n` +
+      `执行后会把各分类的轮转位置归零、重新扫描资源库作品，只归档不删除任何记录。` +
+      `已作废（取消任务 / 取消链接 / 资源已移除）的记录会重新排队；链接仍有效的已推送作品不会重复推送。${extra}`,
       '重建首推任务', { type: 'warning', distinguishCancelAndClose: true })
     scRebuildingFirst.value = true
     const d = await api('/sc/plan/rebuild-first', { method: 'POST', body: JSON.stringify({ payload: { dry_run: false } }) })
@@ -2909,7 +2940,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.15 · Asia/Shanghai</span>
+          <span>v2.1.16 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3735,7 +3766,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="form-grid">
               <div class="field"><label>TgtoDrive 地址</label><el-input v-model="interactionCfg.tgto_base_url" placeholder="http://127.0.0.1:端口"/></div>
               <div class="field"><label>场景名</label><el-input v-model="interactionCfg.tgto_scene" placeholder="ENV_FILTER_GUANGYA"/></div>
-              <div class="field"><label>OpenAPI Token（留空保持原值）</label><el-input v-model="interactionCfg.tgto_api_key" placeholder="已配置则留空" show-password/></div>
+              <div class="field"><label>OpenAPI Token（留空保持原值）</label>
+                <el-input v-model="interactionCfg.tgto_api_key" show-password
+                  :placeholder="interactionCfg.tgto_api_key_needs_reset ? '库里存的是掩码，请重新粘贴完整 Token' : '已配置则留空'"/>
+                <!-- v2.1.16：凭证一律不回显（连掩码都不回）。只给状态，避免「看到星号以为没存 → 再存一次」 -->
+                <small v-if="interactionCfg.tgto_api_key_needs_reset" class="alert">当前存的不是真 Token（是历史掩码），TgtoDrive 会一直 401：请到「实用工具 → OpenAPI」复制完整明文粘贴保存</small>
+                <small v-else-if="interactionCfg.tgto_api_key_configured">已配置（出于安全不回显，留空即保持原值）</small>
+                <small v-else>尚未配置</small>
+              </div>
               <div class="field"><label>a. 分辨率</label><el-select v-model="interactionCfg.tgto_rule_resolution" style="width:100%"><el-option label="4K" value="4k"/><el-option label="1080p" value="1080p"/><el-option label="720p" value="720p"/><el-option label="不限" value="all"/></el-select></div>
               <div class="field"><label>b. 画面效果</label><el-select v-model="interactionCfg.tgto_rule_effect" style="width:100%"><el-option label="全部效果" value="all"/><el-option label="杜比视界" value="dolby"/><el-option label="HDR" value="hdr"/><el-option label="SDR" value="sdr"/></el-select></div>
               <div class="field"><label>c. 自定义必含关键词</label><el-input v-model="interactionCfg.tgto_rule_required_keyword" placeholder="默认 265；留空则不启用必含条件"/></div>
@@ -4343,6 +4381,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <div><small>发送</small><b>{{ scOverview.status_counts?.ready || 0 }}</b></div>
                   <div><small>成功</small><b class="ok">{{ scOverview.status_counts?.published || 0 }}</b></div>
                   <div><small>失败</small><b class="bad">{{ scOverview.status_counts?.failed || 0 }}</b></div>
+                  <div><small>无效推送</small><b class="bad">{{ scOverview.status_counts?.invalid || 0 }}</b></div>
                   <div><small>待建链</small><b class="muted">{{ scOverview.link_state_counts?.unknown || 0 }}</b></div>
                 </div>
                 <div class="sc-table-scroll">
@@ -5023,7 +5062,7 @@ button{font-family:inherit}
 .device-actions{display:flex;gap:12px;justify-content:center;align-items:center}.device-link{color:var(--yg-primary);text-decoration:none;font-size:13px;display:flex;align-items:center;gap:5px}
 .kv-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.kv-grid small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.kv-grid b{font-size:13px;word-break:break-all}
 .hint{color:var(--yg-muted);font-size:11px;line-height:1.8;margin:12px 0 0}
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:7px}.field small{display:block;color:var(--yg-muted);font-size:11px;margin-top:6px}.field small.alert{color:#e5526b;font-weight:600}.field.inline{display:flex;align-items:center;gap:14px}.field.inline label{margin:0}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
 /* v0.9.6：镜像锁占用提示——后台改名复查静默持锁时，让用户知道为何「立即同步」会 409 */
 .mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:var(--yg-tone-amber-bg);border:1px solid var(--yg-line);border-radius:10px;color:var(--yg-tone-amber-fg);font-size:12px;line-height:1.7}

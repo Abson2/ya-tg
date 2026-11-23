@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .models import AppConfig
-from .security import decrypt_secret, encrypt_secret, mask_secret
+from .security import decrypt_secret, encrypt_secret, is_masked_secret, mask_secret
 
 # key -> (settings 属性名, 默认值)。数据库有值（非空）时覆盖环境变量。
 DEFAULTS: dict[str, tuple[str, str]] = {
@@ -302,3 +302,22 @@ def source_map(db: Session) -> dict[str, str]:
 def masked(db: Session, keys: list[str] | None = None) -> dict[str, str]:
     keys = keys or list(DEFAULTS)
     return {k: mask_secret(get(db, k)) for k in keys}
+
+
+def secret_state(db: Session, keys: list[str]) -> dict[str, dict[str, bool]]:
+    """凭证类 key 的**状态**——只回状态，绝不回显任何片段。
+
+    v2.1.16 事故：此前配置页 GET 用 masked() 把掩码（形如 tgto******4ifI）当字段值返回，
+    前端只判「非空」就提交，掩码被 set_many 加密写库，TgtoDrive OpenAPI 从此恒 401。
+
+    现在 GET 一律返回空值 + 这两个标志：
+      configured  —— 库里/环境里是**真凭证**，可直接使用
+      needs_reset —— 存的是掩码（已被污染），必须由人工重新填写真值才能恢复
+    """
+    values = get_many(db, keys)
+    out: dict[str, dict[str, bool]] = {}
+    for key in keys:
+        value = (values.get(key) or "").strip()
+        polluted = is_masked_secret(value)
+        out[key] = {"configured": bool(value) and not polluted, "needs_reset": polluted}
+    return out

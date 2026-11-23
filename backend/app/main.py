@@ -36,7 +36,7 @@ from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, Dis
                      ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution)
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
-from .security import decrypt_secret, encrypt_secret, mask_secret
+from .security import decrypt_secret, encrypt_secret, is_masked_secret, mask_secret
 logger = logging.getLogger(__name__)
 
 from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name,
@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.15", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.16", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.15", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.16", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3577,6 +3577,19 @@ async def _refresh_library_from_b(db: Session, *, reconcile: bool = True,
         out["changes"] = process_change_events(db, publish=True)
     except Exception as exc:
         out["changes"] = {"error": str(exc)[:200]}
+    # v2.1.16：手动扫描本身就是「触发推送任务队列」的方式之一。
+    # 三个「刷新」入口（顶部刷新 / 立即扫描 / 重新扫描库）都走本函数，扫描+识别
+    # 结束后立刻跑一轮分享中心周期（sync → plan → dispatch），让新入库作品在本
+    # 次操作内就进入队列，而不是等下一个 5 秒 tick。
+    # 必须走线程 + 独立 Session：run_cycle 内含同步 commit，在主协程跑会冻结事件
+    # 循环（v1.4.2 以来的既有红线）。先 commit 结束本会话的写事务，避免两个会话
+    # 抢 SQLite 写锁。
+    try:
+        db.commit()
+        out["share_cycle"] = await asyncio.to_thread(
+            _run_share_center_v2_cycle_in_thread)
+    except Exception as exc:
+        out["share_cycle"] = {"error": str(exc)[:200]}
     return out
 
 
@@ -6272,7 +6285,9 @@ def diagnostics(db: Session = Depends(get_db)):
 class InteractionConfigInput(BaseModel):
     contribution_enabled: bool = False
     donation_enabled: bool = False
-    # 以下字段传 None 表示「保持原值」；返回给前端的是掩码值，避免把掩码写回凭证
+    # 以下字段传 None 表示「保持原值」。
+    # v2.1.16：凭证类 key（tgto_api_key / contribution_bot_token）**不回显任何值**，
+    # 只回 *_configured / *_needs_reset 标志；保存时掩码串会被直接丢弃（见 is_masked_secret）。
     tgto_base_url: str | None = None
     tgto_scene: str | None = None
     tgto_api_key: str | None = None
@@ -6307,6 +6322,11 @@ class InteractionConfigInput(BaseModel):
     tg_bot_link: str | None = None       # v0.9.10：推送消息正文里的机器人跳转链接（指向推送 Bot 本身）
 
 
+# v2.1.16：配置页里**只能由人工填写**的凭证 key。这类 key 一律不回显（连掩码都不回），
+# 保存时也拒绝任何形如 mask_secret() 掩码的提交——掩码回写会让鉴权永久 401。
+SECRET_CONFIG_KEYS = ["tgto_api_key", "contribution_bot_token"]
+
+
 @app.get("/api/interaction/config", dependencies=ADMIN)
 def interaction_config_get(db: Session = Depends(get_db)):
     plain = ["tgto_base_url", "tgto_scene", "donation_image_url", "donation_text",
@@ -6315,7 +6335,14 @@ def interaction_config_get(db: Session = Depends(get_db)):
              "tgto_rule_resolution", "tgto_rule_effect", "tgto_rule_required_keyword",
              "contribution_restore_target_dir_id"]
     out = {k: runtime_config.get(db, k) for k in plain}
-    out.update(runtime_config.masked(db, ["tgto_api_key", "contribution_bot_token"]))
+    # v2.1.16：凭证类 key 只回「状态」，不回任何值——包括掩码。
+    # 事故链：以前这里回显 mask_secret() 的掩码（tgto******4ifI），输入框被填满星号，
+    # 用户以为没写入就又点一次保存，掩码被 set_many 加密写库 → TgtoDrive OpenAPI 恒 401，
+    # 且「重新生成真 Token 再填」也会被下一次误保存打回原形。值一律置空，只给标志。
+    out.update({k: "" for k in SECRET_CONFIG_KEYS})
+    for key, state in runtime_config.secret_state(db, SECRET_CONFIG_KEYS).items():
+        out[f"{key}_configured"] = state["configured"]   # 存储的是真凭证，可直接用
+        out[f"{key}_needs_reset"] = state["needs_reset"]  # 存储的是掩码，必须重填
     out["contribution_enabled"] = (runtime_config.get(db, "contribution_enabled") or "").lower() == "true"
     out["donation_enabled"] = (runtime_config.get(db, "donation_enabled") or "").lower() == "true"
     out["contribution_restore_enabled"] = contribution_restore.enabled(db)
@@ -6355,6 +6382,12 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
         v = getattr(p, k)
         if v is not None:
             values[k] = v.strip()
+    # v2.1.16：拒绝掩码回写。GET 现在不回显掩码了，这里再兜一层——旧版前端、浏览器
+    # 缓存的旧 JS、或任何人手工调 API 把 mask_secret() 的产物（如 tgto******4ifI）
+    # 提交上来时，一律丢弃不写库，保持库里原值不动，并回告给页面。
+    ignored_masked = [k for k in SECRET_CONFIG_KEYS if is_masked_secret(values.get(k, ""))]
+    for k in ignored_masked:
+        values.pop(k, None)
     # v0.9.19：投稿转存开关（bool → runtime_config 字符串）
     if p.contribution_restore_enabled is not None:
         values["contribution_restore_enabled"] = "true" if p.contribution_restore_enabled else "false"
@@ -6398,9 +6431,10 @@ def interaction_config_save(p: InteractionConfigInput, db: Session = Depends(get
         values["bot_commands_json"] = json_dumps(cmds)
     runtime_config.set_many(db, values)
     add_audit(db, "interaction_config_saved", target_type="interaction",
-              detail=json_dumps({"keys": sorted(values)}))
+              detail=json_dumps({"keys": sorted(values),
+                                 "ignored_masked": ignored_masked}))
     db.commit()
-    return {"ok": True, "saved": sorted(values)}
+    return {"ok": True, "saved": sorted(values), "ignored_masked": ignored_masked}
 
 
 # ---------- v0.9.5：推送白名单 = 目录路由表（全局单 Bot） ----------
