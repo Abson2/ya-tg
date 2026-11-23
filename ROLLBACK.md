@@ -21,6 +21,9 @@
 # 保留当前故障现场，便于排查
 cp -r ./db ./db.fault-$(date +%Y%m%d%H%M%S)
 cp -r ./logs ./logs.fault-$(date +%Y%m%d%H%M%S)
+# v2.1.8 起 ./data 存 Telegram 登录会话（等同账号凭据）——留证时一并复制，
+# 但**不要**复制到公开位置或提交进版本库。
+cp -r ./data ./data.fault-$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 docker compose logs --tail=500 > ya-tg-fault.log
 ```
 
@@ -33,6 +36,8 @@ docker compose down
 rm -rf ./db ./logs
 cp -r ./backup/db ./db
 cp -r ./backup/logs ./logs
+# 会话目录可选恢复：不恢复只是要重新走一次验证码登录，不影响其它功能
+cp -r ./backup/data ./data 2>/dev/null || true
 
 # 3) 指定旧 tag
 # .env: IMAGE_TAG=v0.9.20
@@ -58,6 +63,9 @@ docker compose up -d
 mkdir -p ./backup
 cp -r ./db ./backup/db
 cp -r ./logs ./backup/logs
+# v2.1.8 起 ./data 存 Telegram 登录会话（等同账号凭据）——按需备份，
+# 不备份只是升级后要重新走一次验证码登录。
+cp -r ./data ./backup/data 2>/dev/null || true
 ```
 确认 `backup/db/ya-tg.db` 存在且大小正常后再升级。
 

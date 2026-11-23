@@ -24,5 +24,11 @@ logs/*
 # 历史版本已从仓库移除（v1.5.1 曾用 git add -A 误提交 9 个 zip）。
 Ya-TG-*.zip
 
+# v2.1.8 #241：Telegram MTProto 会话文件等同账号凭据（.session 承载登录态），
+# 绝不入库；同时把本地数据目录整体排除。
+# （凭据本身走 runtime_config → Fernet 加密落库，session 文件只落本地磁盘。）
+*.session
+data/
+
 # WorkBuddy 本地项目数据（含 memory/automations 记忆文件），属工具侧产物，禁止入库。
 .workbuddy/

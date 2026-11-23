@@ -473,6 +473,39 @@ def _mark_legacy_rename_skipped(db) -> int:
     return changed
 
 
+def _recover_rate_limited_identify(db) -> int:
+    """v2.1.9：把「因 TMDB 限流被写死 failed」的资源救回待重试队列。
+
+    背景（真机 2026-11-22）：一次爆发式全量扫描在几分钟内产生上千新资源，
+    批量识别逐条打 TMDB，场景配额 60 次/60 秒瞬间打满。旧实现把限流异常
+    与真失败一视同仁，一律写 identify_status="failed" 且 identify_note
+    存限流文案——结果 1656 个资源被永久标成「识别失败」，此后再无重试机会。
+
+    判据：identify_status='failed' **且** identify_note 含限流特征
+    （文案来自 TMDB 限流异常）。真失败（无候选 / 404 / 其它异常）不动。
+    回滚为 rate_limited（待重试），下一轮识别会自动重选它们。
+    """
+    from .models import AppConfig, Resource, utcnow
+
+    marker_key = "identify_rate_limit_recover_v219"
+    if db.get(AppConfig, marker_key):
+        return 0
+    marks = ("已被限流", "调用过于频繁", "rate limit", "too many requests")
+    rows = db.query(Resource).filter(Resource.identify_status == "failed").all()
+    changed = 0
+    for r in rows:
+        note = str(r.identify_note or "").lower()
+        if not any(m.lower() in note for m in marks):
+            continue
+        r.identify_status = "rate_limited"
+        r.identify_note = "限流导致的失败已作废，等待重新识别"
+        r.updated_at = utcnow()
+        changed += 1
+    db.add(AppConfig(key=marker_key, value_enc=str(changed), updated_at=utcnow()))
+    db.commit()
+    return changed
+
+
 def migrate() -> None:
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
@@ -494,6 +527,8 @@ def migrate() -> None:
         # 运行期 mirror.is_pruned_dir_error() 已能识别旧文案，落盘补标记只为口径一致。
         _backfill_pruned_dirs(db)
         _mark_legacy_rename_skipped(db)
+        # v2.1.9：限流误标的识别失败回滚为「待重试」，让它们能被重新识别。
+        _recover_rate_limited_identify(db)
 
         tpl = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").first()
         # v0.9.6：去重——历史上「一键恢复默认模板」在并发 / 空表时可能写入多条同名

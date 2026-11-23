@@ -74,6 +74,22 @@ class TmdbRateLimited(RuntimeError):
     """场景限流触发：调用过于频繁，本次请求未发出。"""
 
 
+# v2.1.9：识别限流是**可恢复的瞬时状态**，不是「这个资源识别不出来」。
+# 此前 main.py 的识别循环用 `except Exception` 把限流和真失败一视同仁，
+# 一律写死 identify_status="failed" —— 真机后果是 1656 个资源被永久标成
+# 「识别失败」，identify_note 100% 是限流文案，后续再也不会被重试。
+# 判别口径：异常类型是 TmdbRateLimited，或文案含限流特征。
+_RATE_LIMIT_TEXT_MARKS = ("已被限流", "调用过于频繁", "rate limit", "too many requests")
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """判断一个异常是否为 TMDB 限流（类型优先，文案兜底）。"""
+    if isinstance(exc, TmdbRateLimited):
+        return True
+    msg = str(exc or "").lower()
+    return any(mark.lower() in msg for mark in _RATE_LIMIT_TEXT_MARKS)
+
+
 class TmdbNotFound(RuntimeError):
     """TMDB 明确返回 404：该 ID 在**这个类型命名空间**里不存在。
 
@@ -131,6 +147,32 @@ def check_rate_limit(db: Session, scenario: str = SCAN) -> bool:
         calls.append(now)
         st["last"] = now
         return True
+
+
+def rate_limit_wait_seconds(db: Session, scenario: str = SCAN) -> float:
+    """当前配额下还要等多久才可能放行下一次调用（0 = 现在就能发）。
+
+    v2.1.9：批量识别需要「分帧排队」——先算出还差多少配额/时间，
+    由调用方决定是等待还是中止本轮，而不是直接撞限流然后把整批写成失败。
+
+    返回值取两个约束里较严的一个：
+      - 滑动窗口内调用数已达上限 → 等到最早的调用滑出窗口；
+      - 最小调用间隔未到 → 等到间隔满足。
+    """
+    interval, max_calls, window = _rate_cfg(db, scenario)
+    now = time.monotonic()
+    with _RATE_LOCK:
+        st = _RATE_STATE.setdefault(scenario, {"last": 0.0, "calls": deque()})
+        calls: deque = st["calls"]
+        while calls and now - calls[0] > window:
+            calls.popleft()
+        wait = 0.0
+        if len(calls) >= max_calls:
+            # 最早的那次调用滑出窗口后才会腾出配额
+            wait = max(wait, (calls[0] + window) - now)
+        if interval > 0 and st["last"]:
+            wait = max(wait, (st["last"] + interval) - now)
+        return max(0.0, wait)
 
 
 def _looks_v4(value: str) -> bool:

@@ -241,19 +241,54 @@ def _upgrade_hour_windows(db: Session, version_id: int) -> bool:
       夜间 0-8 点没有任何窗口命中 → _current_hour_allowed 返回 False →
       plan_engine 整轮空转，「偏好低的分类排在夜间」在真机上永远推不出去。
 
-    升级条件（保守，避免覆盖用户配置）：
-      ① 现有窗口全部是「未绑定分类的整点模板」（category_key 为空、段长 1 小时）；
-      ② 或根本没有任何窗口（新建版本）。
-    只要用户绑定过分类或改过段长/配额，就保持原样，由页面「恢复默认模板」处理。
+    v2.1.9 真机取证（线上库只有**一行** 8-24、段长 16 小时）：
+      旧判定要求「段长 == 1 小时」，而线上库是一行 8-24 → pristine=False →
+      **永远不迁移**，0-8 点全天封死。铁证：当日 push_sent 只有 3 条，
+      时间全是 UTC 00:00-00:01（= 北京 08:00-08:01）——8 点才开工，8 点前零产出。
+
+    v2.1.9 修正：不再用「段长 == 1 小时」判 pristine，改为**按形态判定**——
+      ① 所有行都未绑定分类（category_key 空）且配额为 0（用户没手工配过）；
+      ② 每一行的 (start_hour, end_hour) 都命中**系统曾分配过的形态**：
+         v2.1.1 的 16 段整点模板（段长 1 小时）+ v2.1.2 之后的
+         SYSTEM_ASSIGNED_WINDOWS（12 段高峰 / (8,24) / (0,8) / 全天窗口）；
+      ③ 现有窗口**没覆盖满 0-24**（已覆盖满则已是目标形态，无需迁移）。
+    命中上述即视为「系统旧模板」→ 重建为 12 段 0-24 模板。
+    用户手工绑定过分类或改过配额的行保持原样，由页面「恢复默认模板」处理。
+
+    v2.1.9 修正二（v2.1.9 全量门禁抓到的真实回归）：形态判定**不能只认
+    SYSTEM_ASSIGNED_WINDOWS**——v2.1.1 的 16 段整点模板每段都是 (h, h+1)，
+    不在那个集合里，于是老库模板被误判成「用户手工配过」→ 永不迁移。
+    与 v2.1.1 的旧判定保持一致：段长 1 小时同样算系统形态。
     """
     rows = list(db.scalars(select(SCHourWindow).where(
         SCHourWindow.plan_version_id == version_id)).all())
     if rows:
+        def _is_system_shape(r) -> bool:
+            s, e = int(r.start_hour or 0), int(r.end_hour or 0)
+            # v2.1.1 的 16 段整点模板（段长 1 小时）
+            if e - s == 1:
+                return True
+            # v2.1.2 之后的系统形态全集
+            return (s, e) in SYSTEM_ASSIGNED_WINDOWS
+
         pristine = all((not str(r.category_key or "").strip())
                         and int(r.quota or 0) == 0
-                        and int(r.end_hour or 0) - int(r.start_hour or 0) == 1
+                        and _is_system_shape(r)
                         for r in rows)
         if not pristine:
+            return False
+        # 已铺满 0-24 且是目标粒度 → 无需迁移（幂等，避免每次启动重写）。
+        covered = set()
+        for r in rows:
+            s, e = int(r.start_hour or 0), int(r.end_hour or 0)
+            if e > s:
+                covered.update(range(s, e))
+            else:
+                covered.update(range(s, 24))
+                covered.update(range(0, e))
+        if covered >= set(range(24)) and all(
+                int(r.end_hour or 0) - int(r.start_hour or 0) == HOUR_SEGMENT_HOURS
+                for r in rows):
             return False
         for r in rows:
             db.delete(r)
@@ -264,6 +299,55 @@ def _upgrade_hour_windows(db: Session, version_id: int) -> bool:
                             quota=0, enabled=True))
     db.flush()
     return True
+
+
+def _migrate_category_windows(db: Session, version_id: int) -> int:
+    """按当前偏好分配**重排已存在的分类排期行的时段归属**（v2.1.9）。
+
+    背景（真机 2026-11-22）：线上库的 27 行分类排期是按 v2.1.6 的
+    「溢出分类只复用夜间段」口径落的——19 个分类被塞进 0-8 点，
+    而全局总闸一旦封死 0-8，这 19 个分类（恐怖/科幻/悬疑/犯罪等）
+    **配置上彻底死掉、永不出货**；12-16 黄金段只有 2 个分类覆盖。
+
+    修法：溢出池改为全部可用段（见 _assign_category_windows），
+    本函数负责把**存量行**的时段刷成新口径。
+
+    与 _ensure_schedules 的分工（关键，别混用）：
+      - _ensure_schedules：**补齐 + 回填**语义，会为不存在的分类**新建**行，
+        并回填默认上限。仅在用户进「发布规则页」或点「一键恢复默认」时调用。
+      - _migrate_category_windows（本作）：**只重排已存在的行**的时段，
+        不新建行、不改上限、不动用户手工行。挂在 ensure_defaults 上，
+        让存量库自动收敛。
+
+    闸门（与 _ensure_schedules 同口径）：
+      - window_auto=False → 用户手工设定过，一律不动；
+      - 时段形态不在 SYSTEM_ASSIGNED_WINDOWS 内 → 用户手工时段，一律不动。
+    """
+    rows = list(db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version_id)).all())
+    if not rows:
+        return 0
+    windows = _preference_windows(db, _quiet_window(_cycle_plan_of(db, version_id)))
+    if not windows:
+        # 偏好读不到（分类字典尚未种下）→ 不动，避免把时段刷成 (0,24) 全天窗口。
+        return 0
+    changed = 0
+    for row in rows:
+        if not bool(row.window_auto):
+            continue  # 用户手工设定过
+        if not _is_system_managed_schedule(row):
+            continue  # 用户手工时段（形态不在系统窗口集合内）
+        win = windows.get(row.category_key)
+        if not win:
+            continue
+        ws, we = win
+        if (int(row.window_start or 0) != ws or int(row.window_end or 0) != we):
+            row.window_start, row.window_end = ws, we
+            row.updated_at = utcnow()
+            changed += 1
+    if changed:
+        db.flush()
+    return changed
 
 
 def ensure_defaults(db: Session) -> None:
@@ -332,6 +416,30 @@ def ensure_defaults(db: Session) -> None:
             changed = True
     if changed:
         db.commit()
+    # v2.1.9：分类排期同步刷新——存量行按新分配口径重排。
+    # 此前 _ensure_schedules 只在用户进「发布规则页」或点按钮时才跑，
+    # 导致线上库的存量排期**永远不会自动迁移**：
+    # 真机上 19 个分类被塞进 0-8 点（全局总闸封死 0-8 时彻底死掉）、
+    # 12-16 黄金段只有 2 个分类覆盖。这里挂到 ensure_defaults（每轮调度都跑）
+    # 上，升级后自动收敛，无需用户手动点按钮。
+    #
+    # **必须放在分类字典种子之后**：_category_preference 从 SCCategory 读偏好，
+    # 字典还没种下时 windows 为空 → 全部退化成全天窗口 (0,24)，
+    # 反而把「每分类 2 小时颗粒度」的口径破坏掉。
+    #
+    # v2.1.9 修正（v2.1.9 全量门禁抓到的真实副作用）：
+    # 这里**不能**直接调 _ensure_schedules —— 那个函数是「补齐 + 回填」的语义，
+    # 会为**尚未存在**的分类**新建** 27 行启用排期（window_start/window_end
+    # 按偏好分配落成 2 小时段）。后果有两处：
+    #   ① 新库/测试库里 plan_engine 的分类过滤立刻按排期窗口筛，
+    #      每个分类只在自己那 2 小时里能产出 → 整轮 items 归零；
+    #   ② 端点侧再插同一 category_key 时撞 UNIQUE 约束。
+    # 排期行「存在与否」是用户侧语义（页面上能逐行编辑），
+    # 系统只负责**重排已存在行的时段归属**，不替用户造行。
+    try:
+        _migrate_category_windows(db, version.id)
+    except Exception:
+        db.rollback()
 
 
 # v2.0.4：默认排期模板。
@@ -486,6 +594,21 @@ def _assign_category_windows(
     又让长尾分类全天与热门分类抢同一批小时。
     修正：段用完后**冷门优先循环复用夜间段**（复用而非独占），
     语义仍是「冷门排夜间」，但每个分类拿到的都是实打实的 2 小时段。
+
+    v2.1.9 真机取证（线上库 27 个分类的实际分配）：
+      上述「溢出全进夜间」造成 **19 个分类挤在 0-8 点**（用户报 17 个，
+      量级一致），而白天 9 个段各只占 1 个分类。
+      致命后果：全局总闸一旦封死 0-8（老库窗口正是 8-24），
+      这 19 个分类（恐怖/科幻/悬疑/犯罪等）**配置上彻底死掉、永不出货**；
+      同时 12-16 等白天黄金段只有极少数分类能产出。
+
+    v2.1.9 修正三：**溢出分类不再全堆夜间，而是按段序循环复用全部可用段**。
+      - 优先保证「每个段至少有一个分类」——段池不空转；
+      - 热门分类仍拿白天段（用户口径「热门白天、冷门夜间」不变）；
+      - 溢出分类按段顺序轮转分配，白天段同样参与复用，
+        这样 0-8 不会堆积 19 个分类，12-16 也不会只有 2 个分类覆盖；
+      - 分类数少于段数时，多出来的段自然空着（不硬塞），
+        由用户后续新增分类或手工调整。
     """
     if not prefs:
         return {}
@@ -503,8 +626,10 @@ def _assign_category_windows(
     night = [seg for seg in segments if seg in night_set]
     # 热门先占白天段，其后占夜间段（夜间段序里 (22,24) 黄金深夜档排最前）。
     primary = day + night
-    # 溢出池：冷门优先复用夜间段；夜间段被静默吃光时退回白天段。
-    overflow_pool = night or day or segments
+    # v2.1.9 修正三：溢出池改为**全部可用段**（白天段同样参与复用）。
+    # 此前溢出池只有夜间 3 段 → 27 个分类里 19 个挤在 0-8 点，
+    # 而全局总闸封死 0-8 时这些分类彻底死掉、且 12-16 黄金段产出极稀。
+    overflow_pool = list(segments) or primary
     out: dict[str, tuple[int, int]] = {}
     for idx, item in enumerate(prefs):
         key = item["category_key"]

@@ -266,13 +266,19 @@ def test_preference_order_is_stable_and_reproducible(env):
 # ---------------------------------------------------------------------------
 
 def test_assign_peak_windows_by_preference(env):
-    """偏好排名靠前占**白天段**，排名靠后占**夜间段**，溢出冷门循环复用夜间段。
+    """偏好排名靠前占**白天段**，排名靠后占**夜间段**，溢出按段序循环复用可用段。
 
     v2.1.6：取代 v2.1.2 的「高峰独占段」口径——用户明确要求
     「热门分类排在白天，冷门分类排在夜间」。
 
-    v2.1.6 再修正：段用完**不再退化为全天窗口 0-24**（那不是 2 小时颗粒度），
-    改为冷门循环复用夜间段。
+    v2.1.6 再修正：段用完**不再退化为全天窗口 0-24**（那不是 2 小时颗粒度）。
+
+    v2.1.9 修正二（本条断言随之更新）：v2.1.6 把溢出部分**只**放进夜间 3 段，
+    真机上 19 个分类挤在 0-8 点——全局总闸一旦封死 0-8，这些分类彻底死掉；
+    12-16 黄金段只有 2 个分类覆盖。新口径：溢出分类按段序循环复用
+    **全部可用段**（白天段同样参与复用）。本断言守的真红线是
+    「不退化成全天窗口 + 每分类 2 小时颗粒度」，
+    「溢出必须落夜间」是实现副产品、正是本轮要修的病根，故不再断言。
     """
     from app import share_center_v2 as sc2
     S, _ = env
@@ -288,11 +294,15 @@ def test_assign_peak_windows_by_preference(env):
         for j in range(len(night)):
             key = f"k{len(day) + j}"
             assert windows[key] == night[j], f"{key} 应占夜间段 {night[j]}"
-        # 段用完：冷门循环复用夜间段，仍是 2 小时颗粒度（不退化成全天窗口）
+        # 段用完：溢出分类按段序循环复用可用段，仍是 2 小时颗粒度
         used = len(day) + len(night)
-        assert windows[f"k{used}"] == night[0]
-        assert windows[f"k{used + 1}"] == night[1]
+        all_segments = list(sc2.CATEGORY_WINDOW_SEGMENTS)
+        assert windows[f"k{used}"] == all_segments[0], "溢出分类按段序循环复用可用段"
+        assert windows[f"k{used + 1}"] == all_segments[1]
         assert windows[f"k{used}"] != sc2.FULL_DAY_WINDOW
+        for key, (ws, we) in windows.items():
+            assert we - ws == 2, f"{key} 必须是 2 小时颗粒度"
+            assert (ws, we) != sc2.FULL_DAY_WINDOW, f"{key} 不得退化成全天窗口"
 
 
 def test_peak_segment_order_is_fixed_default(env):

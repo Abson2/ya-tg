@@ -8,6 +8,7 @@
   - 打赏 UI 只有单一图片地址入口；README 含「支持」与赞赏码图。
 """
 import asyncio
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -150,6 +151,9 @@ def test_frontend_and_readme():
     assert "单独保存打赏" not in app
     readme = (root / "README.md").read_text(encoding="utf-8")
     assert "## 支持" in readme
-    assert "花了80大洋购买token" in readme
+    # 打赏金额会随作者续费而变（README 里的 80 → 270 就是这么来的），
+    # 这里断言的是「**有打赏说明且金额已填**」这个结构，不是钉死某个数字——
+    # 否则作者改一次金额就会把门禁打红，与功能无关。
+    assert re.search(r"花了\d+大洋购买token", readme), "README 缺少打赏说明或金额未填"
     assert "assets/reward-qr.jpg" in readme
     assert (root / "assets/reward-qr.jpg").exists()

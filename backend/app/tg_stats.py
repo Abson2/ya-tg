@@ -69,6 +69,9 @@ CFG_ENABLED = "tg_stats_enabled"
 CFG_LOOKBACK_HOURS = "tg_stats_lookback_hours"
 # 单轮采集的最大消息数（防接口风暴护栏）。
 CFG_MAX_PER_RUN = "tg_stats_max_per_run"
+# 定时采集间隔（小时）。阅读量是累计值，趋势必须靠**周期采集**才能形成，
+# 只靠手动点按钮永远只有一条数据点。0 表示关闭定时采集（仅手动）。
+CFG_COLLECT_INTERVAL_HOURS = "tg_stats_collect_interval_hours"
 # MTProto 接入点（默认官方；支持自建 DC / 反代）。
 CFG_API_BASE = "tg_api_base"
 
@@ -130,10 +133,21 @@ def _require_telethon():
 
 
 def _session_dir(db: Session) -> Path:
+    """会话文件所在目录（**只算路径，不建目录**）。
+
+    只读的状态查询（status → session_exists）不能有写盘副作用——
+    否则「看一眼状态」就会在服务器上凭空造出目录。
+    真正需要落盘的地方（登录 / 建客户端）显式调 _ensure_session_dir()。
+    """
     raw = runtime_config.get(db, CFG_SESSION_DIR) or os.environ.get("TG_SESSION_DIR") or ""
     if not raw:
         raw = "./data/tg_session"
-    path = Path(raw).expanduser()
+    return Path(raw).expanduser()
+
+
+def _ensure_session_dir(db: Session) -> Path:
+    """确保会话目录存在（登录 / 建客户端前调用）。"""
+    path = _session_dir(db)
     try:
         path.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -188,6 +202,7 @@ def status(db: Session) -> dict[str, Any]:
         "enabled": (runtime_config.get(db, CFG_ENABLED) or "false").lower() == "true",
         "lookback_hours": _int_cfg(db, CFG_LOOKBACK_HOURS, 72),
         "max_per_run": _int_cfg(db, CFG_MAX_PER_RUN, 200),
+        "interval_hours": _int_cfg(db, CFG_COLLECT_INTERVAL_HOURS, 0),
     }
     if not out["dependency_ready"]:
         out["reason"] = "未安装 telethon 依赖"
@@ -220,6 +235,8 @@ async def request_login_code(db: Session) -> dict[str, Any]:
     phone = (runtime_config.get(db, CFG_PHONE) or "").strip()
     if not phone:
         raise MTProtoUnavailable("未配置登录手机号")
+    # 登录要落 session 文件 → 这里才确保目录存在。
+    _ensure_session_dir(db)
     client = TelegramClient(
         str(_session_path(db)), api_id, api_hash,
         api_base=_api_base(db),
@@ -335,6 +352,8 @@ def _get_client(db: Session):
                 client = None
             else:
                 return client
+        # 建客户端要落 session 文件 → 这里才确保目录存在。
+        _ensure_session_dir(db)
         client = TelegramClient(key, api_id, api_hash, api_base=_api_base(db))
         _CLIENTS[key] = client
         return client

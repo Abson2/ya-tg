@@ -44,7 +44,6 @@ class MTProtoStop(RuntimeError):
     """连续失败达上限，停止本轮（内部信号，不对外暴露为异常）。"""
 
 
-
 def _sh_now() -> datetime:
     """当前时间（上海时区）。与 utils.as_utc() 口径保持一致地做比较。"""
     return datetime.now(timezone(timedelta(hours=8)))
@@ -235,12 +234,30 @@ async def collect_once(db: Session) -> dict[str, Any]:
         return result
 
 
-class MTProtoStop(RuntimeError):
-    """连续失败达上限，停止本轮（内部信号，不对外暴露为异常）。"""
+def collect_once_threaded(db: Session) -> dict[str, Any]:
+    """在**独立线程 + 独立事件循环**里跑一轮采集。
 
+    为什么必须隔离（六轮死锁教训）：采集过程中有同步的 `db.commit()`，
+    而 SQLite 只有单写者、`busy_timeout=30000`——一旦碰上写锁竞争，
+    这句同步 commit 会在**事件循环线程**里干等最长 30 秒，整个进程的所有
+    HTTP 请求都被冻住。所以采集绝不能在主事件循环里跑。
 
-class MTProtoStop(RuntimeError):
-    """连续失败达上限，停止本轮（内部信号，不对外暴露为异常）。"""
+    采集本身是 MTProto 异步调用，所以用 `asyncio.run()` 在工作线程里
+    起一个独立事件循环；Telethon 客户端的跨事件循环重建由
+    `tg_stats._get_client()` 自己处理（检测到 loop 变了就断开重建）。
+
+    `db` 由调用方提供（HTTP 请求级会话或后台 job 自建会话），
+    本函数只顺序使用它，不并发——与 FastAPI 把同步端点放进线程池的做法一致。
+    """
+    try:
+        return asyncio.run(collect_once(db))
+    except Exception as exc:  # pragma: no cover - 兜底（collect_once 自身已吞异常）
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "collected": 0, "skipped": 0, "scanned": 0,
+                "reason": "unexpected_error", "error": str(exc)[:300]}
 
 
 def _finish_run(db: Session, run: TelegramStatRun) -> None:
@@ -249,6 +266,29 @@ def _finish_run(db: Session, run: TelegramStatRun) -> None:
         db.commit()
     except Exception:
         pass
+
+
+def due_for_collect(db: Session, interval_hours: int) -> bool:
+    """定时采集是否**到点**了。
+
+    间隔配置可以在运行期由用户改，而 APScheduler 的固定 interval 是启动时
+    定死的——所以这里用「固定 tick 唤醒 + 查上次采集时间判断是否到点」的做法：
+    间隔改了下一轮就生效，重启后也不丢（上次时间在 DB 里，不在内存里）。
+
+    到点判定看最近一次采集记录的**开始时间**——采集失败也算「试过了」，
+    否则失败的间隔会一直重试，把接口打满。
+    """
+    interval_hours = int(interval_hours or 0)
+    if interval_hours <= 0:
+        return False
+    stmt = select(TelegramStatRun).order_by(TelegramStatRun.id.desc()).limit(1)
+    last = db.scalars(stmt).first()
+    if last is None:
+        return True
+    last_at = _as_utc(last.started_at or last.finished_at)
+    if last_at is None:
+        return True
+    return (utcnow() - last_at) >= timedelta(hours=interval_hours)
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +313,6 @@ def _delta_map(rows: list[TelegramMessageStat]) -> dict[tuple[int, str], dict[st
     阅读量是累计值，趋势必须由差值得到。首条快照没有前值 → 不计入增量。
     """
     latest: dict[tuple[int, str], TelegramMessageStat] = {}
-    prev: dict[tuple[int, str], TelegramMessageStat] = {}
     out: dict[tuple[int, str], dict[str, int]] = {}
     for row in rows:
         key = (row.queue_id, row.message_id)
@@ -285,7 +324,6 @@ def _delta_map(rows: list[TelegramMessageStat]) -> dict[tuple[int, str], dict[st
                 "reactions": max(0, int(row.reactions or 0) - int(p.reactions or 0)),
             }
         latest[key] = row
-        prev[key] = row
     return out
 
 
@@ -304,9 +342,12 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
     deltas = _delta_map(rows)
 
     # 按天分桶（上海时区）。
+    # **每行按自身快照时间归桶**——不能一律用「今天」：一次查询覆盖多天窗口，
+    # 若都归到今天，折线图的消息数维度会全部堆在最后一根柱子上，
+    # 而增量维度（下面按 collected_at 归桶）却分散在各天 → 两条口径对不上。
     buckets: dict[str, dict[str, int]] = {}
     for row in rows:
-        day = _sh_now().strftime("%Y-%m-%d")
+        day = _to_sh(row.collected_at).strftime("%Y-%m-%d")
         bucket = buckets.setdefault(day, {
             "views": 0, "forwards": 0, "reactions": 0, "messages": 0})
         bucket["messages"] += 1
@@ -334,6 +375,9 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
     # 登记为群时（配置串了 / 历史遗留），必须分列统计，**不能合并**，
     # 否则「群没有浏览量」的口径会被「频道有浏览量」污染。
     per_target: dict[tuple[str, str], dict[str, Any]] = {}
+    # 消息数按**去重后的消息**计，不按快照条数计——同一条消息每轮采集都会
+    # 再落一份快照，若直接累加快照行，「消息数」会随采集轮数线性虚高。
+    seen_msgs: set[tuple[str, str, str]] = set()
     for row in rows:
         kind = row.target_kind or "channel"
         key = (row.chat_id or "", kind)
@@ -346,7 +390,10 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
             "reactions_total": 0,
             "views_available": kind == "channel",
         })
-        item["messages"] += 1
+        msg_key = (row.chat_id or "", kind, row.message_id or "")
+        if msg_key not in seen_msgs:
+            seen_msgs.add(msg_key)
+            item["messages"] += 1
         item["forwards_total"] = max(item["forwards_total"], int(row.forwards or 0))
         item["reactions_total"] = max(item["reactions_total"], int(row.reactions or 0))
         if item["views_available"]:
@@ -402,16 +449,25 @@ def _to_sh(dt: datetime | None) -> datetime:
 
 
 def recent_items(db: Session, limit: int = 50) -> list[dict[str, Any]]:
-    """最近采集到的消息明细（每条消息取最新一条快照）。"""
+    """最近采集到的消息明细（每条消息取**最新一条快照**）。
+
+    同一条消息每轮采集都会再落一份快照，直接按时间倒序取 limit 条会把
+    同一条消息列出多次（消息少时尤其明显，整页都是同一条）。
+    这里先按消息去重只留最新快照，再排序截断。
+    """
     limit = max(1, min(200, int(limit or 50)))
     stmt = (
         select(TelegramMessageStat)
         .order_by(TelegramMessageStat.collected_at.desc())
-        .limit(limit)
     )
     rows = list(db.scalars(stmt).all())
     out = []
+    seen: set[tuple[int, str]] = set()
     for row in rows:
+        key = (row.queue_id, row.message_id)
+        if key in seen:
+            continue
+        seen.add(key)
         out.append({
             "target_name": row.target_name or "",
             "kind": row.target_kind or "channel",
@@ -423,6 +479,8 @@ def recent_items(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             "work_key": row.work_key or "",
             "collected_at": row.collected_at.isoformat() if row.collected_at else "",
         })
+        if len(out) >= limit:
+            break
     return out
 
 

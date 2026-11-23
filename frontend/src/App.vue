@@ -68,7 +68,7 @@ const scStatsRuns = ref([])
 const scStatsDays = ref(7)
 const scStatsLoading = ref(false)
 const scStatsCollecting = ref(false)
-const scStatsConfig = ref({ api_id: '', api_hash: '', phone: '', enabled: false, lookback_hours: 72, max_per_run: 200 })
+const scStatsConfig = ref({ api_id: '', api_hash: '', phone: '', enabled: false, lookback_hours: 72, max_per_run: 200, interval_hours: 0 })
 const scStatsLoginCode = ref('')
 const scStatsLoginCodeSent = ref(false)
 const scStatsSaving = ref(false)
@@ -884,8 +884,9 @@ const previewText = computed(() => {
 })
 
 function identifyLabel(s) {
+  // v2.1.9：新增 rate_limited（限流待重试）——限流是瞬时状态，不是识别失败。
   return { identified: '已识别', ambiguous: '匹配存疑', failed: '识别失败',
-           none: '无匹配', unidentified: '未识别' }[s] || s
+           none: '无匹配', unidentified: '未识别', rate_limited: '待重试' }[s] || s
 }
 function mediaLabel(t) { return t === 'tv' ? '剧集' : (t === 'movie' ? '电影' : '') }
 
@@ -1996,6 +1997,7 @@ async function loadScStats() {
         enabled: !!scStatsStatus.value.enabled,
         lookback_hours: Number(scStatsStatus.value.lookback_hours || 72),
         max_per_run: Number(scStatsStatus.value.max_per_run || 200),
+        interval_hours: Number(scStatsStatus.value.interval_hours || 0),
       }
     }
     if (tr.status === 'fulfilled') scStatsTrend.value = tr.value || scStatsTrend.value
@@ -2012,6 +2014,7 @@ async function saveScStatsConfig() {
       enabled: !!scStatsConfig.value.enabled,
       lookback_hours: Number(scStatsConfig.value.lookback_hours || 72),
       max_per_run: Number(scStatsConfig.value.max_per_run || 200),
+      interval_hours: Number(scStatsConfig.value.interval_hours || 0),
     }
     // 凭证只在**用户实际填写时**才提交；留空表示不修改。
     if (scStatsConfig.value.api_id) body.api_id = scStatsConfig.value.api_id
@@ -2704,7 +2707,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.7 · Asia/Shanghai</span>
+          <span>v2.1.9 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3502,7 +3505,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         </section>
 
         <section v-else-if="tab === '资源库'" class="fade">
-          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="asyncScanRunning" @click="scan">立即扫描</el-button><el-button size="small" :loading="asyncScanRunning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已分享" value="active"/><el-option label="未分享" value="not_created"/><el-option label="分享失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
+          <div class="page-head"><div><h2>资源库</h2><p>按作品聚合 · 整剧目录分享 · TMDB 识别 · 批量管理</p></div><div class="head-tools"><el-button size="small" type="primary" :loading="asyncScanRunning" @click="scan">立即扫描</el-button><el-button size="small" :loading="asyncScanRunning" @click="rescanLibrary">重新扫描库</el-button><el-button size="small" @click="showScanPanel=!showScanPanel">{{ showScanPanel ? '收起扫描计划' : '扫描计划' }}</el-button><el-button size="small" :loading="finishChecking" @click="loadFinishCheck">完结校验</el-button><el-button size="small" :loading="reidentifying" @click="reidentifyAll">按目录重识别</el-button><el-button size="small" type="danger" plain @click="clearLibrary">清空扫描结果</el-button><el-input v-model="keyword" placeholder="搜索作品名" clearable style="width:200px"><template #prefix><svg class="ico" viewBox="0 0 24 24"><path :d="icon('search')"/></svg></template></el-input><el-select v-model="statusFilter" placeholder="分享状态" clearable style="width:120px"><el-option label="已分享" value="active"/><el-option label="未分享" value="not_created"/><el-option label="分享失败" value="failed"/><el-option label="已取消" value="cancelled"/></el-select><el-select v-model="identifyFilter" placeholder="识别状态" clearable style="width:120px"><el-option label="已识别" value="identified"/><el-option label="匹配存疑" value="ambiguous"/><el-option label="识别失败" value="failed"/><el-option label="待重试" value="rate_limited"/><el-option label="无匹配" value="none"/><el-option label="未识别" value="unidentified"/></el-select></div></div>
 
           <!-- v0.7.0：一级状态栏（参考海报墙布局）：识别状态 + 媒体类型/完结追更 并列 -->
           <div class="status-tabs">
@@ -4157,6 +4160,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <span v-if="scStatsStatus.ready">采集通道已就绪</span>
                   <span v-else>{{ scStatsStatus.reason || '尚未配置采集通道' }}</span>
                   <span class="sc-state-hint">{{ scStatsStatus.capability?.group_note || '群聊不提供浏览量统计' }}</span>
+                  <span class="sc-state-hint">采集方式：{{ scStatsConfig.interval_hours > 0 ? ('每 ' + scStatsConfig.interval_hours + ' 小时自动采集一次') : '仅手动采集' }}</span>
                 </div>
 
                 <!-- 配置区：凭证 + 采集参数 + 登录 -->
@@ -4187,6 +4191,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <label>单轮上限</label>
                       <el-input-number v-model="scStatsConfig.max_per_run" :min="1" :max="2000" controls-position="right" style="width:130px"/><span class="unit">条</span>
                       <small>接口风暴护栏：单轮最多采集多少条消息。</small>
+                    </div>
+                    <div class="field">
+                      <label>自动采集间隔</label>
+                      <el-input-number v-model="scStatsConfig.interval_hours" :min="0" :max="168" controls-position="right" style="width:130px"/><span class="unit">小时</span>
+                      <small>设为 0 则只在你点「立即采集」时采集。阅读量是累计值，需要按间隔自动采集才能看出每日新增的趋势。</small>
                     </div>
                   </div>
                   <div class="sc-form-row" style="margin-top:12px">

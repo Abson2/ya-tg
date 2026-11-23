@@ -74,6 +74,8 @@ def api_stats_status(db: Session = Depends(get_db)):
         "enabled": bool(st.get("enabled")),
         "lookback_hours": int(st.get("lookback_hours") or 72),
         "max_per_run": int(st.get("max_per_run") or 200),
+        # 定时采集间隔（小时）。0 = 只手动采集。
+        "interval_hours": int(st.get("interval_hours") or 0),
         "reason": st.get("reason", ""),
         # 口径说明（前端据此提示用户）
         "capability": {
@@ -107,6 +109,14 @@ def api_stats_config(body: Payload, db: Session = Depends(get_db)):
         except (TypeError, ValueError):
             cap = 200
         updates[tg_stats.CFG_MAX_PER_RUN] = str(cap)
+    if "interval_hours" in data:
+        try:
+            # 0 = 关闭定时采集（仅手动）。上限 168 小时（7 天），
+            # 再长就失去「趋势」意义了。
+            hours = max(0, min(168, int(data["interval_hours"])))
+        except (TypeError, ValueError):
+            hours = 0
+        updates[tg_stats.CFG_COLLECT_INTERVAL_HOURS] = str(hours)
     if "api_id" in data:
         updates[tg_stats.CFG_API_ID] = str(data["api_id"] or "").strip()
     if "api_hash" in data:
@@ -124,6 +134,7 @@ def api_stats_config(body: Payload, db: Session = Depends(get_db)):
         "enabled": bool(st.get("enabled")),
         "lookback_hours": int(st.get("lookback_hours") or 72),
         "max_per_run": int(st.get("max_per_run") or 200),
+        "interval_hours": int(st.get("interval_hours") or 0),
     }
 
 
@@ -165,8 +176,12 @@ def api_stats_logout(db: Session = Depends(get_db)):
 
 @router.post("/stats/collect")
 async def api_stats_collect(db: Session = Depends(get_db)):
-    """手动触发一轮采集。"""
-    result = await tg_stats_service.collect_once(db)
+    """手动触发一轮采集。
+
+    采集过程有同步 `db.commit()`（SQLite 单写者 + busy_timeout 30s），
+    放进线程池执行，避免写锁竞争时把请求线程（乃至事件循环）卡住。
+    """
+    result = await asyncio.to_thread(tg_stats_service.collect_once_threaded, db)
     return {
         "ok": bool(result.get("ok")),
         "collected": int(result.get("collected") or 0),

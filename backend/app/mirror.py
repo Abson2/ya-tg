@@ -98,6 +98,42 @@ RENAME_RATE_LIMIT_MAX_RETRIES = 5          # 单文件内最多退避重试 5 �
 RENAME_RATE_LIMIT_BACKOFF_BASE = 1.0       # 退避基数秒
 RENAME_RATE_LIMIT_BACKOFF_CAP = 8.0        # 退避上限秒，防止单窗口阻塞过久
 RENAME_RATE_LIMIT_MARK = "@RATE_LIMIT_127@"  # 内层失败结果的限流标记，供主循环识别
+# v2.1.9：光鸭 code=127 限流同样适用于**复制**接口（copy_file 是写接口）。
+# 此前只有改名路径（_rename_one_with_backoff）做了指数退避重试，
+# 复制路径两处（strict 批量提交 / 常规批量复制）遇 127 直接写 failed —— 
+# 真机上一次批量复制触发 127，整批 50 个文件瞬间全标 failed 且**永不重试**。
+# 这里补齐同口径的退避重试。
+COPY_RATE_LIMIT_MAX_RETRIES = 5          # 单次 copy_file 最多退避重试 5 次（1/2/4/8/8）
+COPY_RATE_LIMIT_BACKOFF_BASE = 1.0       # 退避基数秒
+COPY_RATE_LIMIT_BACKOFF_CAP = 8.0        # 退避上限秒
+
+
+async def _copy_file_with_backoff(api: "GuangYaWebFiles", fids: list[str],
+                                  target_parent: str) -> tuple[str, str]:
+    """复制一批文件到目标目录，遇光鸭 code=127 限流则指数退避 + 自动重试。
+
+    v2.1.9：与改名路径（_rename_one_with_backoff）同口径。
+      - 仅对 127 限流重试（1/2/4/8/8 秒封顶），真实失败立即返回不重试；
+      - 纯网络，绝不碰 db；
+      - 返回 (task_id, err)：成功时 err 为空；失败时 task_id 为空、err 为原因。
+        限流重试耗尽时 err 带 RATE_LIMIT_MARK 标记，主循环据此区分
+        「限流待重试」与「真实失败」。
+    """
+    delay = COPY_RATE_LIMIT_BACKOFF_BASE
+    last_err = ""
+    for attempt in range(COPY_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            task_id = await api.copy_file(fids, target_parent)
+            return task_id, ""
+        except Exception as exc:
+            last_err = str(exc)[:300]
+            if not _is_rate_limit_error(exc) or attempt >= COPY_RATE_LIMIT_MAX_RETRIES:
+                if _is_rate_limit_error(exc):
+                    last_err = f"{RENAME_RATE_LIMIT_MARK}{last_err}"
+                return "", last_err
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, COPY_RATE_LIMIT_BACKOFF_CAP)
+    return "", f"{RENAME_RATE_LIMIT_MARK}{last_err or 'copy 限流重试耗尽'}"
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -264,6 +300,26 @@ def _discover_works(nodes: dict, root: str) -> list[tuple[dict, list[tuple[str, 
 def work_key_of(work: dict) -> str:
     """作品稳定键，与 sync_rule / MirrorMedia.work_key 同口径（供轮转游标持久化）。"""
     return "work:" + normalize_work_name(work.get("name") or "")
+
+
+def _works_with_pending_files(db: Session, rule_id: int) -> set[str]:
+    """查出「有文件待复制/待重试」的作品键集合。
+
+    v2.1.9：真机上 89 条 MirrorFile 卡在 pending（40 条「B库未找到已同步文件」
+    + 49 条整部电影），原因是这类作品要等轮转游标转到才有机会被处理，
+    而任何一轮异常中断都会让它们永远等下去。
+    本函数让这些作品**无条件**排进本轮处理队列。
+
+    口径：MirrorFile.status ∈ RETRYABLE_FILE_STATUS（pending/copying/failed/unknown）
+    的行，按其所属 MirrorMedia.work_key 归集。**只读，不改任何状态**。
+    """
+    rows = db.execute(
+        select(MirrorMedia.work_key)
+        .join(MirrorFile, MirrorFile.media_id == MirrorMedia.id)
+        .where(MirrorMedia.rule_id == rule_id,
+               MirrorFile.status.in_(sorted(RETRYABLE_FILE_STATUS)))
+    ).all()
+    return {str(k or "") for (k,) in rows if str(k or "").strip()}
 
 
 def plan_work_batch(works: list, max_works: int, cursor: str = "",
@@ -802,12 +858,16 @@ async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRul
             chunk_rows = [r for r, _f, _s in chunk]
             lead_task = chunk_tasks[0]
             fids = [fid for _row, fid, _s in chunk]
-            try:
-                task_id = await api.copy_file(fids, target_parent)
-            except Exception as exc:
-                msg = str(exc)[:300]
+            # v2.1.9：strict 路径同样补 127 限流退避重试（口径与常规批量复制一致）。
+            task_id, copy_err = await _copy_file_with_backoff(api, fids, target_parent)
+            if copy_err:
+                msg = copy_err
                 for row in chunk_rows:
-                    row.status, row.error = "failed", msg
+                    # 限流耗尽 → pending（待重试，下轮再来）；真失败 → failed。
+                    if RENAME_RATE_LIMIT_MARK in msg:
+                        row.status, row.error = "pending", msg
+                    else:
+                        row.status, row.error = "failed", msg
                 for t in chunk_tasks:
                     t.status, t.task_status, t.error = "failed", "failed", msg
                     t.finished_at = utcnow()
@@ -1130,6 +1190,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              "dirs_created": 0, "dirs_mapped": 0, "dirs_fallback": 0,
              "dir_errors": [], "missing_dirs": [], "file_errors": [],
              "idle_seconds": idle, "errors": [],
+             # v2.1.9：作品级异常被隔离跳过的计数（整轮仍正常跑完并落 last_run）
+             "work_errors": 0,
              # v0.9.8 #196：列目录开销诊断（慢在列目录而非全量复制）
              "walk_dirs": 0, "walk_list_calls": 0, "walk_a_files": 0}
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
@@ -1288,6 +1350,34 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             hard_max=max_media)
     else:
         batch, new_cursor, wrapped = works[:max_media], "", False
+    # v2.1.9：待重试作品优先——有 pending / failed 文件待复制的作品，
+    # 本轮**无条件**排进处理队列，不受 max_works_per_run 与轮转游标限制。
+    # 此前这类作品要等游标转到它才有机会被处理；一旦某一轮因异常中断
+    # （整轮带崩，last_run 不更新），它们就永远停在 pending，
+    # 真机上 89 条 MirrorFile 就是这样卡死的。
+    # 口径：优先作品**追加**到 priority_works 之后，不占用 max_works 部数预算
+    #（与 A 类缺集补丁批次同口径），避免挤掉正常轮转的作品。
+    #
+    # **必须排在 batch 切批之后**：本段要用 batch 的作品键做去重
+    #（同一轮里同一部作品绝不能被处理两次）。若写在切批之前，
+    # `batch` 尚未赋值 → UnboundLocalError → 整轮直接崩，
+    # 反而制造出本轮要修的「整轮停摆」症状。
+    try:
+        pending_work_keys = _works_with_pending_files(db, rule.id)
+    except Exception as exc:
+        logger.warning("[mirror] 待重试作品统计失败（不阻断同步）：%s", exc)
+        pending_work_keys = set()
+    if pending_work_keys:
+        seen_keys = {work_key_of(p[0]) for p in priority_works}
+        # 已进 priority_works 的不重复加入；batch 里的由后续去重逻辑处理
+        batch_keys = {work_key_of(p[0]) for p in batch}
+        retry_works = [p for p in works
+                       if work_key_of(p[0]) in pending_work_keys
+                       and work_key_of(p[0]) not in seen_keys
+                       and work_key_of(p[0]) not in batch_keys]
+        if retry_works:
+            priority_works = priority_works + retry_works
+            stats["retry_pending_works"] = len(retry_works)
     stats["batch_size"] = len(batch)
     stats["works_cursor"] = new_cursor
     stats["wrapped"] = wrapped
@@ -1295,319 +1385,342 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # 缺集补丁批次先于正常轮转执行；两者已去重（priority 从 works 抽出），
     # 同一部剧不会在一轮内被处理两次。
     for work, cats in priority_works + batch:
-        cat_path = "/".join(n for n, _ in cats) or "__root__"
-        title = standard_media_name(work["name"])
-        expected = star_media_name(title) if rule.star_naming else title
-        wkey = "work:" + normalize_work_name(work["name"])
-        if wkey == "work:":
-            stats["skipped"] += 1
-            continue
-
-        # 1:1 解析/创建 B 库分类目录（原名），再解析/创建影视主目录（带 ·）
-        target_dir_id = b_root
-        missing_all: list[dict] = []
-        for cat_name, cat_id in cats:
-            fid, miss, _actual = await _ensure_child(target_dir_id, cat_name,
-                                                    "category", cat_id, cat_path)
-            if miss:
-                missing_all.append(miss)
-                break
-            target_dir_id = fid
-        if not missing_all:
-            fid, miss, actual = await _ensure_child(target_dir_id, expected, "work",
-                                                    work["id"], cat_path)
-            if miss:
-                missing_all.append(miss)
-            else:
-                target_dir_id = fid
-                # v0.8.3：降级为不带标记名称时，展示与实际网盘目录保持一致
-                expected = actual
-
-        media = db.scalar(select(MirrorMedia).where(
-            MirrorMedia.rule_id == rule.id, MirrorMedia.work_key == wkey))
-        if not media:
-            media = MirrorMedia(rule_id=rule.id, work_key=wkey, title_standard=title,
-                                title_mirror=expected, source_dir_id=work["id"],
-                                target_dir_id=target_dir_id if not missing_all else "",
-                                category_path=cat_path)
-            db.add(media)
-            db.commit()
-        else:
-            media.title_standard = title
-            media.title_mirror = expected
-            media.source_dir_id = work["id"]
-            media.category_path = cat_path
-            if target_dir_id and not missing_all:
-                media.target_dir_id = target_dir_id
-        if missing_all or not media.target_dir_id:
-            media.status = "blocked"
-            stats["blocked"] += 1
-            stats["skipped"] += 1
-            stats["missing_dirs"].extend(missing_all)
-            db.commit()
-            continue
-
-        tm = _TMDB_TAG.search(work["name"])
-        tmdb_id = int(tm.group(1)) if tm else None
-        all_rows = list(db.scalars(
-            select(MirrorFile).where(MirrorFile.media_id == media.id)).all())
-        # v0.8.4 关键修复：只有 status=synced 才代表「文件确实到了 B 库」。
-        # 旧版把 copying / failed / unknown 也一起塞进 existing 判 unchanged，
-        # 上一轮复制没成功的文件会被永久跳过、再点同步也没用——
-        # 表现就是「B 库目录建好了、命名也对，里面却是空的」。
-        synced_rows = {(m.source_file_id, m.fingerprint): m
-                       for m in all_rows if m.status == "synced"}
-        synced_identities = {m.identity for m in all_rows if m.status == "synced"}
-        retry_rows = {(m.source_file_id, m.fingerprint): m
-                      for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
-        # v0.8.7 补上另一半：DB 标记 synced **也不等于** B 库真的有文件。
-        # 用户实测「B 库影视文件夹下为空目录」反复出现，根因是文件被删 /
-        # 换了 B 库目录 / 复制任务没落地后，记录仍停在 synced，永远判 unchanged。
-        # 每部作品先只读列一次 B 库，核对已同步记录是否真实存在。
-        if synced_rows or retry_rows:
-            candidates, b_verified = await _b_file_candidates(api, media)
-        else:
-            candidates, b_verified = {}, False
-        # 只在「列目录完整可信」时判定缺失；接口抖动 / 分页不全一律不动 synced。
-        b_file_count = len({v for k, v in candidates.items() if ":" in k})
-        if b_verified and synced_rows:
-            if b_file_count < len(synced_rows):
-                for key, row in list(synced_rows.items()):
-                    if _lookup_b_file(candidates, row):
-                        continue
-                    # 复用同一行重新复制，不新建行、不碰 A 库、不改任何目录名
-                    row.status, row.error = "pending", "B 库未找到已同步文件，自动重新复制"
-                    row.target_file_id = ""
-                    # v0.8.8：补复制回来的是 **A 库中文原名**，旧改名状态必须作废。
-                    # 否则 rename_mirror_files() 看到 rename_status=done 会整批跳过，
-                    # 表现就是用户反馈的「现在文件是有了，不过汉字名称没有翻译」。
-                    row.target_name = ""
-                    row.rename_status = ""
-                    row.rename_error = ""
-                    del synced_rows[key]
-                    retry_rows[key] = row
-                    stats["missing_in_b"] += 1
-                    stats["file_errors"].append(
-                        f"{title}/{row.file_name}：B 库未找到已同步文件，已重新入复制队列")
-            else:
-                # B 库文件数不少于已同步记录数：多半是网盘改名 / 重名加了后缀，
-                # 名字对不上而已。此时**绝不重置**，否则会重复复制整部作品。
-                for row in synced_rows.values():
-                    if not _lookup_b_file(candidates, row):
-                        stats["name_mismatch"] += 1
-        # 重试前先核对 B 库：任务其实已成功、只是轮询超时的，回填成 synced 后
-        # 不再重发复制，避免产生重复文件（需求禁止「先删旧再复制」）。
-        if retry_rows:
-            for key, old in list(retry_rows.items()):
-                # v0.8.6：改名后按 target_name 优先，A 原名 file_name 兜底
-                hit = _lookup_b_file(candidates, old)
-                if hit:
-                    old.target_file_id = hit
-                    old.status, old.error, old.task_id = "synced", "", old.task_id
-                    stats["unchanged"] += 1
-                    del retry_rows[key]
-                    synced_rows[key] = old
-            db.commit()
-        sub_cache: dict[str, str] = {}
-        copy_jobs: list[tuple[MirrorFile, str, str]] = []
-        # v2.1.4：本轮是否在 A 库发现了「指纹未命中的新文件」。
-        # 用于在作品级解除 english_source='ignored' 标记（见下方解除逻辑）。
-        has_new_source_file = False
-        for container, item in _media_files(work, nodes):
-            fid = str(item.get("fileId") or "")
-            fname = _dir_name(item)
-            if not fid or not _is_video(fname):
-                continue
-            fp = _fingerprint(item)
-            if (fid, fp) in synced_rows:
-                stats["unchanged"] += 1
-                continue
-            # v2.1.4：A 库出现了本轮的新内容（指纹未命中）——即便这部作品曾被
-            # 「清空待处理清单」标记为 ignored，也必须解除标记、重新解析英文名，
-            # 否则它会永远停留在「永不翻译」状态，新集数也永远改不成英文名。
-            has_new_source_file = True
-            row = retry_rows.pop((fid, fp), None)
-            if row is not None:
-                # 复用旧记录重新复制，不新建行：避免唯一键冲突与历史留痕膨胀
-                identity = row.identity
-                row.status, row.error, row.task_id = "copying", "", ""
-            else:
-                hint = parse_media_name(fname, container["path"])
-                mtype = str(hint.get("type_hint") or "")
-                if hint.get("season") or hint.get("episode") or hint.get("is_tv_hint"):
-                    mtype = "tv"
-                identity, confident = media_identity(
-                    tmdb_id, mtype, hint.get("season"), hint.get("episode"), fname)
-                if not confident and identity in synced_identities:
-                    stats["skipped"] += 1
-                    stats["errors"].append(f"{title}/{fname}：身份不明确，禁止自动替换")
-                    continue
-                for old in all_rows:
-                    if old.identity == identity and old.status == "synced":
-                        old.status = "superseded"
-                        stats["changed"] += 1
-            # 作品目录下的 Season/子目录在 B 库同名镜像（不加标记）
-            target_parent = media.target_dir_id
-            for sub_name in _relative_dir_names(container, work, nodes):
-                key = f"{target_parent}|{normalize_work_name(sub_name)}"
-                if key in sub_cache:
-                    target_parent = sub_cache[key]
-                    continue
-                sub_id, miss, _actual = await _ensure_child(target_parent, standard_media_name(sub_name),
-                                                            "season", container["id"], cat_path)
-                if miss:
-                    stats["missing_dirs"].append(miss)
-                    stats["blocked"] += 1
-                    target_parent = ""
-                    break
-                sub_cache[key] = sub_id
-                target_parent = sub_id
-            if not target_parent:
-                if row is not None:
-                    row.status, row.error = "failed", "B 库子目录未就绪，本次未发起复制"
-                    stats["file_errors"].append(f"{title}/{fname}：B 库子目录未就绪")
+        # v2.1.9：作品级异常隔离——单部作品处理失败（光鸭接口抖动、建目录失败、
+        # B 库核对异常等）**只跳过这一部**，绝不中断整轮同步。
+        # 此前整个循环体没有任何 try/except：任何一步抛异常都会让 sync_rule
+        # 直接抛出 → rule.last_run 永不更新（看起来像定时任务停摆）→
+        # 后续作品全部不处理 → 上一轮遗留的 pending 文件永远卡在队列里。
+        # 真机上 89 条 MirrorFile 卡在 pending、last_run 停在 9.5 小时前，
+        # 根因就是这一部作品把整轮带崩了。
+        try:
+            cat_path = "/".join(n for n, _ in cats) or "__root__"
+            title = standard_media_name(work["name"])
+            expected = star_media_name(title) if rule.star_naming else title
+            wkey = "work:" + normalize_work_name(work["name"])
+            if wkey == "work:":
                 stats["skipped"] += 1
                 continue
-            if row is None:
-                row = MirrorFile(media_id=media.id, rule_id=rule.id, identity=identity,
-                                 source_file_id=fid, target_file_id="", file_name=fname,
-                                 size=int(item.get("fileSize", 0) or 0),
-                                 utime=int(item.get("utime", 0) or 0),
-                                 fingerprint=fp, status="copying")
-                db.add(row)
-                db.commit()
-                stats["new"] += 1
-            else:
-                stats["retries"] += 1
-            copy_jobs.append((row, fid, target_parent))
 
-        # v2.1.4：本轮 A 库有新文件 → 解除该作品的 ignored 标记，恢复英文名解析。
-        #
-        # 根因（用户真机反馈）：「清空待处理清单」把英文名为空的作品批量置
-        # english_source='ignored'，而 _resolve_english_title 对 ignored 直接短路
-        # （force=False 时 return "", "ignored"），导致这些作品**永远不再翻译**——
-        # 即使 A 库后来又出了新集，改名链路也不会再启动，且 push_gate 的
-        # 「文件名已翻译为英文」门禁永远不通过 → 该作品再也进不了推送队列。
-        #
-        # 修法：ignored 的语义收敛为「**本轮没有新内容时**跳过解析」，
-        # 而不是「永久拉黑」。只要 A 库又出现新文件，就解除标记、重新解析。
-        # 用 Core UPDATE + 立即 commit（不污染 ORM 对象，避免 flush 时把读快照
-        # 升级为写事务——这正是 mirror.py 里反复出现 database is locked 的根因）。
-        if has_new_source_file and str(getattr(media, "english_source", "") or "") == "ignored":
-            try:
-                db.execute(update(MirrorMedia).where(MirrorMedia.id == media.id)
-                          .values(english_source=""))
-                db.commit()
-                media.english_source = ""
-                stats["unignored"] = int(stats.get("unignored", 0) or 0) + 1
-                logger.info("[mirror] 作品 %s 出现新文件，解除忽略标记、重新解析英文名",
-                            title)
-            except Exception as exc:
-                db.rollback()
-                logger.warning("[mirror] 解除忽略标记失败 media=%s：%s", media.id, exc)
-
-        if not copy_jobs:
-            # v0.8.4：还有未成功的文件记录时绝不标 synced，
-            # 否则界面显示「已同步」而 B 库其实是空目录。
-            pending_left = any(r.status != "synced" and r.status != "superseded"
-                               for r in all_rows)
-            media.status = "failed" if pending_left else "synced"
-            media.last_synced_at = utcnow()
-            stats["media"] += 1
-            db.commit()
-            continue
-
-        if strict:
-            # 阶段二路线B C3：严格顺序——逐文件「核验→提交→确认完成→下一个」
-            seq_cursor = await _copy_jobs_strict(
-                db, api, rule, media, title, copy_jobs, stats,
-                idle=idle, max_polls=max_polls, poll_interval=poll_interval,
-                batch_id=batch_id, seq_start=seq_cursor)
-            any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
-            any_unknown = any(r.task_id and r.status not in ("synced", "failed", "superseded")
-                              for r, _, _ in copy_jobs)
-            media.status = ("failed" if any_failed else
-                            "synced" if not any_unknown else "syncing")
-            media.last_synced_at = utcnow()
-            db.commit()
-            stats["media"] += 1
-            # 暂停/取消：批次边界立即停止推进后续作品
-            if stats.get("paused") or stats.get("cancelled"):
-                break
-        else:
-            # v1.2 需求①：先扫描文件树（_walk_source/_b_file_candidates 已完成），
-            # 以 B 库目标目录为「最大单元」分组批量复制：同一 parent 下待复制的
-            # 多文件合并成一次 copy_file(fids[], parent)，把「逐文件 N 次请求
-            # + N 次 idle」降为「按目录 M 次请求 + M 次 idle」(M<<N)，显著提速。
-            # 光鸭 copy_file 契约只支持「多文件→同一 parent」，不支持复制整个目录，
-            # 故目录骨架仍由上面的 _ensure_child 逐层建好、副本 ID 由 backfill 回填。
-            buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
-            for row, source_fid, target_parent in copy_jobs:
-                buckets.setdefault(target_parent, []).append((row, source_fid))
-            stats["copy_batches"] = len(buckets)
-            tasks: list[tuple[MirrorTask, list[MirrorFile]]] = []
-            batch_no = 0
-            for target_parent, members in buckets.items():
-                # 单目录文件数超上限再分片，避免单次请求体过大
-                for start in range(0, len(members), COPY_BATCH_SIZE):
-                    chunk = members[start:start + COPY_BATCH_SIZE]
-                    if batch_no:
-                        await asyncio.sleep(idle)
-                    _beat()  # v0.9.21：每批复制推进打点
-                    fids = [fid for _row, fid in chunk]
-                    try:
-                        task_id = await api.copy_file(fids, target_parent)
-                    except Exception as exc:
-                        msg = str(exc)[:300]
-                        stats["failed"] += len(chunk)
-                        for row, _fid in chunk:
-                            row.status, row.error = "failed", msg
-                        stats["errors"].append(
-                            f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
-                        stats["file_errors"].extend(
-                            f"{title}/{row.file_name}：{msg[:240]}" for row, _fid in chunk)
-                        logger.warning("[mirror] 批量 copy_file 失败 %s/%s 文件：%s",
-                                       title, len(chunk), msg)
-                        db.commit()
-                        batch_no += 1
-                        continue
-                    task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
-                                      status="running")
-                    db.add(task)
-                    db.commit()
-                    for row, _fid in chunk:
-                        row.task_id = task_id
-                    tasks.append((task, [row for row, _fid in chunk]))
-                    stats["tasks"] += 1
-                    batch_no += 1
-            await _poll_tasks_batch(api, tasks, max_polls=max_polls, interval=poll_interval)
-            for task, rows in tasks:
-                if task.status == "done":
-                    for r_ in rows:
-                        r_.status, r_.error = "synced", ""
-                    stats["done"] += 1
-                elif task.status == "failed":
-                    for r_ in rows:
-                        r_.status, r_.error = "failed", task.error
-                    stats["failed"] += 1
-                    msg = (f"{title}：复制任务 {task.task_id} 失败"
-                           f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
-                    stats["errors"].append(msg)
-                    stats["file_errors"].append(msg[:240])
+            # 1:1 解析/创建 B 库分类目录（原名），再解析/创建影视主目录（带 ·）
+            target_dir_id = b_root
+            missing_all: list[dict] = []
+            for cat_name, cat_id in cats:
+                fid, miss, _actual = await _ensure_child(target_dir_id, cat_name,
+                                                        "category", cat_id, cat_path)
+                if miss:
+                    missing_all.append(miss)
+                    break
+                target_dir_id = fid
+            if not missing_all:
+                fid, miss, actual = await _ensure_child(target_dir_id, expected, "work",
+                                                        work["id"], cat_path)
+                if miss:
+                    missing_all.append(miss)
                 else:
-                    stats["unknown"] += 1
-                    msg = (f"{title}：复制任务 {task.task_id} 未返回 status=2"
-                           f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
-                    stats["errors"].append(msg)
-                    stats["file_errors"].append(msg[:240])
-            any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
-            media.status = ("failed" if any_failed else
-                            "synced" if tasks and all(t.status == "done" for t, _ in tasks)
-                            else "syncing")
-            media.last_synced_at = utcnow()
-            db.commit()
-            stats["media"] += 1
+                    target_dir_id = fid
+                    # v0.8.3：降级为不带标记名称时，展示与实际网盘目录保持一致
+                    expected = actual
 
+            media = db.scalar(select(MirrorMedia).where(
+                MirrorMedia.rule_id == rule.id, MirrorMedia.work_key == wkey))
+            if not media:
+                media = MirrorMedia(rule_id=rule.id, work_key=wkey, title_standard=title,
+                                    title_mirror=expected, source_dir_id=work["id"],
+                                    target_dir_id=target_dir_id if not missing_all else "",
+                                    category_path=cat_path)
+                db.add(media)
+                db.commit()
+            else:
+                media.title_standard = title
+                media.title_mirror = expected
+                media.source_dir_id = work["id"]
+                media.category_path = cat_path
+                if target_dir_id and not missing_all:
+                    media.target_dir_id = target_dir_id
+            if missing_all or not media.target_dir_id:
+                media.status = "blocked"
+                stats["blocked"] += 1
+                stats["skipped"] += 1
+                stats["missing_dirs"].extend(missing_all)
+                db.commit()
+                continue
+
+            tm = _TMDB_TAG.search(work["name"])
+            tmdb_id = int(tm.group(1)) if tm else None
+            all_rows = list(db.scalars(
+                select(MirrorFile).where(MirrorFile.media_id == media.id)).all())
+            # v0.8.4 关键修复：只有 status=synced 才代表「文件确实到了 B 库」。
+            # 旧版把 copying / failed / unknown 也一起塞进 existing 判 unchanged，
+            # 上一轮复制没成功的文件会被永久跳过、再点同步也没用——
+            # 表现就是「B 库目录建好了、命名也对，里面却是空的」。
+            synced_rows = {(m.source_file_id, m.fingerprint): m
+                           for m in all_rows if m.status == "synced"}
+            synced_identities = {m.identity for m in all_rows if m.status == "synced"}
+            retry_rows = {(m.source_file_id, m.fingerprint): m
+                          for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
+            # v0.8.7 补上另一半：DB 标记 synced **也不等于** B 库真的有文件。
+            # 用户实测「B 库影视文件夹下为空目录」反复出现，根因是文件被删 /
+            # 换了 B 库目录 / 复制任务没落地后，记录仍停在 synced，永远判 unchanged。
+            # 每部作品先只读列一次 B 库，核对已同步记录是否真实存在。
+            if synced_rows or retry_rows:
+                candidates, b_verified = await _b_file_candidates(api, media)
+            else:
+                candidates, b_verified = {}, False
+            # 只在「列目录完整可信」时判定缺失；接口抖动 / 分页不全一律不动 synced。
+            b_file_count = len({v for k, v in candidates.items() if ":" in k})
+            if b_verified and synced_rows:
+                if b_file_count < len(synced_rows):
+                    for key, row in list(synced_rows.items()):
+                        if _lookup_b_file(candidates, row):
+                            continue
+                        # 复用同一行重新复制，不新建行、不碰 A 库、不改任何目录名
+                        row.status, row.error = "pending", "B 库未找到已同步文件，自动重新复制"
+                        row.target_file_id = ""
+                        # v0.8.8：补复制回来的是 **A 库中文原名**，旧改名状态必须作废。
+                        # 否则 rename_mirror_files() 看到 rename_status=done 会整批跳过，
+                        # 表现就是用户反馈的「现在文件是有了，不过汉字名称没有翻译」。
+                        row.target_name = ""
+                        row.rename_status = ""
+                        row.rename_error = ""
+                        del synced_rows[key]
+                        retry_rows[key] = row
+                        stats["missing_in_b"] += 1
+                        stats["file_errors"].append(
+                            f"{title}/{row.file_name}：B 库未找到已同步文件，已重新入复制队列")
+                else:
+                    # B 库文件数不少于已同步记录数：多半是网盘改名 / 重名加了后缀，
+                    # 名字对不上而已。此时**绝不重置**，否则会重复复制整部作品。
+                    for row in synced_rows.values():
+                        if not _lookup_b_file(candidates, row):
+                            stats["name_mismatch"] += 1
+            # 重试前先核对 B 库：任务其实已成功、只是轮询超时的，回填成 synced 后
+            # 不再重发复制，避免产生重复文件（需求禁止「先删旧再复制」）。
+            if retry_rows:
+                for key, old in list(retry_rows.items()):
+                    # v0.8.6：改名后按 target_name 优先，A 原名 file_name 兜底
+                    hit = _lookup_b_file(candidates, old)
+                    if hit:
+                        old.target_file_id = hit
+                        old.status, old.error, old.task_id = "synced", "", old.task_id
+                        stats["unchanged"] += 1
+                        del retry_rows[key]
+                        synced_rows[key] = old
+                db.commit()
+            sub_cache: dict[str, str] = {}
+            copy_jobs: list[tuple[MirrorFile, str, str]] = []
+            # v2.1.4：本轮是否在 A 库发现了「指纹未命中的新文件」。
+            # 用于在作品级解除 english_source='ignored' 标记（见下方解除逻辑）。
+            has_new_source_file = False
+            for container, item in _media_files(work, nodes):
+                fid = str(item.get("fileId") or "")
+                fname = _dir_name(item)
+                if not fid or not _is_video(fname):
+                    continue
+                fp = _fingerprint(item)
+                if (fid, fp) in synced_rows:
+                    stats["unchanged"] += 1
+                    continue
+                # v2.1.4：A 库出现了本轮的新内容（指纹未命中）——即便这部作品曾被
+                # 「清空待处理清单」标记为 ignored，也必须解除标记、重新解析英文名，
+                # 否则它会永远停留在「永不翻译」状态，新集数也永远改不成英文名。
+                has_new_source_file = True
+                row = retry_rows.pop((fid, fp), None)
+                if row is not None:
+                    # 复用旧记录重新复制，不新建行：避免唯一键冲突与历史留痕膨胀
+                    identity = row.identity
+                    row.status, row.error, row.task_id = "copying", "", ""
+                else:
+                    hint = parse_media_name(fname, container["path"])
+                    mtype = str(hint.get("type_hint") or "")
+                    if hint.get("season") or hint.get("episode") or hint.get("is_tv_hint"):
+                        mtype = "tv"
+                    identity, confident = media_identity(
+                        tmdb_id, mtype, hint.get("season"), hint.get("episode"), fname)
+                    if not confident and identity in synced_identities:
+                        stats["skipped"] += 1
+                        stats["errors"].append(f"{title}/{fname}：身份不明确，禁止自动替换")
+                        continue
+                    for old in all_rows:
+                        if old.identity == identity and old.status == "synced":
+                            old.status = "superseded"
+                            stats["changed"] += 1
+                # 作品目录下的 Season/子目录在 B 库同名镜像（不加标记）
+                target_parent = media.target_dir_id
+                for sub_name in _relative_dir_names(container, work, nodes):
+                    key = f"{target_parent}|{normalize_work_name(sub_name)}"
+                    if key in sub_cache:
+                        target_parent = sub_cache[key]
+                        continue
+                    sub_id, miss, _actual = await _ensure_child(target_parent, standard_media_name(sub_name),
+                                                                "season", container["id"], cat_path)
+                    if miss:
+                        stats["missing_dirs"].append(miss)
+                        stats["blocked"] += 1
+                        target_parent = ""
+                        break
+                    sub_cache[key] = sub_id
+                    target_parent = sub_id
+                if not target_parent:
+                    if row is not None:
+                        row.status, row.error = "failed", "B 库子目录未就绪，本次未发起复制"
+                        stats["file_errors"].append(f"{title}/{fname}：B 库子目录未就绪")
+                    stats["skipped"] += 1
+                    continue
+                if row is None:
+                    row = MirrorFile(media_id=media.id, rule_id=rule.id, identity=identity,
+                                     source_file_id=fid, target_file_id="", file_name=fname,
+                                     size=int(item.get("fileSize", 0) or 0),
+                                     utime=int(item.get("utime", 0) or 0),
+                                     fingerprint=fp, status="copying")
+                    db.add(row)
+                    db.commit()
+                    stats["new"] += 1
+                else:
+                    stats["retries"] += 1
+                copy_jobs.append((row, fid, target_parent))
+
+            # v2.1.4：本轮 A 库有新文件 → 解除该作品的 ignored 标记，恢复英文名解析。
+            #
+            # 根因（用户真机反馈）：「清空待处理清单」把英文名为空的作品批量置
+            # english_source='ignored'，而 _resolve_english_title 对 ignored 直接短路
+            # （force=False 时 return "", "ignored"），导致这些作品**永远不再翻译**——
+            # 即使 A 库后来又出了新集，改名链路也不会再启动，且 push_gate 的
+            # 「文件名已翻译为英文」门禁永远不通过 → 该作品再也进不了推送队列。
+            #
+            # 修法：ignored 的语义收敛为「**本轮没有新内容时**跳过解析」，
+            # 而不是「永久拉黑」。只要 A 库又出现新文件，就解除标记、重新解析。
+            # 用 Core UPDATE + 立即 commit（不污染 ORM 对象，避免 flush 时把读快照
+            # 升级为写事务——这正是 mirror.py 里反复出现 database is locked 的根因）。
+            if has_new_source_file and str(getattr(media, "english_source", "") or "") == "ignored":
+                try:
+                    db.execute(update(MirrorMedia).where(MirrorMedia.id == media.id)
+                              .values(english_source=""))
+                    db.commit()
+                    media.english_source = ""
+                    stats["unignored"] = int(stats.get("unignored", 0) or 0) + 1
+                    logger.info("[mirror] 作品 %s 出现新文件，解除忽略标记、重新解析英文名",
+                                title)
+                except Exception as exc:
+                    db.rollback()
+                    logger.warning("[mirror] 解除忽略标记失败 media=%s：%s", media.id, exc)
+
+            if not copy_jobs:
+                # v0.8.4：还有未成功的文件记录时绝不标 synced，
+                # 否则界面显示「已同步」而 B 库其实是空目录。
+                pending_left = any(r.status != "synced" and r.status != "superseded"
+                                   for r in all_rows)
+                media.status = "failed" if pending_left else "synced"
+                media.last_synced_at = utcnow()
+                stats["media"] += 1
+                db.commit()
+                continue
+
+            if strict:
+                # 阶段二路线B C3：严格顺序——逐文件「核验→提交→确认完成→下一个」
+                seq_cursor = await _copy_jobs_strict(
+                    db, api, rule, media, title, copy_jobs, stats,
+                    idle=idle, max_polls=max_polls, poll_interval=poll_interval,
+                    batch_id=batch_id, seq_start=seq_cursor)
+                any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
+                any_unknown = any(r.task_id and r.status not in ("synced", "failed", "superseded")
+                                  for r, _, _ in copy_jobs)
+                media.status = ("failed" if any_failed else
+                                "synced" if not any_unknown else "syncing")
+                media.last_synced_at = utcnow()
+                db.commit()
+                stats["media"] += 1
+                # 暂停/取消：批次边界立即停止推进后续作品
+                if stats.get("paused") or stats.get("cancelled"):
+                    break
+            else:
+                # v1.2 需求①：先扫描文件树（_walk_source/_b_file_candidates 已完成），
+                # 以 B 库目标目录为「最大单元」分组批量复制：同一 parent 下待复制的
+                # 多文件合并成一次 copy_file(fids[], parent)，把「逐文件 N 次请求
+                # + N 次 idle」降为「按目录 M 次请求 + M 次 idle」(M<<N)，显著提速。
+                # 光鸭 copy_file 契约只支持「多文件→同一 parent」，不支持复制整个目录，
+                # 故目录骨架仍由上面的 _ensure_child 逐层建好、副本 ID 由 backfill 回填。
+                buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
+                for row, source_fid, target_parent in copy_jobs:
+                    buckets.setdefault(target_parent, []).append((row, source_fid))
+                stats["copy_batches"] = len(buckets)
+                tasks: list[tuple[MirrorTask, list[MirrorFile]]] = []
+                batch_no = 0
+                for target_parent, members in buckets.items():
+                    # 单目录文件数超上限再分片，避免单次请求体过大
+                    for start in range(0, len(members), COPY_BATCH_SIZE):
+                        chunk = members[start:start + COPY_BATCH_SIZE]
+                        if batch_no:
+                            await asyncio.sleep(idle)
+                        _beat()  # v0.9.21：每批复制推进打点
+                        fids = [fid for _row, fid in chunk]
+                        # v2.1.9：复制路径补 127 限流退避重试（此前直接 failed，整批永不重试）。
+                        task_id, copy_err = await _copy_file_with_backoff(api, fids, target_parent)
+                        if copy_err:
+                            msg = copy_err
+                            stats["failed"] += len(chunk)
+                            for row, _fid in chunk:
+                                # v2.1.9：限流耗尽的行标记为 pending（待重试），不是 failed ——
+                                # 限流是瞬时状态，下一轮有额度就该再试；真失败才写 failed。
+                                if RENAME_RATE_LIMIT_MARK in msg:
+                                    row.status, row.error = "pending", msg
+                                else:
+                                    row.status, row.error = "failed", msg
+                            stats["errors"].append(
+                                f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
+                            stats["file_errors"].extend(
+                                f"{title}/{row.file_name}：{msg[:240]}" for row, _fid in chunk)
+                            logger.warning("[mirror] 批量 copy_file 失败 %s/%s 文件：%s",
+                                           title, len(chunk), msg)
+                            db.commit()
+                            batch_no += 1
+                            continue
+                        task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
+                                          status="running")
+                        db.add(task)
+                        db.commit()
+                        for row, _fid in chunk:
+                            row.task_id = task_id
+                        tasks.append((task, [row for row, _fid in chunk]))
+                        stats["tasks"] += 1
+                        batch_no += 1
+                await _poll_tasks_batch(api, tasks, max_polls=max_polls, interval=poll_interval)
+                for task, rows in tasks:
+                    if task.status == "done":
+                        for r_ in rows:
+                            r_.status, r_.error = "synced", ""
+                        stats["done"] += 1
+                    elif task.status == "failed":
+                        for r_ in rows:
+                            r_.status, r_.error = "failed", task.error
+                        stats["failed"] += 1
+                        msg = (f"{title}：复制任务 {task.task_id} 失败"
+                               f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
+                        stats["errors"].append(msg)
+                        stats["file_errors"].append(msg[:240])
+                    else:
+                        stats["unknown"] += 1
+                        msg = (f"{title}：复制任务 {task.task_id} 未返回 status=2"
+                               f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
+                        stats["errors"].append(msg)
+                        stats["file_errors"].append(msg[:240])
+                any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
+                media.status = ("failed" if any_failed else
+                                "synced" if tasks and all(t.status == "done" for t, _ in tasks)
+                                else "syncing")
+                media.last_synced_at = utcnow()
+                db.commit()
+                stats["media"] += 1
+
+        except Exception as exc:
+            # 单部作品失败：记录后继续下一部，绝不让整轮停摆。
+            db.rollback()
+            title_ = standard_media_name(work.get("name") or "")
+            stats["errors"].append(f"{title_}：本轮处理异常已跳过：{str(exc)[:200]}")
+            stats["file_errors"].append(f"{title_}：{str(exc)[:240]}")
+            stats["work_errors"] = int(stats.get("work_errors") or 0) + 1
+            logger.warning("[mirror] 作品 %s 处理异常（已跳过，不中断整轮）：%s",
+                           title_, exc, exc_info=True)
+            continue
     # v0.9.0：轮转游标落库，下一次定时同步从本批最后一部之后接着做。
     # 仅在配置了单轮上限时写；0（不限量）时清空，避免升级后残留旧游标。
     if max_works > 0 and batch:
@@ -1628,6 +1741,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         f"跳过 {stats['skipped']} · B库缺失补复制 {stats['missing_in_b']} · "
         f"名称不符 {stats['name_mismatch']} · 建目录 {stats['dirs_created']} · "
         f"待建目录 {len(stats['missing_dirs'])} · 文件间隔 {idle}s")
+    # v2.1.9：作品级异常隔离的可见回显——让用户知道「有几部被跳过、为什么」，
+    # 而不是只看到一个笼统的「部分失败」。
+    if int(stats.get("work_errors") or 0) > 0:
+        rule.last_message += f" · 异常跳过 {stats['work_errors']} 部"
     # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
     rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
                           f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")
@@ -2820,10 +2937,19 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
             r.rename_error = ""
             try:
                 await asyncio.sleep(max(float(idle), MIN_FILE_IDLE_SECONDS))
-                task_id = await api.copy_file([str(r.source_file_id)], target_parent)
+                # v2.1.9：定向重试同样补 127 限流退避（单文件版）。
+                task_id, copy_err = await _copy_file_with_backoff(
+                    api, [str(r.source_file_id)], target_parent)
+                if copy_err:
+                    raise Exception(copy_err)
             except Exception as exc:
-                r.status = "failed"
-                r.error = f"[定向重试] copy_file 失败：{str(exc)[:200]}"
+                msg = str(exc)[:300]
+                # v2.1.9：限流耗尽 → pending（待重试），真失败 → failed。
+                if RENAME_RATE_LIMIT_MARK in msg:
+                    r.status = "pending"
+                else:
+                    r.status = "failed"
+                r.error = f"[定向重试] copy_file 失败：{msg[:200]}"
                 out["failed"] += 1
                 out["details"].append(f"{r.file_name}：{r.error}")
                 db.commit()

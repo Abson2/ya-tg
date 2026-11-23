@@ -16,9 +16,13 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/app ./app
 COPY --from=ui /ui/dist ./static
+# v2.1.8 #241：/app/data 存 Telegram 登录会话（等同账号凭据，只落本地）。
+# 主进程经 gosu 以 UID 10001 运行，而 /app 本身属主是 root——若不预先建好
+# 并 chown 这个目录，运行期 mkdir 会 PermissionError（且异常被吞掉 →
+# 登录功能静默失败）。这里显式建目录 + chown，compose 侧再挂卷持久化。
 RUN groupadd -g 10001 yatg && useradd -u 10001 -g yatg -M -s /bin/sh yatg \
-    && mkdir -p /app/db /app/logs \
-    && chown -R yatg:yatg /app/db /app/logs
+    && mkdir -p /app/db /app/logs /app/data \
+    && chown -R yatg:yatg /app/db /app/logs /app/data
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8787

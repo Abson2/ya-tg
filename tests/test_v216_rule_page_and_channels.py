@@ -274,25 +274,37 @@ def test_assign_category_windows_hot_day_cold_night():
 
 
 def test_assign_category_windows_overflow_keeps_two_hour_granularity():
-    """分类数 > 段数时，溢出分类**不得退化成全天窗口 0-24**。
+    """分类数 > 段数时，溢出分类**不得退化成全天窗口 0-24**，且不得挤在夜间。
 
     v2.1.6 真实缺陷：段用完后直接回退 FULL_DAY_WINDOW，
     27 个分类里 15 个的时段是「00:00–24:00」——既不是 2 小时颗粒度，
     又让长尾分类全天与热门分类抢同一批小时。
-    修正：冷门优先**循环复用夜间段**，每个分类拿到的都是 2 小时段。
+    修正：每个分类拿到的都是 2 小时段。
+
+    v2.1.9 修正二（本条断言随之更新）：v2.1.6 把溢出部分**只**放进夜间 3 段，
+    真机上 19 个分类挤在 0-8 点——全局总闸一旦封死 0-8，这 19 个分类
+    （恐怖/科幻/悬疑/犯罪等）配置上彻底死掉；12-16 黄金段只有 2 个分类覆盖。
+    新口径：溢出分类按段序**循环复用全部可用段**（白天段同样参与）。
+    本断言守的真正红线是「不退化成全天窗口 + 每分类 2 小时颗粒度」，
+    「溢出必须落夜间」是当时的实现副产品，正是本轮要修的病根，故不再断言。
     """
     from app import share_center_v2 as sc2
     prefs = [{"category_key": f"k{i}", "score": 100 - i} for i in range(27)]
     windows = sc2._assign_category_windows(prefs)
     assert len(windows) == 27
-    night = list(sc2.CATEGORY_NIGHT_SEGMENTS)
     for key, (ws, we) in windows.items():
         assert we - ws == 2, f"{key} 的时段必须是 2 小时颗粒度，不得退化成全天窗口"
         assert (ws, we) != sc2.FULL_DAY_WINDOW, f"{key} 不得退化成全天窗口"
-    # 溢出部分落在夜间段（冷门排夜间）
+    # v2.1.9：溢出部分不得再全部堆在 0-8（全局总闸封死 0-8 时这些分类彻底死掉）
     overflow_start = len(sc2.CATEGORY_DAY_SEGMENTS) + len(sc2.CATEGORY_NIGHT_SEGMENTS)
-    for i in range(overflow_start, 27):
-        assert windows[f"k{i}"] in night, f"溢出分类 k{i} 应落在夜间段"
+    overflow_night = sum(1 for i in range(overflow_start, 27)
+                         if windows[f"k{i}"][0] < 8)
+    assert overflow_night <= 8, \
+        f"溢出分类不得全堆在 0-8，实际 {overflow_night} 个"
+    # 12-16 黄金段必须有溢出分类覆盖（否则黄金档产出极稀）
+    golden = sum(1 for i in range(overflow_start, 27)
+                 if windows[f"k{i}"][0] < 16 and windows[f"k{i}"][1] > 12)
+    assert golden >= 3, f"12-16 黄金段应至少有 3 个溢出分类覆盖，实际 {golden}"
 
 
 def test_assign_category_windows_avoid_quiet():

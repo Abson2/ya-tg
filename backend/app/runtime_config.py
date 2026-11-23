@@ -206,6 +206,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 采集回溯窗口（小时）与单轮上限（防接口风暴护栏）
     "tg_stats_lookback_hours": ("tg_stats_lookback_hours", "72"),
     "tg_stats_max_per_run": ("tg_stats_max_per_run", "200"),
+    # 定时采集间隔（小时）。阅读量是累计值，趋势必须靠周期采集才能形成，
+    # 只靠手动点按钮永远只有一个数据点。0 = 关闭定时采集（仅手动触发）。
+    "tg_stats_collect_interval_hours": ("tg_stats_collect_interval_hours", "0"),
     # MTProto 接入点（默认官方；支持自建 DC）
     "tg_api_base": ("tg_api_base", ""),
 }

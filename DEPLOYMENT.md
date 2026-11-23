@@ -13,7 +13,7 @@ docker compose up -d
 
 - 镜像：`abson2/ya-tg:${IMAGE_TAG:-latest}`
 - 端口：`${WEB_BIND:-0.0.0.0}:${WEB_PORT:-8787}:8787`
-- 卷：`./db:/app/db`（数据库）、`./logs:/app/logs`（日志）
+- 卷：`./db:/app/db`（数据库）、`./logs:/app/logs`（日志）、`./data:/app/data`（Telegram 登录会话，v2.1.8 起）
 - 时区：`Asia/Shanghai`；数据库：`sqlite:////app/db/ya-tg.db`
 - 健康检查：`/api/health`，30s 间隔 / 3 次失败
 - 日志限额：`json-file` 10m × 3
@@ -31,15 +31,20 @@ docker compose up -d
 若升级后容器报数据库/日志目录权限错误（自定义 NAS 卷属主非 root）：
 
 ```bash
-mkdir -p ./db ./logs
-chown -R 10001:10001 ./db ./logs
+mkdir -p ./db ./logs ./data
+chown -R 10001:10001 ./db ./logs ./data
 docker compose restart
 ```
 
 entrypoint 已尝试自动 chown，多数场景无需手动；仅特殊权限环境执行上述命令。
 
+> `./data` 存 Telegram 登录会话（等同账号凭据）。目录不存在或属主不对时，
+> 运行期建目录会 `PermissionError` 且错误被吞掉——表现为「阅读量」页永远显示
+> 「未就绪」而没有任何提示。其它功能不受影响。
+
 ## 4. 升级步骤（从 v0.9.20 / v0.9.21 源码验证版）
-1. **备份**当前 `./db` 与 `./logs`（见 ROLLBACK.md）。
+1. **备份**当前 `./db` 与 `./logs`（见 ROLLBACK.md）；`./data` 存登录会话凭据，
+   按需一并备份（不备份只是升级后要重新走一次验证码登录）。
 2. `.env` 设目标 `IMAGE_TAG=<本次发版版本>`（统一发版后填入实际版本号）。
 3. `docker compose pull && docker compose up -d`。
 4. 观察启动日志与 `/api/health`；确认 DB 迁移无报错。

@@ -23,8 +23,8 @@ from sqlalchemy.orm import Session
 
 from . import (admin_session, ai_assist, async_scan_state, bot_listener,
                contribution_restore, guangya_auth, guangya_sms, log_retention,
-               mirror, mirror_batch, runtime_config, share_center_v2, tg_stats_api,
-               tgto, tmdb)
+               mirror, mirror_batch, runtime_config, share_center_v2, tg_stats,
+               tg_stats_api, tg_stats_service, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
 from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
 from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
@@ -43,6 +43,13 @@ from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name
                     work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+
+# v2.1.9：批量识别时的 TMDB 限流「分帧排队」阈值（秒）。
+# 场景配额是 60 次/60 秒、最小间隔 0.2 秒。批量识别一轮最多 500 条，
+# 一次性全打出去必然在几十条后撞限流——此前撞上就把整批写成 failed。
+# 口径：等配额最多等 3 秒（够跨过最小间隔与窗口滑动），
+# 超过则**中止本轮**，剩余资源留到下一轮（下一轮自动重选待重试资源）。
+IDENTIFY_RATE_LIMIT_WAIT_MAX = 3.0
 
 
 class _TimedMirrorLock:
@@ -606,6 +613,93 @@ async def _job_sc_ai_weekly() -> None:
     await asyncio.to_thread(_run_sc_ai_weekly_in_thread)
 
 
+# ---------------------------------------------------------------------------
+# v2.1.8 #241：Telegram 阅读量定时采集
+#
+# 为什么必须有定时采集：阅读量是**累计值**，趋势必须由相邻快照求差得到。
+# 只靠页面上的手动按钮，趋势图永远只有一个数据点（首次采集没有前值 → 不计增量），
+# 「每日新增阅读」这类口径根本无法成立。所以这里按配置的间隔周期采集。
+# ---------------------------------------------------------------------------
+
+_tg_stats_lock = asyncio.Lock()
+
+# 定时采集的唤醒节奏（固定 tick）。
+# **间隔本身不写在这里**——用户在管理页改的间隔要能运行期生效，
+# 所以固定每 10 分钟醒一次，由 due_for_collect() 按「距上次采集多久」判断是否到点。
+_TG_STATS_TICK_SECONDS = 600
+
+
+def _tg_stats_collect_in_thread() -> dict:
+    """在**工作线程 + 线程内独立 Session** 里跑一轮采集。
+
+    Session 必须在**线程内**创建（对齐 `_bot_poll_in_thread` /
+    `_reap_stale_mirror_tasks_in_thread` / `_run_share_center_v2_cycle_in_thread`
+    的既有做法）：SQLAlchemy Session 不是线程安全对象，跨线程复用同一实例
+    是隐患；线程内自建会话则与「DB 密集 job 一律独立 Session」的红线一致。
+    """
+    with SessionLocal() as db:
+        try:
+            enabled = (runtime_config.get(db, tg_stats.CFG_ENABLED) or "").lower() == "true"
+            interval = 0
+            try:
+                interval = int(runtime_config.get(db, tg_stats.CFG_COLLECT_INTERVAL_HOURS) or 0)
+            except (TypeError, ValueError):
+                interval = 0
+            if not enabled:
+                return {"ok": False, "collected": 0, "skipped": 0, "scanned": 0,
+                        "reason": "disabled"}
+            if interval <= 0:
+                return {"ok": False, "collected": 0, "skipped": 0, "scanned": 0,
+                        "reason": "interval_disabled"}
+            if not tg_stats_service.due_for_collect(db, interval):
+                return {"ok": False, "collected": 0, "skipped": 0, "scanned": 0,
+                        "reason": "not_due"}
+            # 采集内部还有同步 db.commit()，而 SQLite 只有单写者 +
+            # busy_timeout=30000——写锁竞争时同步 commit 会在**事件循环线程**
+            # 里干等最长 30 秒，把整个进程冻住。所以再隔一层：采集本体
+            # 由 collect_once_threaded 在**它自己的线程 + 独立事件循环**里跑。
+            #
+            # 注意：这里**不能**提前 close 会话——collect_once_threaded 要用
+            # 它写快照与执行记录。close 交给 with 语句在函数返回时统一做。
+            return tg_stats_service.collect_once_threaded(db)
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning("[tg_stats] 定时采集异常", exc_info=True)
+            return {"ok": False, "collected": 0, "skipped": 0, "scanned": 0,
+                    "reason": "unexpected_error", "error": str(exc)[:300]}
+
+
+async def _job_tg_stats_collect() -> None:
+    """按间隔自动跑一轮阅读量采集。
+
+    - 采集过程有同步 `db.commit()`（SQLite 单写者 + busy_timeout 30s），
+      **必须**放到线程里跑，否则写锁竞争会把主事件循环冻住整整 30 秒
+      （六轮死锁教训）。collect_once_threaded() 在工作线程里起独立事件循环。
+    - 进程内非阻塞锁防重入：上一轮没跑完时直接跳过本轮（不排队、不并发）。
+    - 开关未开 / 间隔为 0 / 依赖缺失 / 未登录时直接跳过或由 collect_once 短路返回，
+      **不抛异常**。
+    - 任何异常都只记日志——**阅读量是辅助能力，绝不能拖累主链**。
+    """
+    if _tg_stats_lock.locked():
+        return
+    async with _tg_stats_lock:
+        result = await asyncio.to_thread(_tg_stats_collect_in_thread)
+    collected = int(result.get("collected") or 0)
+    skipped = int(result.get("skipped") or 0)
+    scanned = int(result.get("scanned") or 0)
+    reason = str(result.get("reason") or "")
+    if collected or skipped:
+        logger.info("[tg_stats] 定时采集完成：扫描 %s 条，采集 %s 条，跳过 %s 条%s",
+                    scanned, collected, skipped,
+                    f"（{reason}）" if reason else "")
+    elif reason and reason not in ("disabled", "interval_disabled", "not_due",
+                                   "dependency_missing"):
+        logger.info("[tg_stats] 定时采集未采集到数据（%s）", reason)
+
+
 async def _job_share_center() -> None:
     """分享中心调度入口：v2 新数据体系默认接管，旧链保留为降级路径。"""
     with SessionLocal() as db:
@@ -707,6 +801,11 @@ async def lifespan(app: FastAPI):
                       CronTrigger.from_crontab("30 3 * * 1", timezone="Asia/Shanghai"),
                       id="sc_ai_weekly", replace_existing=True,
                       max_instances=1, coalesce=True)
+    # v2.1.8 #241：阅读量定时采集。固定 tick 唤醒，实际是否采集由
+    # due_for_collect() 按管理页配置的间隔判断（间隔改了下一轮就生效）。
+    scheduler.add_job(_job_tg_stats_collect, "interval",
+                      seconds=_TG_STATS_TICK_SECONDS, id="tg_stats_collect",
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.start()
     yield
     # 阶段四 A-11：wait=True 等待正在执行的 job 收尾，避免容器停止时腰斩
@@ -721,17 +820,18 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.7", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.9", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
 # v2.1.7 #241：Telegram 阅读量采集与趋势报表。同样走管理会话鉴权。
+# v2.1.8 #241：阅读量报表口径修正 + 定时采集（详见 CHANGELOG）。
 app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.7", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.9", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2236,17 +2336,36 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     tmdb_id 回查 TMDB detail 补 status，否则角标永远不显示。
     """
     stats = {"identified": 0, "failed": 0, "queued": 0, "finish_backfilled": 0,
+             # v2.1.9：限流单独计数——限流是「待重试」不是「识别失败」，
+             # 单独暴露出来才能和真失败区分开（真机上二者曾混在一起）。
+             "rate_limited": 0,
              # v0.9.9 #201/#206：入队拦截诊断，逐条累积后供镜像管线与前端进度节点展示
              "enqueue_diag": {},
              # v0.9.10.2：本轮识别 / 入队的作品键集合（按 TMDB 去重），
              # 供进度看板显示「剧集 N 部 / 电影 M 部」而非集数。
              "identified_work_keys": set(), "queued_work_keys": set()}
     diag = stats["enqueue_diag"]
+    # v2.1.9：待识别集合加入 rate_limited（限流待重试）。
+    # 限流是瞬时状态，只要下一轮还有额度就该再试一次——写死 failed 等于永久放弃。
     pending = list(db.scalars(select(Resource).where(
-        Resource.identify_status.in_(["unidentified", "ambiguous", "failed", "none", ""])
+        Resource.identify_status.in_(
+            ["unidentified", "ambiguous", "failed", "none", "", "rate_limited"])
     ).order_by(Resource.id.desc()).limit(min(limit, 500))).all())
-    for x in pending:
+    for idx, x in enumerate(pending):
         try:
+            # v2.1.9：分帧排队——发请求前先看配额还差多少。
+            # 差得多就**中止本轮**（剩下的资源下一轮再识别），而不是继续撞限流
+            # 把整批资源全写成失败。真机上一次爆发式全量扫描正是这样
+            # 把上千个资源一次性标成 failed 的。
+            wait = tmdb.rate_limit_wait_seconds(db, tmdb.SCAN)
+            if wait > IDENTIFY_RATE_LIMIT_WAIT_MAX:
+                # 本轮剩余资源都还没发过请求，不算「限流失败」，
+                # 只记「本轮因配额不足提前结束」。
+                stats["rate_limited"] += len(pending) - idx
+                stats["rate_limit_deferred"] = len(pending) - idx
+                break
+            if wait > 0:
+                await asyncio.sleep(min(wait, IDENTIFY_RATE_LIMIT_WAIT_MAX))
             r = await identify_with_a_source_fallback(x.name, x, db)
             if r.get("ok") and r.get("best"):
                 _apply_identification(x, r["best"], source=r.get("source") or "tmdb",
@@ -2269,6 +2388,16 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
                 stats["failed"] += 1
         except Exception as exc:
             # TMDB 未配置/401/限流不得阻断扫描链路（项目既定降级约定）
+            # v2.1.9：**限流单独捕获**——标记为「待重试」而不是 failed。
+            # 真机上 1656 个资源因限流被永久写死 failed、后续再无重试机会，
+            # 根因就是这里把限流和真失败一视同仁。
+            if tmdb.is_rate_limited(exc):
+                x.identify_status = "rate_limited"
+                x.identify_note = str(exc)[:300]
+                stats["rate_limited"] += 1
+                # 限流说明本轮额度已尽，继续跑只会把后面所有资源也写成限流。
+                # 中止本轮，剩下的资源保持原状，下一轮（有额度时）自动重试。
+                break
             x.identify_status = "failed"
             x.identify_note = str(exc)[:300]
             stats["failed"] += 1
@@ -3855,8 +3984,9 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
     """
     stmt = select(Resource).order_by(Resource.id.desc()).limit(min(limit, 200))
     if not force:
+        # v2.1.9：加入 rate_limited（限流待重试）——限流是瞬时状态，下一轮该再试。
         stmt = stmt.where(Resource.identify_status.in_(
-            ["unidentified", "ambiguous", "failed", "none", ""]))
+            ["unidentified", "ambiguous", "failed", "none", "", "rate_limited"]))
     rows = list(db.scalars(stmt).all())
     done = pending = queued = 0
     for x in rows:
@@ -3873,6 +4003,12 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
                 x.identify_note = r["reason"]
                 pending += 1
         except Exception as exc:
+            # v2.1.9：限流单独标记为「待重试」，不写死 failed（口径同 _post_scan_identify）。
+            if tmdb.is_rate_limited(exc):
+                x.identify_status = "rate_limited"
+                x.identify_note = str(exc)[:500]
+                pending += 1
+                continue
             x.identify_status = "failed"
             x.identify_note = str(exc)[:500]
             pending += 1

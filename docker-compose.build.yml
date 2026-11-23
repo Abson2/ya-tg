@@ -16,6 +16,8 @@ services:
     volumes:
       - ./db:/app/db
       - ./logs:/app/logs
+      # v2.1.8 #241：Telegram 登录会话（等同账号凭据，只落本地磁盘）。
+      - ./data:/app/data
     # v0.8.3：容器 stdout 日志硬限额，避免 docker json-file 无限增长
     logging:
       driver: json-file
