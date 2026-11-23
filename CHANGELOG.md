@@ -53,6 +53,7 @@
 - **反证**：六条关键断言逐条做了反证——把代码改回缺陷版本（限流写死 failed / pristine 改回「段长==1 小时」/ 溢出池改回夜间 3 段 / copy_file 改回直调 / 撤掉作品循环 try-except / 待重试逻辑移回切批之前），确认对应用例**真的变红**，恢复后全绿——不是假绿门禁。其中「溢出池改回夜间 3 段」的反证精确复现了线上症状：**0-8 点分类数 19**（与真机一致）。
 - **修掉 v2.1.8 遗留的三处门禁假红**：①三个用例依赖 pytest 的 `tmp_path` fixture，沙箱下 pytest 在系统临时根建 `pytest-of-<user>` 目录与既有目录撞 EEXIST → PermissionError 直接 ERROR（与被测行为无关）——按项目内既有约定改用 `tempfile.mkdtemp(dir="/tmp")` 自建临时目录；②容器可写性用例用 `entry.split("chown")[1][:80]` 取片段，而**注释里**也出现 "chown" 字样 → 取到注释片段假红——改为按命令行判定；③版本断言同步到 v2.1.9。
 - **全量**：`1345 passed / 1 skipped / 0 failed`（修复前为 `1326 passed / 16 failed / 3 errors`）。
+- **发版实体**：commit `fe3987a`，tag `v2.1.9`，CI run `45099848758`（tag）+ `45099845700`（main）双绿，Release id `454918512`，源码包 asset `781218607`（`Ya-TG-2.1.9.zip`，1569957 字节，顶层 `ya-tg/`，230 文件）。**本版为合并发布**：v2.1.8 原定内容并入本版段内的 `### v2.1.8 原定内容` 子小节，Release body 与本地 `scripts/changelog_for_release.py` 生成结果**逐字节一致**（22427 字节）。
 - **版本号六处一致升级到 v2.1.9**（`main.py` 的 `app` version + health `version`、`App.vue` 页脚、`package.json`、`package-lock.json` 顶层两处、`README.md`；`require-directory@2.1.1` 第三方依赖未被误改），版本断言测试 `test_v141_rate_limit_backoff.py`（5 处）/ `test_v143_bot_poll_no_write_lock.py`（3 处）/ `test_v144_budget_drain_fix.py`（5 处）同步。
 
 ---
