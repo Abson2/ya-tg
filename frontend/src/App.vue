@@ -94,6 +94,8 @@ const scDetailVisible = ref(false), scDetailTask = ref(null), scDetailExecutions
 // v2.1.2：分享详情改隐藏式弹窗（点「详情」才弹出），清理按钮的 loading 态
 const scShareDetailVisible = ref(false)
 const scCleaningTasks = ref(false), scCleaningLinks = ref(false), scAdoptingAllAi = ref(false)
+// v2.1.15：重建首推（先预演再执行），处理「游标已越过历史快照」导致的永久卡死
+const scRebuildingFirst = ref(false)
 const scCatForm = ref({ category_key: '', name: '', media_type: '', priority: 0 })
 const scPlanVersionForm = ref({ plan_id: 1, config: '{}' })
 const scFilteredTasks = computed(() => {
@@ -2341,6 +2343,35 @@ async function scCleanupTasks() {
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
   finally { scCleaningTasks.value = false }
 }
+// v2.1.15：重建首推任务——修复「轮转游标已越过历史快照」导致的永久不出任务。
+// 先 dry_run 预演给真实数字（与后端同一条去重裁决，不是估算），确认后才执行；
+// 执行只把轮转游标归零重扫，不删历史行，已推送过的作品不会被重复推送。
+async function scRebuildFirst() {
+  try {
+    const pre = await api('/sc/plan/rebuild-first', { method: 'POST', body: JSON.stringify({ payload: { dry_run: true } }) })
+    if (!pre.ok) { ElMessage.warning(pre.reason || '预演失败'); return }
+    const can = (pre.would_create || 0) + (pre.would_revive || 0)
+    if (!can) {
+      ElMessage.info(`没有可重排的首推：${pre.works || 0} 部作品中，已推送过 ${pre.blocked_pushed || 0} 部、仍在处理中 ${pre.blocked_active || 0} 部。`)
+      return
+    }
+    let extra = ''
+    if (pre.hour_allowed === false) extra = '\n注意：当前时段不在任何排期窗口内，执行后要等到窗口生效才会建任务。'
+    else if (pre.hour_category) extra = `\n当前时段仅排「${pre.hour_category}」分类，其余分类到各自时段自动继续。`
+    await ElMessageBox.confirm(
+      `${pre.works || 0} 部作品 × ${pre.channels || 0} 个渠道中，可重排首推 ${can} 条（其中复用历史清单项 ${pre.would_revive || 0} 条）；` +
+      `已推送过而跳过 ${pre.blocked_pushed || 0} 条，仍在处理中而跳过 ${pre.blocked_active || 0} 条。\n` +
+      `执行后会把各分类的轮转位置归零并重新扫描历史作品，只归档不删除任何记录，已成功推送过的作品不会重复推送。${extra}`,
+      '重建首推任务', { type: 'warning', distinguishCancelAndClose: true })
+    scRebuildingFirst.value = true
+    const d = await api('/sc/plan/rebuild-first', { method: 'POST', body: JSON.stringify({ payload: { dry_run: false } }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '重建失败'); return }
+    const made = (d.plan?.tasks || 0)
+    ElMessage.success(`已重新扫描并生成 ${made} 个推送任务${made ? '' : '（当前时段未命中排期窗口，到点自动继续）'}`)
+    await loadSc()
+  } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
+  finally { scRebuildingFirst.value = false }
+}
 // v2.1.2：清理无效分享链接（归档，不删 B 库资源、不删远端分享）
 async function scCleanupLinks() {
   try {
@@ -2878,7 +2909,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.14 · Asia/Shanghai</span>
+          <span>v2.1.15 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4354,6 +4385,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-button size="small" :disabled="!scSelectedTasks.length" @click="scBatchTask('retry')">提交重试</el-button>
                   <el-button size="small" :disabled="!scSelectedTasks.length" @click="scBatchTask('cancel')">取消任务</el-button>
                   <el-button size="small" plain :loading="scCleaningTasks" @click="scCleanupTasks">清理无效任务</el-button>
+                  <!-- v2.1.15：重建首推（先预演再执行）。用于「轮转位置已越过历史作品」
+                       导致长期不出任务的场景；不删记录、不重复推送已推过的作品。 -->
+                  <el-button size="small" type="warning" plain :loading="scRebuildingFirst" @click="scRebuildFirst">重建首推任务</el-button>
                 </div>
                 <div v-if="!scTaskViewRows.length" class="empty">暂无发布任务（当前筛选条件下为空）</div>
               </div>

@@ -27,6 +27,7 @@ from .db import get_db
 from .guangya import GuangYaShareClient, create_share_parsed
 from .push_gate import evaluate_push_gate
 from .models import (
+    AuditLog,
     Channel,
     DiscoveredChat,
     QueueItem,
@@ -1094,11 +1095,60 @@ def _item_still_owns_first(db: Session, item: SCPushListItem) -> bool:
     return any(str(s or "") != CLEANED_TASK_STATUS for s in statuses)
 
 
-def _ever_published(db: Session, *, work_key: str, chat_id: str) -> bool:
-    """该作品在该渠道是否曾真正推送成功（`published`）。
+def _pushed_pairs_from_audit(db: Session) -> set[tuple[str, str]]:
+    """从历史推送审计还原「(作品, 渠道 chat_id) 已经推送过」集合。
 
-    「清理后重建首推」的防重复闸：清理只挑 `failed`/`cancelled`，理论上不会命中
-    `published`；这里仍显式挡一道，避免历史脏数据把已推过的作品再推一遍。
+    为什么不能只看 `SCPublishTask.status='published'`：分享中心 v2 自己推送成功会写
+    published，但**旧的推送队列**（publisher.py）成功时只写
+    `audit_logs(action='push_sent', detail={resource_id, channel_id, message_id})`。
+    真机库里有 233 条这类历史推送——只查 published 会漏掉它们，重建首推时就会把
+    早已推过的作品再推一遍（正是用户明确担心的重复首推）。
+
+    这里按 `resource_id → work_key`、`channel_id → chat_id` **精确归属**，
+    不做「一律当作推过」的粗判：同一作品推到别的渠道不算重复。
+    detail 解析不了或缺字段的行跳过（无法归属就不冒充结论），由调用方如实计数。
+    """
+    details = list(db.scalars(select(AuditLog.detail).where(
+        AuditLog.action == "push_sent")).all())
+    if not details:
+        return set()
+    parsed: list[tuple[int, int]] = []
+    for raw in details:
+        try:
+            d = json.loads(raw or "{}")
+        except Exception:
+            continue
+        rid, cid = d.get("resource_id"), d.get("channel_id")
+        if rid in (None, "") or cid in (None, ""):
+            continue
+        try:
+            parsed.append((int(rid), int(cid)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return set()
+    res_ids = {rid for rid, _ in parsed}
+    ch_ids = {cid for _, cid in parsed}
+    res_map = {r.id: utils.work_group_key(r)
+               for r in db.scalars(select(Resource).where(Resource.id.in_(res_ids))).all()}
+    ch_map = {c.id: str(c.chat_id or "")
+              for c in db.scalars(select(Channel).where(Channel.id.in_(ch_ids))).all()}
+    return {(res_map[rid], ch_map[cid]) for rid, cid in parsed
+            if rid in res_map and cid in ch_map}
+
+
+def _ever_published(db: Session, *, work_key: str, chat_id: str,
+                    pushed_pairs: set[tuple[str, str]] | None = None) -> bool:
+    """该作品在该渠道是否曾**真正推送成功**。
+
+    两个来源都要看（缺一不可）：
+      ① 分享中心 v2 自己的任务：`SCPublishTask.status == 'published'`；
+      ② 旧推送队列的历史：`audit_logs` 里的 `push_sent`（见 `_pushed_pairs_from_audit`）。
+
+    这是「清理后重建首推」的防重复闸：清理只挑 `failed`/`cancelled`，理论上不会
+    命中已推成功的；但历史数据里确实存在「任务被判失败、其实消息已送达」的情况，
+    所以两道都查，宁可少推也不重复推。
+    `pushed_pairs` 可由调用方预先算好传入，避免逐作品重复扫审计表。
     """
     row = db.scalar(
         select(SCPublishTask.id)
@@ -1107,11 +1157,17 @@ def _ever_published(db: Session, *, work_key: str, chat_id: str) -> bool:
         .where(SCPushListItem.chat_id == chat_id)
         .where(SCPublishTask.status == "published")
         .limit(1))
-    return row is not None
+    if row is not None:
+        return True
+    if pushed_pairs is None:
+        pushed_pairs = _pushed_pairs_from_audit(db)
+    return (work_key, chat_id) in pushed_pairs
 
 
 def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
-                     dedup: str) -> tuple[str, SCPushListItem | None]:
+                     dedup: str,
+                     pushed_pairs: set[tuple[str, str]] | None = None,
+                     ) -> tuple[str, SCPushListItem | None]:
     """首推去重决策。返回 `(action, 可复用的旧清单项)`。
 
       - `"skip"`   ：已有仍有效的首推，或该作品在此渠道曾真正推送成功 → 不建任务；
@@ -1134,7 +1190,8 @@ def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
         .order_by(SCPushListItem.id)).all())
     if any(_item_still_owns_first(db, c) for c in candidates):
         return "skip", None
-    if _ever_published(db, work_key=work_key, chat_id=chat_id):
+    if _ever_published(db, work_key=work_key, chat_id=chat_id,
+                       pushed_pairs=pushed_pairs):
         return "skip", None
     if candidates:
         # 优先复用「新格式 dedup」那一行，其次才是历史格式行
@@ -1170,6 +1227,8 @@ def plan_engine(db: Session) -> dict[str, int]:
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
     if not channels:
         return {"lists": 0, "items": 0, "tasks": 0}
+    # v2.1.15：历史推送审计只扫一次，供本轮所有作品复用（避免逐作品重复查表）。
+    pushed_pairs = _pushed_pairs_from_audit(db)
 
     categories = list(db.scalars(
         select(SCCategory).where(SCCategory.enabled.is_(True))
@@ -1289,7 +1348,8 @@ def plan_engine(db: Session) -> dict[str, int]:
                 # 两次都**不看任务状态**——已清理（cleaned）的旧首推项把名额永久占死，
                 # 新入库作品因此建不出任何推送任务（真机 227 个快照被挡）。
                 action, reuse = first_dedup_plan(
-                    db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup)
+                    db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup,
+                    pushed_pairs=pushed_pairs)
                 if action == "skip":
                     continue
                 if action == "revive" and reuse is not None:
@@ -3167,6 +3227,93 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
             it.status = CLEANED_TASK_STATUS
     db.commit()
     return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
+
+
+def reset_plan_cursors(db: Session, version_id: int) -> int:
+    """把该计划版本下所有分类轮转游标归零，让 plan_engine 重新扫一遍历史快照。
+
+    v2.1.15：这是「第三道锁」的恢复通道。plan_engine 只取
+    `SCLibraryVersion.id > cursor.last_library_version_id`，而游标在去重被卡死的那段
+    时间里已经推进到**全部快照之后**——即使去重修好，也永远不再回头看那批快照。
+    归零**不删任何数据**，也不放宽去重：已推送过 / 仍在途的作品照样被挡。
+    """
+    cursors = list(db.scalars(select(SCCategoryCursor).where(
+        SCCategoryCursor.plan_version_id == version_id)).all())
+    for c in cursors:
+        c.last_library_version_id = 0
+        c.last_work_key = ""
+        c.updated_at = utcnow()
+    db.flush()
+    return len(cursors)
+
+
+def preview_first_rebuild(db: Session) -> dict[str, Any]:
+    """预演「重建首推」会怎么走：完全不写库，只按裁决计数。
+
+    逐作品 × 逐渠道调用 `first_dedup_plan`（与 plan_engine 同一条裁决），
+    因此这里给出的数字与真实执行后的结果同源，不是估算。
+    """
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "当前没有生效中的计划版本"}
+    channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
+    if not channels:
+        return {"ok": False, "reason": "还没有启用中的推送渠道"}
+    pushed_pairs = _pushed_pairs_from_audit(db)
+    versions = list(db.scalars(
+        select(SCLibraryVersion).order_by(SCLibraryVersion.id)).all())
+    out: dict[str, Any] = {"ok": True, "works": len(versions), "channels": len(channels),
+                           "would_create": 0, "would_revive": 0,
+                           "blocked_active": 0, "blocked_pushed": 0}
+    for lv in versions:
+        for channel in channels:
+            chat_id = str(channel.chat_id or "")
+            dedup = f"{lv.work_key}:{channel.id}:first"[:255]
+            action, _reuse = first_dedup_plan(
+                db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup,
+                pushed_pairs=pushed_pairs)
+            if action == "create":
+                out["would_create"] += 1
+            elif action == "revive":
+                out["would_revive"] += 1
+            else:
+                # 再判一次「是已推过还是仍在途」，只用于如实分类展示
+                if _ever_published(db, work_key=lv.work_key, chat_id=chat_id,
+                                   pushed_pairs=pushed_pairs):
+                    out["blocked_pushed"] += 1
+                else:
+                    out["blocked_active"] += 1
+    # 当前时段口径如实回报：未命中时段的分类到点才会建任务（不是缺陷）
+    win = _current_hour_window(db, version)
+    key = str(getattr(win, "category_key", "") or "")
+    out["hour_allowed"] = bool(_current_hour_allowed(db, version))
+    out["hour_category"] = key.split(":", 1)[-1] if key else ""
+    return out
+
+
+@router.post("/plan/rebuild-first")
+def api_rebuild_first(body: Payload, db: Session = Depends(get_db)):
+    """重建首推任务：把被卡住的首推重新排出来（幂等，绝不重复首推）。
+
+    真机死锁是三道锁叠加，本端点处理的是**第三道**（前两道由 v2.1.14 修掉）：
+      - 分类游标 `last_library_version_id` 已推进到全部快照之后 → plan_engine 只取
+        `id > 游标`，永远不再回头看历史快照，所以「等一等」不会自愈。
+    流程：`dry_run=true` 先只预演（不写库）→ 确认后把游标归零 → 立刻跑一轮
+    plan_engine。已推送过（含旧队列 push_sent 历史）与仍在途的作品照样被挡，
+    历史行一条不删。
+    """
+    p = body.payload or {}
+    dry = bool(p.get("dry_run", True))
+    if dry:
+        return preview_first_rebuild(db)
+    version = _active_version(db)
+    if not version:
+        return {"ok": False, "reason": "当前没有生效中的计划版本"}
+    reset = reset_plan_cursors(db, version.id)
+    db.commit()
+    plan = plan_engine(db)
+    return {"ok": True, "cursors_reset": reset, "plan": plan,
+            "note": "游标已归零，本轮只处理当前时段命中的分类；其余分类到各自窗口自动继续。"}
 
 
 @router.post("/share-records/cleanup")
