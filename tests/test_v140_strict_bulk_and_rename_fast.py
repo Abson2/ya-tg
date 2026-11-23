@@ -1,10 +1,13 @@
-"""v1.4 验收：strict 目录级批量复制 + 改名并发提速。
+"""v1.4 验收：目录级批量复制 + 改名并发提速。
 
-① strict 按 B 库目标目录分桶：同目录多文件一次 copy_file，跨目录分别提交；
+① 按 B 库目标目录分桶：同目录多文件一次 copy_file，跨目录分别提交；
 ② skip/cancel 粒度由单文件升为目录桶（用户拍板）；
 ③ 改名 idle 与复制 idle 解耦（rename_idle_seconds，默认 0.3，下限 0.2）；
 ④ 改名并发默认开（rename_concurrency=3），并发只发网络、写库在主协程串行；
 ⑤ 光鸭无批量 rename/正则替换接口——本地算名 + 并发单文件 rename 是唯一可行提速。
+
+v2.1.13：严格顺序引擎已移除，①②两条现在是**唯一复制路径**的行为（不再只在
+strict 下成立），因此下面的断言已去掉 `strict=True`。
 """
 import asyncio
 import inspect
@@ -120,8 +123,7 @@ def test_strict_buckets_by_target_dir(env):
         db.refresh(rule)
         api = TwoDirAPI()
         with patch("app.mirror.GuangYaWebFiles", lambda d: api):
-            stats = asyncio.run(mirror.sync_rule(db, rule, strict=True,
-                                                 max_polls=5, poll_interval=0.0))
+            stats = asyncio.run(mirror.sync_rule(db, rule, max_polls=5, poll_interval=0.0))
         assert stats["copy_batches"] == 2, stats
         assert len(api.copies) == 2, api.copies
         # 每批正好是该季目录的 2 个文件，parent 是对应 B 库季目录
@@ -153,8 +155,7 @@ def test_strict_skip_is_dir_level(env):
         api = TwoDirAPI()
         with patch("app.mirror.mirror_batch.start_batch", side_effect=start_with_skip), \
              patch("app.mirror.GuangYaWebFiles", lambda d: api):
-            stats = asyncio.run(mirror.sync_rule(db, rule, strict=True,
-                                                 max_polls=5, poll_interval=0.0))
+            stats = asyncio.run(mirror.sync_rule(db, rule, max_polls=5, poll_interval=0.0))
         assert stats["skipped"] >= 2, stats  # 首桶整桶 2 文件被跳过
         skipped_tasks = [t for t in db.scalars(select(models.MirrorTask)).all()
                          if t.task_status == "skipped"]

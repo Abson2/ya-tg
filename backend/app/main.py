@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.12", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.13", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.12", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.13", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1925,7 +1925,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="copy", running=True)
         db.commit()
         _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制开始）
-        # 阶段二路线B C4：strict=True 走严格顺序引擎，默认 False 保持旧批量路径
+        # v2.1.13：严格顺序引擎已移除，只有一套复制路径；strict 仅作为兼容入参透传（被忽略）
         stats = await mirror.sync_rule(db, r, strict=strict)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
@@ -2046,7 +2046,9 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
 async def mirror_run(post_identify: bool | None = None, strict: bool = False,
                      db: Session = Depends(get_db)):
     """v0.8.9：立即同步入口加互斥；重复点击直接 409，不让长任务排队堆积。
-    strict=True（阶段二路线B）：走严格顺序引擎；默认 False 保持旧批量路径。
+
+    v2.1.13：严格顺序引擎已移除，只剩一套复制路径。`strict` 参数保留仅为
+    兼容旧前端/旧脚本（`?strict=1` 仍然能调通），传入后不再改变任何行为。
     """
     with _mirror_guard():
         return await _do_mirror_run(post_identify, db, strict=strict)

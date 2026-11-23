@@ -556,9 +556,12 @@ def test_copy_file_with_backoff_does_not_retry_real_failure():
 
 
 def test_all_copy_file_call_sites_use_backoff():
-    """三处 copy_file 调用点（常规/strict/定向重试）都必须走退避封装。
+    """所有 copy_file 调用点（常规批量 / 定向重试）都必须走退避封装。
 
     反证点：任一处仍直接调 api.copy_file，遇 127 就直接写 failed、整批永不重试。
+    v2.1.13：严格顺序引擎已移除，原来的「strict 批量」调用点随之消失，
+    因此这里的调用点计数从 3 降为 2 —— 但**约束本身不变**：只要还有调用点，
+    就必须经 `_copy_file_with_backoff`。
     """
     import re
     src = (BACKEND / "app" / "mirror.py").read_text(encoding="utf-8")
@@ -571,9 +574,9 @@ def test_all_copy_file_call_sites_use_backoff():
     outside = [m for m in direct if not (helper_start <= m.start() < helper_end)]
     assert not outside, f"仍有 {len(outside)} 处 copy_file 未走退避封装"
 
-    # 三处调用点都必须调用封装
-    assert src.count("_copy_file_with_backoff(api") >= 3, \
-        "常规批量 / strict 批量 / 定向重试 三处都要接入退避封装"
+    # 现存两处调用点（作品内分桶批量 / 失败文件定向重试）都必须调用封装
+    assert src.count("_copy_file_with_backoff(api") >= 2, \
+        "常规批量 / 定向重试两处都要接入退避封装"
 
 
 # ===========================================================================

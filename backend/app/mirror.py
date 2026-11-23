@@ -824,263 +824,6 @@ async def _poll_tasks_batch(api: GuangYaWebFiles, tasks: list[tuple[MirrorTask, 
         task.status = "unknown"
 
 
-async def _wait_one_task(api: "GuangYaWebFiles", task: MirrorTask, *,
-                         max_polls: int, interval: float) -> str:
-    """严格顺序：轮询单个复制任务直到终态，返回 done/failed/unknown。
-
-    复用 _task_outcome 的真实语义（status=2 完成、3 或 detail.code≠0 失败）。
-    unknown 不猜含义，保留 status 供 poll_pending_tasks 续跑。
-    """
-    for i in range(max_polls):
-        if i:
-            await asyncio.sleep(interval)
-        _beat()
-        try:
-            r = await api.get_task_status(task.task_id)
-        except Exception as exc:
-            task.error = str(exc)[:300]
-            task.polls = i + 1
-            continue
-        await asyncio.sleep(TASK_STATUS_MIN_INTERVAL)
-        raw = r.get("status")
-        task.raw_status = "" if raw is None else str(raw)
-        task.polls = i + 1
-        outcome, err = _task_outcome(raw, r.get("detail") or {})
-        if outcome == "done":
-            task.status, task.error, task.task_status = "done", "", "completed"
-            task.finished_at = utcnow()
-            return "done"
-        if outcome == "failed":
-            task.status, task.error, task.task_status = "failed", err[:300], "failed"
-            task.finished_at = utcnow()
-            return "failed"
-    task.status, task.task_status = "unknown", "pending"  # 待下轮续跑
-    return "unknown"
-
-
-async def _copy_jobs_strict(db: Session, api: "GuangYaWebFiles", rule: MirrorRule,
-                            media: MirrorMedia, title: str,
-                            copy_jobs: list[tuple["MirrorFile", str, str]],
-                            stats: dict, *, idle: float, max_polls: int,
-                            poll_interval: float, batch_id: str,
-                            seq_start: int = 0) -> int:
-    """v1.4 目录级批量严格顺序复制执行核心。
-
-    【v2.1.12 #296/#297 结论：这部分**不能整块删**】
-    用户问过「顺序固定按网盘文件名升序后，严格顺序引擎是不是可以不要了」。
-    核实结果：它在 #296 之后**只剩顺序职责是多余的**，另外两块职责无可替代：
-
-      ① 顺序职责（已多余）：本地逐文件 sequence 占位 + `cursor_sequence` 续跑游标，
-         目的是让「处理顺序」可确定、可续。现已由请求侧 `LIST_ORDER_BY/SORT_TYPE`
-         + 取消本地重排统一负责，这一层确实不再需要。
-      ② 控制职责（不可去）：`mirror_batch.consume_control` **全项目唯一调用点**就在这里，
-         pause / resume / skip / cancel 四个按钮只有走 strict 才真正生效。
-         删掉等于删功能，与「按钮一个不删」红线冲突。
-      ③ 崩溃续跑职责（不可去）：`start_batch` / `finish_batch` / `rule.cursor_sequence`
-         让长任务中断后能从上次的位置继续，非 strict 路径是「一次性提交 + 统一轮询」，
-         没有续跑锚点。
-
-    所以结论是**保留**，不做「控制检查点下沉到公共路径」的改造——
-    那个改造要动默认复制路径（生产实际走的就是这条），收益只是少一个开关，
-    风险却是把 1400+ 回归里 strict/非 strict 两条路径的用例全打乱，不划算。
-
-    v1.4 目录级批量严格顺序复制执行核心。
-
-    sequence 顺序记录、批次控制、崩溃续跑、确认后推进的语义全部保留；
-    v1.4 把网络层从「逐文件 copy_file + 逐文件轮询」升级为
-    「按 B 库目标目录分桶 → 每桶一次 copy_file(fids[], parent) →
-    统一批量轮询 → 按名+大小回填副本 ID」，请求量随目录数而非文件数增长。
-    每个写操作后立即 commit，绝不跨 await 持写事务。
-
-    sequence 仍是每个文件一个（顺序记录与续跑游标粒度不变）；
-    唯一语义变化：skip/cancel 的控制粒度由「单文件」升为「目录桶」
-    （skip 跳过整桶、cancel 取消余下全部），符合用户 v1.4 拍板。
-
-    控制指令在"任务边界"（桶边界）检查，不打断在途 copy_file/轮询：
-      pause → 置批次 paused 并立即停止推进（余下保持 pending，resume 后续跑）；
-      skip  → 当前桶全部标 skipped 并推进；
-      cancel→ 余下任务全部标 cancelled 并停止。
-
-    返回本轮推进到的最后一个 sequence_id（供游标）。
-    """
-    seq = seq_start
-    # v1.4 目录级批量：复制前只读列一次 B 库，核验待复制文件是否已存在（防重复复制）。
-    # 旧逐文件版是每文件列一次目录；这里整部作品只列一次，请求量从 N 降到 1。
-    try:
-        pre_candidates, pre_verified = await _b_file_candidates(api, media)
-    except Exception:
-        pre_candidates, pre_verified = {}, False
-
-    # 按 B 库目标目录分桶，桶内保持 A 库自然序（sequence 顺序记录不变）。
-    buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
-    for row, source_fid, target_parent in copy_jobs:
-        buckets.setdefault(target_parent, []).append((row, source_fid))
-    stats["copy_batches"] = len(buckets)
-
-    for target_parent, members in buckets.items():
-        # ---- 桶边界：检查批次控制指令（不打断在途 copy_file/轮询）----
-        action = mirror_batch.consume_control(db, rule)
-        if action == "pause":
-            rule.batch_status = "paused"
-            db.commit()
-            stats["paused"] = True
-            return seq
-        if action == "cancel":
-            rule.batch_status = "cancelled"
-            try:
-                n = mirror_batch.cancel_remaining(db, batch_id)
-                stats["cancelled_tasks"] = n
-            except Exception:
-                pass
-            db.commit()
-            stats["cancelled"] = True
-            return seq
-        if action == "skip":
-            # 目录级 skip：整桶成员落 skipped 终态，游标推进整桶长度。
-            for _row, _fid in members:
-                seq += 1
-                try:
-                    mirror_batch.mark_sequence_status(db, batch_id, seq, "skipped",
-                                                      error="skip by control (dir-level)")
-                except Exception:
-                    pass
-            stats["skipped"] += len(members)
-            db.commit()
-            continue
-        if rule.batch_status in ("paused", "cancelled"):
-            stats["paused"] = True
-            return seq
-
-        if seq > seq_start:
-            await asyncio.sleep(idle)  # 桶间 idle，不再是每文件一次
-        _beat()
-
-        # 桶内逐文件核验：已在 B 库的直接标 synced，其余进入待提交队列。
-        pending: list[tuple[MirrorFile, str, int]] = []
-        for row, source_fid in members:
-            seq += 1
-            hit = _lookup_b_file(pre_candidates, row) if pre_verified else ""
-            if hit:
-                row.status, row.error, row.target_file_id = "synced", "", hit
-                try:
-                    mirror_batch.mark_sequence_status(db, batch_id, seq, "completed")
-                except Exception:
-                    pass
-                stats["unchanged"] += 1
-                db.commit()
-                continue
-            pending.append((row, source_fid, seq))
-
-        if not pending:
-            rule.cursor_sequence = seq
-            db.commit()
-            continue
-
-        # 占位行：每个待提交文件落一个 sequence 任务（纯 DB，零网络，修 B-09 重启窗口）。
-        submit_tasks: list[MirrorTask] = []
-        for row, _fid, this_seq in pending:
-            task = mirror_batch.add_sequence_task(
-                db, rule_id=rule.id, media_id=media.id, batch_id=batch_id,
-                sequence_id=this_seq, parent_sequence_id=seq_start,
-                note=f"{title}/{row.file_name}")
-            task.task_status = "submitting"
-            db.commit()
-            submit_tasks.append(task)
-
-        # 分片提交 copy_file：同桶多文件合并为一次请求，超 COPY_BATCH_SIZE 再切。
-        groups: list[tuple[MirrorTask, list[MirrorTask], list[MirrorFile]]] = []
-        for start in range(0, len(pending), COPY_BATCH_SIZE):
-            chunk = pending[start:start + COPY_BATCH_SIZE]
-            chunk_tasks = submit_tasks[start:start + len(chunk)]
-            chunk_rows = [r for r, _f, _s in chunk]
-            lead_task = chunk_tasks[0]
-            fids = [fid for _row, fid, _s in chunk]
-            # v2.1.9：strict 路径同样补 127 限流退避重试（口径与常规批量复制一致）。
-            task_id, copy_err = await _copy_file_with_backoff(api, fids, target_parent)
-            if copy_err:
-                msg = copy_err
-                for row in chunk_rows:
-                    # 限流耗尽 → pending（待重试，下轮再来）；真失败 → failed。
-                    if RENAME_RATE_LIMIT_MARK in msg:
-                        row.status, row.error = "pending", msg
-                    else:
-                        row.status, row.error = "failed", msg
-                for t in chunk_tasks:
-                    t.status, t.task_status, t.error = "failed", "failed", msg
-                    t.finished_at = utcnow()
-                stats["failed"] += len(chunk)
-                stats["errors"].append(f"{title}/{len(chunk)} 文件批量复制失败 {msg[:160]}")
-                # v1.4：整批失败也逐文件留一条 errors，保证长剧诊断可追溯到单集
-                stats["errors"].extend(
-                    f"{title}/{row.file_name}：批量复制失败 {msg[:160]}" for row in chunk_rows)
-                stats["file_errors"].extend(
-                    f"{title}/{row.file_name}：{msg[:240]}" for row in chunk_rows)
-                logger.warning("[mirror] strict 批量 copy_file 失败 %s/%s：%s",
-                               title, len(chunk), msg)
-                db.commit()
-                continue
-            lead_task.task_id = task_id
-            for t in chunk_tasks:
-                t.task_status = "submitted"
-            for row in chunk_rows:
-                row.task_id = task_id
-            db.commit()
-            stats["tasks"] += 1
-            groups.append((lead_task, chunk_tasks, chunk_rows))
-
-        if not groups:
-            rule.cursor_sequence = seq
-            db.commit()
-            continue
-
-        # 统一轮询本桶所有复制任务，替代逐任务 _wait_one_task。
-        poll_tasks = [(lead, rows) for lead, _all, rows in groups]
-        await _poll_tasks_batch(api, poll_tasks, max_polls=max_polls, interval=poll_interval)
-
-        # 复制后只读列一次 B 库，按名+大小回填副本 fileId（光鸭复制响应不返回副本 ID）。
-        try:
-            post_candidates, _post_verified = await _b_file_candidates(api, media)
-        except Exception:
-            post_candidates = {}
-
-        for lead, chunk_tasks, chunk_rows in groups:
-            outcome = lead.status  # done / failed / unknown（_poll_tasks_batch 已置）
-            if outcome == "done":
-                for row in chunk_rows:
-                    row.status, row.error = "synced", ""
-                    hit = _lookup_b_file(post_candidates, row)
-                    if hit:
-                        row.target_file_id = hit
-                stats["done"] += len(chunk_rows)  # 按文件计数，与旧逐文件语义口径一致
-                for t in chunk_tasks:
-                    t.status, t.task_status, t.finished_at = "completed", "completed", utcnow()
-            elif outcome == "failed":
-                for row in chunk_rows:
-                    row.status, row.error = "failed", lead.error
-                stats["failed"] += len(chunk_rows)
-                for t in chunk_tasks:
-                    t.status, t.task_status, t.finished_at = "failed", "failed", utcnow()
-                msg = (f"{title}：复制任务 {lead.task_id} 失败"
-                       f"（{lead.error or 'status=' + (lead.raw_status or '未知')}）")
-                stats["errors"].append(msg)
-                stats["file_errors"].append(msg[:240])
-            else:
-                stats["unknown"] += 1
-                for t in chunk_tasks:
-                    # status 同步为 unknown（与旧逐文件版一致，供故障注入测试与续跑判定），
-                    # task_status 复位 pending 表示待下轮续跑，不猜含义。
-                    t.status, t.task_status = "unknown", "pending"
-                msg = (f"{title}：复制任务 {lead.task_id} 未返回 status=2"
-                       f"（最后状态 {lead.raw_status or '未知'}），已保留任务供继续轮询")
-                stats["errors"].append(msg)
-                stats["file_errors"].append(msg[:240])
-            db.commit()
-
-        rule.cursor_sequence = seq
-        db.commit()
-    return seq
-
-
 def _ext(name: str) -> str:
     return "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
@@ -1305,9 +1048,14 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     strict: bool = False) -> dict:
     """执行一次 A→B 增量同步。逐部影视完成后立即提交，不等整库结束。
 
-    strict=False（默认，旧路径）：作品内批量提交 copy_file + 批量轮询。
-    strict=True（阶段二路线B C3）：严格顺序——一个文件复制并确认完成后才提交
-    下一个，带批次序列持久化与暂停/恢复/跳过/取消控制点。其余逻辑完全复用。
+    v2.1.13：**只剩一套复制路径**（作品内按目标目录分桶批量提交 + 批量轮询）。
+      - 处理顺序：完全按光鸭网盘返回的文件名升序（v2.1.12 #296 已落地，
+        顺序真源是 `guangya.LIST_ORDER_BY/LIST_SORT_TYPE`，本地不再重排）。
+      - 批次控制（暂停 / 恢复 / 跳过当前目录桶 / 取消批次）：在**桶边界**消费指令，
+        不再依赖 strict。此前只有 strict 才 start_batch/finish_batch，而 strict
+        默认关闭 → 生产上 batch_status 永远是 idle、5 个批次按钮等于死按钮。
+      - `strict` 参数**已废弃**，仅为兼容既有调用方（含 `?strict=1` 的旧前端）
+        而保留，传入后不做任何事。严格顺序引擎（逐文件占位序列 + 续跑游标）已删除。
 
     v0.8.1：
       - 分类目录 1:1 镜像到 B 库，名称不修改；只有影视主目录按 star_naming 加 ·。
@@ -1320,6 +1068,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         同一部剧不拆两轮」。
     """
     idle = max(float(getattr(rule, "file_idle_seconds", 1.0) or 1.0), MIN_FILE_IDLE_SECONDS)
+    # v2.1.13：strict 已废弃 —— 显式忽略，保留入参只为兼容旧调用方。
+    _ = strict
     if max_works is None:
         try:
             max_works = max(0, int(getattr(rule, "max_works_per_run", 0) or 0))
@@ -1342,12 +1092,13 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
         raise WebFileError("请先配置 A 源头库目录 ID 与 B 镜像库目录 ID")
     api = GuangYaWebFiles(db)
-    # 阶段二路线B C3：严格模式开启批次，全批次共享 sequence 游标
-    batch_id = ""
-    seq_cursor = 0
-    if strict:
-        batch_id = mirror_batch.start_batch(db, rule)
-        stats["batch_id"] = batch_id
+    # v2.1.13：批次控制（暂停/恢复/跳过/取消）改成**默认路径标配**。
+    # 此前只有 strict 才 start_batch，而 strict 默认关闭 → 生产上 batch_status 永远是
+    # idle，request_control 全部返回「只有运行中的批次才能…」，5 个按钮等于死按钮。
+    batch_id = mirror_batch.start_batch(db, rule)
+    stats["batch_id"] = batch_id
+    # v2.1.13：跳过时按文件落 sequence 行，序号从这里连续推进（供「恢复被跳过项」）。
+    seq_no = 0
     stats["purged_legacy"] = _purge_legacy_failed(db, rule.id)
     nodes, complete = await _walk_source(api, rule.source_root_id, stats=stats)
     if not complete:
@@ -1760,101 +1511,128 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 db.commit()
                 continue
 
-            if strict:
-                # 阶段二路线B C3：严格顺序——逐文件「核验→提交→确认完成→下一个」
-                seq_cursor = await _copy_jobs_strict(
-                    db, api, rule, media, title, copy_jobs, stats,
-                    idle=idle, max_polls=max_polls, poll_interval=poll_interval,
-                    batch_id=batch_id, seq_start=seq_cursor)
-                any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
-                any_unknown = any(r.task_id and r.status not in ("synced", "failed", "superseded")
-                                  for r, _, _ in copy_jobs)
-                media.status = ("failed" if any_failed else
-                                "synced" if not any_unknown else "syncing")
-                media.last_synced_at = utcnow()
-                db.commit()
-                stats["media"] += 1
-                # 暂停/取消：批次边界立即停止推进后续作品
-                if stats.get("paused") or stats.get("cancelled"):
+            # v2.1.13：只保留一套复制路径 —— 严格顺序引擎已移除。
+            # 顺序由网盘自身的 orderBy/sortType 决定（#296 已落地），逐文件
+            # 「确认完再提交下一个」不再带来任何收益；批次控制（暂停/跳过/取消）
+            # 已下沉到下面 bucket 循环的桶边界，与旧 strict 同语义。
+            # v1.2 需求①：先扫描文件树（_walk_source/_b_file_candidates 已完成），
+            # 以 B 库目标目录为「最大单元」分组批量复制：同一 parent 下待复制的
+            # 多文件合并成一次 copy_file(fids[], parent)，把「逐文件 N 次请求
+            # + N 次 idle」降为「按目录 M 次请求 + M 次 idle」(M<<N)，显著提速。
+            # 光鸭 copy_file 契约只支持「多文件→同一 parent」，不支持复制整个目录，
+            # 故目录骨架仍由上面的 _ensure_child 逐层建好、副本 ID 由 backfill 回填。
+            buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
+            for row, source_fid, target_parent in copy_jobs:
+                buckets.setdefault(target_parent, []).append((row, source_fid))
+            stats["copy_batches"] = len(buckets)
+            tasks: list[tuple[MirrorTask, list[MirrorFile]]] = []
+            batch_no = 0
+            for target_parent, members in buckets.items():
+                # ---- v2.1.13 桶边界：消费批次控制指令（语义与旧严格引擎一致）----
+                # 只在「桶与桶之间」看指令，绝不打断在途的 copy_file / 轮询。
+                action = mirror_batch.consume_control(db, rule)
+                if action == "pause":
+                    rule.batch_status = "paused"
+                    db.commit()
+                    stats["paused"] = True
                     break
-            else:
-                # v1.2 需求①：先扫描文件树（_walk_source/_b_file_candidates 已完成），
-                # 以 B 库目标目录为「最大单元」分组批量复制：同一 parent 下待复制的
-                # 多文件合并成一次 copy_file(fids[], parent)，把「逐文件 N 次请求
-                # + N 次 idle」降为「按目录 M 次请求 + M 次 idle」(M<<N)，显著提速。
-                # 光鸭 copy_file 契约只支持「多文件→同一 parent」，不支持复制整个目录，
-                # 故目录骨架仍由上面的 _ensure_child 逐层建好、副本 ID 由 backfill 回填。
-                buckets: dict[str, list[tuple[MirrorFile, str]]] = {}
-                for row, source_fid, target_parent in copy_jobs:
-                    buckets.setdefault(target_parent, []).append((row, source_fid))
-                stats["copy_batches"] = len(buckets)
-                tasks: list[tuple[MirrorTask, list[MirrorFile]]] = []
-                batch_no = 0
-                for target_parent, members in buckets.items():
-                    # 单目录文件数超上限再分片，避免单次请求体过大
-                    for start in range(0, len(members), COPY_BATCH_SIZE):
-                        chunk = members[start:start + COPY_BATCH_SIZE]
-                        if batch_no:
-                            await asyncio.sleep(idle)
-                        _beat()  # v0.9.21：每批复制推进打点
-                        fids = [fid for _row, fid in chunk]
-                        # v2.1.9：复制路径补 127 限流退避重试（此前直接 failed，整批永不重试）。
-                        task_id, copy_err = await _copy_file_with_backoff(api, fids, target_parent)
-                        if copy_err:
-                            msg = copy_err
-                            stats["failed"] += len(chunk)
-                            for row, _fid in chunk:
-                                # v2.1.9：限流耗尽的行标记为 pending（待重试），不是 failed ——
-                                # 限流是瞬时状态，下一轮有额度就该再试；真失败才写 failed。
-                                if RENAME_RATE_LIMIT_MARK in msg:
-                                    row.status, row.error = "pending", msg
-                                else:
-                                    row.status, row.error = "failed", msg
-                            stats["errors"].append(
-                                f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
-                            stats["file_errors"].extend(
-                                f"{title}/{row.file_name}：{msg[:240]}" for row, _fid in chunk)
-                            logger.warning("[mirror] 批量 copy_file 失败 %s/%s 文件：%s",
-                                           title, len(chunk), msg)
-                            db.commit()
-                            batch_no += 1
-                            continue
-                        task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
-                                          status="running")
-                        db.add(task)
-                        db.commit()
+                if action == "cancel":
+                    rule.batch_status = "cancelled"
+                    try:
+                        stats["cancelled_tasks"] = mirror_batch.cancel_remaining(db, batch_id)
+                    except Exception:
+                        pass
+                    db.commit()
+                    stats["cancelled"] = True
+                    break
+                if action == "skip":
+                    # 跳过当前目录桶：整桶不复制，行保持 pending → 下一轮自动重试。
+                    # 同时按文件落一条 skipped 序列行，让「恢复被跳过项」有据可依
+                    # （否则它会永远回「本批次没有被跳过的任务」，又变成一个死按钮）。
+                    for _row, _fid in members:
+                        seq_no += 1
+                        try:
+                            mirror_batch.mark_sequence_status(
+                                db, batch_id, seq_no, "skipped",
+                                error="skip by control (dir-level)")
+                        except Exception:
+                            pass
+                    rule.cursor_sequence = seq_no
+                    stats["skipped"] += len(members)
+                    logger.info("[mirror] 批次控制跳过当前目录桶 %s（%d 个文件）",
+                                target_parent, len(members))
+                    db.commit()
+                    continue
+                if rule.batch_status in ("paused", "cancelled"):
+                    stats["paused"] = True
+                    break
+                # 单目录文件数超上限再分片，避免单次请求体过大
+                for start in range(0, len(members), COPY_BATCH_SIZE):
+                    chunk = members[start:start + COPY_BATCH_SIZE]
+                    if batch_no:
+                        await asyncio.sleep(idle)
+                    _beat()  # v0.9.21：每批复制推进打点
+                    fids = [fid for _row, fid in chunk]
+                    # v2.1.9：复制路径补 127 限流退避重试（此前直接 failed，整批永不重试）。
+                    task_id, copy_err = await _copy_file_with_backoff(api, fids, target_parent)
+                    if copy_err:
+                        msg = copy_err
+                        stats["failed"] += len(chunk)
                         for row, _fid in chunk:
-                            row.task_id = task_id
-                        tasks.append((task, [row for row, _fid in chunk]))
-                        stats["tasks"] += 1
+                            # v2.1.9：限流耗尽的行标记为 pending（待重试），不是 failed ——
+                            # 限流是瞬时状态，下一轮有额度就该再试；真失败才写 failed。
+                            if RENAME_RATE_LIMIT_MARK in msg:
+                                row.status, row.error = "pending", msg
+                            else:
+                                row.status, row.error = "failed", msg
+                        stats["errors"].append(
+                            f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
+                        stats["file_errors"].extend(
+                            f"{title}/{row.file_name}：{msg[:240]}" for row, _fid in chunk)
+                        logger.warning("[mirror] 批量 copy_file 失败 %s/%s 文件：%s",
+                                       title, len(chunk), msg)
+                        db.commit()
                         batch_no += 1
-                await _poll_tasks_batch(api, tasks, max_polls=max_polls, interval=poll_interval)
-                for task, rows in tasks:
-                    if task.status == "done":
-                        for r_ in rows:
-                            r_.status, r_.error = "synced", ""
-                        stats["done"] += 1
-                    elif task.status == "failed":
-                        for r_ in rows:
-                            r_.status, r_.error = "failed", task.error
-                        stats["failed"] += 1
-                        msg = (f"{title}：复制任务 {task.task_id} 失败"
-                               f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
-                        stats["errors"].append(msg)
-                        stats["file_errors"].append(msg[:240])
-                    else:
-                        stats["unknown"] += 1
-                        msg = (f"{title}：复制任务 {task.task_id} 未返回 status=2"
-                               f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
-                        stats["errors"].append(msg)
-                        stats["file_errors"].append(msg[:240])
-                any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
-                media.status = ("failed" if any_failed else
-                                "synced" if tasks and all(t.status == "done" for t, _ in tasks)
-                                else "syncing")
-                media.last_synced_at = utcnow()
-                db.commit()
-                stats["media"] += 1
+                        continue
+                    task = MirrorTask(rule_id=rule.id, media_id=media.id, task_id=task_id,
+                                      status="running")
+                    db.add(task)
+                    db.commit()
+                    for row, _fid in chunk:
+                        row.task_id = task_id
+                    tasks.append((task, [row for row, _fid in chunk]))
+                    stats["tasks"] += 1
+                    batch_no += 1
+            await _poll_tasks_batch(api, tasks, max_polls=max_polls, interval=poll_interval)
+            for task, rows in tasks:
+                if task.status == "done":
+                    for r_ in rows:
+                        r_.status, r_.error = "synced", ""
+                    stats["done"] += 1
+                elif task.status == "failed":
+                    for r_ in rows:
+                        r_.status, r_.error = "failed", task.error
+                    stats["failed"] += 1
+                    msg = (f"{title}：复制任务 {task.task_id} 失败"
+                           f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
+                    stats["errors"].append(msg)
+                    stats["file_errors"].append(msg[:240])
+                else:
+                    stats["unknown"] += 1
+                    msg = (f"{title}：复制任务 {task.task_id} 未返回 status=2"
+                           f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
+                    stats["errors"].append(msg)
+                    stats["file_errors"].append(msg[:240])
+            any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
+            media.status = ("failed" if any_failed else
+                            "synced" if tasks and all(t.status == "done" for t, _ in tasks)
+                            else "syncing")
+            media.last_synced_at = utcnow()
+            db.commit()
+            stats["media"] += 1
+            # v2.1.13：暂停/取消 → 立即停止推进后续作品（本轮到此为止，下次接着做）
+            if stats.get("paused") or stats.get("cancelled"):
+                break
 
         except Exception as exc:
             # 单部作品失败：记录后继续下一部，绝不让整轮停摆。
@@ -1908,10 +1686,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         rule.last_message += " · 首个文件错误：" + stats["file_errors"][0][:300]
     if stats["dirs_fallback"]:
         rule.last_message += f" · 已降级标准名 {stats['dirs_fallback']} 次"
-    if strict and batch_id:
-        stats["seq_cursor"] = seq_cursor
+    # v2.1.13：批次收尾对所有路径生效。此前只有 strict 才 finish_batch，
+    # 默认路径的 batch_status 永远停在 idle → request_control 一律判「非运行中」，
+    # 5 个批次按钮在生产上等于死按钮。
+    if batch_id:
         stats["batch_status"] = rule.batch_status
-        # paused 保留状态供 resume 续跑；cancelled/idle 正常收尾
+        # paused 保留状态供 resume 续跑；cancelled 保留终态供页面展示
         if rule.batch_status not in ("paused", "cancelled"):
             mirror_batch.finish_batch(db, rule, status="idle")
     rule.last_message = rule.last_message[:1000]

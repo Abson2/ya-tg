@@ -5,9 +5,13 @@
   - 下载/复制超时、网络断、连接错误 → 归可重试，不吞消息、不丢进度；
   - 429 / 5xx → 可重试；401 / 非法链接 / 配置缺失 → 不可重试（业务拒答）；
   - DB 锁（database is locked/busy）→ 可重试；
-  - 严格顺序执行器遇 copy_file 异常 → 单行标 failed 不中断整批、不跨 await 持写事务；
+  - 复制执行器遇 copy_file 异常 → 落 failed 不中断整批、不跨 await 持写事务；
   - 幂等：远端已存在（按名+大小回填）→ 跳过复制，标 synced 不新增任务；
-  - 重启续跑：paused 批次的 pending 任务在下次 strict 运行从游标继续。
+  - 重启续跑：未确认终态的任务（status=unknown）在下次 poll_pending_tasks 继续轮询。
+
+v2.1.13：严格顺序引擎已移除，只剩一套复制路径（分桶批量提交 + 批量轮询），
+本文件的断言按该单一路径口径校准（`stats["done"]` 计数单位=复制任务，
+未知终态的续跑依据是 `MirrorTask.status` 而不是旧 `task_status` 游标）。
 """
 import asyncio
 import shutil
@@ -127,22 +131,22 @@ def env():
     shutil.rmtree(root, ignore_errors=True)
 
 
-def _run_strict(db, rule, api):
+def _run_sync(db, rule, api):
+    """跑一次同步（v2.1.13 起只有单一路径，不再有 strict 开关）。"""
     with patch("app.mirror.GuangYaWebFiles", lambda d: api):
-        return asyncio.run(mirror.sync_rule(db, rule, strict=True,
-                                            max_polls=5, poll_interval=0.0))
+        return asyncio.run(mirror.sync_rule(db, rule, max_polls=5, poll_interval=0.0))
 
 
 def test_copy_timeout_marks_single_file_failed_continues_batch(env):
     """网盘超时：copy_file 抛超时 → 整批（同目录一次请求）标 failed，不崩、错误可诊断。
 
-    v1.4 strict 升级为目录级批量：同目录多文件合并为一次 copy_file，请求失败则
-    整批一起 failed（这是批量的固有语义，用户已拍板目录级）。质量红线不变：
-    失败必须落库留痕、错误可见、批次正常收尾、后续作品/批次不被中断。
+    同目录多文件合并为一次 copy_file，请求失败则整批一起 failed（目录级批量的固有
+    语义，用户已拍板目录级）。质量红线不变：失败必须落库留痕、错误可见、批次正常
+    收尾、后续作品/批次不被中断。
     """
     db, rule, _, _ = env
     api = FaultAPI(fail_copy_n=1)
-    stats = _run_strict(db, rule, api)
+    stats = _run_sync(db, rule, api)
     assert stats["failed"] >= 1, stats
     assert stats["copy_batches"] >= 1, "目录级批量应记录批次数"
     assert api.copies == 1, "同目录两文件合并为一次 copy_file（目录级批量）"
@@ -163,7 +167,7 @@ def test_remote_verify_skips_existing_file_idempotent(env):
          "utime": 1, "parentId": B_WORK},
     ]
     api = FaultAPI(b_files=existing)
-    stats = _run_strict(db, rule, api)
+    stats = _run_sync(db, rule, api)
     # 至少不重复报已存在文件的复制；unchanged 或 done 均可（回填按 name+size 匹配）
     assert stats["unchanged"] + stats["done"] + stats["failed"] >= 1
     # 幂等核心：不重复对同一 source 建多条映射
@@ -172,27 +176,40 @@ def test_remote_verify_skips_existing_file_idempotent(env):
 
 
 def test_unknown_task_status_retained_for_resume(env):
-    """网络断：get_task_status 永远 pending → 任务保留供续跑，不误标 done。"""
+    """网络断：get_task_status 永远 pending → 任务保留供续跑，不误标 done。
+
+    v2.1.13：续跑依据是 `MirrorTask.status`（默认路径在轮询用尽后写 `unknown`），
+    旧严格引擎的 `task_status` 游标字段在单一路径下不再写入。
+    """
     db, rule, _, _ = env
     api = FaultAPI(permanent_status=True)
-    stats = _run_strict(db, rule, api)
+    stats = _run_sync(db, rule, api)
     assert stats["unknown"] >= 1, stats
     assert stats["done"] == 0, "未确认终态绝不能标 done"
     tasks = list(db.scalars(select(models.MirrorTask)).all())
     assert tasks, "未终结任务须落库供 60s job 续跑"
-    # _wait_one_task 的 unknown 分支把 task_status 复位 pending 供下轮续跑，不误标 completed
-    assert all(t.task_status == "pending" for t in tasks), [t.task_status for t in tasks]
     assert all(t.status == "unknown" for t in tasks), [t.status for t in tasks]
+    assert all(t.task_status == "" for t in tasks), [t.task_status for t in tasks]
+    # 存量续跑 job 必须真的能拾取它（过滤条件含 unknown），且不会误判为完成
+    with patch("app.mirror.GuangYaWebFiles", lambda d: api):
+        out = asyncio.run(mirror.poll_pending_tasks(db, rule, max_polls=1, interval=0.0))
+    assert out["tasks"] == len(tasks), out
+    assert out["done"] == 0 and out["still_unknown"] == len(tasks), out
+    rows = list(db.scalars(select(models.MirrorFile)).all())
+    assert all(r.status != "synced" for r in rows), [r.status for r in rows]
 
 
 def test_config_missing_failure_recorded_not_crash(env):
     """配置缺失导致 copy_file 立即失败 → 记 failed + error，不抛未捕获异常。"""
     db, rule, _, _ = env
     api = FaultAPI(timeout_copy=True)
-    stats = _run_strict(db, rule, api)
+    stats = _run_sync(db, rule, api)
     # 两文件都失败但整批正常返回
     assert stats["failed"] == 2, stats
-    assert len(stats["errors"]) >= 2
+    # 单一路径按「一个目录桶一条聚合错误」写 errors；逐文件明细在 file_errors
+    assert len(stats["errors"]) >= 1
+    assert any("batch" in e or "批量复制失败" in e for e in stats["errors"]), stats["errors"]
+    assert len(stats["file_errors"]) >= 2, stats["file_errors"]
     assert rule.batch_status == "idle", "异常路径也必须正常收尾批次"
 
 

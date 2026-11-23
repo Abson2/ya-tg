@@ -38,10 +38,11 @@ def test_uses_only_loaded_refs_no_new_api():
     start = APP.index("const taskCenter = computed")
     end = APP.index("const syntaxHint = computed", start)
     block = APP[start:end]
-    # 已加载 ref
+    # 已加载 ref（v2.1.13：mirrorStrict 已随严格顺序引擎一起移除）
     for ref in ["mirrorStatus.value", "queue.value", "contributions.value",
-                "mediaRequests.value", "interactionStatus.value", "batchInfo.value", "mirrorStrict.value"]:
+                "mediaRequests.value", "interactionStatus.value", "batchInfo.value"]:
         assert ref in block, f"任务中心未使用预期已加载数据：{ref}"
+    assert "mirrorStrict" not in block, "严格顺序引擎开关已移除，不得再被任务中心引用"
     # 不新增 API
     assert "api(" not in block, "任务中心不得新增任何 API 调用"
     assert "fetch(" not in block, "任务中心不得直接 fetch"

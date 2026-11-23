@@ -136,7 +136,7 @@ const mediaLinkLabel = (state) => ({
 //   统一叫「已跳过」会让用户完全分不清是哪种：
 //   ① 忽略翻译   —— 作品被标记不再解析英文名
 //   ② 改名跳过   —— 文件名已达标 / 无中文可改，跳过改名
-//   ③ 跳过本序列 —— 严格顺序引擎里整段序列被跳过（后端 _task_status_label）
+//   ③ 跳过本序列 —— 批量同步里整段序列被跳过（后端 _task_status_label）
 //   ④ 已跳过投递 —— 该资源在此渠道已推送过，跳过重复投递（本处）
 //   ⑤ 跳过当前   —— 用户在批次里主动跳过当前任务（按钮文案）
 const scTaskStatusLabel = (status) => ({
@@ -292,8 +292,8 @@ const diagCount = computed(() => {
     (c.invalid_mappings || 0) + (c.unmapped_dirs || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
-// 阶段二路线B C4：严格顺序引擎开关 + 批次控制状态
-const mirrorStrict = ref(false), batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_sequence: 0 })
+// v2.1.13：严格顺序模式与开关已移除（顺序固定按网盘文件名升序，批次控制常态生效）
+const batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_sequence: 0 })
 // v2.1.11：「已清理待重建」目录行可勾选重建（此前只能整批清空）
 const prunedDirSelected = ref([])
 // v0.9.17.2：失败任务定向批量重试的勾选行（目录 / 文件各自独立）
@@ -851,8 +851,7 @@ const taskCenter = computed(() => {
     { key: 'mirror', label: '镜像任务', icon: 'copy', target: '镜像同步',
       status: batchStatus === 'running' ? 'active' : (['paused', 'cancelling'].includes(batchStatus) ? 'warn' : 'idle'),
       metrics: [mk('批次状态', batchLabel, batchStatus === 'running' ? 'good' : ''),
-                mk('当前序列', batchInfo.value?.current_sequence || 0),
-                mk('严格顺序', mirrorStrict.value ? '开' : '关')],
+                mk('当前序列', batchInfo.value?.current_sequence || 0)],
       note: '来源：批次状态接口 + 镜像进度接口（实时轮询）' },
     { key: 'copy', label: '复制到 B 库', icon: 'copy', target: '镜像同步',
       status: copyN.status || 'idle',
@@ -1308,7 +1307,6 @@ async function runMirror(mode = 'auto') {
   try {
     const parts = []
     if (mode !== 'auto') parts.push(`post_identify=${mode === 'force' ? 'true' : 'false'}`)
-    if (mirrorStrict.value) parts.push('strict=true')  // 阶段二路线B：严格顺序引擎
     const q = parts.length ? '?' + parts.join('&') : ''
     const d = await api(`/mirror/run${q}`, { method: 'POST' }, 300000)
     const extra = []
@@ -2859,7 +2857,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.12 · Asia/Shanghai</span>
+          <span>v2.1.13 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3172,20 +3170,20 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </el-collapse-item>
             </el-collapse>
             <div v-if="mirrorStatus.lock?.busy && !mirrorBusy" class="mirror-lock-tip"><el-tag type="warning" size="small">后台任务运行中</el-tag> {{ mirrorStatus.lock.owner || '镜像任务' }} 已运行约 {{ mirrorStatus.lock.held_seconds }} 秒；同步 / 改名共用一把锁，等它结束再点「立即同步」即可，无需刷新页面。</div>
-            <!-- 阶段二路线B C4：严格顺序引擎与批次控制 -->
+            <!-- v2.1.13：严格顺序模式已移除——处理顺序固定按光鸭网盘的文件名升序，
+                 不再需要额外开关；批次控制（暂停/恢复/跳过/取消）在所有同步里都生效。 -->
             <!-- v2.1.11：按钮按批次真实状态禁用；状态标签用中文；补「恢复被跳过项」 -->
             <div class="batch-control-row">
-              <span class="hint">严格顺序引擎</span>
-              <el-switch v-model="mirrorStrict" size="small"/>
-              <span class="hint">一个文件复制确认完成后才提交下一个，可暂停 / 恢复 / 跳过 / 取消。</span>
-              <el-tag v-if="batchInfo.batch_id" size="small" :type="batchInfo.status === 'paused' ? 'warning' : batchInfo.status === 'running' ? 'success' : 'info'">{{ batchStatusLabel(batchInfo.status) }} · {{ batchInfo.done || 0 }}/{{ batchInfo.total || 0 }} · 序列 {{ batchInfo.current_sequence || 0 }}</el-tag>
-              <el-button size="small" :disabled="!mirrorStrict || !batchCan('pause')" @click="batchControl('pause')">暂停</el-button>
-              <el-button size="small" :disabled="!mirrorStrict || !batchCan('resume')" @click="batchControl('resume')">恢复</el-button>
-              <el-button size="small" :disabled="!mirrorStrict || !batchCan('skip')" @click="batchControl('skip')">跳过当前任务</el-button>
-              <el-button size="small" type="danger" :disabled="!mirrorStrict || !batchCan('cancel')" @click="batchControl('cancel')">取消批次</el-button>
+              <span class="hint">批次控制</span>
+              <span class="hint">按光鸭文件名升序逐个目录推进，可在目录边界暂停 / 恢复 / 跳过 / 取消。</span>
+              <el-tag v-if="batchInfo.batch_id" size="small" :type="batchInfo.status === 'paused' ? 'warning' : batchInfo.status === 'running' ? 'success' : 'info'">{{ batchStatusLabel(batchInfo.status) }}</el-tag>
+              <el-button size="small" :disabled="!batchCan('pause')" @click="batchControl('pause')">暂停</el-button>
+              <el-button size="small" :disabled="!batchCan('resume')" @click="batchControl('resume')">恢复</el-button>
+              <el-button size="small" :disabled="!batchCan('skip')" @click="batchControl('skip')">跳过当前任务</el-button>
+              <el-button size="small" type="danger" :disabled="!batchCan('cancel')" @click="batchControl('cancel')">取消批次</el-button>
               <!-- v2.1.11：skip 此前是不可逆终态，点错一次这批文件就再也不被复制。
                    补一条恢复路径：把被跳过的任务改回待处理，下次同步重新拾取。 -->
-              <el-button size="small" plain :disabled="!mirrorStrict || !batchCan('reopen')" @click="batchControl('reopen')">恢复被跳过项</el-button>
+              <el-button size="small" plain :disabled="!batchCan('reopen')" @click="batchControl('reopen')">恢复被跳过项</el-button>
             </div>
             <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button><!-- v2.1.11 需求1：B 库被手动清空后的端到端重整入口 -->
               <el-button type="warning" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="restructureBLibrary">B 库清空重整</el-button></div>
@@ -3303,7 +3301,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="polls" label="轮询次数" width="100"/>
               <el-table-column label="备注 / 报错" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '—' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">严格顺序引擎的失败 / 跳过 / 取消终态此前只体现在统计数字里，任务表本身看不到——用户无从判断该不该重试。现在每条任务都有中文状态与报错原因；被「跳过当前」跳掉的任务可用上方「恢复被跳过项」恢复为待处理。</p>
+            <p class="hint">批次任务此前失败 / 跳过 / 取消的终态只体现在统计数字里，任务表本身看不到——用户无从判断该不该重试。现在每条任务都有中文状态与报错原因；被「跳过当前」跳掉的任务可用上方「恢复被跳过项」恢复为待处理。</p>
           </div>
           <div v-if="mirrorStatus.invalid_media?.length" class="panel">
             <div class="panel-head"><h3>无效影视映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.invalid_media.length }} 条</el-tag><el-button size="small" type="danger" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearInvalidMedia">清理无效影视映射</el-button></div>

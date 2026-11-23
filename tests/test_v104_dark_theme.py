@@ -20,10 +20,18 @@ def test_all_tab_entries_preserved():
 
 
 def test_mirror_batch_control_buttons_preserved():
-    """阶段二 C4 的批次控制四按钮不得被 UI 升级删掉。"""
-    for action in ["pause", "resume", "skip", "cancel"]:
+    """批次控制按钮不得被 UI 升级删掉。
+
+    v2.1.13：严格顺序引擎（含 mirrorStrict 开关）已移除，批次控制从「仅 strict 可用」
+    变成常态可用，因此这里是**五个**按钮（含 v2.1.11 新增的“恢复被跳过项”）全在。
+    """
+    for action in ["pause", "resume", "skip", "cancel", "reopen"]:
         assert f"batchControl('{action}')" in APP, f"批次控制按钮丢失：{action}"
-    assert "mirrorStrict" in APP and "batchInfo" in APP
+    assert "batchInfo" in APP, "批次状态载体丢失"
+    assert "batchCan(" in APP, "按钮可用性判断丢失（按真实状态禁用）"
+    # 严格顺序引擎的开关与配置项必须彻底消失，防止被误加回来
+    assert "mirrorStrict" not in APP, "严格顺序引擎开关应已移除"
+    assert "严格顺序引擎" not in APP
 
 
 def test_dark_theme_toggle_present():
