@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QRCode from 'qrcode'
 
@@ -292,6 +292,27 @@ const diagCount = computed(() => {
     (c.invalid_mappings || 0) + (c.unmapped_dirs || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
+// v2.1.14：目录映射 / 影视映射清单加分页。此前两张表把全部行一次性渲染，
+// 真机上千条映射时页面被拉得极长、滚动卡顿。改成**前端本地分页**（数据仍由
+// /api/mirror/status 一次返回，不新增接口、不改后端口径），默认每页 5 条、可切换条数。
+const useLocalPager = (rowsRef, defaultSize = 5) => {
+  const page = ref(1)
+  const pageSize = ref(defaultSize)
+  const sizeOptions = [5, 10, 20, 50, 100]
+  const total = computed(() => rowsRef.value.length)
+  const pageCount = computed(() => Math.max(1, Math.ceil(total.value / (Number(pageSize.value) || defaultSize))))
+  const paged = computed(() => {
+    const size = Math.max(1, Number(pageSize.value) || defaultSize)
+    const start = (page.value - 1) * size
+    return rowsRef.value.slice(start, start + size)
+  })
+  // 改每页条数 → 回第一页；数据变少（清理/重载）→ 页码夹回有效范围，不留空白页
+  watch(pageSize, () => { page.value = 1 })
+  watch(pageCount, n => { if (page.value > n) page.value = n })
+  return { page, pageSize, sizeOptions, total, pageCount, paged }
+}
+const dirPager = useLocalPager(computed(() => mirrorStatus.value.dirs || []))
+const mediaPager = useLocalPager(computed(() => mirrorStatus.value.media || []))
 // v2.1.13：严格顺序模式与开关已移除（顺序固定按网盘文件名升序，批次控制常态生效）
 const batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_sequence: 0 })
 // v2.1.11：「已清理待重建」目录行可勾选重建（此前只能整批清空）
@@ -2857,7 +2878,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.13 · Asia/Shanghai</span>
+          <span>v2.1.14 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3338,7 +3359,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div class="panel">
             <div class="panel-head"><h3>目录映射清单</h3><el-tag size="small" type="info">分类目录原名 1:1 · 影视主目录带 ·</el-tag><el-tag v-if="mirrorStatus.counts?.dirs_pruned_zombie" size="small" type="warning">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条已清理待重建</el-tag><el-button size="small" :loading="mirrorBusy" :disabled="mirrorBusy" @click="pruneMirrorMappings">清理无效映射</el-button><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.counts?.dirs_pruned_zombie" @click="clearPrunedMappings">清空已清理映射</el-button></div>
             <p class="hint">「清理无效映射」只读核对 B 库，把已不存在的文件 / 目录映射重置为待同步（保留 A 库文件名与指纹），下一轮「立即同步」自动补复制；不删资源、分享与队列。被清理的目录标记「待重建」后不再占用上方「待创建目录」清单——确认后点「清空已清理映射」可彻底删除这些僵尸行（A 库仍在时下轮同步会自动重建）。</p>
-            <div class="table-scroll"><el-table :data="mirrorStatus.dirs || []" size="small">
+            <div class="table-scroll"><el-table :data="dirPager.paged.value" size="small">
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="category_path" label="所属分类" min-width="160"/>
@@ -3347,11 +3368,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
               <el-table-column prop="error" label="备注 / 失败原因" min-width="200"/>
             </el-table></div>
+            <!-- v2.1.14：本地分页，默认每页 5 条、可切换每页条数 -->
+            <div class="pager-row">
+              <el-pagination background small layout="total, sizes, prev, pager, next, jumper"
+                :total="dirPager.total.value"
+                v-model:current-page="dirPager.page.value"
+                v-model:page-size="dirPager.pageSize.value"
+                :page-sizes="dirPager.sizeOptions" />
+            </div>
             <p class="hint">分类目录保持 A 库原名、不加标记；只有影视主目录按 · 规则命名，括号里的年份与 TMDB 标记保持原样。</p>
           </div>
           <div class="panel">
             <div class="panel-head"><h3>影视映射清单</h3><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy || !mirrorStatus.media?.length" @click="clearInvalidMedia">清理无效影视映射</el-button></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.media || []" size="small">
+            <div class="table-scroll"><el-table :data="mediaPager.paged.value" size="small">
               <el-table-column prop="category_path" label="分类目录" min-width="140"/>
               <el-table-column prop="title" label="标准影视名" min-width="180"/>
               <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
@@ -3360,6 +3389,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <!-- v2.1.11：状态列改用后端给出的中文标签，页面不再直出英文枚举 -->
               <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
             </el-table></div>
+            <!-- v2.1.14：本地分页，默认每页 5 条、可切换每页条数 -->
+            <div class="pager-row">
+              <el-pagination background small layout="total, sizes, prev, pager, next, jumper"
+                :total="mediaPager.total.value"
+                v-model:current-page="mediaPager.page.value"
+                v-model:page-size="mediaPager.pageSize.value"
+                :page-sizes="mediaPager.sizeOptions" />
+            </div>
             <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。<b>点「清理无效影视映射」会只读核对 B 库</b>，把网盘上已整部删除文件的历史映射行清掉（列目录不可信或有文件的行一律保留）；只删 A→B 映射登记，不删资源 / 分享 / 队列 / B 库文件。</p>
           </div>
             </el-collapse-item>
@@ -5387,6 +5424,9 @@ button{font-family:inherit}
 }
 /* 表格横向滚动：包一层即可，避免列多撑破布局 */
 .table-scroll{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* v2.1.14：映射清单分页条。移动端允许换行，避免页码被挤出屏幕 */
+.pager-row{display:flex;justify-content:flex-end;margin-top:10px;flex-wrap:wrap}
+.pager-row :deep(.el-pagination){flex-wrap:wrap;row-gap:6px}
 .table-scroll .el-table{min-width:560px}
 /* 固定宽度内联控件的通用兜底：窄屏不要溢出 */
 .head-tools .el-input,.head-tools .el-select{max-width:100%}

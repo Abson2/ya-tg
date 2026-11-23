@@ -27,6 +27,19 @@ from .config import settings
 
 RULE_SOURCE = "ya-tg"
 
+# v2.1.14：401 文案改成「可操作的排查指引」，不再只丢一句「Token 无效」。
+# 真机根因（2026-11-23 两容器交叉核对）：不是 Token 被撤销，而是**错配**——
+# 本机保存的 Token 与 TgtoDrive 端当前有效的凭据不是同一个值（前缀与 sha256 均不同），
+# 服务端对「不存在的凭据」和「随便编的假 Token」返回的是同一个 401。
+# 用户侧看到的现象是「TgtoDrive 里凭据明明有效，却一直 401」。
+TOKEN_401_HINT = (
+    "TgtoDrive OpenAPI Token 无效（401）：本机保存的 Token 与 TgtoDrive 端当前有效的"
+    "凭据不一致（凭据在 TgtoDrive 端不存在，常见于对方重新生成过 Token）。"
+    "请到 TgtoDrive「实用工具 → OpenAPI」复制该凭据的**最新完整 Token**，"
+    "回填到本页 TgtoDrive 配置并保存，再点「测试连接」验证；"
+    "若刚升级过本系统，请同时确认升级没有覆盖已保存的配置。"
+)
+
 # 阶段五 B-07：求片白名单采纳时 _tmdb_meta 每次都请求 TMDB（走 SCAN 限流），同一
 # 作品被重复采纳/刷新会重复消耗配额。加进程内 TTL 缓存，只覆盖这一条链路，不动
 # 识别/英文名解析的 TMDB 调用。失败/未配置结果不缓存，避免暂时故障被固化。
@@ -223,7 +236,7 @@ async def fetch_config(db: Session) -> tuple[dict, str]:
         r = await client.get(f"{base}/api/visual-filter/config",
                              params={"scene": scene}, headers=_headers(token))
     if r.status_code == 401:
-        raise TgtoError("TgtoDrive OpenAPI Token 无效（401）")
+        raise TgtoError(TOKEN_401_HINT)
     if r.status_code >= 400:
         raise TgtoError(f"读取 TgtoDrive 配置失败 HTTP {r.status_code}：{r.text[:200]}")
     try:
@@ -244,7 +257,7 @@ async def save_config(db: Session, data: dict, scene: str, scene_obj: dict) -> N
         r = await client.post(f"{base}/api/visual-filter/config",
                               json=body, headers=_headers(token))
     if r.status_code == 401:
-        raise TgtoError("TgtoDrive OpenAPI Token 无效（401）")
+        raise TgtoError(TOKEN_401_HINT)
     if r.status_code >= 400:
         raise TgtoError(f"写回 TgtoDrive 配置失败 HTTP {r.status_code}：{r.text[:200]}")
 

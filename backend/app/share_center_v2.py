@@ -1077,6 +1077,72 @@ def _prune_empty_push_lists(db: Session) -> int:
     return len(doomed)
 
 
+def _item_still_owns_first(db: Session, item: SCPushListItem) -> bool:
+    """这条首推清单项是否仍「占用」该作品在该渠道的首推名额。
+
+    v2.1.14 修的真机死锁：清理无效任务只把 `SCPublishTask` 标成 `cleaned`，
+    对应的 `SCPushListItem` 仍是 `planned`；而建任务时的两道 dedup 都**不看任务状态**，
+    于是系统永远认为「这个作品的首推已存在」→ 新入库作品再也建不出推送任务。
+    真机实测：227 个最新作品快照被这种已清理旧项挡住。
+    """
+    statuses = list(db.scalars(select(SCPublishTask.status).where(
+        SCPublishTask.list_item_id == item.id)).all())
+    if not statuses:
+        # 清单项没有任何任务：无法判断它是否推过，**保守视为仍占用**，
+        # 宁可少建也不能造成重复首推。
+        return True
+    return any(str(s or "") != CLEANED_TASK_STATUS for s in statuses)
+
+
+def _ever_published(db: Session, *, work_key: str, chat_id: str) -> bool:
+    """该作品在该渠道是否曾真正推送成功（`published`）。
+
+    「清理后重建首推」的防重复闸：清理只挑 `failed`/`cancelled`，理论上不会命中
+    `published`；这里仍显式挡一道，避免历史脏数据把已推过的作品再推一遍。
+    """
+    row = db.scalar(
+        select(SCPublishTask.id)
+        .join(SCPushListItem, SCPushListItem.id == SCPublishTask.list_item_id)
+        .where(SCPublishTask.work_key == work_key)
+        .where(SCPushListItem.chat_id == chat_id)
+        .where(SCPublishTask.status == "published")
+        .limit(1))
+    return row is not None
+
+
+def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
+                     dedup: str) -> tuple[str, SCPushListItem | None]:
+    """首推去重决策。返回 `(action, 可复用的旧清单项)`。
+
+      - `"skip"`   ：已有仍有效的首推，或该作品在此渠道曾真正推送成功 → 不建任务；
+      - `"revive"` ：旧首推项的任务**全部已清理** → 复活同一行再建任务；
+      - `"create"` ：从来没有首推项 → 新建。
+
+    为什么 revive 而不是新插一行：`SCPushListItem.dedup_key` 是**唯一约束**，
+    旧行还在，直接按同一 dedup 另插一条会撞唯一键、整轮计划失败。
+    复活只更新清单项本身，历史任务行与执行记录一条不动。
+    """
+    # 本项目 Session 是 autoflush=False：同一轮里刚建/刚改的任务状态必须先落库，
+    # 否则下面的状态判定读到的是旧值（与 api_cleanup_tasks 处同一条坑）。
+    db.flush()
+    candidates = list(db.scalars(
+        select(SCPushListItem)
+        .where(or_(SCPushListItem.dedup_key == dedup,
+                   (SCPushListItem.work_key == work_key)
+                   & (SCPushListItem.chat_id == chat_id)
+                   & (SCPushListItem.source_kind == "first")))
+        .order_by(SCPushListItem.id)).all())
+    if any(_item_still_owns_first(db, c) for c in candidates):
+        return "skip", None
+    if _ever_published(db, work_key=work_key, chat_id=chat_id):
+        return "skip", None
+    if candidates:
+        # 优先复用「新格式 dedup」那一行，其次才是历史格式行
+        reuse = next((c for c in candidates if c.dedup_key == dedup), candidates[0])
+        return "revive", reuse
+    return "create", None
+
+
 def plan_engine(db: Session) -> dict[str, int]:
     """按活动计划版本与分类游标生成推送清单、清单项和发布任务。"""
     version = _active_version(db)
@@ -1218,28 +1284,35 @@ def plan_engine(db: Session) -> dict[str, int]:
                 # 不依赖这条首推 dedup。
                 chat_id = str(channel.chat_id or "")
                 dedup = f"{lv.work_key}:{channel.id}:first"[:255]
-                exists = db.scalar(select(SCPushListItem.id).where(SCPushListItem.dedup_key == dedup))
-                if exists:
+                # v2.1.14：两道 dedup 合并成一次「看任务状态」的决策。
+                # 旧写法是 dedup_key 查一次 + (work_key, chat_id, first) 兜底查一次，
+                # 两次都**不看任务状态**——已清理（cleaned）的旧首推项把名额永久占死，
+                # 新入库作品因此建不出任何推送任务（真机 227 个快照被挡）。
+                action, reuse = first_dedup_plan(
+                    db, work_key=lv.work_key, chat_id=chat_id, dedup=dedup)
+                if action == "skip":
                     continue
-                # 历史兼容：老库的 first 项 dedup 是 work_key:fingerprint:channel_id，
-                # 格式变了但**语义不变**（同一作品同一渠道的首推只应有一条）。
-                # 只查新 dedup 会让老行全部失效 → 反而制造一次重复首推。
-                # 因此再按 (work_key, chat_id, source_kind=first) 兜底查一次。
-                legacy = db.scalar(select(SCPushListItem.id).where(
-                    SCPushListItem.work_key == lv.work_key,
-                    SCPushListItem.chat_id == chat_id,
-                    SCPushListItem.source_kind == "first").limit(1))
-                if legacy:
-                    continue
-                item = SCPushListItem(
-                    list_id=push_list.id, work_key=lv.work_key,
-                    library_version_id=lv.id, category_key=category.category_key,
-                    target_type=target_type, bot_id=channel.bot_id or 0,
-                    chat_id=str(channel.chat_id or ""), dedup_key=dedup,
-                    source_kind="first", status="planned",
-                )
-                db.add(item)
-                db.flush()
+                if action == "revive" and reuse is not None:
+                    # 复活旧行：dedup_key 是唯一约束，另插一条会撞唯一键。
+                    # 只更新清单项本身，历史任务行与执行记录全部保留。
+                    item = reuse
+                    item.list_id = push_list.id
+                    item.library_version_id = lv.id
+                    item.category_key = category.category_key
+                    item.target_type = target_type
+                    item.bot_id = channel.bot_id or 0
+                    item.status = "planned"
+                    db.flush()
+                else:
+                    item = SCPushListItem(
+                        list_id=push_list.id, work_key=lv.work_key,
+                        library_version_id=lv.id, category_key=category.category_key,
+                        target_type=target_type, bot_id=channel.bot_id or 0,
+                        chat_id=str(channel.chat_id or ""), dedup_key=dedup,
+                        source_kind="first", status="planned",
+                    )
+                    db.add(item)
+                    db.flush()
                 item_count += 1
                 task = SCPublishTask(
                     list_item_id=item.id, work_key=lv.work_key,
@@ -3075,6 +3148,23 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
         task.updated_at = utcnow()
         cleaned += 1
         details.append({"id": task.id, "reason": reason})
+    # v2.1.14：清单项状态跟着任务走。此前只把任务标 cleaned、清单项留 planned，
+    # 「发布清单」里因此仍挂着一排「待推送」，首推名额也被这些僵尸项占死
+    # （见 first_dedup_plan）。只在**该项下所有任务都已清理**时才标 cleaned，
+    # 不误伤仍有在途任务的清单项；历史行一律保留，不做物理删除。
+    # 注意：本项目 Session 是 autoflush=False，必须先 flush，否则下面的
+    # 「还有没有未清理任务」查询读不到上面刚改的 cleaned，清单项永远不会被更新。
+    db.flush()
+    item_ids = {int(t.list_item_id or 0) for t in rows if int(t.list_item_id or 0) > 0}
+    for iid in sorted(item_ids):
+        left = db.scalar(select(SCPublishTask.id).where(
+            SCPublishTask.list_item_id == iid,
+            SCPublishTask.status != CLEANED_TASK_STATUS).limit(1))
+        if left:
+            continue
+        it = db.get(SCPushListItem, iid)
+        if it is not None:
+            it.status = CLEANED_TASK_STATUS
     db.commit()
     return {"ok": True, "cleaned": cleaned, "skipped": skipped, "items": details}
 
