@@ -1618,6 +1618,11 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 这次重查是**并发兜底**，保证已投递的行永远不会被重置回 pending。
         q = db.scalar(select(QueueItem).where(QueueItem.resource_id == rep.id,
                                              QueueItem.channel_id == channel.id))
+        if q is None:
+            # v2.1.11：归档行也占着 (resource_id, channel_id) 唯一键，
+            # 直接 INSERT 会撞约束。B 库清空重整后重建时命中归档行 → 复活复用。
+            from .archive import find_queue_item
+            q = find_queue_item(db, rep.id, channel.id)
         if not q:
             q = QueueItem(resource_id=rep.id, channel_id=channel.id)
             db.add(q)

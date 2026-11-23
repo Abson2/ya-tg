@@ -132,18 +132,25 @@ const mediaLinkLabel = (state) => ({
 // 推送任务状态中文化（界面上不暴露内部枚举名）
 // v2.1.6：新增 skipped ——「该资源在此渠道已推送过，跳过重复投递」
 // （泰迪熊2 双推修复：已 sent 的队列行不得被复活，故任务落到已跳过终态）。
+// v2.1.11：措辞收敛——本项目有 5 种含义不同的「跳过」，页面必须各说各的，
+//   统一叫「已跳过」会让用户完全分不清是哪种：
+//   ① 忽略翻译   —— 作品被标记不再解析英文名
+//   ② 改名跳过   —— 文件名已达标 / 无中文可改，跳过改名
+//   ③ 跳过本序列 —— 严格顺序引擎里整段序列被跳过（后端 _task_status_label）
+//   ④ 已跳过投递 —— 该资源在此渠道已推送过，跳过重复投递（本处）
+//   ⑤ 跳过当前   —— 用户在批次里主动跳过当前任务（按钮文案）
 const scTaskStatusLabel = (status) => ({
   planned: '待发布', ready: '待推送', building: '建链中',
   submitted: '已提交', accepted: '已领取', publishing: '推送中',
   published: '已成功', failed: '失败', cancelled: '已取消',
-  skipped: '已跳过',
+  skipped: '已跳过投递',
 }[status || ''] || status || '—')
 // v2.1.6：执行记录里的「阶段 / 状态」同样中文化，页面不得直出内部枚举名。
 const scExecStageLabel = (stage) => ({
   build: '建分享', submit: '提交队列', send: '发送',
 }[stage || ''] || stage || '—')
 const scExecStatusLabel = (status) => ({
-  running: '进行中', success: '成功', failed: '失败', skipped: '已跳过',
+  running: '进行中', success: '成功', failed: '失败', skipped: '已跳过投递',
 }[status || ''] || status || '—')
 // v2.1.3：时间显示统一简化。
 // 真机问题：后端原先直接吐 ISO 串 `2026-11-22T01:00:17.123456+00:00`——
@@ -263,15 +270,32 @@ const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, mirror_mode: 'full', interval_presets: [], unverified_endpoints: [], note: '' })
 const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
+// v2.1.11：三处折叠组各用独立 v-model——此前共用同一个 mirrorDiagOpen，
+// 展开一个会收起另一个，用户刚展开「问题诊断」又发现「清单」被关掉了。
 const mirrorDiagOpen = ref([])
+const mirrorCfgOpen = ref([])
+const mirrorStatusOpen = ref([])
 const diagCount = computed(() => {
   const s = mirrorStatus.value
+  const c = s.counts || {}
+  // v2.1.11：补齐所有失败/待处理态——此前只算 4 项，
+  // 页面「同步状态」里显示「失败任务 3」但折叠头写「无待处理项」，
+  // 用户根本不知道该不该点进去。
   return (s.missing_dirs?.length || 0) + (s.file_errors?.length || 0) +
-    (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0)
+    (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0) +
+    (c.files_failed || 0) + (c.files_copying || 0) + (c.files_unknown || 0) +
+    (c.files_retryable || 0) + (c.files_rename_failed || 0) +
+    (c.tasks_failed || 0) + (c.tasks_unknown || 0) +
+    (c.tasks_skipped || 0) + (c.tasks_cancelled || 0) +
+    // v2.1.11：用后端给的中文口径别名，不再在后端字段名上直接取值
+    // （页面不得体现后端代码名词）。
+    (c.invalid_mappings || 0) + (c.unmapped_dirs || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // 阶段二路线B C4：严格顺序引擎开关 + 批次控制状态
 const mirrorStrict = ref(false), batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_sequence: 0 })
+// v2.1.11：「已清理待重建」目录行可勾选重建（此前只能整批清空）
+const prunedDirSelected = ref([])
 // v0.9.17.2：失败任务定向批量重试的勾选行（目录 / 文件各自独立）
 const missingDirSelected = ref([]), fileErrSelected = ref([])
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
@@ -710,6 +734,21 @@ async function pollMirrorStatus() {
   try { batchInfo.value = await api('/mirror/batch/status') } catch (e) {}
 }
 // 阶段二路线B C4：批次控制（暂停/恢复/跳过/取消），危险操作二次确认
+// v2.1.11：按批次真实状态禁用按钮 + 后端返回 applied/reason 后给**真实反馈**。
+// 此前无论后端有没有真的执行，前端都无条件弹「批次指令已下发」——
+// 用户点了没反应却看到「已下发」，典型的「有按钮无效果」。
+const batchStatusLabel = (s) => ({
+  idle: '空闲', running: '运行中', paused: '已暂停',
+  cancelling: '取消中', cancelled: '已取消'
+}[String(s || 'idle')] || '空闲')
+// 各指令的可用条件：与后端 request_control 的判定保持一致
+const batchCan = (action) => {
+  const st = String(batchInfo.value?.status || 'idle')
+  if (action === 'pause' || action === 'skip' || action === 'cancel') return st === 'running'
+  if (action === 'resume') return st === 'paused' || st === 'cancelling'
+  if (action === 'reopen') return !!batchInfo.value?.batch_id
+  return false
+}
 async function batchControl(action) {
   if (action === 'cancel') {
     try { await ElMessageBox.confirm('取消后未完成的复制任务将停止推进，确定继续？', '取消当前批次', { type: 'warning' }) }
@@ -717,7 +756,17 @@ async function batchControl(action) {
   }
   try {
     const d = await api(`/mirror/batch/control?action=${action}`, { method: 'POST' })
-    ElMessage.success(`批次指令已下发：${action}`)
+    // 后端明说这条指令到底有没有生效，前端据此给真实反馈
+    if (d && d.applied === false) {
+      ElMessage.warning(d.reason || '该指令当前不适用，未执行')
+    } else {
+      const tips = {
+        pause: '已暂停本批次', resume: '已恢复本批次',
+        skip: '已跳过当前任务', cancel: '已请求取消本批次',
+        reopen: d?.reopened ? `已恢复 ${d.reopened} 个被跳过的任务` : '本批次没有被跳过的任务'
+      }
+      ElMessage.success(tips[action] || '指令已生效')
+    }
     await pollMirrorStatus()
     return d
   } catch (e) { ElMessage.error(String(e?.message || e)) }
@@ -807,7 +856,9 @@ const taskCenter = computed(() => {
       note: '来源：批次状态接口 + 镜像进度接口（实时轮询）' },
     { key: 'copy', label: '复制到 B 库', icon: 'copy', target: '镜像同步',
       status: copyN.status || 'idle',
-      metrics: [mk('本轮完成', copyN.value || 0), mk('文件总数', copyN.total || 0)],
+      // v2.1.11：标签口径修正——这个数字是「本轮提交的复制任务数」，
+      // 不是 B 库文件总数；叫「文件总数」会让人以为是全库文件量。
+      metrics: [mk('本轮完成', copyN.value || 0), mk('复制任务数', copyN.total || 0)],
       note: '来源：镜像进度流水线「复制到 B 库」节点' },
     { key: 'rename', label: '英文改名', icon: 'file', target: '镜像同步',
       status: (s.rename_errors?.length || s.untranslated_works?.length) ? 'warn' : (renameN.status || 'idle'),
@@ -1276,11 +1327,11 @@ async function runMirror(mode = 'auto') {
     // 「改名 0 · 待翻译 0 · 失败 0」三个零看不出到底是跳过、无中文还是改名没执行
     const r = d.rename
     if (r) {
-      const rp = [`改名 ${r.renamed || 0} · 已达标跳过 ${r.skipped || 0} · 无中文跳过 ${r.ascii || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`]
+      const rp = [`改名 ${r.renamed || 0} · 改名跳过(已达标) ${r.skipped || 0} · 改名跳过(无中文) ${r.ascii || 0} · 待翻译作品 ${r.untranslated || 0} · 改名失败 ${r.failed || 0}`]
       // v0.8.9：TMDB 查不到英文名时直接直译，必须让用户看得到走了哪条兜底
       if (r.literal_ai || r.literal_pinyin) rp.push(`无官方英文名·直译 ${r.literal_ai || 0} 部 · 拼音兜底 ${r.literal_pinyin || 0} 部`)
       if (r.no_rows) rp.push(`无待改名文件 ${r.no_rows} 部`)
-      // v2.1.10：把「重复改名核对」这类过程指标摆出来。网盘回报「文件名已存」时，
+      // v2.1.11：把「重复改名核对」这类过程指标摆出来。网盘回报「文件名已存」时，
       // 其实改名早已生效、只是记录没跟上；系统会自动核对并收敛成完成态。
       // 不说清楚的话，用户只看到过程里反复报错，却不知道最终结果如何。
       if (r.name_exists_recovered) rp.push(`重复改名核对 ${r.name_exists_recovered} 个（已确认为完成）`)
@@ -1303,7 +1354,7 @@ async function renameMirrorFiles(force = false) {
   mirrorBusy.value = true
   try {
     const d = await api(`/mirror/rename?force=${force ? 'true' : 'false'}`, { method: 'POST' }, 300000)
-    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}` + ((d.literal_ai || d.literal_pinyin) ? ` · 无官方英文名·直译 ${d.literal_ai || 0} 部 · 拼音兜底 ${d.literal_pinyin || 0} 部` : '') + (d.name_exists_recovered ? ` · 重复改名核对 ${d.name_exists_recovered} 个（已确认为完成）` : '') + (d.name_exists_conflict ? ` · 名称被占用 ${d.name_exists_conflict} 个（下轮自动加序号）` : '')
+    const msg = `改名完成 ${d.renamed || 0} 个文件：改名跳过(已达标) ${d.skipped || 0} · 改名跳过(无中文) ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}` + ((d.literal_ai || d.literal_pinyin) ? ` · 无官方英文名·直译 ${d.literal_ai || 0} 部 · 拼音兜底 ${d.literal_pinyin || 0} 部` : '') + (d.name_exists_recovered ? ` · 重复改名核对 ${d.name_exists_recovered} 个（已确认为完成）` : '') + (d.name_exists_conflict ? ` · 名称被占用 ${d.name_exists_conflict} 个（下轮自动加序号）` : '')
     const first = d.errors?.length ? ` · 首个错误：${String(d.errors[0]).slice(0, 140)}` : ''
     const notice = d.notices?.length ? ` · ${String(d.notices[0]).slice(0, 160)}` : ''
     if (d.failed || d.untranslated) ElMessage.warning(msg + notice + first)
@@ -1392,61 +1443,112 @@ async function clearUntranslated() {
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
+// v2.1.11：统一的清理入口——三个清单的清理动作都走 /mirror/cleanup，
+// 用 scope 区分范围、dry_run 先预览。此前三个按钮各调各的老端点，
+// 口径、是否联网、是否物理删除都不一样，用户点之前无法预判会发生什么。
+// 返回体结构按 scope 不同，这里统一成一段可读文案。
+function cleanupScopeText(d) {
+  const parts = []
+  if (d.removed != null) parts.push(`移除 ${d.removed} 条`)
+  if (d.files_pruned) parts.push(`重置 ${d.files_pruned} 个文件映射`)
+  if (d.dirs_pruned) parts.push(`重置 ${d.dirs_pruned} 个目录映射`)
+  if (d.removed_media) parts.push(`移除 ${d.removed_media} 条影视映射`)
+  if (d.removed_files) parts.push(`连带 ${d.removed_files} 个文件映射`)
+  const skipped = (d.media_skipped_unverified || 0) + (d.dirs_skipped_unverified || 0) +
+                  (d.skipped_unverified || 0)
+  if (skipped) parts.push(`${skipped} 项核对不可信已跳过`)
+  if (d.media_skipped_empty) parts.push(`${d.media_skipped_empty} 部 B 库无文件已跳过`)
+  if (!parts.length) parts.push('没有需要清理的内容')
+  return parts.join('；')
+}
+async function runMirrorCleanup(scope, extra = {}) {
+  const body = { scope, dry_run: true, ...extra }
+  let preview
+  try {
+    preview = await api('/mirror/cleanup', { method: 'POST', body: JSON.stringify(body) }, 300000)
+  } catch (e) { ElMessage.error(e.message); return null }
+  // v2.1.11：确认文案按 scope 分化。
+  // 此前三个清理按钮共用一段「只会被重置为待同步」的话术，但其中两个
+  // （清空已清理映射 / 清理无效影视映射）实际是**物理删行**——
+  // 用户点之前看到的描述与真实后果不一致，这正是「有按钮无效果」
+  // 之外的另一种坑：按钮有效，但用户以为的后果是错的。
+  const how = ({
+    all: '文件映射只会被重置为待同步（A 库文件名与指纹保留），目录映射会被标记为待重建。下一轮「立即同步」自动补复制并改名。资源、分享与推送队列不受影响。',
+    file: '只处理文件映射：把 B 库已不存在的文件映射重置为待同步（A 库文件名与指纹保留），下一轮「立即同步」自动补复制。目录映射、影视映射、资源、分享与推送队列都不受影响。',
+    dir: '只处理目录映射：把 B 库已不存在的目录映射标记为待重建，下一轮「立即同步」自动重建目录。文件映射、影视映射、资源、分享与推送队列都不受影响。',
+    pruned: '会**彻底移除**「已清理待重建」的僵尸目录行（这些行对应的 B 库目录已经不存在）。只删这些行，不碰真正建目录失败的映射，也不删资源、分享与推送队列。A 库仍在的话，下一轮「立即同步」会重新建目录并自动重建映射。',
+    media: '会**彻底移除**无效影视映射行及其子文件映射行（口径：只读核对 B 库，整部作品已无文件的行才处理；有文件、列目录不可信的行一律保留）。不删资源、分享、推送队列与 B 库文件。'
+  })[scope] || '具体影响范围见上方预览。'
+  const ok = await confirmBox(
+    '即将执行清理，先确认影响范围：\n\n' + cleanupScopeText(preview) +
+    '\n\n' + how)
+  if (!ok) return null
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/cleanup', { method: 'POST', body: JSON.stringify({ scope, dry_run: false, ...extra }) }, 300000)
+    ElMessage.success('清理完成：' + cleanupScopeText(d))
+    await load()
+    return d
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
 // v0.9.6：彻底删除「已清理待重建」的僵尸目录映射（带 [pruned] 标记的 missing 行）。
 async function clearPrunedMappings() {
   const n = mirrorStatus.value.counts?.dirs_pruned_zombie || 0
   if (!n) { ElMessage.info('当前没有可清空的已清理映射'); return }
-  const ok = await confirmBox(
-    `将物理删除 ${n} 条「已清理待重建」的目录映射记录（B 库已不存在的僵尸行）。\n\n` +
-    '只删这类 [pruned] 记录，不碰真正建目录失败的映射，也不删资源 / 分享 / 推送队列。' +
-    'A 库仍是权威源：若目录还在，下一轮「立即同步」会自动重建映射。')
-  if (!ok) return
-  mirrorBusy.value = true
-  try {
-    const d = await api('/mirror/mappings/clear-pruned', { method: 'POST' })
-    ElMessage.success(`已清空 ${d.removed || 0} 条无效映射记录`)
-    await load()
-  } catch (e) { ElMessage.error(e.message) }
-  finally { mirrorBusy.value = false }
+  await runMirrorCleanup('pruned')
 }
-// v0.9.10：清理影视映射清单的无效行——口径改为「核对 B 库，删除网盘文件已整部删除的历史行」。
+// v0.9.10：清理影视映射清单的无效行——口径为「核对 B 库，删除网盘文件已整部删除的历史行」。
 async function clearInvalidMedia() {
   if (!mirrorStatus.value.media?.length) { ElMessage.info('影视映射清单为空，无需清理'); return }
-  const ok = await confirmBox(
-    '将只读核对 B 库真实内容，把网盘上已整部删除文件的历史影视映射行清理掉。\n\n' +
-    '只有确认列目录完整可信、且 B 库确实一个文件都没有才清理；接口异常或有文件的行一律跳过。' +
-    '同时清理本地失败/阻断且无已同步文件的僵尸行。\n\n' +
-    '只删 A→B 映射登记，不删资源 / 分享 / 推送队列 / B 库文件。')
-  if (!ok) return
-  mirrorBusy.value = true
-  try {
-    const d = await api('/mirror/media/clear-invalid', { method: 'POST' }, 300000)
-    const parts = [`已核对 B 库 ${d.b_checked || 0} 部，删除 ${d.removed_media || 0} 条无效影视映射（${d.removed_files || 0} 个文件映射）`]
-    if (d.skipped_has_files) parts.push(`${d.skipped_has_files} 部 B 库仍有文件，已保留`)
-    if (d.skipped_unverified > 0) parts.push(`${d.skipped_unverified} 部列目录不可信，已跳过`)
-    ElMessage.success(parts.join('；'))
-    await load()
-  } catch (e) { ElMessage.error(e.message) }
-  finally { mirrorBusy.value = false }
+  await runMirrorCleanup('media')
 }
 // v0.8.9：清理 B 库已不存在的文件 / 目录映射。只重置映射，不删资源与分享。
 async function pruneMirrorMappings() {
+  await runMirrorCleanup('all')
+}
+// v2.1.11：勾选「已清理待重建」目录行后定向重建（A 库仍在，可立即重建不必等下一轮同步）
+async function rebuildPrunedDirs() {
+  const ids = prunedDirSelected.value
+  if (!ids.length) { ElMessage.info('请先勾选要重建的目录'); return }
+  mirrorBusy.value = true
+  try {
+    await api('/mirror/retry/dirs', { method: 'POST', body: JSON.stringify({ ids }) }, 300000)
+    ElMessage.success(`已提交 ${ids.length} 个目录重建，下一轮同步会自动映射其下文件`)
+    prunedDirSelected.value = []
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v2.1.11 需求1：B 库被用户手动清空后的端到端重整。
+// 关键：重整只归位状态，**不触发镜像同步**——重建等下一次定时镜像同步任务自然开始。
+async function restructureBLibrary() {
   const ok = await confirmBox(
-    '将只读核对 B 库实际内容，清理其中已不存在的文件 / 目录映射。\n\n' +
-    '只重置映射（保留 A 库文件名与指纹），下一轮「立即同步」会自动补复制并改名；' +
-    '不会删除资源、分享链接或推送队列。\n' +
-    '列目录不可信或整部作品 B 库为空时一律跳过，绝不误清。')
+    '适用场景：你在网盘里手动清掉了 B 库存量文件，准备重新整理。\n\n' +
+    '本操作会一次性归位四层状态：\n' +
+    '· 镜像映射：文件映射重置为待同步（保留 A 库文件名与指纹），目录映射标记待重建\n' +
+    '· 复制任务：未完成的复制任务终止\n' +
+    '· 资源库与推送队列：相关记录归档（历史保留，不再显示在面板上）\n' +
+    '· 分享中心：未完成的分享任务取消、失效分享链接作废\n\n' +
+    '不会删除任何历史记录；A 库全程只读。\n' +
+    '本次操作**不会触发镜像同步**，重建由下一次定时镜像同步任务自然开始。')
   if (!ok) return
   mirrorBusy.value = true
   try {
-    const d = await api('/mirror/mappings/prune', { method: 'POST' }, 300000)
-    const parts = [`已清理 ${d.files_pruned || 0} 个文件映射 · ${d.dirs_pruned || 0} 个目录映射`]
-    const skipped = (d.media_skipped_unverified || 0) + (d.dirs_skipped_unverified || 0)
-    if (skipped) parts.push(`列目录不可信跳过 ${skipped} 项`)
-    if (d.media_skipped_empty) parts.push(`${d.media_skipped_empty} 部 B 库无文件已跳过，请点「立即同步」补复制`)
-    if (d.errors?.length) parts.push(`首个错误：${String(d.errors[0]).slice(0, 120)}`)
-    if (d.errors?.length) ElMessage.warning(parts.join(' · '))
-    else ElMessage.success(parts.join(' · '))
+    // 先预览
+    const prev = await api('/mirror/restructure', { method: 'POST', body: JSON.stringify({ scope: 'library', dry_run: true }) })
+    const p = prev?.preview || {}
+    const ok2 = await confirmBox(
+      '将要重整：\n' +
+      `· 影视映射 ${p.media || 0} 部 · 文件映射 ${p.files || 0} 个 · 目录映射 ${p.dirs || 0} 个\n` +
+      `· 资源库记录 ${p.resources || 0} 条 · 推送队列 ${p.queue || 0} 条\n` +
+      `· 分享任务 ${p.share_tasks || 0} 个 · 分享链接 ${p.share_records || 0} 条\n\n` +
+      '确认执行？（本次不触发镜像同步）')
+    if (!ok2) return
+    const d = await api('/mirror/restructure', { method: 'POST', body: JSON.stringify({ scope: 'library', dry_run: false }) })
+    ElMessage.success(
+      `已重整：影视 ${d.media || 0} 部 · 文件映射 ${d.files || 0} 个 · 目录映射 ${d.dirs || 0} 个 · ` +
+      `资源 ${d.resources || 0} 条 · 队列 ${d.queue || 0} 条 · 分享任务 ${d.share_tasks || 0} 个`)
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
@@ -1807,7 +1909,7 @@ async function clearLibrary() {
   } catch (e) { ElMessage.error(e.message) }
 }
 // 作品视图操作：用组内已识别的代表资源执行，避免对散落单集逐个操作
-// v2.1.10：代表资源可能还没回填 A 库映射，此时用作品组上的映射兜底
+// v2.1.11：代表资源可能还没回填 A 库映射，此时用作品组上的映射兜底
 // （手动修正窗口要靠它预填正确剧名与影视号）。
 function seriesRepresentative(g) {
   const hit = resources.value.find(r => r.id === g.representative_id)
@@ -1859,7 +1961,7 @@ function dirTitle(path) {
   }
   return title
 }
-// v2.1.10：取「映射回 A 库」的识别线索 —— 正确作品名 + 影视号 + 类型。
+// v2.1.11：取「映射回 A 库」的识别线索 —— 正确作品名 + 影视号 + 类型。
 // B 库改过名（单集名是英文译名、作品目录带 · 标记），直接拿去 TMDB 搜几乎必然零命中。
 // 注意：返回给用户的只有「作品名 / 影视号 / 电影·剧集」，
 // 不暴露任何后端字段名。
@@ -2740,7 +2842,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.10 · Asia/Shanghai</span>
+          <span>v2.1.11 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3001,7 +3103,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中 · 每 2 秒自动刷新' : '实时状态 · 每 2 秒自动刷新' }}</span></div>
             <div class="sync-progress">
               <div class="sync-progress-track"><i :style="{ width: (mirrorStatus.progress?.percent || 0) + '%' }"></i></div>
-              <span>{{ mirrorStatus.progress?.percent || 0 }}%<template v-if="mirrorStatus.progress?.running"> · {{ stageLabel(mirrorStatus.progress?.stage) }}</template><template v-else>（{{ mirrorStatus.progress?.synced || 0 }}/{{ mirrorStatus.progress?.total || 0 }} 文件已同步）</template></span>
+              <!-- v2.1.11：进度文字与进度条同源——都取后端 progress.label。
+                   此前进度条按本轮百分比、右侧文字按全库累计 synced/total，
+                   两套口径并排会出现「进度条 100% 而文字显示 3/89」。 -->
+              <span>{{ mirrorStatus.progress?.percent || 0 }}%<template v-if="mirrorStatus.progress?.running"> · {{ stageLabel(mirrorStatus.progress?.stage) }}</template><template v-else>（{{ mirrorStatus.progress?.label || '暂无本轮进度记录' }}）</template></span>
             </div>
             <div class="pipeline-flow">
               <div v-for="node in (mirrorStatus.pipeline || [])" :key="node.key" class="pipe-node" :class="'is-' + (node.status || 'idle')">
@@ -3041,7 +3146,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <small><b>A 库始终只读，两种模式都不写 A。</b>全镜像：A 库文件/作品已删除时，单轮预扫描会<b>自动删除 B 库对应文件并清理映射清单</b>（仅 A 目录树完整读取成功时才删，避免误删）；B 与 A 保持一致。半镜像：A 已删时 B 库文件与映射清单<b>都原样保留</b>，B 作为 A 的超集，不做任何删除。删除不可逆，请按你的备份策略选择。</small>
               </div>
             </div>
-            <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
+            <el-collapse v-model="mirrorCfgOpen" class="mirror-fold">
               <el-collapse-item name="config-help">
                 <template #title><span class="fold-title">配置说明 · 改名规则 · 链路口径</span></template>
             <p class="hint">开启「同步后自动入库识别并推送」后，同步结束会刷新 B 库入库、识别影视，并把<b>本轮识别成功且拿到海报</b>的影视按 TG 分发规则入队；不会对全库群发，也不会批量补推历史内容变化事件。关闭后定时同步与「立即同步」都只复制文件，需要到资源库手动点「立即扫描」。</p>
@@ -3051,20 +3156,26 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </el-collapse>
             <div v-if="mirrorStatus.lock?.busy && !mirrorBusy" class="mirror-lock-tip"><el-tag type="warning" size="small">后台任务运行中</el-tag> {{ mirrorStatus.lock.owner || '镜像任务' }} 已运行约 {{ mirrorStatus.lock.held_seconds }} 秒；同步 / 改名共用一把锁，等它结束再点「立即同步」即可，无需刷新页面。</div>
             <!-- 阶段二路线B C4：严格顺序引擎与批次控制 -->
+            <!-- v2.1.11：按钮按批次真实状态禁用；状态标签用中文；补「恢复被跳过项」 -->
             <div class="batch-control-row">
               <span class="hint">严格顺序引擎</span>
               <el-switch v-model="mirrorStrict" size="small"/>
               <span class="hint">一个文件复制确认完成后才提交下一个，可暂停 / 恢复 / 跳过 / 取消。</span>
-              <el-tag v-if="batchInfo.batch_id" size="small" :type="batchInfo.status === 'paused' ? 'warning' : batchInfo.status === 'running' ? 'success' : 'info'">{{ batchInfo.status || 'idle' }} · {{ batchInfo.done || 0 }}/{{ batchInfo.total || 0 }} · 序列 {{ batchInfo.current_sequence || 0 }}</el-tag>
-              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('pause')">暂停</el-button>
-              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('resume')">恢复</el-button>
-              <el-button size="small" :disabled="!mirrorStrict" @click="batchControl('skip')">跳过当前</el-button>
-              <el-button size="small" type="danger" :disabled="!mirrorStrict" @click="batchControl('cancel')">取消批次</el-button>
+              <el-tag v-if="batchInfo.batch_id" size="small" :type="batchInfo.status === 'paused' ? 'warning' : batchInfo.status === 'running' ? 'success' : 'info'">{{ batchStatusLabel(batchInfo.status) }} · {{ batchInfo.done || 0 }}/{{ batchInfo.total || 0 }} · 序列 {{ batchInfo.current_sequence || 0 }}</el-tag>
+              <el-button size="small" :disabled="!mirrorStrict || !batchCan('pause')" @click="batchControl('pause')">暂停</el-button>
+              <el-button size="small" :disabled="!mirrorStrict || !batchCan('resume')" @click="batchControl('resume')">恢复</el-button>
+              <el-button size="small" :disabled="!mirrorStrict || !batchCan('skip')" @click="batchControl('skip')">跳过当前任务</el-button>
+              <el-button size="small" type="danger" :disabled="!mirrorStrict || !batchCan('cancel')" @click="batchControl('cancel')">取消批次</el-button>
+              <!-- v2.1.11：skip 此前是不可逆终态，点错一次这批文件就再也不被复制。
+                   补一条恢复路径：把被跳过的任务改回待处理，下次同步重新拾取。 -->
+              <el-button size="small" plain :disabled="!mirrorStrict || !batchCan('reopen')" @click="batchControl('reopen')">恢复被跳过项</el-button>
             </div>
-            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button></div>
+            <div class="panel-foot"><el-button type="primary" :loading="mirrorSaving" @click="saveMirror">保存设置</el-button><el-button type="success" :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('auto')">立即同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('force')">强制入库识别</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="runMirror('skip')">仅同步</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="renameMirrorFiles(false)">按英文规范改名</el-button><el-button :loading="mirrorBusy" :disabled="mirrorBusy" @click="pollMirrorTasks">继续轮询任务</el-button><!-- v2.1.11 需求1：B 库被手动清空后的端到端重整入口 -->
+              <el-button type="warning" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="restructureBLibrary">B 库清空重整</el-button></div>
           </div>
           <div class="panel mirror-col">
-            <div class="panel-head"><h3>同步状态</h3><el-tag size="small">{{ mirrorStatus.rule?.last_status || 'never' }}</el-tag></div>
+            <div class="panel-head"><h3>同步状态</h3><!-- v2.1.11：状态标签只显示后端算好的中文 state.label，不再直出英文枚举 -->
+              <el-tag size="small" :type="mirrorStatus.state?.running ? 'warning' : (mirrorStatus.state?.code === 'failed' ? 'danger' : 'info')">{{ mirrorStatus.state?.label || '尚未同步' }}</el-tag></div>
             <div class="stat-group">
               <div class="stat-group-title"><span class="grp-ico">⇄</span>文件传输</div>
               <div class="mini-stat-grid">
@@ -3083,7 +3194,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div class="mini-stat"><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div>
                 <div class="mini-stat"><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div>
                 <!-- v2.1.4：被标记忽略的作品单独统计并透明展示，避免「清空后红字仍在」的错觉 -->
-                <div class="mini-stat"><small>已忽略解析</small><b :style="mirrorStatus.counts?.works_english_ignored ? 'color:#cf7f1c' : ''">{{ mirrorStatus.counts?.works_english_ignored || 0 }}</b></div>
+                <div class="mini-stat"><small>忽略翻译</small><b :style="mirrorStatus.counts?.works_english_ignored ? 'color:#cf7f1c' : ''">{{ mirrorStatus.counts?.works_english_ignored || 0 }}</b></div>
               </div>
             </div>
             <div class="stat-group">
@@ -3103,7 +3214,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </div>
             </div>
             <p class="hint">{{ mirrorStatus.rule?.last_message || '尚未执行同步' }}</p>
-            <el-collapse v-model="mirrorDiagOpen" class="mirror-fold">
+            <el-collapse v-model="mirrorStatusOpen" class="mirror-fold">
               <el-collapse-item name="status-detail">
                 <template #title><span class="fold-title">生效配置 · 已确认接口 · 待验证接口</span></template>
             <div class="info-chips">
@@ -3142,8 +3253,17 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">这里显示的是 create_dir 接口的真实报错（或「自动创建已关闭」），不再用通用文案掩盖。v0.8.3 起主目录直接用 ·（网盘拒绝 * 返回 code=141）；只有连 · 也拒绝时，才会降级为无标记标准名重试一次。<b>v0.9.17.2：勾选后点「批量重建选中」只对这些目录重发 create_dir，不扫描 A 源头库；重建成功后下轮同步自动映射其下文件。</b></p>
           </div>
           <div v-if="mirrorStatus.counts?.dirs_pruned_zombie" class="panel">
-            <div class="panel-head"><h3>已清理待重建目录映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条</el-tag><el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearPrunedMappings">清空已清理映射</el-button></div>
-            <p class="hint">这些是历史「清理无效映射」留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。旧版本无标记的行现在同样识别；确认后点「清空已清理映射」即可从清单彻底移除，不影响资源 / 分享 / 队列。</p>
+            <div class="panel-head"><h3>已清理待重建目录映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.counts.dirs_pruned_zombie }} 条</el-tag><!-- v2.1.11：可勾选定向重建，不必等下一轮同步 -->
+              <el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !prunedDirSelected.length" @click="rebuildPrunedDirs">重建选中 ({{ prunedDirSelected.length }})</el-button>
+              <el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearPrunedMappings">清空已清理映射</el-button></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.pruned_dirs || []" size="small" row-key="id" @selection-change="v => prunedDirSelected = v.map(x => x.id)">
+              <el-table-column type="selection" width="42" align="center"/>
+              <el-table-column prop="name" label="目录名" min-width="200"/>
+              <el-table-column prop="kind" label="类别" width="100"/>
+              <el-table-column prop="category_path" label="所属分类" min-width="160"/>
+              <el-table-column prop="error" label="说明" min-width="240"/>
+            </el-table></div>
+            <p class="hint">这些是历史「清理无效映射」或 B 库清空重整留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。勾选后点「重建选中」可立即定向重建，不必等下一轮同步；确认这些行彻底无用时点「清空已清理映射」从清单移除，不影响资源 / 分享 / 队列。</p>
           </div>
           <div v-if="mirrorStatus.file_errors?.length" class="panel">
             <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
@@ -3155,6 +3275,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column label="失败原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
             <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>v0.9.17.2：勾选后点「批量重试选中」只对这些文件定向重发复制——只扫描其所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队</b>；也可等下一轮「立即同步」全量重试。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
+          </div>
+          <div v-if="mirrorStatus.tasks?.length" class="panel">
+            <div class="panel-head"><h3>复制任务</h3><el-tag size="small" type="info">{{ mirrorStatus.tasks.length }} 条（最近 30 条）</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.tasks" size="small">
+              <el-table-column prop="work" label="作品" min-width="160"/>
+              <el-table-column prop="task_id" label="任务 ID" min-width="150"/>
+              <!-- v2.1.11：状态列用后端中文标签，页面不再直出英文枚举 -->
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
+              <el-table-column prop="polls" label="轮询次数" width="100"/>
+              <el-table-column label="备注 / 报错" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '—' }}</span></template></el-table-column>
+            </el-table></div>
+            <p class="hint">严格顺序引擎的失败 / 跳过 / 取消终态此前只体现在统计数字里，任务表本身看不到——用户无从判断该不该重试。现在每条任务都有中文状态与报错原因；被「跳过当前」跳掉的任务可用上方「恢复被跳过项」恢复为待处理。</p>
+          </div>
+          <div v-if="mirrorStatus.invalid_media?.length" class="panel">
+            <div class="panel-head"><h3>无效影视映射</h3><el-tag type="warning" size="small">{{ mirrorStatus.invalid_media.length }} 条</el-tag><el-button size="small" type="danger" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearInvalidMedia">清理无效影视映射</el-button></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.invalid_media" size="small">
+              <el-table-column prop="title" label="标准影视名" min-width="200"/>
+              <el-table-column prop="category_path" label="分类目录" min-width="160"/>
+              <el-table-column prop="files" label="文件数" width="90"/>
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
+            </el-table></div>
+            <p class="hint">这些影视映射在 B 库已无有效文件，或本地处于失败 / 阻断且没有已同步文件。点「清理无效影视映射」会只读核对 B 库真实内容后清理，列目录不可信或有文件的行一律保留。</p>
           </div>
           <div v-if="mirrorStatus.untranslated_works?.length || mirrorStatus.rename_errors?.length || mirrorStatus.counts?.works_english_ignored" class="panel">
             <div class="panel-head"><h3>英文改名待处理 / 失败</h3><el-tag type="warning" size="small">{{ mirrorStatus.untranslated_works?.length || 0 }} 部待翻译 · {{ mirrorStatus.rename_errors?.length || 0 }} 个失败</el-tag><el-tag v-if="mirrorStatus.counts?.works_english_ignored" type="info" size="small">已忽略 {{ mirrorStatus.counts.works_english_ignored }} 部</el-tag><el-tag v-if="mirrorStatus.counts?.files_rename_skipped_legacy" type="info" size="small">历史不回刷 {{ mirrorStatus.counts.files_rename_skipped_legacy }} 个</el-tag></div>
@@ -3185,7 +3327,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="category_path" label="所属分类" min-width="160"/>
-              <el-table-column label="状态" width="120"><template #default="s"><el-tag v-if="s.row.pruned" type="warning" size="small">待重建</el-tag><span v-else>{{ s.row.status }}</span></template></el-table-column>
+              <!-- v2.1.11：状态列改用后端给出的中文标签，页面不再直出英文枚举 -->
+              <el-table-column label="状态" width="120"><template #default="s"><el-tag v-if="s.row.pruned" type="warning" size="small">待重建</el-tag><span v-else>{{ s.row.status_label || '—' }}</span></template></el-table-column>
               <el-table-column prop="target_dir_id" label="B 库目录 ID" min-width="180"/>
               <el-table-column prop="error" label="备注 / 失败原因" min-width="200"/>
             </el-table></div>
@@ -3199,7 +3342,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="mirror_name" label="B 库期望目录名" min-width="180"/>
               <el-table-column prop="media_type" label="类型" width="90"/>
               <el-table-column prop="files" label="文件" width="80"/>
-              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status }}</span></template></el-table-column>
+              <!-- v2.1.11：状态列改用后端给出的中文标签，页面不再直出英文枚举 -->
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
             </el-table></div>
             <p class="hint">B 库目录名里的 · 只存在于网盘（v0.8.3 起网盘拒绝 *）；资源库、分享标题与 Telegram 推送一律使用标准影视名。<b>点「清理无效影视映射」会只读核对 B 库</b>，把网盘上已整部删除文件的历史映射行清掉（列目录不可信或有文件的行一律保留）；只删 A→B 映射登记，不删资源 / 分享 / 队列 / B 库文件。</p>
           </div>

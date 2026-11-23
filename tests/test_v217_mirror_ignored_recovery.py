@@ -382,7 +382,11 @@ def test_frontend_clear_button_never_vanishes():
 
 
 def test_frontend_shows_ignored_count():
-    """已忽略作品数量透明展示。"""
+    """已忽略作品数量透明展示。
+
+    v2.1.11：统计卡标题按用户口径从「已忽略解析」改为「忽略翻译」——
+    页面里原本有 5 种含义都叫「跳过」，需要用不同词区分开。
+    """
     app = APP_VUE.read_text(encoding="utf-8")
     assert "works_english_ignored" in app, "未消费已忽略计数"
-    assert "已忽略解析" in app, "缺少已忽略统计卡"
+    assert "忽略翻译" in app, "缺少已忽略统计卡"

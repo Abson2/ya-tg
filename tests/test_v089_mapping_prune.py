@@ -213,6 +213,17 @@ def test_frontend_has_prune_button_and_folded_sections():
     app_vue = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     assert "清理无效映射" in app_vue
     assert "pruneMirrorMappings" in app_vue
-    assert "/mirror/mappings/prune" in app_vue
+    # v2.1.11：清理动作统一走 /mirror/cleanup（scope=all），
+    # 老端点 /mirror/mappings/prune 在后端保留为薄封装（端点不删，只换实现）。
+    assert "/mirror/cleanup" in app_vue
     assert 'name="diagnostics"' in app_vue and 'name="mappings"' in app_vue
     assert "mirrorDiagOpen" in app_vue
+
+
+def test_backend_prune_endpoint_still_exists():
+    """红线：统一清理端点上线后，老端点不得删除——只允许换实现。"""
+    main_src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/mirror/mappings/prune"' in main_src
+    assert '@app.post("/api/mirror/cleanup"' in main_src
+    assert '@app.post("/api/mirror/mappings/clear-pruned"' in main_src
+    assert '@app.post("/api/mirror/media/clear-invalid"' in main_src

@@ -412,10 +412,13 @@ def _upsert_queue_item(db: Session, task: ShareTask, channel_id: int) -> QueueIt
 
     这样更新推送虽是独立 ShareTask（独立事件 ID），物理上仍复用 QueueItem 行，
     不破坏 push_queue 的 uq_resource_channel 唯一约束。
+
+    v2.1.11：复用时**归档行也要能被复用**——B 库清空重整后归档的队列行
+    仍占着 (resource_id, channel_id) 唯一键，直接 INSERT 会撞约束。
+    命中归档行时复活它（清归档标记）并重置。
     """
-    q = db.scalar(select(QueueItem).where(
-        QueueItem.resource_id == task.resource_id,
-        QueueItem.channel_id == channel_id).limit(1))
+    from .archive import find_queue_item
+    q = find_queue_item(db, task.resource_id, channel_id)
     if q:
         q.status = "pending"  # 旧链兼容：仍从 pending 消费
         q.attempts, q.error = 0, ""

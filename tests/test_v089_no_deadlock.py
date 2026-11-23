@@ -284,7 +284,17 @@ def test_all_long_entrypoints_are_guarded():
     # v0.9.9 #205：media clear-invalid 只删本地僵尸映射行、不联网不写 B 库，已刻意不持锁
     # （否则后台改名复查持锁时按钮报「有任务在进行」），故这里为 4。
     # v0.9.17.2：新增 mirror_retry_files / mirror_retry_dirs 两个定向重试端点也持同一把锁 → 6
+    # v2.1.11：清理动作统一到 /api/mirror/cleanup（scope=file|dir|all 时联网核对 B 库，
+    #   必须持锁）；老端点 /api/mirror/mappings/prune 改为薄封装转发，不再自己持锁。
+    #   持锁处总数不变（仍为 6），但**持锁点归属变了**：现在是 5 个独立端点
+    #   + cleanup 一处共享闸门。
     assert src.count("with _mirror_guard():") == 6
+    # v2.1.11：统一清理端点必须持锁（它会联网只读核对 B 库）
+    cleanup_src = src.split('@app.post("/api/mirror/cleanup"')[1].split("@app.")[0]
+    assert "with _mirror_guard():" in cleanup_src
+    # v2.1.11：老端点已改为薄封装转发，不再自己持锁（否则会与 cleanup 争同一把锁）
+    prune_src = src.split('@app.post("/api/mirror/mappings/prune"')[1].split("@app.")[0]
+    assert "with _mirror_guard():" not in prune_src
     # v2.1.10：闸门改「等待式」后，非阻塞获取带了 owner 参数：
     #   `_mirror_lock.acquire(blocking=False, owner="…")`。
     # 定时镜像/定时扫描走 `acquire_async`（排队等待，不丢轮次）；

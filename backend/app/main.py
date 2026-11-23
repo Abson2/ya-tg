@@ -92,7 +92,7 @@ class _TimedMirrorLock:
         self._since = 0.0
         self._last_beat = 0.0
         self._fence = 0  # 代次计数，每次 acquire（含接管）递增
-        # v2.1.10：等待队列（先来先得）。定时任务不再「抢不到就跳过」，
+        # v2.1.11：等待队列（先来先得）。定时任务不再「抢不到就跳过」，
         # 而是排队等上一轮彻底结束再跑本轮（用户口径：上一轮没跑完，下一轮
         # 不启动；上一轮结束了才按新的定时启动新一轮）。
         self._meta = threading.Lock()
@@ -227,13 +227,13 @@ class _TimedMirrorLock:
                 "held_seconds": int(self._held_seconds()) if held else 0,
                 "idle_seconds": int(self._idle_seconds()) if held else 0,
                 "fence": self._fence,
-                # v2.1.10：正在排队等上一轮结束的任务数（>0 说明有轮次在等位）
+                # v2.1.11：正在排队等上一轮结束的任务数（>0 说明有轮次在等位）
                 "waiting": waiting}
 
 
 _mirror_lock = _TimedMirrorLock()
 
-# v2.1.10 口径反转（用户 2026-11-23 明确）：镜像流水线**必须串行**。
+# v2.1.11 口径反转（用户 2026-11-23 明确）：镜像流水线**必须串行**。
 # 「复制 → 改名 → 翻译 → 识别 → 入库资源库」合起来算**一轮**；上一轮没跑完，
 # 下一轮定时任务不启动，等上一轮彻底结束后，才按（可能已经更新过的）定时
 # 启动新一轮。目的是杜绝并发冲突：两个任务同时改同一批文件、同时抢 SQLite
@@ -243,7 +243,7 @@ _mirror_lock = _TimedMirrorLock()
 # 因为真机上镜像长跑 119 部作品时，改名复查每 120 秒抢不到锁直接 return →
 # 英文名解析链路整体停摆（56 部作品集体无英文名）。
 # 那版的病灶是「**抢不到就跳过本轮**」，不是「并行」本身。
-# v2.1.10 保留串行（并发才是真冲突），但把语义换成**排队等待**：
+# v2.1.11 保留串行（并发才是真冲突），但把语义换成**排队等待**：
 # 抢不到就等上一轮结束再跑本轮（不丢轮次）——既不并发，也不饿死。
 _rename_lock = _mirror_lock  # 旧引用兼容：改名与复制 / 翻译共用同一把闸门
 
@@ -251,7 +251,7 @@ _rename_lock = _mirror_lock  # 旧引用兼容：改名与复制 / 翻译共用�
 # 绝不无限堆积。给足余量是为了覆盖「镜像长跑 / 大批量识别」这类正常长任务。
 PIPELINE_WAIT_SECONDS = 3600.0
 
-# v2.1.10：改名门禁从「整轮拦截」收敛为「作品级拦截」。
+# v2.1.11：改名门禁从「整轮拦截」收敛为「作品级拦截」。
 #
 # 起因（真机 2026-11-23）：同轮 20 部作品的镜像复制全部成功、英文名全部解析成功，
 # 但资源库里一条都查不到——被 v2.1.0 的「改名硬门禁」整轮拦下了。触发点是**一部剧
@@ -264,7 +264,7 @@ PIPELINE_WAIT_SECONDS = 3600.0
 #   都是 rename_status='done'（且有目标名），否则该作品不入队、不推送。
 # 也就是说「整轮拦截」属于过度拦截：它连入库与识别一起拦了，而那部分没有任何风险。
 #
-# v2.1.10 起：改名没成功的作品自己不入队推送（作品级闸门），其余作品照常
+# v2.1.11 起：改名没成功的作品自己不入队推送（作品级闸门），其余作品照常
 # 入库 → 识别 → 推送。要恢复 v2.1.0 的整轮口径，把下面开关改回 True 即可。
 RENAME_GATE_BLOCK_WHOLE_ROUND = False
 
@@ -416,7 +416,7 @@ def untranslated_reason(lock_info: dict, tmdb_ok: bool, ai_ok: bool) -> str:
     其实正常、真正卡点是镜像锁被占，静态甩锅「补齐 TMDB/AI」会把排查带偏。
     """
     if lock_info.get("busy"):
-        # v2.1.10：闸门改成「排队等待」后，用户会看到「上一轮在跑、下一轮在等」。
+        # v2.1.11：闸门改成「排队等待」后，用户会看到「上一轮在跑、下一轮在等」。
         # 把等待数量也说清楚，免得以为任务卡死。
         waiting = int(lock_info.get("waiting", 0) or 0)
         wait_hint = (f"；另有 {waiting} 个定时任务在排队等它结束" if waiting else "")
@@ -436,13 +436,52 @@ def untranslated_reason(lock_info: dict, tmdb_ok: bool, ai_ok: bool) -> str:
 def _rename_status_label(status: str) -> str:
     """把内部改名状态翻成中性中文（页面不出现内部状态词）。
 
-    v2.1.10：待办清单此前直接把 `rename_status` 原始值（pending_visible /
+    v2.1.11：待办清单此前直接把 `rename_status` 原始值（pending_visible /
     skipped_legacy / failed）塞进「状态」列——内部状态词直接漏给用户。
     这里统一走中文标签，与 `mirror.rename_error_label` 一起构成中性展示口径。
     """
     return ({"": "待处理", "pending_visible": "等待网盘可见", "failed": "未完成",
              "skipped_ascii": "无中文名", "skipped_legacy": "历史条目"}
             .get(str(status or ""), "待处理"))
+
+
+# v2.1.11：镜像模块三类状态的中文标签（媒体 / 目录 / 任务）。
+# 页面此前直接把 MirrorMedia.status / MirrorDir.status / MirrorTask.status
+# 的英文码渲染到表格里（synced / failed / missing / pending / unknown…），
+# 违反「页面不得体现后端代码名词」这条红线。这里统一在后端出文案，
+# 前端只渲染 *_label 字段。
+def _media_status_label(status: str) -> str:
+    """影视映射状态中文标签。"""
+    return ({"synced": "已同步", "failed": "同步失败", "blocked": "有阻断项",
+             "pending": "待同步", "copying": "复制中", "syncing": "同步中",
+             "unknown": "状态待确认", "": "待同步"}
+            .get(str(status or "").strip().lower(), "待同步"))
+
+
+def _dir_status_label(status: str) -> str:
+    """目录映射状态中文标签。"""
+    return ({"mapped": "已映射", "created": "已创建", "missing": "待创建",
+             "created_fallback": "已创建（标准名）", "": "待创建"}
+            .get(str(status or "").strip().lower(), "待创建"))
+
+
+def _task_status_label(status: str, task_status: str = "") -> str:
+    """复制任务状态中文标签。
+
+    严格顺序引擎写 task_status（''/pending/submitting/submitted/verifying/
+    completed/failed/skipped/cancelled），旧批量路径写 status
+    （pending/running/done/failed/unknown）。两套并存时以 task_status 优先，
+    这样「跳过本序列」与「已跳过投递」这类语义不会被混成同一个词。
+    """
+    ts = str(task_status or "").strip().lower()
+    if ts:
+        return ({"pending": "待处理", "submitting": "提交中", "submitted": "已提交",
+                 "verifying": "确认中", "completed": "已完成", "failed": "失败",
+                 "skipped": "跳过本序列", "cancelled": "已取消"}
+                .get(ts, "进行中"))
+    return ({"pending": "待处理", "running": "进行中", "done": "已完成",
+             "failed": "失败", "unknown": "状态待确认"}
+            .get(str(status or "").strip().lower(), "待处理"))
 
 
 # v0.9.21：僵尸镜像任务自愈。进程崩溃/强中断时 mirror_tasks 的 running 行会
@@ -479,7 +518,7 @@ def reap_stale_mirror_tasks(db: Session, *, stale_minutes: int | None = None) ->
 def backfill_source_titles(db: Session, limit: int = 5000) -> int:
     """把 A 库映射回填到资源库：作品名 / 原文件名 / 影视号 / 类型 / 分类目录。
 
-    v2.1.10 需求：资源库的**识别与展示**都要用映射回 A 库的正确影视名与
+    v2.1.11 需求：资源库的**识别与展示**都要用映射回 A 库的正确影视名与
     TMDB 影视号。B 库改过名（单集名英文、作品目录带 · 标记），拿去 TMDB
     搜几乎必然零命中，用户看到的就是「资源库里识别不出来」。
 
@@ -550,7 +589,7 @@ def backfill_source_titles(db: Session, limit: int = 5000) -> int:
 
 
 def _backfill_source_titles_in_thread() -> int:
-    """v2.1.10：A 库映射回填（DB 密集，放线程池；Session 在线程内创建）。
+    """v2.1.11：A 库映射回填（DB 密集，放线程池；Session 在线程内创建）。
 
     独立 Session → 独立事务 → 回填完自己 commit，与请求级会话互不干扰。
     """
@@ -567,7 +606,7 @@ def _backfill_source_titles_in_thread() -> int:
 
 
 async def _job_source_map_backfill():
-    """v2.1.10：定时把「映射回 A 库」的作品名/影视号/类型回填到资源库。
+    """v2.1.11：定时把「映射回 A 库」的作品名/影视号/类型回填到资源库。
 
     覆盖两种场景：
       1. 老库存量（升级前入库的资源，启动时先回填一次）；
@@ -601,7 +640,7 @@ async def _job_mirror_task_poll():
     修复审计缺口：重启后 strict 批次停在 submitted/verifying 的任务此前只能手动
     /api/mirror/tasks/poll 才续跑。此 job 每 60s 自动确认远端状态。
 
-    v2.1.10：纳入流水线闸门（非阻塞）。上一轮任务在跑就跳过本轮轮询；
+    v2.1.11：纳入流水线闸门（非阻塞）。上一轮任务在跑就跳过本轮轮询；
     更关键的是本 job 自己**也持锁**——否则它正在轮询时，定时镜像轮次可能同时
     拿到闸门开跑，两条链路并发碰同一批文件。
     """
@@ -660,7 +699,7 @@ async def _job_rename_pending():
     都 `acquire(blocking=False)` 失败直接 return → 英文名解析链路整体停摆（07:23 后
     56 部作品集体无英文名、rename_status 56 条为空）。当时的修法是「拆两把锁并行」。
 
-    v2.1.10（用户口径：复制 / 改名 / 翻译 / 识别直到入库资源库算**一轮**，上一轮没跑完
+    v2.1.11（用户口径：复制 / 改名 / 翻译 / 识别直到入库资源库算**一轮**，上一轮没跑完
     下一轮不启动）：回到**同一把闸门**，但语义从「抢不到就跳过本轮」改成
     **排队等上一轮彻底结束再跑本轮**（不丢轮次）。
     既杜绝了并发冲突（两个任务同时改同一批文件 / 同时抢 SQLite 写锁），
@@ -731,7 +770,7 @@ async def _scheduled_scan(root: str) -> None:
     造成误删；对账只由用户主动点击「重新扫描库」触发。全程独立 Session，
     不复用请求级 db，异常自行吞掉并由 run_scan 写入 ScanTask.last_status。
 
-    v2.1.10：纳入**流水线闸门**。这一轮做的是「扫描入库 → 识别（翻译）→ 推送」，
+    v2.1.11：纳入**流水线闸门**。这一轮做的是「扫描入库 → 识别（翻译）→ 推送」，
     与镜像轮的「复制 → 改名」是同一条链路的两端；以前它**完全没有锁**，
     会与正在跑的镜像轮次并发（一边改 B 库文件名、一边按旧名入库），
     正是「资源库里名字对不上 / 这轮看不到」的成因之一。
@@ -746,7 +785,7 @@ async def _scheduled_scan(root: str) -> None:
                 # v0.8.1：每次执行都重新取 B 镜像库目录，用户在镜像设置里改 ID 后立即生效
                 effective, _ = _effective_scan_root(db)
                 await run_scan(effective, resume=False)
-                # v2.1.10：入库后回填「映射回 A 库」的作品名/影视号/类型，
+                # v2.1.11：入库后回填「映射回 A 库」的作品名/影视号/类型，
                 # 让本轮识别用 A 库口径（顺序必须在识别之前）。
                 db.commit()
                 backfill_source_titles(db)
@@ -1030,7 +1069,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(_job_tg_stats_collect, "interval",
                       seconds=_TG_STATS_TICK_SECONDS, id="tg_stats_collect",
                       replace_existing=True, max_instances=1, coalesce=True)
-    # v2.1.10：A 库映射回填。启动先补一次老库存量（升级前入库的资源），
+    # v2.1.11：A 库映射回填。启动先补一次老库存量（升级前入库的资源），
     # 之后每 10 分钟补一次新入库未匹配上映射的行（幂等，只补空映射）。
     scheduler.add_job(_job_source_map_backfill, "interval", seconds=600,
                       id="source_map_backfill", replace_existing=True,
@@ -1054,7 +1093,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.10", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.11", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1065,7 +1104,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.10", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.11", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1443,10 +1482,12 @@ def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
 def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
                              mode: str, copied: int = 0, renamed: int = 0,
                              identified: int = 0, queued: int = 0,
-                             total_files: int = 0,
+                             copy_tasks: int = 0, scan_files: int = 0,
+                             works_total: int = 0, works_done: int = 0,
                              enqueue_diag: dict | None = None,
                              works: dict | None = None,
-                             running: bool = False, stage: str = "") -> None:
+                             running: bool = False, stage: str = "",
+                             total_files: int = 0) -> None:
     """v0.9.10：把本轮任务各节点处理量写入 MirrorRule.last_pipeline_json。
 
     「处理流程与进度」只读这个快照显示当前任务量，不再拿全库累计计数冒充进度。
@@ -1455,12 +1496,33 @@ def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
     写进快照，前端节点直接显示，不再靠 last_message 字符串解析（会被截断/覆盖）。
     v0.9.10.2：带 works（按 TMDB 去重的剧集/电影部数）、running/stage（实时阶段），
     供「进度看板」实时轮询展示各阶段真实数量变化；进度条只有分享+推送全完成才 100%。
+
+    v2.1.11：拆掉同名字段漂移。
+      旧 `total_files` 在不同帧里塞过两种完全不同的东西——复制任务数（rename/identify 帧）
+      与扫描文件数（done 帧），同一字段名两种口径，前端只能靠猜。
+      现在改为两个互不重叠的字段：
+        copy_tasks  本轮提交的复制任务数（分子分母同口径，进度条用它）
+        scan_files  本轮 B 库扫描到的文件数（入库口径，只做展示）
+      老快照仍带 total_files，读侧保留兼容回退，不让升级后历史快照显示空进度。
+
+      **输入端保留 `total_files` 兼容别名**（映射到 copy_tasks）：既有调用与
+      回归测试都按这个参数名传值，直接改名会破坏契约。输出端（快照 JSON）
+      只有 copy_tasks / scan_files 两个字段，不再有同名漂移。
+
+    v2.1.11：补部数口径 works_total / works_done——用户口径里「部」才是主单位
+      （单轮上限 max_works_per_run 按部、分享/推送按 TMDB 作品去重按部），
+      此前部数只存在于 last_message 文本里，前端拿不到，进度无法按部表达。
     """
     if not r:
         return
+    # 兼容别名：老调用只传 total_files 时，按「复制任务数」解读
+    if not copy_tasks and total_files:
+        copy_tasks = int(total_files or 0)
     snap = {"mode": mode, "copied": int(copied or 0), "renamed": int(renamed or 0),
             "identified": int(identified or 0), "queued": int(queued or 0),
-            "total_files": int(total_files or 0), "at": utcnow().isoformat(),
+            "copy_tasks": int(copy_tasks or 0), "scan_files": int(scan_files or 0),
+            "works_total": int(works_total or 0), "works_done": int(works_done or 0),
+            "at": utcnow().isoformat(),
             "enqueue_diag": dict(enqueue_diag or {}),
             "works": dict(works or {}), "running": bool(running), "stage": str(stage or "")}
     try:
@@ -1522,7 +1584,7 @@ async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
         "directories": int(scan.get("directories", 0) or 0),
         "complete": bool(scan.get("complete", False)),
     }
-    # v2.1.10：入库后立刻把「映射回 A 库」的影视名/影视号/类型回填到资源库，
+    # v2.1.11：入库后立刻把「映射回 A 库」的影视名/影视号/类型回填到资源库，
     # 识别与展示都走 A 库口径（B 库改过名的英文译名拿去 TMDB 几乎必然零命中）。
     # 顺序很重要：必须在 _post_scan_identify **之前**，否则这一轮识别仍用旧线索。
     # run_scan 用的是独立 Session 且已提交，这里先 commit 结束本会话的旧读事务，
@@ -1568,7 +1630,7 @@ async def _scheduled_mirror() -> None:
 
     v0.8.5 起不再写死「镜像完成不推 TG」：识别成功（拿到海报）的影视按分发规则推送。
     仍不对全库群发，也不批量补推历史内容变化事件。
-    v2.1.10：**等待式**进入流水线闸门 —— 上一轮（复制→改名→翻译→识别→入库）
+    v2.1.11：**等待式**进入流水线闸门 —— 上一轮（复制→改名→翻译→识别→入库）
     还没彻底结束，本轮定时镜像不并发启动，而是排队等它结束再跑（不丢轮次）。
     """
     if not await _mirror_lock.acquire_async("定时镜像", timeout=PIPELINE_WAIT_SECONDS):
@@ -1580,20 +1642,28 @@ async def _scheduled_mirror() -> None:
             try:
                 r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
                 if r and r.source_root_id and r.target_root_id:
-                    await mirror.sync_rule(db, r)
+                    # v2.1.11：定时路径补齐中间帧。此前定时路径只在整轮结束时写一帧
+                    # 且 copied/renamed 硬编码 0，页面看定时同步时进度条全程停在
+                    # 「复制 0 项」，与手动同步表现完全不同（同一套 UI 两套口径）。
+                    # 现在定时路径与手动路径共用同一套快照字段与阶段语义。
+                    _write_pipeline_snapshot(db, r, mode="定时同步", stage="copy", running=True)
+                    db.commit()
+                    stats = await mirror.sync_rule(db, r)
                     await mirror.backfill_target_file_ids(db, r)
                     # v0.8.6：改名必须赶在「扫描入库」之前，否则 Resource 记的是旧中文名。
                     # 只改 B 库单集/单电影文件名，A 库与 B 库目录名都不动。
                     # v0.8.9：TMDB 查不到英文名会快速直译兜底，不阻断下面的入库/推送。
                     # v2.1.0 改名硬门禁（与手动 mirror_run 同一口径）：改名任一文件失败
                     # 或整体异常 → 本轮不进入库识别推送，杜绝英文名没改对就先推群/频道。
-                    # v2.1.10：门禁**收敛到作品级**（详见 RENAME_GATE_BLOCK_WHOLE_ROUND
+                    # v2.1.11：门禁**收敛到作品级**（详见 RENAME_GATE_BLOCK_WHOLE_ROUND
                     # 处说明）：真机上一部剧的「假失败」（光鸭 160，实际早已改名成功）
                     # 把同轮另外 19 部作品全拦在门外、资源库里一条都没有。
                     # 「英文名没改对不推群/频道」这条原意由推送侧的作品级闸门兜底。
                     rename_failed = False
+                    rename_stats: dict = {}
                     if bool(getattr(r, "rename_files", True)):
                         rn = await _safe_rename(db, r)
+                        rename_stats = dict(rn or {})
                         rename_failed = bool((rn or {}).get("errors")) or int((rn or {}).get("failed") or 0) > 0
                         if rename_failed:
                             bad_works = [w for w in ((rn or {}).get("failed_works") or []) if w]
@@ -1606,17 +1676,28 @@ async def _scheduled_mirror() -> None:
                                 + f" · 改名未完成 {len(bad_works) or 1} 部作品"
                                   "（这些作品本轮不入队推送，其余作品照常入库）")
                             db.commit()
+                    # 改名完成 → 写「入库识别中」中间帧（与手动路径同语义）
+                    _write_pipeline_snapshot(
+                        db, r, mode="定时同步", stage="identify", running=True,
+                        copied=int(stats.get("done", 0) or 0),
+                        renamed=int(rename_stats.get("renamed", 0) or 0),
+                        copy_tasks=int(stats.get("done", 0) or 0),
+                        works_total=int(stats.get("batch_size", 0) or 0))
+                    db.commit()
                     gate_block_round = rename_failed and RENAME_GATE_BLOCK_WHOLE_ROUND
                     if bool(getattr(r, "auto_identify", True)) and not gate_block_round:
                         p = await _mirror_post_sync_pipeline(db, r)
-                        # v0.9.10：定时同步也写本轮任务快照（复制量定时路径不细究，记 0）
                         ident = p.get("identify") or {}
                         _write_pipeline_snapshot(
                             db, r, mode="定时同步", stage="done", running=False,
-                            copied=0, renamed=0,
+                            copied=int(stats.get("done", 0) or 0),
+                            renamed=int(rename_stats.get("renamed", 0) or 0),
                             identified=int(ident.get("identified", 0) or 0),
                             queued=int(p.get("queued", 0) or 0),
-                            total_files=int(p.get("files", 0) or 0),
+                            copy_tasks=int(stats.get("done", 0) or 0),
+                            scan_files=int(p.get("files", 0) or 0),
+                            works_total=int(stats.get("batch_size", 0) or 0),
+                            works_done=int(stats.get("media", 0) or 0),
                             enqueue_diag=dict(p.get("enqueue_diag") or {}),
                             works=dict(ident.get("work_stats") or {}))
                         db.commit()
@@ -1625,6 +1706,18 @@ async def _scheduled_mirror() -> None:
                                 f"{p['identify']['identified']} · 入队 {p['queued']}"
                                 f" · 内容变化待处理 {p['changes_pending']}")
                         r.last_message = (str(r.last_message or "") + tail)[-1000:]
+                        db.commit()
+                    else:
+                        # v2.1.11：定时路径关入库 / 改名门禁拦截时也要把 running 归位。
+                        # 此前这条分支不写终态帧 → 进度条永远停在「入库识别中」，
+                        # 页面看着像还在跑，实际早就结束了。
+                        _write_pipeline_snapshot(
+                            db, r, mode="定时同步", stage="done", running=False,
+                            copied=int(stats.get("done", 0) or 0),
+                            renamed=int(rename_stats.get("renamed", 0) or 0),
+                            copy_tasks=int(stats.get("done", 0) or 0),
+                            works_total=int(stats.get("batch_size", 0) or 0),
+                            works_done=int(stats.get("media", 0) or 0))
                         db.commit()
             except Exception as exc:
                 db.rollback()
@@ -1660,6 +1753,21 @@ class MirrorConfigInput(BaseModel):
 
 class MirrorRetryInput(BaseModel):
     """v0.9.17.2：失败任务定向批量重试的勾选行 id。"""
+    ids: list[int] = []
+
+
+class MirrorCleanupInput(BaseModel):
+    """v2.1.11：统一「清理无效」端点的入参。
+
+    scope   清理范围：file（文件映射）/ dir（目录映射）/ pruned（僵尸目录行）
+            / media（影视映射行）
+    dry_run 只返回预览清单不写库
+    rule_id 限定镜像规则（0 = 当前生效规则）
+    ids     限定只处理这些行 id（空 = 该 scope 下全部）
+    """
+    scope: str = "file"
+    dry_run: bool = False
+    rule_id: int = 0
     ids: list[int] = []
 
 
@@ -1750,7 +1858,7 @@ def _mirror_guard():
     成倍放大列目录与 rename 请求，管理页所有请求排队到 30 秒 busy_timeout，
     表现就是「整理剧集改名时后台页面卡死打不开」。宁可明确拒绝，也不排队。
 
-    v2.1.10：闸门升级为「复制 / 改名 / 翻译 / 识别 / 入库」全链路共用一把，
+    v2.1.11：闸门升级为「复制 / 改名 / 翻译 / 识别 / 入库」全链路共用一把，
     这里的 409 文案也随之更新——占用者可能是任意一段流水线，且后台定时任务
     现在是「排队等」而不是「跳过」，所以提示要说明「等它跑完即可」。
     """
@@ -1818,9 +1926,11 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         stats = await mirror.sync_rule(db, r, strict=strict)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
+        # v2.1.11：copy_tasks 用复制任务数（分子分母同口径），不再复用 total_files。
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="rename", running=True,
                                  copied=int(stats.get("done", 0) or 0),
-                                 total_files=int(stats.get("done", 0) or 0))
+                                 copy_tasks=int(stats.get("done", 0) or 0),
+                                 works_total=int(stats.get("batch_size", 0) or 0))
         db.commit()
         _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制完成→改名）
         # v0.8.6：改名赶在「扫描入库」之前，只动 B 库单集/单电影文件名；
@@ -1839,7 +1949,7 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         # v2.1.0 改名硬门禁（用户决策：改名失败阻断后续入库识别推送）：
         # 改名任一文件失败或整体异常 → 本轮不进后置管线，等人工处理/下一轮重试，
         # 杜绝「英文名没改对就先推给群/频道」。仅 rename_files 开启时才校验。
-        # v2.1.10：门禁**收敛到作品级**（见 RENAME_GATE_BLOCK_WHOLE_ROUND 处说明）：
+        # v2.1.11：门禁**收敛到作品级**（见 RENAME_GATE_BLOCK_WHOLE_ROUND 处说明）：
         # 真机上一部剧的假失败（光鸭 160）把同轮 19 部健康作品一起拦在门外、
         # 资源库里一条都没有。「英文名没改对不推群/频道」由推送侧的作品级闸门兜底。
         rename_failed = False
@@ -1863,7 +1973,8 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="identify", running=True,
                                      copied=int(stats.get("done", 0) or 0),
                                      renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
-                                     total_files=int(stats.get("done", 0) or 0))
+                                     copy_tasks=int(stats.get("done", 0) or 0),
+                                     works_total=int(stats.get("batch_size", 0) or 0))
             db.commit()
             _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（改名完成→入库识别）
             # v0.8.9：找不到官方英文名的作品在改名环节已直接直译兜底，绝不在这里
@@ -1881,7 +1992,10 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
                 renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
                 identified=int(ident.get("identified", 0) or 0),
                 queued=int(pipe.get("queued", 0) or 0),
-                total_files=int(pipe.get("files", 0) or 0),
+                copy_tasks=int(stats.get("done", 0) or 0),
+                scan_files=int(pipe.get("files", 0) or 0),
+                works_total=int(stats.get("batch_size", 0) or 0),
+                works_done=int(stats.get("media", 0) or 0),
                 enqueue_diag=dict(pipe.get("enqueue_diag") or {}),
                 works=dict(ident.get("work_stats") or {}))
         else:
@@ -1889,7 +2003,9 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="done", running=False,
                                      copied=int(stats.get("done", 0) or 0),
                                      renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
-                                     total_files=int(stats.get("done", 0) or 0))
+                                     copy_tasks=int(stats.get("done", 0) or 0),
+                                     works_total=int(stats.get("batch_size", 0) or 0),
+                                     works_done=int(stats.get("media", 0) or 0))
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
                                      "done": stats.get("done"), "unknown": stats.get("unknown"),
@@ -2078,26 +2194,375 @@ async def mirror_poll_tasks(db: Session = Depends(get_db)):
         return await _do_mirror_poll_tasks(db)
 
 
+@app.post("/api/mirror/cleanup", dependencies=ADMIN)
+async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
+    """v2.1.11：统一的「清理无效」端点——把三个清单模块的清理动作收敛到一处。
+
+    此前管理页有三个语义重叠的清理按钮（清理无效映射 / 清空已清理映射 /
+    清理无效影视映射），各自的口径、是否联网、是否物理删除都不一致，用户点之前
+    根本无法预判会发生什么。现在统一为一个端点，用 scope 区分范围：
+
+      scope=file    清理失效的文件映射：只读核对 B 库，把已不存在的文件映射
+                    重置为待同步（保留 A 库锚点，不删行）
+      scope=dir     清理失效的目录映射：只读核对 B 库，把已不存在的目录映射
+                    置为「待重建」（不删行，下轮同步自动重建）
+      scope=pruned  彻底移除「已清理待重建」的僵尸目录行（物理删除，可按 ids 限定）
+      scope=media   清理无效影视映射：只读核对 B 库，删除整部已无文件的映射行
+
+    通用参数：
+      dry_run=true  只返回预览清单，不写库（强烈建议先预览）
+      rule_id       限定只处理某条镜像规则的行（0 = 当前规则）
+      ids           限定只处理这些行 id（空 = 该 scope 下全部）
+
+    三个老端点保留为薄封装转发到本端点，历史调用与断言不受影响。
+    """
+    scope = (p.scope or "file").strip().lower()
+    # scope=all：文件段 + 目录段一起清（老端点 /mirror/mappings/prune 的原语义）
+    if scope not in ("all", "file", "dir", "pruned", "media"):
+        raise HTTPException(400, "清理范围只能是 all / file / dir / pruned / media")
+    r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
+    if p.rule_id and int(p.rule_id) != int(r.id):
+        raise HTTPException(400, "指定的镜像规则与当前生效规则不一致")
+    ids = [int(x) for x in (p.ids or []) if str(x).strip().isdigit()]
+
+    if scope == "pruned":
+        # 纯 DB 操作：物理移除带 [pruned] 标记的僵尸目录行
+        # （与老端点 /mirror/mappings/clear-pruned 共用同一份同步实现）
+        return _cleanup_pruned_dirs(db, r.id, ids, dry_run=bool(p.dry_run))
+
+    if scope == "media":
+        out = await mirror_media_clear_invalid_async(dry_run=p.dry_run, db=db)
+        out["scope"] = scope
+        return out
+
+    # file / dir：联网只读核对 B 库后重置映射
+    if not (r.target_root_id or "").strip():
+        raise HTTPException(400, "请先在镜像设置里填写 B 镜像库目录 ID")
+    with _mirror_guard():
+        stats = await mirror.prune_stale_mappings(db, r, dry_run=p.dry_run, scope=scope)
+        if not p.dry_run:
+            add_audit(db, "mirror_cleanup", target_type="mirror",
+                      detail=json_dumps({"scope": scope,
+                                         "files_pruned": stats["files_pruned"],
+                                         "dirs_pruned": stats["dirs_pruned"]}))
+            db.commit()
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# v2.1.11 需求1：B 库被用户手动清空后的「重整」编排端点
+# ---------------------------------------------------------------------------
+
+class MirrorRestructureInput(BaseModel):
+    """B 库清空重整的入参。
+
+    scope:
+      library  整个 B 库被清空（默认）
+      dir      只有个别子目录被清空（按 A 库目录 ID 圈定）
+    source_dir_ids: scope=dir 时要重整的 A 库目录 ID 列表
+                     （= MirrorDir.source_dir_id，对应用户视角里的「子目录」）
+    dry_run:  只出预览清单，不写库
+    """
+    scope: str = "library"
+    source_dir_ids: list[str] = []
+    dry_run: bool = False
+
+
+def _restructure_scope_rows(db: Session, r: MirrorRule, scope: str,
+                            src_ids: list[str]):
+    """算出本次重整涉及的各层行。
+
+    关联口径（**必须精确，不能靠作品名猜**）：
+      资源库行 ↔ 文件映射行，用 **B 库文件 ID**：`Resource.file_id`
+      等于 `MirrorFile.target_file_id`。这是唯一严格对得上的键。
+      ——不能用作品名：`MirrorMedia.work_key` 是「A 库目录名」归一化，
+      `work_group_key(resource)` 是「B 库资源名」归一化，两套口径，
+      名字对不上时就漏掉整部作品（实测踩过）。
+
+      分享中心行 ↔ 资源库行，用 `work_group_key(resource)`——
+      分享任务本来就是从资源行建出来的，这套键在分享中心内部自洽。
+    """
+    medias = list(db.scalars(select(MirrorMedia).where(
+        MirrorMedia.rule_id == r.id)).all())
+    if scope == "dir" and src_ids:
+        hit = set(src_ids)
+        medias = [m for m in medias if str(m.source_dir_id or "") in hit]
+    media_ids = {m.id for m in medias}
+    files = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.media_id.in_(list(media_ids)))).all()) if media_ids else []
+    dirs = list(db.scalars(select(MirrorDir).where(
+        MirrorDir.rule_id == r.id)).all())
+    if scope == "dir" and src_ids:
+        hit = set(src_ids)
+        dirs = [d for d in dirs if str(d.source_dir_id or "") in hit]
+
+    # 受影响的 B 库文件 ID（精确键）
+    b_file_ids = {str(f.target_file_id) for f in files if str(f.target_file_id or "")}
+    res_rows = list(db.scalars(select(Resource)).all())
+    if scope == "library":
+        res_hit = list(res_rows)
+    else:
+        res_hit = [x for x in res_rows if str(x.file_id or "") in b_file_ids]
+    res_ids = [x.id for x in res_hit]
+    q_rows = list(db.scalars(select(QueueItem).where(
+        QueueItem.resource_id.in_(res_ids))).all()) if res_ids else []
+    # 分享中心按资源行的作品键圈定（与分享中心内部口径一致）
+    work_keys = {work_group_key(x) for x in res_hit}
+    return {"medias": medias, "files": files, "dirs": dirs,
+            "res_hit": res_hit, "q_rows": q_rows, "work_keys": work_keys}
+
+
+def _restructure_preview(db: Session, r: MirrorRule, scope: str,
+                         src_ids: list[str]) -> dict:
+    """统计本次重整会动到的各层行数（不写库）。"""
+    from . import share_center as _sc
+
+    g = _restructure_scope_rows(db, r, scope, src_ids)
+    tasks = list(db.scalars(select(MirrorTask).where(
+        MirrorTask.rule_id == r.id)).all())
+    work_keys = g["work_keys"]
+    st_hit = []
+    for st in db.scalars(select(_sc.ShareTask)).all():
+        if scope == "library" or str(st.work_key or "") in work_keys:
+            if st.status not in (_sc.ST_PUBLISHED, _sc.ST_CANCELLED, _sc.ST_FAILED):
+                st_hit.append(st)
+    sr_hit = []
+    for sr in db.scalars(select(_sc.ShareRecord)).all():
+        if scope == "library" or str(sr.work_key or "") in work_keys:
+            if int(sr.current_flag or 0) == 1:
+                sr_hit.append(sr)
+    return {
+        "media": len(g["medias"]), "files": len(g["files"]), "dirs": len(g["dirs"]),
+        "tasks": len(tasks), "resources": len(g["res_hit"]),
+        "queue": len(g["q_rows"]), "share_tasks": len(st_hit),
+        "share_records": len(sr_hit),
+        "media_titles": [m.title_standard for m in g["medias"][:10]],
+    }
+
+
+@app.post("/api/mirror/restructure", dependencies=ADMIN)
+def mirror_restructure(p: MirrorRestructureInput, db: Session = Depends(get_db)):
+    """v2.1.11 需求1：B 库被用户手动清空后的端到端重整。
+
+    用户场景（原文）：「用户手动清理了存量文件，准备重新整理」——
+    网盘上的 B 库文件被用户手工删掉/搬走，但系统里的镜像映射、资源库、
+    推送队列、分享任务还停留在「已同步 / 已推送 / 已分享」的旧状态，
+    于是页面显示一堆实际不存在的资源，推送时又报「文件不存在」。
+
+    本端点把这条链路的**四层状态一次性归位**，让下一次定时镜像同步任务
+    从干净的起点重新建目录、补复制、重新入库。
+
+    ★ 硬红线：清理动作**不联动镜像同步**。
+      绝不调用 sync_rule、绝不启动任何镜像任务、绝不碰 A 库。
+      重建完全交给下一次定时镜像同步任务自然开始（用户原话：
+      「重新镜像同步任务执行不联动，仍然等镜像同步任务开始」）。
+
+    四层处理（每层都只归档/归零，不物理删除——历史行与执行记录必须保留）：
+
+      ① 镜像映射层：MirrorFile 重置为待同步（**保留 A 库锚点**
+         file_name / source_file_id / fingerprint）；MirrorMedia 状态归零为
+         待同步；MirrorDir 置为「待重建」并打上 [pruned] 标记。
+         ——下轮同步据此从 A 库原样重建 B 库目录与文件。
+
+      ② 镜像任务层：本规则下的复制任务全部终态化（未终结的置 cancelled），
+         避免旧任务被轮询领走后指向已不存在的 B 库文件。
+
+      ③ 资源库层：命中的 Resource 行**归档**（clean_state='cleaned'），
+         推送队列行同样归档并终态化，分享态归零。
+         ——归档行不出现在资源库面板、不再被识别、不再被推送，但历史可查。
+
+      ④ 分享中心层：未终结的分享任务置为已取消，当前有效分享记录作废
+         （保留历史行）。——避免下一轮推送复用一个已失效的分享链接。
+
+    ⑤ 日志层：镜像规则的 last_status / last_message / last_pipeline_json
+         归零，进度条与状态标签回到「尚未同步」，不再显示上一轮的陈旧结果。
+
+    参数：
+      scope=library      整个 B 库被清空（默认）
+      scope=dir          只有个别子目录被清空
+      source_dir_ids     scope=dir 时的 A 库目录 ID 列表
+      dry_run=true       只出预览清单，不写库（强烈建议先预览）
+    """
+    from .archive import archive_queue_item, archive_resource
+    from . import share_center as _sc
+
+    scope = (p.scope or "library").strip().lower()
+    if scope not in ("library", "dir"):
+        raise HTTPException(400, "重整范围只能是 library（整个 B 库）或 dir（个别子目录）")
+    src_ids = [str(x).strip() for x in (p.source_dir_ids or []) if str(x).strip()]
+    if scope == "dir" and not src_ids:
+        raise HTTPException(400, "重整个别子目录时必须指定要重整的目录")
+    r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
+
+    # 正在跑的镜像批次不打断——用户点错了会毁掉正在进行的同步。
+    if str(r.batch_status or "") in ("running", "paused"):
+        raise HTTPException(409, "镜像批次正在运行或已暂停，请先等待本轮结束再重整")
+
+    preview = _restructure_preview(db, r, scope, src_ids)
+    if p.dry_run:
+        return {"ok": True, "dry_run": True, "scope": scope, "preview": preview,
+                "note": "仅预览，未改动任何数据"}
+
+    # ---- ① 镜像映射层 ----
+    g = _restructure_scope_rows(db, r, scope, src_ids)
+    medias, files, dirs = g["medias"], g["files"], g["dirs"]
+    for f in files:
+        # 保留 A 库锚点（file_name / source_file_id / fingerprint）——
+        # 下轮同步靠它判断「这个文件还没复制过」，清了就变成永远复制不回来。
+        f.status = "pending"
+        f.target_file_id = ""
+        f.target_name = ""
+        f.rename_status = ""
+        f.rename_error = ""
+        f.task_id = ""
+        f.error = "B 库内容已被手动清理，映射已重置，等待下次镜像同步重建"
+        f.updated_at = utcnow()
+    for m in medias:
+        m.status = "pending"
+        m.last_synced_at = None
+    for d in dirs:
+        d.status = "missing"
+        d.target_dir_id = ""
+        d.error = mirror.PRUNED_DIR_MARK + "B 库内容已被手动清理，等待下次镜像同步重建"
+        d.updated_at = utcnow()
+    db.commit()
+
+    # ---- ② 镜像任务层：未终结的复制任务终态化 ----
+    tasks = list(db.scalars(select(MirrorTask).where(
+        MirrorTask.rule_id == r.id)).all())
+    task_done = 0
+    for t in tasks:
+        if t.task_status in ("pending", "submitting", "submitted", "verifying"):
+            t.task_status = "cancelled"
+            t.status = "cancelled"
+            t.finished_at = utcnow()
+            t.error = "B 库内容已被手动清理，任务已终止，等待下次镜像同步重建"
+            task_done += 1
+        elif str(t.status or "") in ("pending", "running"):
+            t.status = "cancelled"
+            t.finished_at = utcnow()
+            task_done += 1
+    db.commit()
+
+    # ---- ③ 资源库层：资源行与推送队列行归档 ----
+    res_hit = g["res_hit"]
+    q_rows = g["q_rows"]
+    work_keys = g["work_keys"]
+    for x in res_hit:
+        archive_resource(x, "B库内容已手动清理，归档资源库记录")
+        x.share_status = "not_created"
+        x.share_id = ""
+        x.share_url = ""
+    for q in q_rows:
+        archive_queue_item(q, "B库内容已手动清理，归档推送队列记录")
+        if q.status not in ("sent", "skipped", "failed"):
+            q.status = "cancelled"
+    db.commit()
+
+    # ---- ④ 分享中心层：取消未终结的分享任务 + 作废当前分享记录 ----
+    st_cancelled = 0
+    sr_retired = 0
+    try:
+        st_rows = list(db.scalars(select(_sc.ShareTask)).all())
+        for st in st_rows:
+            if scope != "library" and str(st.work_key or "") not in work_keys:
+                continue
+            if st.status in (_sc.ST_PUBLISHED, _sc.ST_CANCELLED, _sc.ST_FAILED):
+                continue
+            st.status = _sc.ST_CANCELLED
+            st.error = "B 库内容已被手动清理，分享任务已取消，等待重新入库后再分享"
+            st_cancelled += 1
+        sr_rows = list(db.scalars(select(_sc.ShareRecord)).all())
+        for sr in sr_rows:
+            if scope != "library" and str(sr.work_key or "") not in work_keys:
+                continue
+            if int(sr.current_flag or 0) != 1:
+                continue
+            _sc.retire_share_record(db, str(sr.work_key or ""),
+                                    reason="B 库内容已手动清理，分享链接作废")
+            sr_retired += 1
+        db.commit()
+    except Exception as exc:
+        logger.exception("[mirror] 重整分享中心层失败：%s", exc)
+
+    # ---- ⑤ 日志层：镜像规则的状态与进度归零 ----
+    r.last_status = "never"
+    r.last_message = ""
+    r.last_pipeline_json = ""
+    r.control_action = ""
+    r.batch_status = "idle"
+    r.batch_id = ""
+    r.cursor_sequence = 0
+    db.commit()
+
+    add_audit(db, "mirror_restructured", target_type="mirror",
+              detail=json_dumps({"scope": scope, "source_dir_ids": src_ids,
+                                 "media": len(medias), "files": len(files),
+                                 "dirs": len(dirs), "tasks": task_done,
+                                 "resources": len(res_hit), "queue": len(q_rows),
+                                 "share_tasks": st_cancelled,
+                                 "share_records": sr_retired}))
+    db.commit()
+    return {"ok": True, "dry_run": False, "scope": scope,
+            "media": len(medias), "files": len(files), "dirs": len(dirs),
+            "tasks": task_done, "resources": len(res_hit), "queue": len(q_rows),
+            "share_tasks": st_cancelled, "share_records": sr_retired,
+            "note": "已重置镜像映射、资源库与分享中心状态；"
+                    "重建将由下一次定时镜像同步任务自然开始（本次清理不触发同步）"}
+
+
 @app.post("/api/mirror/mappings/prune", dependencies=ADMIN)
 async def mirror_mappings_prune(dry_run: bool = False, db: Session = Depends(get_db)):
     """v0.8.9：清理 B 库中已不存在的文件 / 目录映射（管理页「清理无效映射」）。
 
     只读核对 B 库实际内容，列目录不可信或整部作品为空时一律跳过，绝不误清。
     默认真正执行；`dry_run=true` 只返回清单不写库，供用户先预览。
+
+    v2.1.11：薄封装转发到统一端点 /api/mirror/cleanup（scope=all），
+    行为与旧端点完全一致（文件段 + 目录段一起清），保留端点是为了
+    不破坏既有调用方与历史断言——**端点不删，只是实现换了地方**。
     """
-    with _mirror_guard():
-        r = _mirror_rule(db)
-        if not r or not (r.target_root_id or "").strip():
-            raise HTTPException(400, "请先在镜像设置里填写 B 镜像库目录 ID")
-        stats = await mirror.prune_stale_mappings(db, r, dry_run=dry_run)
-        if not dry_run:
-            add_audit(db, "mirror_mappings_prune", target_type="mirror",
-                      detail=json_dumps({
-                          "files_pruned": stats["files_pruned"],
-                          "dirs_pruned": stats["dirs_pruned"],
-                          "media_skipped_unverified": stats["media_skipped_unverified"]}))
+    return await mirror_cleanup(MirrorCleanupInput(scope="all", dry_run=dry_run),
+                                db=db)
+
+
+def _cleanup_pruned_dirs(db: Session, rule_id: int, ids: list[int],
+                         dry_run: bool) -> dict:
+    """scope=pruned 的实现：彻底移除「已清理待重建」的僵尸目录行。
+
+    抽成**同步**函数的原因：`/api/mirror/mappings/clear-pruned` 这个老端点
+    一直是同步的（历史上有测试与内部调用方直接同步调用它），把它改成
+    转发协程端点会导致「coroutine was never awaited」——函数返回一个
+    协程对象却没人 await，实际什么都没删。
+
+    所以：纯 DB 逻辑放在这个同步实现里，
+    统一端点 /api/mirror/cleanup 与老端点都调它，两边行为完全一致。
+    """
+    stmt = select(MirrorDir).where(MirrorDir.status == "missing",
+                                   MirrorDir.rule_id == rule_id)
+    rows = list(db.scalars(stmt).all())
+    targets = [d for d in rows if mirror.is_pruned_dir_error(getattr(d, "error", ""))]
+    if ids:
+        targets = [d for d in targets if d.id in ids]
+    removed = len(targets)
+    if not dry_run:
+        for d in targets:
+            db.delete(d)
+        if targets:
+            add_audit(db, "mirror_mappings_clear_pruned", target_type="mirror",
+                      detail=json_dumps({"removed": removed}))
             db.commit()
-        return stats
+    return {"ok": True, "scope": "pruned", "dry_run": bool(dry_run),
+            "removed": removed,
+            "removed_media": 0, "removed_files": 0, "files_pruned": 0,
+            "dirs_pruned": 0, "media_checked": 0, "b_checked": 0,
+            "b_deleted": 0, "skipped_has_files": 0, "skipped_unverified": 0,
+            "samples": [d.name_standard for d in targets[:20]],
+            "errors": []}
 
 
 @app.post("/api/mirror/mappings/clear-pruned", dependencies=ADMIN)
@@ -2109,17 +2574,14 @@ def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
     物理删除，让「目录映射清单」恢复干净。安全前提：A 库是权威源，若目录仍在，
     下轮「立即同步」会经 _record_dir 按 source_dir_id 原样重建；不会删资源 / 分享 / 队列。
     只删带 [pruned] 标记的 missing 行，不碰真正建目录失败的 missing 与任何正常映射。
+
+    v2.1.11：与统一端点 /api/mirror/cleanup（scope=pruned）共用同一份实现，
+    并补上此前缺失的 rule_id 过滤——此前查全表 missing 行，多规则场景会跨删。
     """
-    rows = list(db.scalars(select(MirrorDir).where(MirrorDir.status == "missing")).all())
-    targets = [d for d in rows if mirror.is_pruned_dir_error(getattr(d, "error", ""))]
-    removed = len(targets)
-    for d in targets:
-        db.delete(d)
-    if removed:
-        add_audit(db, "mirror_mappings_clear_pruned", target_type="mirror",
-                  detail=json_dumps({"removed": removed}))
-    db.commit()
-    return {"ok": True, "removed": removed}
+    r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
+    return _cleanup_pruned_dirs(db, r.id, [], dry_run=False)
 
 
 @app.post("/api/mirror/media/clear-invalid", dependencies=ADMIN)
@@ -2151,7 +2613,9 @@ async def mirror_media_clear_invalid_async(dry_run: bool = False,
             checked["errors"].append(f"B 库核对失败：{str(exc)[:200]}")
             checked["skipped_unverified"] = -1  # 标记核对整体失败，不让本地清理冒充成功
     # ② 本地口径僵尸行（无 synced 文件）只在真正执行时删；dry_run 仅统计
-    targets = _invalid_media_rows(db)
+    # v2.1.11：补 rule_id 过滤（此前查全表，多规则场景会跨删别的规则的映射行）
+    _rule = _mirror_rule(db)
+    targets = _invalid_media_rows(db, _rule.id if _rule else None)
     local_media = len(targets)
     local_files = sum(db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
                       for m in targets)
@@ -2200,7 +2664,7 @@ def mirror_media_clear_invalid(db: Session) -> dict:
     return {"ok": True, "removed_media": removed_media, "removed_files": removed_files}
 
 
-def _invalid_media_rows(db: Session) -> list:
+def _invalid_media_rows(db: Session, rule_id: int | None = None) -> list:
     """v0.9.9 #205：判定「历史无效影视映射」——没有任何 synced 文件、且不在进行中的僵尸行。
 
     v0.9.8 口径只认 failed/blocked，真机上大量「status=synced 但 B 库文件已删」或
@@ -2210,10 +2674,17 @@ def _invalid_media_rows(db: Session) -> list:
       - 且状态不是可信完成态 synced-with-files（已被上一条排除）。
     这样 failed/blocked/unknown/synced(无文件)/空状态 都归为可清理僵尸行。
     删除只清 A→B 映射登记，不删资源 / 分享 / 队列；A 库仍有文件时下轮同步自动重建。
+
+    v2.1.11：加 rule_id 过滤——此前查全表 MirrorMedia，多规则场景下
+    「清理无效影视映射」会跨规则删除别的规则的映射行。当前部署是单规则，
+    但这是防御性缺口，补上以免将来多规则时误删。
     """
     in_progress = {"copying", "syncing", "pending"}
+    stmt = select(MirrorMedia).order_by(MirrorMedia.id.desc())
+    if rule_id:
+        stmt = stmt.where(MirrorMedia.rule_id == int(rule_id))
     out = []
-    for m in db.scalars(select(MirrorMedia).order_by(MirrorMedia.id.desc())).all():
+    for m in db.scalars(stmt).all():
         status = str(getattr(m, "status", "") or "").strip().lower()
         if status in in_progress:
             continue
@@ -2251,7 +2722,7 @@ def mirror_status(db: Session = Depends(get_db)):
     # v0.8.6：改名失败与「英文名待处理」都必须持久化可查，刷新页面仍在
     rename_failed = list(db.scalars(select(MirrorFile).where(
         MirrorFile.rename_status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
-    # v2.1.10：失败原因同时给「中性标签」——原始报错带 code=160 / code=127 这类
+    # v2.1.11：失败原因同时给「中性标签」——原始报错带 code=160 / code=127 这类
     # 后端口径，页面只展示中文标签（原始文本仍留在库里供排查）。
     rename_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
                       "file": f.file_name, "target": f.target_name or "",
@@ -2306,8 +2777,9 @@ def mirror_status(db: Session = Depends(get_db)):
     # v0.9.10：用户要求「只显示当前任务处理的数量和进度，不要历史累计」——
     #   优先读 MirrorRule.last_pipeline_json（本轮任务快照）；无快照时全 0 + 空闲提示。
     #   全库累计计数移到 counts.* 保留给其它面板，不再冒充本轮进度。
-    total_files = db.query(MirrorFile).count()
-    synced_files = db.query(MirrorFile).filter(MirrorFile.status == "synced").count()
+    # v2.1.11：这里原本算的 total_files / synced_files（全库累计）已删除——
+    #   它们只被 progress.synced/total 使用，而那正是「进度条 100% 时文字显示 3/89」
+    #   的病根（进度条按本轮、文字按全库）。全库累计统一走 counts.synced / counts.files。
     # v0.9.10.1：入队诊断优先读本轮快照 enqueue_diag（结构化、不会被截断）；
     # 老库无该字段时回退解析 last_message 字符串，保持升级兼容。
     snap = {}
@@ -2320,7 +2792,17 @@ def mirror_status(db: Session = Depends(get_db)):
     renamed = int(snap.get("renamed", 0) or 0) if has_snap else 0
     identified = int(snap.get("identified", 0) or 0) if has_snap else 0
     queued = int(snap.get("queued", 0) or 0) if has_snap else 0
-    snap_files = int(snap.get("total_files", 0) or 0) if has_snap else 0
+    # v2.1.11：拆掉 total_files 同名字段漂移。
+    #   copy_tasks —— 本轮提交的复制任务数（进度条分子分母同口径用它）
+    #   scan_files —— 本轮 B 库扫描到的文件数（入库口径，只做展示）
+    # 老快照只有 total_files：按「复制任务数」解读（与 v2.1.11 之前的 rename/identify 帧一致），
+    # 保证升级后历史快照的进度不退化成 0。
+    copy_tasks = int(snap.get("copy_tasks", snap.get("total_files", 0)) or 0) if has_snap else 0
+    scan_files = int(snap.get("scan_files", 0) or 0) if has_snap else 0
+    # v2.1.11：部数口径进结构化字段（此前只在 last_message 文本里，前端拿不到）
+    works_total = int(snap.get("works_total", 0) or 0) if has_snap else 0
+    works_done = int(snap.get("works_done", 0) or 0) if has_snap else 0
+    snap_files = copy_tasks
     mode_label = str(snap.get("mode") or "上轮任务") if has_snap else ""
     idle_detail = "尚无任务记录，点「立即同步」或扫描后显示本轮处理量"
     # 诊断文案：快照 enqueue_diag 优先，回退 last_message 字符串
@@ -2381,12 +2863,26 @@ def mirror_status(db: Session = Depends(get_db)):
     ident_disp = (_works_text(ws_ident) if not legacy else "") or f"{identified} 部"
     queued_value = int(ws_queued.get("total", 0) or 0) if not legacy else queued
     queued_disp = (_works_text(ws_queued) if not legacy else "") or f"{queued} 项"
+    # v2.1.11：部数进度——分子分母都取快照的 works_done / works_total（同源）。
+    # 此前进度条用「五节点综合百分比」，右侧文字用「全库累计 synced/total」，
+    # 两套口径并排 → 进度条 100% 时文字可能显示「3/89」。现在两侧共用同一组数字。
+    works_progress_total = works_total
+    works_progress_done = works_done
+    works_progress_label = ""
+    if works_progress_total:
+        works_progress_label = f"本轮已整理 {works_progress_done}/{works_progress_total} 部"
+    elif has_snap and not legacy:
+        # 无部数口径（手动扫描 / 不写 works_total 的路径）：退回条数口径，
+        # 仍与 percent 同一来源，不出现「一条口径算 percent、另一条算文字」。
+        works_progress_label = f"本轮复制 {copied} 项 · 识别 {ident_value} 部"
+    elif has_snap:
+        works_progress_label = f"本轮复制 {copied}/{copy_tasks} 项"
 
     pipeline = [
-        {"key": "copy", "label": "① 复制到 B 库", "value": copied, "total": snap_files,
+        {"key": "copy", "label": "① 复制到 B 库", "value": copied, "total": copy_tasks,
          "status": ("active" if copy_active else "done") if has_snap else "idle",
          "detail": (f"{mode_label}：本轮复制 {copied} 项" if has_snap else idle_detail)},
-        {"key": "rename", "label": "② 英文改名", "value": renamed, "total": snap_files,
+        {"key": "rename", "label": "② 英文改名", "value": renamed, "total": copy_tasks,
          "status": ("active" if rename_active else ("done" if (renamed or stage) else "idle")) if has_snap else "idle",
          "detail": (f"本轮改名 {renamed} 项（可选步骤）" if has_snap else idle_detail)},
         {"key": "identify", "label": "③ 入库识别", "value": ident_value, "total": ident_total,
@@ -2406,20 +2902,28 @@ def mirror_status(db: Session = Depends(get_db)):
                     if has_snap else (idle_detail
                                       + (f" · 上次拦截：{enqueue_diag_text}" if enqueue_diag_text else "")))},
     ]
-    # 同步进度百分比。无本轮快照直接 0（不拿历史队列冒充任务进度）；
-    # 老快照沿用 copied/files；新快照走五节点综合完成度，
-    # 只有非运行 + 分享队列清空才 100%（分享/推送没完成绝不显示 100%）。
+    # v2.1.11：进度百分比唯一口径。
+    #   首选：部数口径（works_done / works_total）——用户主单位是「部」
+    #         （单轮上限按部、分享/推送按 TMDB 作品去重也按部）。
+    #         分享/推送未完成时压到 99，绝不显示 100%。
+    #   次选：五节点综合完成度（手动扫描等不写部数口径的路径仍走这里）。
+    #   兜底：老快照沿用 copied / copy_tasks（v2.1.11 之前口径），升级后不退化。
+    # 进度条与右侧文字共用 progress 里的同一组数字（前端不再自己拼）。
     if not has_snap:
         progress = 0.0
     elif legacy:
         progress = round(copied / snap_files * 100, 1) if snap_files else 0.0
+    elif works_progress_total:
+        progress = round(min(works_progress_done / works_progress_total, 1.0) * 100, 1)
+        if progress >= 100 and (running or queue_pending):
+            progress = 99.0  # 未完成分享/推送时不显示 100%
     else:
-        all_done = (has_snap and not running and queue_pending == 0)
+        all_done = (not running and queue_pending == 0)
         if all_done:
             progress = 100.0
         else:
             steps = []
-            steps.append(min(copied / snap_files, 1.0) if snap_files else 0.0)
+            steps.append(min(copied / copy_tasks, 1.0) if copy_tasks else 0.0)
             steps.append(1.0 if (renamed or stage in ("identify", "done")) else 0.0)
             steps.append(1.0 if ws_ident else 0.0)
             steps.append((queue_sent / share_total) if share_total else 0.0)
@@ -2428,6 +2932,40 @@ def mirror_status(db: Session = Depends(get_db)):
             if progress >= 100:
                 progress = 99.0  # 未完成分享/推送时不显示 100%
     lock_info = _mirror_lock.info()
+
+    # v2.1.11：单一权威状态源。
+    # 此前 last_status（最近一轮结果）/ last_pipeline_json.running（实时）/
+    # batch_status（严格引擎批次）/ lock.busy（互斥锁）四套并行，前端各取各的，
+    # 于是出现「红字显示失败」与「进度条显示已完成」并存。
+    # 现在由后端统一算出一个 state：
+    #   实时态（running / stage）以快照 + 闸门为准；
+    #   结果态（success / partial / blocked / failed）取自 last_status；
+    #   页面只显示 state.label，不再直出 never/success/partial/blocked/failed 英文码。
+    _last_status = str(getattr(r, "last_status", "") or "never") if r else "never"
+    _state_label = {
+        "never": "尚未同步", "success": "同步成功", "partial": "部分完成",
+        "blocked": "有阻断项", "failed": "同步失败",
+    }.get(_last_status, "尚未同步")
+    _stage_label = {
+        "copy": "复制到 B 库", "rename": "英文改名", "identify": "入库识别",
+        "done": "收尾", "failed": "失败",
+    }.get(stage, "处理中")
+    _is_running = bool(running) or bool(lock_info.get("busy"))
+    _state_code = "running" if _is_running else (
+        "failed" if stage == "failed" else (_last_status or "never"))
+    _state_label = f"同步中 · {_stage_label}" if _is_running else _state_label
+    if _is_running and stage == "failed":
+        _state_label = "同步失败"
+    state = {
+        "code": _state_code,
+        "label": _state_label,
+        "running": _is_running,
+        "stage": stage,
+        "stage_label": _stage_label,
+        "owner": str(lock_info.get("owner") or ""),
+        # 「本轮结果」与「实时状态」分开：结果态只在非运行时展示，避免运行中显示上一轮结果
+        "result": ("" if _is_running else _state_label),
+    }
 
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
@@ -2468,7 +3006,18 @@ def mirror_status(db: Session = Depends(get_db)):
                     MirrorMedia.english_title == ""),
                 MirrorMedia.english_source == "ignored").count(),
             "tasks_unknown": db.query(MirrorTask).filter(MirrorTask.status == "unknown").count(),
-            "tasks_failed": db.query(MirrorTask).filter(MirrorTask.status == "failed").count(),
+            # v2.1.11：失败计数合并两套任务状态字段。
+            # 严格顺序引擎写 task_status（failed），旧批量路径写 status（failed），
+            # 此前只读 status → 严格引擎的失败任务一条都不计入，页面显示「失败 0」，
+            # 但问题诊断里却挂着红色失败清单。两者都读，口径才与清单一致。
+            "tasks_failed": db.query(MirrorTask).filter(
+                or_(MirrorTask.status == "failed",
+                    MirrorTask.task_status == "failed")).count(),
+            # v2.1.11：严格引擎终态任务计数（跳过/取消/完成），供清单与按钮状态用
+            "tasks_skipped": db.query(MirrorTask).filter(
+                MirrorTask.task_status == "skipped").count(),
+            "tasks_cancelled": db.query(MirrorTask).filter(
+                MirrorTask.task_status == "cancelled").count(),
             "scan_batches": db.query(ResourceScanBatch).count(),
             "change_events": db.query(DistributionEvent).count(),
             "dirs_mapped": db.query(MirrorDir).filter(MirrorDir.status != "missing").count(),
@@ -2480,9 +3029,17 @@ def mirror_status(db: Session = Depends(get_db)):
                 MirrorDir.status == "created_fallback").count(),
             # v0.9.8：历史无效影视映射（failed/blocked 且无 synced 文件）
             "media_invalid": len(invalid_media),
+            # v2.1.11：给前端的中文口径别名。
+            # 「页面不得体现后端代码名词」是硬红线，前端此前直接写
+            # `counts.media_invalid` 取值——字段名本身就成了页面上的代码痕迹。
+            # 这里后端出中性别名，前端只认这个别名；老键 media_invalid 保留
+            # 给历史调用方，不删。
+            "invalid_mappings": len(invalid_media),
+            "unmapped_dirs": len(missing),
         },
         "media": [{"id": m.id, "title": m.title_standard, "mirror_name": m.title_mirror,
                    "media_type": m.media_type, "status": m.status,
+                   "status_label": _media_status_label(m.status),
                    "english_title": getattr(m, "english_title", "") or "",
                    "english_source": getattr(m, "english_source", "") or "",
                    "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
@@ -2491,15 +3048,29 @@ def mirror_status(db: Session = Depends(get_db)):
                    "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
                   for m in media],
         # v0.9.8：历史无效影视映射清单，供管理页「清理无效影视映射」按钮展示/确认
+        # v2.1.11：补 files 计数 + 中文状态标签，供前端渲染这张表
         "invalid_media": [{"id": m.id, "title": m.title_standard,
-                           "status": m.status, "category_path": getattr(m, "category_path", "") or ""}
+                           "status": m.status,
+                           "status_label": _media_status_label(m.status),
+                           "category_path": getattr(m, "category_path", "") or "",
+                           "files": db.query(MirrorFile).filter(
+                               MirrorFile.media_id == m.id).count()}
                           for m in invalid_media],
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
+                  "status_label": _dir_status_label(d.status),
                   "parent_target_id": d.parent_target_id, "target_dir_id": d.target_dir_id,
                   "pruned": mirror.is_pruned_dir_error(getattr(d, "error", "")),
                   "error": getattr(d, "error", "") or ""}
                  for d in dirs],
+        # v2.1.11：「已清理待重建」的僵尸目录行单独列出，供前端勾选重建。
+        # 此前这些行只能被物理清空（clear-pruned），用户无法对其中某几行
+        # 单独触发重建——A 库还在、下轮同步会自动重建，但用户等不了下一轮。
+        "pruned_dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
+                         "category_path": d.category_path,
+                         "parent_target_id": d.parent_target_id,
+                         "error": getattr(d, "error", "") or ""}
+                        for d in pruned_dirs],
         # v0.8.2：tip 不再硬编码成「请手工建立」，直接回显 create_dir 的真实报错
         # v0.9.17.2：补 id 供「待创建目录」批量勾选定向重建
         "missing_dirs": [{"id": d.id, "parent_id": d.parent_target_id, "name": d.name_standard,
@@ -2507,8 +3078,13 @@ def mirror_status(db: Session = Depends(get_db)):
                           "error": getattr(d, "error", "") or "",
                           "tip": (getattr(d, "error", "") or "")
                                  or "在 B 库该父目录下建立此目录后重新同步"} for d in missing],
+        # v2.1.11：任务清单补 task_status 与中文标签——严格顺序引擎的失败/跳过
+        # 此前只体现在 counts 里，任务表本身看不到，用户无从判断该不该重试。
         "tasks": [{"id": t.id, "task_id": t.task_id, "status": t.status,
-                   "raw_status": t.raw_status, "polls": t.polls, "error": t.error} for t in tasks],
+                   "task_status": t.task_status,
+                   "status_label": _task_status_label(t.status, t.task_status),
+                   "raw_status": t.raw_status, "polls": t.polls, "error": t.error,
+                   "work": titles.get(t.media_id, "")} for t in tasks],
         # v0.8.4：文件复制失败清单（持久化，刷新页面仍在）
         "file_errors": file_errors,
         # v0.8.6：改名失败与英文名待处理清单
@@ -2524,10 +3100,23 @@ def mirror_status(db: Session = Depends(get_db)):
         "lock": _mirror_lock.info(),
         # v0.9.8 #195：全流程节点 + 同步进度，首页/镜像页据此展示流程条与进度
         "pipeline": pipeline,
-        "progress": {"percent": progress, "synced": synced_files, "total": total_files,
-                     "running": bool(lock_info.get("busy")) or running,
+        # v2.1.11：进度唯一口径 —— 分子分母与右侧文字同源（部数口径）。
+        #   此前 percent 走五节点综合，而右侧文字取全库累计 synced/total，
+        #   进度条 100% 时文字可能显示「3/89」。现在 percent / done / total /
+        #   label 全部来自同一组快照数字，前端只渲染 label，不再自己拼。
+        "progress": {"percent": progress,
+                     "done": works_progress_done,
+                     "total": works_progress_total,
+                     "unit": "部",
+                     "label": (works_progress_label
+                               or (f"本轮已整理 {works_progress_done}/{works_progress_total} 部"
+                                   if works_progress_total else "")),
+                     "running": _is_running,
                      "stage": stage,
+                     "stage_label": _stage_label,
                      "owner": lock_info.get("owner", "")},
+        # v2.1.11：单一权威状态（实时态 + 结果态），页面只显示 state.label
+        "state": state,
         # v0.8.2：回显实际生效配置，一眼看出「自动创建是不是被关掉了」
         "config": {
             "auto_create_dirs": (True if getattr(r, "auto_create_dirs", None) is None
@@ -2571,19 +3160,34 @@ def mirror_batch_status(db: Session = Depends(get_db)):
 
 @app.post("/api/mirror/batch/control", dependencies=ADMIN)
 def mirror_batch_control(action: str, db: Session = Depends(get_db)):
-    """派发批次控制指令：pause / resume / skip / cancel。
+    """派发批次控制指令：pause / resume / skip / cancel / reopen。
 
     指令在"任务边界"生效，不打断正在进行的 copy_file/轮询。幂等。
+
+    v2.1.11：
+      - 返回 `applied` + `reason`，前端据此给真实反馈（此前非 running 时
+        后端静默无操作，前端却弹「指令已下发」——有按钮无效果）。
+      - 新增 `reopen`：把本批次被 skip 掉的序列任务恢复为待处理。
+        skip 此前是不可逆终态，用户点错一次这批文件就再也不被复制。
     """
     r = _mirror_rule(db)
     if not r:
         raise HTTPException(400, "尚无镜像规则")
+    act = (action or "").strip().lower()
+    if act == "reopen":
+        out = mirror_batch.reopen_skipped(db, r)
+        add_audit(db, "mirror_batch_reopen", target_type="mirror",
+                  detail=json_dumps({"batch_id": r.batch_id,
+                                     "reopened": out.get("reopened")}))
+        db.commit()
+        return {"ok": bool(out.get("ok")), **out}
     try:
-        out = mirror_batch.request_control(db, r, action)
+        out = mirror_batch.request_control(db, r, act)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     add_audit(db, "mirror_batch_control", target_type="mirror",
-              detail=json_dumps({"action": action, "batch_id": r.batch_id}))
+              detail=json_dumps({"action": act, "batch_id": r.batch_id,
+                                 "applied": out.get("applied")}))
     db.commit()
     return {"ok": True, **out}
 
@@ -2757,7 +3361,9 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0, "skipped": skipped}
     if empty_ok and not seen:
         logger.info("[library] 用户主动刷新：B 库可信空批次，按实际内容清空资源库面板")
-    stale = [x for x in db.scalars(select(Resource)).all() if x.file_id not in seen]
+    stale = [x for x in db.scalars(select(Resource).where(
+        or_(Resource.clean_state.is_(None), Resource.clean_state != "cleaned"))).all()
+        if x.file_id not in seen]
     if not stale:
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0}
     share_ids = {str(x.share_id) for x in stale if x.share_id}
@@ -2770,8 +3376,19 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
                 cancelled += 1
             except Exception:
                 pass  # 单个分享取消失败不阻断对账
-    q = db.query(QueueItem).filter(QueueItem.resource_id.in_(ids)).delete(
-        synchronize_session=False)
+    # v2.1.11：推送队列行**归档不物理删除**（红线：历史执行记录必须保留）。
+    # 此前是 .delete()，整批行直接消失，事后无从追溯「当时推过什么」。
+    q_rows = list(db.scalars(select(QueueItem).where(
+        QueueItem.resource_id.in_(ids))).all())
+    now = utcnow()
+    for q in q_rows:
+        q.clean_state = "cleaned"
+        q.cleaned_at = now
+        q.clean_reason = "B库内容已移除，归档推送队列记录"
+        # 终态化，避免归档行仍被 worker 领走重发（文件已不存在）
+        if q.status not in ("sent", "skipped", "failed"):
+            q.status = "cancelled"
+    q = len(q_rows)
     # 四模块重构 阶段C 规则2：B 库整部删除 → 分享中心取消原分享任务（出库解耦）。
     # 按 stale 资源作品键取消未终结的 ShareTask；A 库仍在时镜像下一轮补齐 B 库，
     # 新资源重新入库后走 _enqueue_ready 建新的 first 任务→重新分享推送（闭环）。
@@ -2799,12 +3416,22 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
                     payload={"reason": "b_library_removed", "share_ids": sorted(share_ids)})
     except Exception:
         pass
+    # v2.1.11：资源库行**归档不物理删除**（红线：历史行与执行记录必须保留）。
+    # 此前是 db.delete(x) —— 一次 B 库重建空窗期的事故就把 4387 行彻底抹掉，
+    # 事后完全无从追溯。归档后行还在（历史可查），只是不再出现在资源库面板、
+    # 不再参与识别/分享/推送；A 库补齐后新一轮扫描会重新入库新的资源行。
     for x in stale:
-        db.delete(x)
+        x.clean_state = "cleaned"
+        x.cleaned_at = now
+        x.clean_reason = "B库内容已移除，归档资源库记录"
+        # 分享态一并归零，避免归档行还被当作「已分享」复用旧链接
+        x.share_status = "not_created"
     add_audit(db, "library_reconciled", target_type="library",
               detail=json_dumps({"removed": len(ids), "shares_cancelled": cancelled,
-                                 "queue_cleared": q, "empty_seen_allowed": empty_ok}))
-    out = {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q}
+                                 "queue_cleared": q, "empty_seen_allowed": empty_ok,
+                                 "archived": True}))
+    out = {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q,
+           "archived": True}
     if empty_ok:
         out["empty_seen_allowed"] = True
     return out
@@ -2855,8 +3482,18 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
         except Exception:
             pass
         ids = [m.id for m in members]
+        # v2.1.11：归档行也占着唯一键，命中则复活复用而不是新建。
+        # 「内容更新」推送会重置队列项状态，归档行复活后正好承接这次更新推送。
+        from .archive import find_queue_item, revive_queue_item
+        from .models import include_archived
         q = db.scalar(select(QueueItem).where(
             QueueItem.resource_id.in_(ids)).order_by(QueueItem.id).limit(1))
+        if q is None:
+            with include_archived():
+                q = db.scalar(select(QueueItem).where(
+                    QueueItem.resource_id.in_(ids)).order_by(QueueItem.id).limit(1))
+            if q is not None:
+                revive_queue_item(q)
         if q:
             # 复用原队列项并重置为待发送 = 一次「内容更新」推送，不新增第二条
             q.status, q.attempts, q.error = "pending", 0, ""
@@ -2892,7 +3529,7 @@ async def _refresh_library_from_b(db: Session, *, reconcile: bool = True,
     data = await run_scan(root, resume=False)
     out = {k: v for k, v in data.items() if k != "seen_file_ids"}
     out["root_source"] = root_source
-    # v2.1.10：入库后回填「映射回 A 库」的作品名/影视号/类型（识别前的关键一步）。
+    # v2.1.11：入库后回填「映射回 A 库」的作品名/影视号/类型（识别前的关键一步）。
     db.commit()
     out["source_mapped"] = backfill_source_titles(db)
     db.commit()
@@ -2991,7 +3628,7 @@ async def _run_async_scan(mode: str) -> None:
                     copied=0, renamed=0,
                     identified=int(ident.get("identified", 0) or 0),
                     queued=int(ident.get("queued", 0) or 0),
-                    total_files=int(out.get("files", 0) or 0),
+                    scan_files=int(out.get("files", 0) or 0),
                     enqueue_diag=dict(ident.get("enqueue_diag") or {}),
                     works=dict(ident.get("work_stats") or {}))
                 db.commit()
@@ -3075,7 +3712,7 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
             "origin_country", "vote_average", "season", "episode", "identify_status",
             "identify_source", "identify_note", "share_url", "share_status",
             "share_duration", "revision", "utime",
-            # v2.1.10：A 库映射（正确作品名 / 原文件名 / 影视号 / 类型）。
+            # v2.1.11：A 库映射（正确作品名 / 原文件名 / 影视号 / 类型）。
             # 前端手动修正窗口用这几个字段预填，避免拿 B 库英文名去搜。
             "source_title", "source_name", "source_tmdb_id", "source_media_type"]
     return [{k: getattr(x, k) for k in keys} for x in db.scalars(stmt).all()]
@@ -3098,7 +3735,7 @@ def _series_group_key(x: Resource) -> str:
 def _year_of(title: str) -> str:
     """从作品名里取年份（如「大军师司马懿 (2017)」→ 2017）。
 
-    v2.1.10：展示改用 A 库正确作品名后，年份也要跟着从 A 库名里取
+    v2.1.11：展示改用 A 库正确作品名后，年份也要跟着从 A 库名里取
     （B 库英文名里往往没有年份）。
     """
     m = re.search(r"[\[\(\{]\s*((?:19|20)\d{2})\s*[\]\)\}]", str(title or ""))
@@ -3166,7 +3803,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         g = groups.get(key)
         if g is None:
             hint = parse_media_name(x.name)
-            # v2.1.10：展示也走「映射回 A 库」口径。
+            # v2.1.11：展示也走「映射回 A 库」口径。
             # 标题优先用识别成功的 TMDB 正名；未识别时用 A 库正确作品名
             # （B 库改过名的英文译名对用户没有意义）。
             src_title = str(getattr(x, "source_title", "") or "").strip()
@@ -3183,7 +3820,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "genres": x.genres or "",
                 "vote_average": float(x.vote_average or 0),
                 "tmdb_id": x.tmdb_id,
-                # v2.1.10：A 库映射的影视号与类型一并透出，
+                # v2.1.11：A 库映射的影视号与类型一并透出，
                 # 供前端手动修正窗口预填（不必拿 B 库英文名去搜）。
                 "source_title": src_title,
                 "source_tmdb_id": src_tmdb,
@@ -3206,7 +3843,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             }
         g["count"] += 1
         g["ids"].append(x.id)
-        # v2.1.10：组内成员可能识别状态不齐（A 库映射只在部分行回填成功），
+        # v2.1.11：组内成员可能识别状态不齐（A 库映射只在部分行回填成功），
         # 标题/影视号/类型取「组内已有的最好信息」，不因首个成员缺映射就定死。
         if not g.get("source_title") and str(getattr(x, "source_title", "") or "").strip():
             g["source_title"] = str(x.source_title or "").strip()
@@ -3391,9 +4028,13 @@ def clear_library(db: Session = Depends(get_db)):
     """v0.6.4：清空当前扫描结果（资源 + 队列 + 审核 + 扫描断点），保留 Bot/频道/规则/模板/凭证。
 
     用于重新扫描前清除旧的识别失败、重试残留数据。不触碰光鸭网盘文件、不删除已建分享。
+
+    v2.1.11：计数改用 select(func.count())——`query().count()` 走的是
+    SELECT COUNT(*) 不经过 do_orm_execute 事件钩子，拿不到归档过滤，
+    会把已归档行也算进来（数字对不上实际删除量）。
     """
-    resources = db.query(Resource).count()
-    queue = db.query(QueueItem).count()
+    resources = db.scalar(select(func.count()).select_from(Resource)) or 0
+    queue = db.scalar(select(func.count()).select_from(QueueItem)) or 0
     cursors = db.query(ScanCursor).count()
     db.query(QueueItem).delete(synchronize_session=False)
     db.query(Resource).delete(synchronize_session=False)
@@ -3467,7 +4108,7 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
                                              "members": len(targets)}))
                 ok += 1
             elif action == "identify":
-                # v2.1.10：手动识别走「映射回 A 库」线索，且**绕过缓存**（手动=重新解析）。
+                # v2.1.11：手动识别走「映射回 A 库」线索，且**绕过缓存**（手动=重新解析）。
                 r = await _identify_with_source_hints(x.name, x, db)
                 if r.get("ok") and r.get("best"):
                     _apply_identification(x, r["best"], source=r["source"],
@@ -3728,6 +4369,16 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     if exists:
         return False
     auto_publish = bool(rule.auto_publish)
+    # v2.1.11：归档行也占着 (resource_id, channel_id) 唯一键，直接 INSERT 会撞约束。
+    # 命中归档行时复活复用（历史行保留，唯一键不重复）。
+    from .archive import find_queue_item
+    q_old = find_queue_item(db, x.id, rule.channel_id)
+    if q_old is not None:
+        q_old.status = "pending" if auto_publish else "review"
+        q_old.attempts, q_old.error = 0, ""
+        q_old.next_retry_at, q_old.sent_at = None, None
+        db.flush()
+        return True
     db.add(QueueItem(resource_id=x.id, channel_id=rule.channel_id,
                      status="pending" if auto_publish else "review"))
     db.flush()  # autoflush=False：立即落库，供同批次后续单集的去重查询看到
@@ -3821,7 +4472,7 @@ def _identify_cache_put(key: tuple[str, str, int, str], value: dict) -> None:
 async def _identify_with_source_hints(name: str, x: Resource, db: Session) -> dict:
     """按「映射回 A 库」的线索做一次识别（**不经缓存**）。
 
-    v2.1.10 抽出的核，供两处复用：
+    v2.1.11 抽出的核，供两处复用：
       - `identify_with_a_source_fallback`：带缓存的常规路径；
       - 手动识别 / force 批量识别：**必须绕过缓存**（红线：force 才重解析）。
     """
@@ -3844,12 +4495,12 @@ async def _identify_with_source_hints(name: str, x: Resource, db: Session) -> di
 
 
 async def identify_with_a_source_fallback(name: str, x: Resource, db: Session) -> dict:
-    """识别结果缓存 + **映射回 A 库** 的识别线索（v2.1.10 起）。
+    """识别结果缓存 + **映射回 A 库** 的识别线索（v2.1.11 起）。
 
     保持 tmdb.identify 的返回契约不变（ok/best/status/reason/...）。
     失败/存疑不缓存。
 
-    v2.1.10 需求：资源库识别必须用 A 库的正确影视名 + TMDB 影视号，
+    v2.1.11 需求：资源库识别必须用 A 库的正确影视名 + TMDB 影视号，
     不能用改名后的 B 库名（B 库单集名是英文译名、作品目录带 · 标记，
     拿去 TMDB 搜几乎必然零命中）。
     线索来源（`utils.source_query_hint`）：
@@ -4222,7 +4873,7 @@ async def tmdb_test(db: Session = Depends(get_db)):
 async def tmdb_candidates(rid: int, media_type: str = "", db: Session = Depends(get_db)):
     """手动匹配窗口打开时先带出候选；指定类型时只搜该类型（不回退）。
 
-    v2.1.10：候选线索改用「映射回 A 库」的正确作品名 + TMDB 影视号 + 类型，
+    v2.1.11：候选线索改用「映射回 A 库」的正确作品名 + TMDB 影视号 + 类型，
     不用改名后的 B 库名（B 库单集名是英文译名，搜不到）。
     """
     x = db.get(Resource, rid)
@@ -4343,7 +4994,7 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
     done = pending = queued = 0
     for x in rows:
         try:
-            # v2.1.10：批量重识别同样走「映射回 A 库」线索；手动触发**绕过缓存**。
+            # v2.1.11：批量重识别同样走「映射回 A 库」线索；手动触发**绕过缓存**。
             r = await _identify_with_source_hints(x.name, x, db)
             if r["ok"] and r.get("best"):
                 _apply_identification(x, r["best"], source=r["source"],
@@ -5036,7 +5687,12 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
             if q:
                 q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
             else:
-                db.add(QueueItem(resource_id=x.id, channel_id=ch.id, status="pending"))
+                from .archive import find_queue_item
+                q = find_queue_item(db, x.id, ch.id)
+                if q:
+                    q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+                else:
+                    db.add(QueueItem(resource_id=x.id, channel_id=ch.id, status="pending"))
             added += 1
         if not matched:
             skipped.append("资源目录未匹配任何推送路由（可在「目录路由」把 dir_id 留空做整库推送）")
@@ -5064,7 +5720,13 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
             q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
             added += 1
         else:
-            db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
+            # v2.1.11：归档行也占着唯一键，命中则复活复用而不是 INSERT（否则撞约束）
+            from .archive import find_queue_item
+            q = find_queue_item(db, x.id, r.channel_id)
+            if q:
+                q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+            else:
+                db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
             added += 1
     # v1.1：autoflush=False，上面新 add 的 QueueItem 必须先 flush 才能被下面查询看到，
     # 否则 force 任务 channel_targets=[] → submit_to_dispatch 返回 0 → 强推消息发不出去。

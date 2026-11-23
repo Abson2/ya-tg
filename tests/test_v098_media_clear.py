@@ -73,9 +73,13 @@ def test_status_exposes_invalid_media(session):
 
 def test_frontend_clear_invalid_media_controls():
     assert "async function clearInvalidMedia" in APP
-    assert "/mirror/media/clear-invalid" in APP
+    # v2.1.11：清理动作统一走 /mirror/cleanup（scope=media），旧端点
+    # /mirror/media/clear-invalid 在后端保留为薄封装（端点不删，只换实现）。
+    assert "/mirror/cleanup" in APP
     assert "清理无效影视映射" in APP
     # v0.9.10：清理口径改为联网核对 B 库，前端不再展示本地 media_invalid 数字 / 「无效待清理」标签
     assert "核对 B 库" in APP
+    # 红线：页面不得体现后端代码名词——media_invalid 是后端 counts 的键名，
+    # 前端只能用后端给的中文口径别名（invalid_mappings）。
     assert "media_invalid" not in APP
     assert "无效待清理" not in APP

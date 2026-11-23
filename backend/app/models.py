@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from sqlalchemy import String, Integer, BigInteger, Boolean, DateTime, Float, Text, ForeignKey, UniqueConstraint, Index, column
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
@@ -6,6 +7,56 @@ from .db import Base
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+# v2.1.11：归档旁路上下文。
+#
+# 全局默认过滤（见 db.py::_install_archive_filter）让所有 SELECT 自动排除
+# clean_state='cleaned' 的归档行。但归档操作本身、审计追溯、统计「清了多少条」
+# 这些场景必须能看到归档行——用这个上下文临时关掉过滤。
+#
+# 用法：
+#     with include_archived():
+#         rows = db.scalars(select(Resource)).all()
+@contextmanager
+def include_archived():
+    """在上下文内让 Resource / QueueItem 查询可见归档行。
+
+    v2.1.11：改用 ContextVar 的 token 语义，支持嵌套（内层退出后自动恢复
+    外层状态），且线程/任务之间互不干扰——publisher 与分享中心都在
+    asyncio.to_thread 的工作线程里跑，模块级开关会互相串味。
+    """
+    from . import db as _db
+    token = _db._ARCHIVE_FILTER_OFF.set(True)
+    try:
+        yield
+    finally:
+        _db._ARCHIVE_FILTER_OFF.reset(token)
+
+
+def revive_archived(row):
+    """把归档行**复活**（取消归档标记），返回是否发生了复活。
+
+    v2.1.11：归档行仍留在表里，唯一键（resources.file_id /
+    push_queue 的 resource_id+channel_id）依然被占用。若重建时按唯一键
+    直接 INSERT 新行，会撞 `UNIQUE constraint failed` 让整批扫描崩掉。
+
+    正确做法是：重建命中同唯一键时，**复用归档行**并清掉归档标记——
+    历史行保留（红线要求），同时不撞约束。这与 share_center.ensure_task
+    里「cancelled 的 first 任务要复活而不是新建」是同一条原则：
+    **同一唯一键永远只有一行，历史靠状态与时间戳区分，不靠重复行。**
+
+    实现见 app/archive.py（revive_resource / revive_queue_item），
+    此处保留为通用入口，两边行为一致。
+    """
+    if row is None:
+        return False
+    if getattr(row, "clean_state", "") != "cleaned":
+        return False
+    row.clean_state = ""
+    row.cleaned_at = None
+    row.clean_reason = ""
+    return True
 
 
 class Resource(Base):
@@ -77,6 +128,14 @@ class Resource(Base):
     source_category: Mapped[str] = mapped_column(String(512), default="")
     revision: Mapped[int] = mapped_column(Integer, default=0)  # utime/size 变化次数
     scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # v2.1.11：归档标记——B 库被用户手动清空后，资源库行**不物理删除**，
+    # 只标记为已归档（clean_state='cleaned'）并记时间。历史行与执行记录必须保留，
+    # 这是清理类操作的既定红线（此前 _reconcile_library 是物理 delete，直接违反）。
+    # 查询侧统一过滤 clean_state != 'cleaned'，归档行只在历史/审计视角可见。
+    clean_state: Mapped[str] = mapped_column(String(24), default="")
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # v2.1.11：归档原因（B 库清空 / 分享失效 / 人工清理…），便于事后追溯是哪条流程清的
+    clean_reason: Mapped[str] = mapped_column(String(64), default="")
 
 
 class ScanTask(Base):
@@ -250,6 +309,11 @@ class QueueItem(Base):
     status_ext: Mapped[str] = mapped_column(String(24), default="")  # submitted/accepted/publishing/done（空=旧链）
     accept_worker: Mapped[str] = mapped_column(String(64), default="")
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # v2.1.11：归档标记——B 库清空时推送队列行**不物理删除**，只标记已归档。
+    # 与 Resource.clean_state 同口径：历史执行记录必须保留，便于追溯「当时推过什么」。
+    clean_state: Mapped[str] = mapped_column(String(24), default="")
+    cleaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    clean_reason: Mapped[str] = mapped_column(String(64), default="")
     __table_args__ = (UniqueConstraint("resource_id", "channel_id", name="uq_resource_channel"),)
 
 

@@ -310,7 +310,9 @@ def test_safe_rename_failure_is_surfaced_and_persisted(db):
 
 def test_frontend_prompt_exposes_skip_reasons():
     vue = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    for s in ("已达标跳过", "无中文跳过", "无待改名文件", "首个改名错误",
+    # v2.1.11：改名跳过按用户口径统一成「改名跳过(已达标)」/「改名跳过(无中文)」，
+    # 与「忽略翻译」「跳过本序列」「已跳过投递」区分开——此前 5 种含义都叫「跳过」。
+    for s in ("改名跳过(已达标)", "改名跳过(无中文)", "无待改名文件", "首个改名错误",
               "本次未自动改名（未返回统计）", "r?.errors?.length"):
         assert s in vue, s
 

@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from .db import SessionLocal, json_dumps
 from .guangya import GuangYaOpenAPI, GuangYaWebFiles
 from .models import (AuditLog, AuthToken, DistributionEvent, Resource, ResourceScanBatch,
-                     ResourceVersion, ScanCursor, ScanTask, utcnow)
+                     ResourceVersion, ScanCursor, ScanTask, include_archived,
+                     revive_archived, utcnow)
 from .utils import work_group_key
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,13 @@ def _upsert_resource(db: Session, item: dict, parent: str,
     ext = (item.get("ext") or ("." + name.rsplit(".", 1)[-1] if "." in name else "")).lower()
     utime = int(item.get("utime", 0) or 0)
     size = int(item.get("fileSize", 0) or 0)
-    row = db.scalar(select(Resource).where(Resource.file_id == fid))
+    # v2.1.11：查不到未归档行时，再看是否有一条**归档行**占着这个 file_id。
+    # B 库清空重整后归档的行仍在表里，且 file_id 是唯一键——直接 INSERT 新行
+    # 会撞 `UNIQUE constraint failed: resources.file_id`，**整批扫描直接崩**。
+    # 真实触发路径：用户从网盘回收站恢复文件，fileId 不变 → 下一轮扫描撞约束。
+    # 正确做法是复用归档行并取消归档标记（历史行保留，唯一键不重复）。
+    from .archive import find_resource_by_file_id
+    row = find_resource_by_file_id(db, fid)
     raw_parent = str(item.get("parentId") or "")
     if not raw_parent or raw_parent == "*":
         raw_parent = parent

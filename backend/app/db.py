@@ -1,5 +1,6 @@
 import json
 import logging
+from contextvars import ContextVar
 from sqlalchemy import create_engine, event, inspect, or_, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
@@ -40,8 +41,181 @@ if _IS_SQLITE:
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
+# v2.1.11：归档过滤的旁路开关（ContextVar，线程/任务级隔离）。
+# 置 True 时，本上下文内的 SELECT 能看到已归档行。
+# 用 ContextVar 而非模块级变量：publisher / 分享中心在 to_thread 工作线程里跑，
+# 模块级变量会被多线程共享，旁路一开就把归档行漏给普通查询。
+_ARCHIVE_FILTER_OFF: ContextVar[bool] = ContextVar("archive_filter_off", default=False)
+
+
 class Base(DeclarativeBase):
     pass
+
+
+# v2.1.11：归档行全局过滤（B 库清空重整用）。
+#
+# 背景：B 库被用户手动清空后，资源库行与推送队列行**不物理删除**，只标记
+# clean_state='cleaned'（红线：历史行与执行记录必须保留）。这样一来，
+# 全项目几十处 Resource / QueueItem 查询都必须记得排除归档行——
+# 靠人工逐处加过滤条件，漏一处就会让「已归档的资源」重新出现在面板、
+# 被再次识别、再次入队推送，正是这次要根治的病根。
+#
+# 做法：用 SQLAlchemy 的 do_orm_execute 事件在**所有** SELECT 上自动追加
+# 「未归档」条件，一处生效、全局覆盖，绝不漏。
+# 需要看归档行时用 `include_archived()` 上下文（见 models.py）临时关闭。
+def _collect_table_names(clause, names: set[str]) -> None:
+    """递归展开 from 子句，收集涉及的表名。
+
+    v2.1.11：JOIN 查询时 `get_final_froms()` 返回的是 `_ORMJoin`（Join 的子类），
+    **没有 .name 属性**——直接取 `t.name` 会抛 AttributeError，
+    整条查询直接崩（本项目 `mirror_status` 的队列统计就是 JOIN 两张表）。
+    这里按「表 → 直接取 name；Join → 递归左右两侧」的规则展开。
+    """
+    if clause is None:
+        return
+    name = getattr(clause, "name", None)
+    if name:
+        names.add(str(name))
+        return
+    left = getattr(clause, "left", None)
+    right = getattr(clause, "right", None)
+    if left is not None:
+        _collect_table_names(left, names)
+    if right is not None:
+        _collect_table_names(right, names)
+
+
+def _install_archive_filter() -> None:
+    """给所有 SELECT 自动追加「排除归档行」条件。
+
+    只对 resources / push_queue 两张表生效；其余模型完全不受影响。
+
+    v2.1.11：改成**递归下钻**版本。
+      此前只检查 statement 顶层的 from 子句，遇到 `Query.count()` /
+      `Query.exists()` 这类把查询包成子查询的写法就漏了——顶层 from 是
+      匿名子查询（anon），真正的 resources 表在里层，于是归档行照样
+      被算进 count，页面上「资源数」比实际多。
+      现在逐层找���每一条引用了归档表的 Select，在**它自己那一层**加条件，
+      内层子查询也一并覆盖。
+    """
+    from . import models  # 延迟导入，避免与 models 的循环依赖
+
+    # 过滤条件对象按表缓存：同一张表复用同一个 criterion，
+    # 这样「这层是否已经打过补丁」可以用对象身份直接判定（幂等）。
+    criteria: dict[str, object] = {}
+
+    def _criterion_for(table: str):
+        if table not in criteria:
+            cls = models.Resource if table == "resources" else models.QueueItem
+            crit = or_(cls.clean_state.is_(None), cls.clean_state != "cleaned")
+            # 打标记：克隆后的 criterion 会丢失自定义属性？实测会保留，
+            # 但保守起见用对象身份判定即可，标记只作人工排查用。
+            try:
+                crit._ya_archive_criterion = table
+            except Exception:
+                pass
+            criteria[table] = crit
+        return criteria[table]
+
+    def _tables_of(sel) -> set[str]:
+        names: set[str] = set()
+        try:
+            for t in sel.get_final_froms():
+                _collect_table_names(t, names)
+        except Exception:
+            pass
+        return names
+
+    def _selects_in(node) -> list:
+        """找出 node 内所有 Select（含嵌套子查询）。"""
+        from sqlalchemy.sql import Select
+        from sqlalchemy.sql import visitors
+        out = []
+        try:
+            for e in visitors.iterate(node):
+                if isinstance(e, Select):
+                    out.append(e)
+        except Exception:
+            pass
+        return out
+
+    def _already_patched(sel, table: str) -> bool:
+        crit = _criterion_for(table)
+        for c in getattr(sel, "_where_criteria", ()) or ():
+            if c is crit:
+                return True
+        return False
+
+    def _needs_patch(sel) -> list[str]:
+        out = []
+        for t in _tables_of(sel):
+            if t in ("resources", "push_queue") and not _already_patched(sel, t):
+                out.append(t)
+        return out
+
+    def _pending_children(sel) -> list:
+        """sel 内部还没打补丁的 Select（深度更深的那层）。"""
+        out = []
+        for s in _selects_in(sel):
+            if s is not sel and _needs_patch(s):
+                out.append(s)
+        return out
+
+    def _patch_tree(stmt):
+        """自内向外逐层打补丁。
+
+        为什么自内向外：`replacement_traverse` 替换一个节点后会停止下钻
+        （stop_on 机制），若先替换外层，内层就再也走不到。
+        所以每一轮只处理「内层已无待打补丁子节点」的那一层，循环直到收敛。
+        """
+        from sqlalchemy.sql import Select
+        from sqlalchemy.sql import visitors
+        tree = stmt
+        for _ in range(8):  # 嵌套层级上限，够用
+            targets = {}
+            for s in _selects_in(tree):
+                need = _needs_patch(s)
+                if not need or _pending_children(s):
+                    continue
+                targets[id(s)] = need
+            if not targets:
+                break
+
+            def _repl(el):
+                if not isinstance(el, Select):
+                    return None
+                need = targets.get(id(el))
+                if not need:
+                    return None
+                new = el
+                for t in need:
+                    new = new.where(_criterion_for(t))
+                return new
+
+            out = visitors.replacement_traverse(tree, {}, _repl)
+            if out is None:
+                break
+            tree = out
+        return tree
+
+    @event.listens_for(SessionLocal, "do_orm_execute")
+    def _apply_archive_filter(state):  # pragma: no cover - 由 SQLAlchemy 事件驱动
+        if not state.is_select:
+            return
+        # v2.1.11：用 ContextVar 而非模块级全局变量做旁路开关。
+        #   publisher / 分享中心都用 asyncio.to_thread 在工作线程里跑，模块级
+        #   变量会被多个线程共享——线程 A 打开 include_archived() 期间，
+        #   线程 B 的普通查询也会漏出归档行（曾归档的资源被重新推送）。
+        #   ContextVar 每个线程/任务各持一份，天然隔离。
+        if _ARCHIVE_FILTER_OFF.get():
+            return
+        try:
+            state.statement = _patch_tree(state.statement)
+        except Exception as exc:  # pragma: no cover - 兜底：绝不因过滤失败让查询崩
+            logger.warning("[archive] 归档过滤补丁异常，本次查询按原样执行：%s", exc)
+
+
+_install_archive_filter()
 
 
 def get_db():
@@ -93,6 +267,11 @@ _COLUMNS = {
         "source_media_type": "TEXT DEFAULT ''",
         # A 库分类目录链：类型判定的最可靠依据（分类目录里的「电影/剧集」直接定命名空间）。
         "source_category": "TEXT DEFAULT ''",
+        # v2.1.11：归档标记——B 库被手动清空时资源库行不物理删除，只标记已归档。
+        # 历史行与执行记录必须保留（清理类操作的既定红线）。
+        "clean_state": "TEXT DEFAULT ''",
+        "cleaned_at": "DATETIME",
+        "clean_reason": "TEXT DEFAULT ''",
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
@@ -103,6 +282,10 @@ _COLUMNS = {
         "status_ext": "TEXT DEFAULT ''",
         "accept_worker": "TEXT DEFAULT ''",
         "accepted_at": "DATETIME",
+        # v2.1.11：归档标记——推送队列行不物理删除，只标记已归档（保留历史执行记录）
+        "clean_state": "TEXT DEFAULT ''",
+        "cleaned_at": "DATETIME",
+        "clean_reason": "TEXT DEFAULT ''",
     },
     # 四模块重构 阶段A：分享任务表增加索引列（表本身由 create_all 新建，老库若已存在补列）
     "share_tasks": {

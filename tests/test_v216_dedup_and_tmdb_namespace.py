@@ -640,9 +640,14 @@ def test_identify_unknown_type_still_may_cross_namespace():
 # ---------------------------------------------------------------------------
 
 def test_frontend_maps_skipped_status_to_chinese():
-    """后端新增 skipped 状态 → 前端必须有中文映射，不得直出英文枚举。"""
+    """后端新增 skipped 状态 → 前端必须有中文映射，不得直出英文枚举。
+
+    v2.1.11：措辞按用户口径收敛——「跳过」在页面里原本有 5 种含义，
+    全部叫「已跳过」会让用户以为是同一件事。现在区分成：
+      忽略翻译 / 改名跳过 / 跳过本序列 / 已跳过投递
+    """
     src = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
-    assert "skipped: '已跳过'" in src, "任务状态缺少 skipped 的中文映射"
+    assert "skipped: '已跳过投递'" in src, "任务状态缺少 skipped 的中文映射"
     # 执行记录表的阶段 / 状态同样要中文化
     assert "scExecStageLabel" in src and "scExecStatusLabel" in src
     assert "scExecStageLabel(s.row.stage)" in src

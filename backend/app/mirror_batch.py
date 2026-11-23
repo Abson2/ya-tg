@@ -46,26 +46,92 @@ def request_control(db: Session, rule: MirrorRule, action: str) -> dict:
     """派发控制指令（pause/resume/skip/cancel）。幂等，返回当前批次状态。
 
     - pause：仅在 running 时置指令；paused 时重复调用无副作用。
-    - resume：paused/cancelling 时直接恢复 running 并清指令。
+    - resume：**无条件清掉待消费的一次性指令**；批次处于 paused/cancelling 时
+      同时把状态恢复为 running。
+      旧语义是「resume 在 running 下清任何指令」——这一点必须保留：
+      用户在 running 状态下点了「跳过当前任务」，又后悔了，resume 应当
+      撤销这条尚未被消费的一次性指令（指令在任务边界才消费，
+      在此之前一直挂着）。v2.1.11 曾把清理挪到「仅 paused/cancelling」分支，
+      结果 running 下的 resume 变成空操作，用户无法撤销误点的跳过。
     - skip/cancel：仅 running 时可派发。
     指令由执行器在"任务边界"消费，不打断正在进行的 copy_file/轮询。
+
+    v2.1.11：**返回真实执行结果**（applied + reason）。
+      此前非 running 时静默无操作，前端却无条件弹「批次指令已下发」，
+      典型的"有按钮无效果"。现在后端明说这条指令到底有没有生效，
+      前端据此给出真实反馈（成功 / 未生效 + 原因）。
     """
     action = (action or "").strip().lower()
     if action not in {"pause", "resume", "skip", "cancel"}:
         raise ValueError(f"未知批次控制指令: {action}")
 
+    applied = True
+    reason = ""
     if action == "resume":
+        # 撤销尚未消费的一次性指令（skip / cancel / pause）——
+        # 这在 running 状态下同样有意义，用户可以反悔。
+        cleared = rule.control_action or ""
+        rule.control_action = ""
         if rule.batch_status in {"paused", "cancelling"}:
             rule.batch_status = "running"
-        rule.control_action = ""
+            reason = "已恢复本批次运行" + (f"，并撤销待执行的「{cleared}」指令" if cleared else "")
+        elif cleared:
+            reason = f"已撤销待执行的「{cleared}」指令"
+        else:
+            reason = "当前批次正在运行，无需恢复"
     elif action == "pause":
         if rule.batch_status == "running":
             rule.control_action = "pause"
+        else:
+            applied = False
+            reason = f"只有运行中的批次才能暂停（当前：{_status_label(rule.batch_status)}）"
     elif action in {"skip", "cancel"}:
         if rule.batch_status == "running":
             rule.control_action = action
+        else:
+            applied = False
+            reason = f"只有运行中的批次才能{'跳过' if action == 'skip' else '取消'}（当前：{_status_label(rule.batch_status)}）"
     db.commit()
-    return batch_status(db, rule)
+    out = batch_status(db, rule)
+    out["applied"] = applied
+    out["reason"] = reason
+    return out
+
+
+def _status_label(status: str) -> str:
+    """批次状态中文标签（供指令反馈文案使用，不把英文码抛给页面）。"""
+    return {"idle": "空闲", "running": "运行中", "paused": "已暂停",
+            "cancelling": "取消中", "cancelled": "已取消"}.get(
+                str(status or ""), "空闲")
+
+
+def reopen_skipped(db: Session, rule: MirrorRule) -> dict:
+    """v2.1.11：把批次里被跳过的序列任务恢复为「待处理」，给 skip 一个恢复路径。
+
+    背景：严格顺序引擎的 skip 是**不可逆终态**——桶内成员一旦落 skipped，
+    就再也不会被本批次重新拾取。用户点错一次「跳过当前」，这批文件就永远
+    不在本轮被复制，且界面上没有任何提示，用户只能重新跑整轮。
+
+    这里把 skipped 的序列任务改回 pending（同时清 finished_at / error），
+    下一次「继续轮询任务」或下一轮同步就能重新拾取它们。
+    批次不在运行中时也可以执行——恢复只是改数据，不触发任何网络动作。
+    """
+    batch_id = str(rule.batch_id or "")
+    if not batch_id:
+        return {"ok": False, "reopened": 0, "reason": "没有进行中的批次，无需恢复"}
+    rows = list(db.scalars(select(MirrorTask).where(
+        MirrorTask.batch_id == batch_id,
+        MirrorTask.task_status == "skipped")).all())
+    for t in rows:
+        t.task_status = "pending"
+        t.status = "pending"
+        t.finished_at = None
+        t.error = ""
+    if rows:
+        db.commit()
+    return {"ok": True, "reopened": len(rows),
+            "reason": (f"已恢复 {len(rows)} 个被跳过的任务，下次同步会重新处理"
+                       if rows else "本批次没有被跳过的任务")}
 
 
 def batch_status(db: Session, rule: MirrorRule) -> dict:

@@ -2782,6 +2782,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
 
 async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
                                dry_run: bool = False,
+                               scope: str = "all",
                                max_media: int = 200) -> dict:
     """v0.8.9：只读核对 B 库实际内容，清理「B 库已经不存在」的 A→B 映射。
 
@@ -2797,15 +2798,28 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
          清 target_file_id / target_name / rename_status，下轮同步自动补复制并改名。
       3. 不动 Resource / share_url / QueueItem / DistributionEvent，也不删 B 库文件。
       4. 每次写立即 `db.commit()`（设计红线 8：绝不跨 await 持有 SQLite 写事务）。
+
+    v2.1.11：加 `scope` 拆分文件段与目录段。
+      此前「清理无效映射」一个端点同时清文件与目录，导致管理页三个清理按钮
+      各自含义重叠、又都只能全表操作。现在 scope=file 只处理文件映射、
+      scope=dir 只处理目录映射、scope=all 保持原行为（两个老端点仍走 all，兼容）。
     """
+    scope = (scope or "all").strip().lower()
+    if scope not in ("all", "file", "dir"):
+        scope = "all"
+    do_file = scope in ("all", "file")
+    do_dir = scope in ("all", "dir")
     api = GuangYaWebFiles(db)
-    stats = {"ok": True, "dry_run": bool(dry_run), "media_checked": 0,
+    stats = {"ok": True, "dry_run": bool(dry_run), "scope": scope,
+             "media_checked": 0,
              "media_skipped_unverified": 0, "media_skipped_empty": 0,
              "files_pruned": 0, "dirs_checked": 0, "dirs_pruned": 0,
              "dirs_skipped_unverified": 0, "samples": [], "errors": []}
     medias = list(db.scalars(select(MirrorMedia).where(
         MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")).all())
     for media in medias[:max_media]:
+        if not do_file:
+            break
         stats["media_checked"] += 1
         try:
             candidates, verified = await _b_file_candidates(api, media)
@@ -2848,7 +2862,7 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
     dirs = list(db.scalars(select(MirrorDir).where(
         MirrorDir.rule_id == rule.id,
         MirrorDir.target_dir_id != "",
-        MirrorDir.status != "missing")).all())
+        MirrorDir.status != "missing")).all()) if do_dir else []
     groups: dict[str, list[MirrorDir]] = {}
     for d in dirs:
         groups.setdefault(str(d.parent_target_id or ""), []).append(d)

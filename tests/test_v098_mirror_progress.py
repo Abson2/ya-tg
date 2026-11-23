@@ -92,17 +92,24 @@ def test_pipeline_idle_without_snapshot(session):
 def test_progress_percent(session):
     _seed(session)
     out = main.mirror_status(db=session)
-    # synced/total 仍是全库计数（兼容其它面板），但 percent 是「本轮任务进度」，
-    # 无快照时为 0。写入快照后按本轮 copied/total_files 计算。
-    assert out["progress"]["synced"] == 2
-    assert out["progress"]["total"] == 3
+    # v2.1.11：进度唯一口径——progress 里不再塞全库累计的 synced/total。
+    #   全库计数统一走 counts.*（兼容其它面板）；progress 只描述「本轮任务进度」，
+    #   分子分母与右侧文字同源（部数口径）。此前 progress.synced 走全库累计、
+    #   percent 走本轮快照，两套口径并排 → 进度条 100% 时文字显示「3/89」。
+    assert out["counts"]["synced"] == 2
+    assert out["counts"]["files"] == 3
     assert out["progress"]["percent"] == 0.0
+    # progress 内不再出现全库累计字段（防止双口径回流）
+    assert "synced" not in out["progress"]
     rule = session.query(MirrorRule).first()
     rule.last_pipeline_json = ('{"mode":"镜像同步","copied":2,"renamed":0,"identified":1,'
                                '"queued":1,"total_files":3,"at":"2026-11-19T20:00:00"}')
     session.commit()
     out = main.mirror_status(db=session)
+    # 老快照（无 works/stage）走 legacy 口径：copied / copy_tasks
     assert out["progress"]["percent"] == 66.7
+    # 进度条文字与百分比同源（前端只渲染 label，不再自己拼数字）
+    assert out["progress"]["label"] == "本轮复制 2/3 项"
 
 
 def test_pipeline_empty_ok(session):
