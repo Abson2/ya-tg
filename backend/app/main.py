@@ -39,7 +39,8 @@ from .security import decrypt_secret, encrypt_secret, mask_secret
 logger = logging.getLogger(__name__)
 
 from .utils import (as_utc, is_video_file, normalize_work_name, parse_media_name,
-                    retry_after_seconds, standard_media_name, star_media_name, utcnow,
+                    retry_after_seconds, source_query_hint, standard_media_name,
+                    star_media_name, strip_tmdb_tag, utcnow,
                     work_episode_numbers, work_group_key)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
@@ -91,6 +92,62 @@ class _TimedMirrorLock:
         self._since = 0.0
         self._last_beat = 0.0
         self._fence = 0  # 代次计数，每次 acquire（含接管）递增
+        # v2.1.10：等待队列（先来先得）。定时任务不再「抢不到就跳过」，
+        # 而是排队等上一轮彻底结束再跑本轮（用户口径：上一轮没跑完，下一轮
+        # 不启动；上一轮结束了才按新的定时启动新一轮）。
+        self._meta = threading.Lock()
+        self._waiters: dict[int, float] = {}  # 票据 → 开始等待的时刻
+        self._wait_seq = 0
+
+    def _register_waiter(self) -> int:
+        with self._meta:
+            self._wait_seq += 1
+            self._waiters[self._wait_seq] = time.monotonic()
+            return self._wait_seq
+
+    def _unregister_waiter(self, ticket: int) -> None:
+        with self._meta:
+            self._waiters.pop(ticket, None)
+
+    def _is_earliest_waiter(self, ticket: int) -> bool:
+        """先来先得：只有等得最久的那个才去抢锁，避免后来者插队。"""
+        with self._meta:
+            if not self._waiters:
+                return True
+            mine = self._waiters.get(ticket)
+            if mine is None:
+                return True
+            return all(t == ticket or v > mine for t, v in self._waiters.items())
+
+    async def acquire_async(self, owner: str = "", timeout: float = 3600.0) -> bool:
+        """等待式获取（定时任务用）：上一轮没跑完就排队等，等到了再跑本轮。
+
+        用户口径（2026-11-23）：「复制、改名、翻译、识别直到入库资源库」算**一轮**，
+        上一轮没跑完，下一轮定时任务不启动；上一轮彻底结束后，等着的这一轮
+        继续跑（**不丢轮次**），按最新定时执行下一轮。
+
+        实现要点：
+          - 用 `await asyncio.sleep` 轮询，**绝不阻塞事件循环**——同步等待会占住
+            loop 线程，让所有 job 与 API 一起饿死（六轮死锁教训）；
+          - 等待者按先来先得排队，避免每次都是最后到的那个先抢到；
+          - 超时放弃本轮（下一轮定时自然会重来），绝不无限堆积；
+          - 锁被持有期间 `acquire()` 内部仍按「距最后心跳」判残留并强制接管，
+            真卡死的上一轮不会把后续轮次永久堵死。
+        """
+        ticket = self._register_waiter()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        try:
+            while True:
+                if self._is_earliest_waiter(ticket):
+                    if self.acquire(blocking=False, owner=owner):
+                        return True
+                if time.monotonic() >= deadline:
+                    logger.warning("[pipeline] 等待上一轮任务结束超时（%.0fs），本轮放弃：%s",
+                                   timeout, owner or "未命名任务")
+                    return False
+                await asyncio.sleep(1.0)
+        finally:
+            self._unregister_waiter(ticket)
 
     def _valid_fence(self) -> bool:
         """调用方是否当前持有者；跨线程无 token 时按旧语义放行。"""
@@ -164,24 +221,52 @@ class _TimedMirrorLock:
 
     def info(self) -> dict:
         held = self._lock.locked()
+        with self._meta:
+            waiting = len(self._waiters)
         return {"busy": held, "owner": self._owner if held else "",
                 "held_seconds": int(self._held_seconds()) if held else 0,
                 "idle_seconds": int(self._idle_seconds()) if held else 0,
-                "fence": self._fence}
+                "fence": self._fence,
+                # v2.1.10：正在排队等上一轮结束的任务数（>0 说明有轮次在等位）
+                "waiting": waiting}
 
 
 _mirror_lock = _TimedMirrorLock()
 
-# v2.1.3 真机死锁根治：改名专用互斥锁。
-# 原来「后台改名复查」与「定时镜像 / 立即同步」抢同一把 _mirror_lock，真机
-# 2026-11-22 上镜像长跑 119 部作品 → 改名复查每 120 秒都抢不到锁直接 return
-# → 英文名解析链路整体停摆（56 部作品集体无英文名）。
-# 复制（动文件流向）与改名（只改 B 库文件名）互不冲突，拆成两把锁后：
-#   - _mirror_lock：复制 / 建目录 / 映射维护（长任务）
-#   - _rename_lock：改名（只改 B 库已有文件的名称）
-# 两者可以并行；真正的互斥只发生在「两个改名任务同时改同一批文件」上。
-# 同样非阻塞获取：抢不到就跳过本轮，不排队堆积。
-_rename_lock = threading.Lock()
+# v2.1.10 口径反转（用户 2026-11-23 明确）：镜像流水线**必须串行**。
+# 「复制 → 改名 → 翻译 → 识别 → 入库资源库」合起来算**一轮**；上一轮没跑完，
+# 下一轮定时任务不启动，等上一轮彻底结束后，才按（可能已经更新过的）定时
+# 启动新一轮。目的是杜绝并发冲突：两个任务同时改同一批文件、同时抢 SQLite
+# 写锁、同时建目录 / 改目录名。
+#
+# v2.1.3 曾经把「后台改名复查」拆成独立的 `_rename_lock` 与镜像锁并行，
+# 因为真机上镜像长跑 119 部作品时，改名复查每 120 秒抢不到锁直接 return →
+# 英文名解析链路整体停摆（56 部作品集体无英文名）。
+# 那版的病灶是「**抢不到就跳过本轮**」，不是「并行」本身。
+# v2.1.10 保留串行（并发才是真冲突），但把语义换成**排队等待**：
+# 抢不到就等上一轮结束再跑本轮（不丢轮次）——既不并发，也不饿死。
+_rename_lock = _mirror_lock  # 旧引用兼容：改名与复制 / 翻译共用同一把闸门
+
+# 定时任务等待上一轮结束的最长秒数。超时只是放弃**本轮**（下一次定时会重来），
+# 绝不无限堆积。给足余量是为了覆盖「镜像长跑 / 大批量识别」这类正常长任务。
+PIPELINE_WAIT_SECONDS = 3600.0
+
+# v2.1.10：改名门禁从「整轮拦截」收敛为「作品级拦截」。
+#
+# 起因（真机 2026-11-23）：同轮 20 部作品的镜像复制全部成功、英文名全部解析成功，
+# 但资源库里一条都查不到——被 v2.1.0 的「改名硬门禁」整轮拦下了。触发点是**一部剧
+# 的假失败**：光鸭回 code=160「文件名已存」，而那 63 个文件其实早已改名成功，
+# 只是 DB 状态没跟上。1 部剧的 1 个假失败 → 同轮 19 部健康作品一起被拦。
+#
+# v2.1.0 门禁的**原意**只有一条：「杜绝英文名没改对就先推群/频道」。
+# 这条原意在推送侧本来就有**作品级**闸门兜底：
+#   `push_gate.evaluate_push_gate` 的 `file_english` 项 —— 作品所有已同步文件必须
+#   都是 rename_status='done'（且有目标名），否则该作品不入队、不推送。
+# 也就是说「整轮拦截」属于过度拦截：它连入库与识别一起拦了，而那部分没有任何风险。
+#
+# v2.1.10 起：改名没成功的作品自己不入队推送（作品级闸门），其余作品照常
+# 入库 → 识别 → 推送。要恢复 v2.1.0 的整轮口径，把下面开关改回 True 即可。
+RENAME_GATE_BLOCK_WHOLE_ROUND = False
 
 
 # 阶段四 B-11：审计日志脱敏。异常 str(exc) 可能带 token / 签名 URL 片段，
@@ -331,10 +416,14 @@ def untranslated_reason(lock_info: dict, tmdb_ok: bool, ai_ok: bool) -> str:
     其实正常、真正卡点是镜像锁被占，静态甩锅「补齐 TMDB/AI」会把排查带偏。
     """
     if lock_info.get("busy"):
-        return ("被镜像任务占用：同步 / 改名任务「%s」运行中（已 %s 秒，%s 秒无进展），"
+        # v2.1.10：闸门改成「排队等待」后，用户会看到「上一轮在跑、下一轮在等」。
+        # 把等待数量也说清楚，免得以为任务卡死。
+        waiting = int(lock_info.get("waiting", 0) or 0)
+        wait_hint = (f"；另有 {waiting} 个定时任务在排队等它结束" if waiting else "")
+        return ("被镜像任务占用：同步 / 改名任务「%s」运行中（已 %s 秒，%s 秒无进展）%s，"
                 "待其结束后点「按英文规范改名」重跑"
                 % (lock_info.get("owner") or "未知任务", lock_info.get("held_seconds", 0),
-                   lock_info.get("idle_seconds", 0)))
+                   lock_info.get("idle_seconds", 0), wait_hint))
     if not tmdb_ok and not ai_ok:
         return "配置缺失：TMDB 与 AI 均未配置；至少配其一后点「按英文规范改名」重跑（无配置时会走拼音兜底）"
     if not tmdb_ok:
@@ -342,6 +431,18 @@ def untranslated_reason(lock_info: dict, tmdb_ok: bool, ai_ok: bool) -> str:
     if not ai_ok:
         return "AI 未配置（TMDB 可用）：点「按英文规范改名」重跑；TMDB 查不到时走拼音兜底"
     return "待重跑：TMDB / AI 配置均正常，点「按英文规范改名」重跑即可"
+
+
+def _rename_status_label(status: str) -> str:
+    """把内部改名状态翻成中性中文（页面不出现内部状态词）。
+
+    v2.1.10：待办清单此前直接把 `rename_status` 原始值（pending_visible /
+    skipped_legacy / failed）塞进「状态」列——内部状态词直接漏给用户。
+    这里统一走中文标签，与 `mirror.rename_error_label` 一起构成中性展示口径。
+    """
+    return ({"": "待处理", "pending_visible": "等待网盘可见", "failed": "未完成",
+             "skipped_ascii": "无中文名", "skipped_legacy": "历史条目"}
+            .get(str(status or ""), "待处理"))
 
 
 # v0.9.21：僵尸镜像任务自愈。进程崩溃/强中断时 mirror_tasks 的 running 行会
@@ -375,6 +476,107 @@ def reap_stale_mirror_tasks(db: Session, *, stale_minutes: int | None = None) ->
     return {"scanned": len(stale), "reaped": reaped}
 
 
+def backfill_source_titles(db: Session, limit: int = 5000) -> int:
+    """把 A 库映射回填到资源库：作品名 / 原文件名 / 影视号 / 类型 / 分类目录。
+
+    v2.1.10 需求：资源库的**识别与展示**都要用映射回 A 库的正确影视名与
+    TMDB 影视号。B 库改过名（单集名英文、作品目录带 · 标记），拿去 TMDB
+    搜几乎必然零命中，用户看到的就是「资源库里识别不出来」。
+
+    关联链：Resource.file_id == MirrorFile.target_file_id（B 库 fileId 一一对应），
+    再经 MirrorFile.media_id 取 MirrorMedia 的 A 库作品名。
+
+    类型来源见 `mirror._source_media_type`：**identity → 分类目录 → media_type**
+    三级判定，判不出就留空——**宁可不锁类型，也不猜错类型**（猜错会把作品
+    整个认错，比不认更糟）。
+
+    实现要点：
+      - **单条 JOIN 一次取齐**，不做逐行 N+1 查询（资源库动辄上千行）。
+      - 只处理**还没有**映射的行（source_title 为空），避免每轮扫描都全表更新。
+      - **只 flush 不 commit**：同一 Session 内后续识别立刻能读到新映射；
+        跨 Session 场景（启动回填）由调用方显式提交。
+
+    为什么放在 main.py 而不放在 mirror.py：mirror.py 是**红线模块**，
+    其内不允许出现 `db.flush()`（会重新引入跨 await 写事务，见 test_v089）。
+    本函数是纯同步 DB 操作、不跨 await，故放在 main.py 侧安全。
+
+    返回回填行数。
+    """
+    try:
+        joined = db.execute(
+            select(Resource, MirrorFile, MirrorMedia)
+            .join(MirrorFile, MirrorFile.target_file_id == Resource.file_id)
+            .join(MirrorMedia, MirrorMedia.id == MirrorFile.media_id)
+            .where(Resource.source_title == "")
+            .limit(max(1, int(limit or 5000)))
+        ).all()
+    except Exception as exc:
+        logger.warning("[library] A 库映射回填查询失败：%s", exc)
+        return 0
+    if not joined:
+        return 0
+    changed = 0
+    seen_ids: set[int] = set()
+    for x, mf, media in joined:
+        if int(x.id) in seen_ids:
+            continue
+        seen_ids.add(int(x.id))
+        # A 库作品名：MirrorMedia.title_standard 就是 A 库作品目录名（含年份、
+        # 可能带 {tmdb-} 标记）。展示要「作品名 + 影视号」分开，故去掉标记。
+        src_title = strip_tmdb_tag(standard_media_name(str(media.title_standard or ""))).strip()
+        src_tmdb = 0
+        ident_tid, _ident_type = mirror.identity_tmdb(str(mf.identity or ""))
+        if ident_tid:
+            src_tmdb = ident_tid
+        if not src_tmdb:
+            src_tmdb = mirror.tmdb_tag_id(str(media.title_standard or ""))
+        cat = str(media.category_path or "")
+        if cat == "__root__":
+            cat = ""
+        src_type = mirror.source_media_type(str(mf.identity or ""), media, cat)
+        if not src_title:
+            # 没有 A 库作品名 → 视为未命中，source_title 留空，下一轮再来。
+            continue
+        x.source_title = src_title
+        x.source_name = str(mf.file_name or "")
+        x.source_tmdb_id = src_tmdb or None
+        x.source_media_type = src_type
+        x.source_category = cat
+        changed += 1
+    if changed:
+        # 只 flush 不 commit：同一 Session 内后续识别立刻可见；跨 Session 由调用方提交。
+        db.flush()
+    return changed
+
+
+def _backfill_source_titles_in_thread() -> int:
+    """v2.1.10：A 库映射回填（DB 密集，放线程池；Session 在线程内创建）。
+
+    独立 Session → 独立事务 → 回填完自己 commit，与请求级会话互不干扰。
+    """
+    with SessionLocal() as db:
+        try:
+            n = backfill_source_titles(db)
+            if n:
+                db.commit()
+            return n
+        except Exception:
+            db.rollback()
+            logger.warning("[library] A 库映射回填异常", exc_info=True)
+            return 0
+
+
+async def _job_source_map_backfill():
+    """v2.1.10：定时把「映射回 A 库」的作品名/影视号/类型回填到资源库。
+
+    覆盖两种场景：
+      1. 老库存量（升级前入库的资源，启动时先回填一次）；
+      2. 新入库但当轮没匹配上映射的行（下一轮定时补）。
+    幂等：只处理还没有映射的行，重复跑不会重复写。
+    """
+    await asyncio.to_thread(_backfill_source_titles_in_thread)
+
+
 def _reap_stale_mirror_tasks_in_thread() -> None:
     """A-07：纯同步 DB 自愈扫描，放到线程池执行，Session 也在线程内创建（SQLite 安全）。"""
     with SessionLocal() as db:
@@ -397,23 +599,29 @@ async def _job_mirror_task_poll():
     """阶段二路线B C5：定时轮询未确认的复制任务（含严格顺序批次遗留）。
 
     修复审计缺口：重启后 strict 批次停在 submitted/verifying 的任务此前只能手动
-    /api/mirror/tasks/poll 才续跑。此 job 每 60s 自动确认远端状态；镜像锁被持有
-    时跳过，避免与正在进行的同步/轮询互相干扰。
+    /api/mirror/tasks/poll 才续跑。此 job 每 60s 自动确认远端状态。
+
+    v2.1.10：纳入流水线闸门（非阻塞）。上一轮任务在跑就跳过本轮轮询；
+    更关键的是本 job 自己**也持锁**——否则它正在轮询时，定时镜像轮次可能同时
+    拿到闸门开跑，两条链路并发碰同一批文件。
     """
-    if _mirror_lock.info().get("busy"):
+    if not _mirror_lock.acquire(blocking=False, owner="复制任务轮询"):
         return
-    with SessionLocal() as db:
-        try:
-            r = _mirror_rule(db)
-            if not r or not (r.source_root_id and r.target_root_id):
-                return
-            out = await mirror.poll_pending_tasks(db, r, max_polls=3, interval=1.0)
-            if out.get("done") or out.get("failed"):
-                logger.info("[mirror] 定时续跑：done=%s failed=%s",
-                            out["done"], out["failed"])
-        except Exception:
-            db.rollback()
-            logger.warning("[mirror] 定时轮询未确认任务异常", exc_info=True)
+    try:
+        with SessionLocal() as db:
+            try:
+                r = _mirror_rule(db)
+                if not r or not (r.source_root_id and r.target_root_id):
+                    return
+                out = await mirror.poll_pending_tasks(db, r, max_polls=3, interval=1.0)
+                if out.get("done") or out.get("failed"):
+                    logger.info("[mirror] 定时续跑：done=%s failed=%s",
+                                out["done"], out["failed"])
+            except Exception:
+                db.rollback()
+                logger.warning("[mirror] 定时轮询未确认任务异常", exc_info=True)
+    finally:
+        _mirror_lock.release()
 
 
 def _log_prune_in_thread() -> None:
@@ -445,22 +653,21 @@ async def _job_rename_pending():
     """v0.9.2：后台复查「B 库暂未可见」的单文件改名，不复制、不入库、不推送。
 
     复制任务完成后网盘文件可见可能有秒级延迟。改名只认只读列目录命中的 fileId，
-    每次仍走 file_idle_seconds 风控间隔与 rename 预算；拿不到镜像互斥锁就跳过，
-    不与「立即同步 / 手动改名」抢 SQLite 写锁。
+    每次仍走 file_idle_seconds 风控间隔与 rename 预算。
 
     v2.1.3 真机死锁根治（2026-11-22）：原来本 job 与「定时镜像 / 立即同步」抢**同一把**
     `_mirror_lock`。真机上镜像同步（119 部作品的大轮次）长时间持锁 → 本 job 每 120 秒
     都 `acquire(blocking=False)` 失败直接 return → 英文名解析链路整体停摆（07:23 后
-    56 部作品集体无英文名、rename_status 56 条为空）。而「复制」与「改名」是两类
-    互不冲突的操作（复制动 A→B 文件流向，改名只改 B 库已有文件的名称），本就不该
-    用同一把锁互相饿死。
+    56 部作品集体无英文名、rename_status 56 条为空）。当时的修法是「拆两把锁并行」。
 
-    现在改名用**独立的 `_rename_lock`**：
-      - 与镜像同步锁解耦 → 镜像长跑时改名复查照样推进（英文名不再停摆）；
-      - 仍与「手动改名 / 改名单文件」互斥（同一批文件不能被两个改名任务同时改）；
-      - 非阻塞获取，拿不到就跳过本轮，绝不排队堆积。
+    v2.1.10（用户口径：复制 / 改名 / 翻译 / 识别直到入库资源库算**一轮**，上一轮没跑完
+    下一轮不启动）：回到**同一把闸门**，但语义从「抢不到就跳过本轮」改成
+    **排队等上一轮彻底结束再跑本轮**（不丢轮次）。
+    既杜绝了并发冲突（两个任务同时改同一批文件 / 同时抢 SQLite 写锁），
+    也不会像 v2.1.3 之前那样被饿死——等得到就一定会跑。
     """
-    if not _rename_lock.acquire(blocking=False):
+    if not await _mirror_lock.acquire_async("待改名复查", timeout=PIPELINE_WAIT_SECONDS):
+        logger.info("[mirror] 等待上一轮任务结束超时，本轮待改名复查放弃")
         return
     try:
         with SessionLocal() as db:
@@ -489,7 +696,7 @@ async def _job_rename_pending():
     except Exception as exc:
         logger.warning("[mirror] 待改名复查失败：%s", exc)
     finally:
-        _rename_lock.release()
+        _mirror_lock.release()
 
 
 def _queue_trigger(db: Session):
@@ -523,20 +730,37 @@ async def _scheduled_scan(root: str) -> None:
     与手动「重新扫描库」的区别：定时任务**不做对账删除**，避免断点/接口抖动
     造成误删；对账只由用户主动点击「重新扫描库」触发。全程独立 Session，
     不复用请求级 db，异常自行吞掉并由 run_scan 写入 ScanTask.last_status。
+
+    v2.1.10：纳入**流水线闸门**。这一轮做的是「扫描入库 → 识别（翻译）→ 推送」，
+    与镜像轮的「复制 → 改名」是同一条链路的两端；以前它**完全没有锁**，
+    会与正在跑的镜像轮次并发（一边改 B 库文件名、一边按旧名入库），
+    正是「资源库里名字对不上 / 这轮看不到」的成因之一。
+    现在：上一轮没彻底结束就排队等，结束后再跑，绝不并发。
     """
-    with SessionLocal() as db:
-        try:
-            # v0.8.1：每次执行都重新取 B 镜像库目录，用户在镜像设置里改 ID 后立即生效
-            effective, _ = _effective_scan_root(db)
-            await run_scan(effective, resume=False)
-            await _post_scan_identify(db, publish_after_identify=True)
-            process_change_events(db, publish=True)
-            db.commit()
-        except Exception:
-            db.rollback()
-            # A-09：run_scan 虽会写 ScanTask.last_status，但此前此处无应用日志，
-            # 定时任务失败在日志侧不可见。补 exc_info，业务状态与应用日志双留痕。
-            logger.warning("[scan] 定时全量扫描异常", exc_info=True)
+    if not await _mirror_lock.acquire_async("定时扫描识别", timeout=PIPELINE_WAIT_SECONDS):
+        logger.info("[scan] 等待上一轮任务结束超时，本轮定时扫描放弃")
+        return
+    try:
+        with SessionLocal() as db:
+            try:
+                # v0.8.1：每次执行都重新取 B 镜像库目录，用户在镜像设置里改 ID 后立即生效
+                effective, _ = _effective_scan_root(db)
+                await run_scan(effective, resume=False)
+                # v2.1.10：入库后回填「映射回 A 库」的作品名/影视号/类型，
+                # 让本轮识别用 A 库口径（顺序必须在识别之前）。
+                db.commit()
+                backfill_source_titles(db)
+                db.commit()
+                await _post_scan_identify(db, publish_after_identify=True)
+                process_change_events(db, publish=True)
+                db.commit()
+            except Exception:
+                db.rollback()
+                # A-09：run_scan 虽会写 ScanTask.last_status，但此前此处无应用日志，
+                # 定时任务失败在日志侧不可见。补 exc_info，业务状态与应用日志双留痕。
+                logger.warning("[scan] 定时全量扫描异常", exc_info=True)
+    finally:
+        _mirror_lock.release()
 
 
 def _consume_resource_events_in_thread() -> None:
@@ -806,7 +1030,17 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(_job_tg_stats_collect, "interval",
                       seconds=_TG_STATS_TICK_SECONDS, id="tg_stats_collect",
                       replace_existing=True, max_instances=1, coalesce=True)
+    # v2.1.10：A 库映射回填。启动先补一次老库存量（升级前入库的资源），
+    # 之后每 10 分钟补一次新入库未匹配上映射的行（幂等，只补空映射）。
+    scheduler.add_job(_job_source_map_backfill, "interval", seconds=600,
+                      id="source_map_backfill", replace_existing=True,
+                      max_instances=1, coalesce=True)
     scheduler.start()
+    # 启动即回填老库存量（放线程池，不阻塞事件循环启动）。
+    try:
+        await asyncio.to_thread(_backfill_source_titles_in_thread)
+    except Exception as exc:
+        logger.warning("[library] 启动时 A 库映射回填失败（不影响启动）：%s", exc)
     yield
     # 阶段四 A-11：wait=True 等待正在执行的 job 收尾，避免容器停止时腰斩
     # 队列推送 / 转存 / 扫描（各 job 网络调用自带超时，不会无限阻塞）
@@ -820,7 +1054,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.9", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.10", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -831,7 +1065,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.9", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.10", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1288,6 +1522,14 @@ async def _mirror_post_sync_pipeline(db: Session, r: MirrorRule) -> dict:
         "directories": int(scan.get("directories", 0) or 0),
         "complete": bool(scan.get("complete", False)),
     }
+    # v2.1.10：入库后立刻把「映射回 A 库」的影视名/影视号/类型回填到资源库，
+    # 识别与展示都走 A 库口径（B 库改过名的英文译名拿去 TMDB 几乎必然零命中）。
+    # 顺序很重要：必须在 _post_scan_identify **之前**，否则这一轮识别仍用旧线索。
+    # run_scan 用的是独立 Session 且已提交，这里先 commit 结束本会话的旧读事务，
+    # 保证下面的 JOIN 能读到本轮刚入库的行。
+    db.commit()
+    out["source_mapped"] = backfill_source_titles(db)
+    db.commit()
     ident = await _post_scan_identify(db, publish_after_identify=True, limit=500)
     out["identify"] = ident
     out["queued"] = int(ident.get("queued", 0) or 0)
@@ -1326,10 +1568,11 @@ async def _scheduled_mirror() -> None:
 
     v0.8.5 起不再写死「镜像完成不推 TG」：识别成功（拿到海报）的影视按分发规则推送。
     仍不对全库群发，也不批量补推历史内容变化事件。
-    v0.8.9：与手动同步共用互斥锁，手动任务在跑时直接跳过本轮，不叠加长任务。
+    v2.1.10：**等待式**进入流水线闸门 —— 上一轮（复制→改名→翻译→识别→入库）
+    还没彻底结束，本轮定时镜像不并发启动，而是排队等它结束再跑（不丢轮次）。
     """
-    if not _mirror_lock.acquire(blocking=False):
-        logger.info("[mirror] 已有同步 / 改名任务运行，跳过本轮定时镜像")
+    if not await _mirror_lock.acquire_async("定时镜像", timeout=PIPELINE_WAIT_SECONDS):
+        logger.info("[mirror] 等待上一轮任务结束超时，本轮定时镜像放弃")
         return
     _mirror_lock.set_owner("定时镜像")
     try:
@@ -1344,16 +1587,27 @@ async def _scheduled_mirror() -> None:
                     # v0.8.9：TMDB 查不到英文名会快速直译兜底，不阻断下面的入库/推送。
                     # v2.1.0 改名硬门禁（与手动 mirror_run 同一口径）：改名任一文件失败
                     # 或整体异常 → 本轮不进入库识别推送，杜绝英文名没改对就先推群/频道。
+                    # v2.1.10：门禁**收敛到作品级**（详见 RENAME_GATE_BLOCK_WHOLE_ROUND
+                    # 处说明）：真机上一部剧的「假失败」（光鸭 160，实际早已改名成功）
+                    # 把同轮另外 19 部作品全拦在门外、资源库里一条都没有。
+                    # 「英文名没改对不推群/频道」这条原意由推送侧的作品级闸门兜底。
                     rename_failed = False
                     if bool(getattr(r, "rename_files", True)):
                         rn = await _safe_rename(db, r)
                         rename_failed = bool((rn or {}).get("errors")) or int((rn or {}).get("failed") or 0) > 0
                         if rename_failed:
-                            logger.warning("[mirror] 定时镜像改名硬门禁：改名失败，跳过入库识别推送")
-                            r.last_message = (str(r.last_message or "")
-                                              + " · 改名硬门禁拦截（定时）：改名失败，已跳过入库识别推送")
+                            bad_works = [w for w in ((rn or {}).get("failed_works") or []) if w]
+                            logger.warning(
+                                "[mirror] 定时镜像：%s 部作品改名未完成（%s）——这些作品本轮"
+                                "不入队推送，其余作品照常入库识别",
+                                len(bad_works) or 1, "、".join(bad_works[:3]))
+                            r.last_message = (
+                                str(r.last_message or "")
+                                + f" · 改名未完成 {len(bad_works) or 1} 部作品"
+                                  "（这些作品本轮不入队推送，其余作品照常入库）")
                             db.commit()
-                    if bool(getattr(r, "auto_identify", True)) and not rename_failed:
+                    gate_block_round = rename_failed and RENAME_GATE_BLOCK_WHOLE_ROUND
+                    if bool(getattr(r, "auto_identify", True)) and not gate_block_round:
                         p = await _mirror_post_sync_pipeline(db, r)
                         # v0.9.10：定时同步也写本轮任务快照（复制量定时路径不细究，记 0）
                         ident = p.get("identify") or {}
@@ -1490,24 +1744,29 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
 
 @contextmanager
 def _mirror_guard():
-    """v0.8.9：镜像同步 / 改名互斥，拿不到锁立刻 409，不让长任务排队堆积。
+    """v0.8.9：镜像流水线互斥，拿不到闸门立刻 409，不让长任务排队堆积。
 
     用户等不及连点「立即同步」时，多个分钟级任务并发会互相抢 SQLite 写锁、
     成倍放大列目录与 rename 请求，管理页所有请求排队到 30 秒 busy_timeout，
     表现就是「整理剧集改名时后台页面卡死打不开」。宁可明确拒绝，也不排队。
+
+    v2.1.10：闸门升级为「复制 / 改名 / 翻译 / 识别 / 入库」全链路共用一把，
+    这里的 409 文案也随之更新——占用者可能是任意一段流水线，且后台定时任务
+    现在是「排队等」而不是「跳过」，所以提示要说明「等它跑完即可」。
     """
-    if not _mirror_lock.acquire(blocking=False):
+    if not _mirror_lock.acquire(blocking=False, owner="手动同步 / 改名"):
         info = _mirror_lock.info()
         owner = info.get("owner") or "未知任务"
         held = info.get("held_seconds", 0)
-        # v0.9.6：把占用者说清楚——多数「假 409」是后台改名复查（每 120 秒静默跑）
-        # 正持锁，界面看不到它，用户误以为「没有任务在跑」。给出占用者与时长，
-        # 超过阈值的残留由 _TimedMirrorLock.acquire 自动回收，这里只报真实在跑的。
+        waiting = int(info.get("waiting", 0) or 0)
+        wait_hint = (f"；另有 {waiting} 个定时任务正在排队等它结束"
+                     if waiting else "")
         raise HTTPException(
-            409, f"已有镜像同步 / 改名任务「{owner}」正在运行（已持续约 {held} 秒）；"
-                 "后台改名复查已限制为短任务（最多约 20 秒），稍候重试即可；"
+            409, f"已有镜像同步 / 改名 / 识别任务「{owner}」正在运行"
+                 f"（已持续约 {held} 秒）{wait_hint}；"
+                 "本流程一轮要走完「复制 → 改名 → 翻译 → 识别 → 入库资源库」，"
+                 "上一轮彻底结束后才会启动下一轮；"
                  f"若长时间（>30 分钟）仍报此错，重启容器即可清除残留锁。")
-    _mirror_lock.set_owner("手动同步 / 改名")
     try:
         yield
     finally:
@@ -1580,16 +1839,26 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         # v2.1.0 改名硬门禁（用户决策：改名失败阻断后续入库识别推送）：
         # 改名任一文件失败或整体异常 → 本轮不进后置管线，等人工处理/下一轮重试，
         # 杜绝「英文名没改对就先推给群/频道」。仅 rename_files 开启时才校验。
+        # v2.1.10：门禁**收敛到作品级**（见 RENAME_GATE_BLOCK_WHOLE_ROUND 处说明）：
+        # 真机上一部剧的假失败（光鸭 160）把同轮 19 部健康作品一起拦在门外、
+        # 资源库里一条都没有。「英文名没改对不推群/频道」由推送侧的作品级闸门兜底。
         rename_failed = False
         if stats["rename_enabled"]:
             rn = stats.get("rename") or {}
             rename_failed = bool(rn.get("errors")) or int(rn.get("failed") or 0) > 0
-            stats["rename_gate_blocked"] = rename_failed
+        gate_block_round = rename_failed and RENAME_GATE_BLOCK_WHOLE_ROUND
+        stats["rename_gate_blocked"] = gate_block_round
         if rename_failed:
-            logger.warning("[mirror] 改名硬门禁：本轮改名存在失败，跳过入库识别推送")
+            bad_works = [w for w in ((stats.get("rename") or {}).get("failed_works") or []) if w]
+            stats["rename_failed_works"] = bad_works
+            logger.warning(
+                "[mirror] %s 部作品改名未完成（%s）——这些作品本轮不入队推送，"
+                "其余作品照常入库识别",
+                len(bad_works) or 1, "、".join(bad_works[:3]))
             r.last_message = ((r.last_message or "")
-                              + " · 改名硬门禁拦截：改名失败，已跳过入库识别推送")
-        if do_pipeline and not rename_failed:
+                              + f" · 改名未完成 {len(bad_works) or 1} 部作品"
+                                "（这些作品本轮不入队推送，其余作品照常入库）")
+        if do_pipeline and not gate_block_round:
             # 改名完成 → 写「入库识别中」阶段帧
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="identify", running=True,
                                      copied=int(stats.get("done", 0) or 0),
@@ -1982,8 +2251,11 @@ def mirror_status(db: Session = Depends(get_db)):
     # v0.8.6：改名失败与「英文名待处理」都必须持久化可查，刷新页面仍在
     rename_failed = list(db.scalars(select(MirrorFile).where(
         MirrorFile.rename_status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
+    # v2.1.10：失败原因同时给「中性标签」——原始报错带 code=160 / code=127 这类
+    # 后端口径，页面只展示中文标签（原始文本仍留在库里供排查）。
     rename_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
                       "file": f.file_name, "target": f.target_name or "",
+                      "error_label": mirror.rename_error_label(f.rename_error),
                       "error": f.rename_error or ""} for f in rename_failed]
     # v0.9.6：排除用户已「清空 / 忽略」的待翻译项（english_source=ignored）。
     # 这些作品英文名为空但已被用户确认跳过，不再占用待处理清单；点「重新解析英文名并改名」
@@ -2019,8 +2291,11 @@ def mirror_status(db: Session = Depends(get_db)):
     ).order_by(MirrorFile.id).limit(200)).all())
     for f in rename_todo:
         pending_items.append({"kind": "文件待改名", "work": titles.get(f.media_id, ""),
-                              "target": f.file_name, "status": f.rename_status or "pending",
-                              "detail": (f.rename_error or "等待英文名解析 / B 库可见")[:300]})
+                              "target": f.file_name,
+                              "status": _rename_status_label(f.rename_status),
+                              "detail": (mirror.rename_error_label(f.rename_error)
+                                         if f.rename_error
+                                         else "等待英文名解析 / 网盘文件可见")[:300]})
     for t in tasks:
         if t.status in ("pending", "running", "unknown"):
             pending_items.append({"kind": "复制任务待确认", "work": titles.get(t.media_id, ""),
@@ -2617,6 +2892,10 @@ async def _refresh_library_from_b(db: Session, *, reconcile: bool = True,
     data = await run_scan(root, resume=False)
     out = {k: v for k, v in data.items() if k != "seen_file_ids"}
     out["root_source"] = root_source
+    # v2.1.10：入库后回填「映射回 A 库」的作品名/影视号/类型（识别前的关键一步）。
+    db.commit()
+    out["source_mapped"] = backfill_source_titles(db)
+    db.commit()
     if reconcile:
         out["reconcile"] = await _reconcile_library(
             db, data.get("seen_file_ids") or [],
@@ -2795,7 +3074,10 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
             "media_title", "original_title", "overview", "poster_path", "genres",
             "origin_country", "vote_average", "season", "episode", "identify_status",
             "identify_source", "identify_note", "share_url", "share_status",
-            "share_duration", "revision", "utime"]
+            "share_duration", "revision", "utime",
+            # v2.1.10：A 库映射（正确作品名 / 原文件名 / 影视号 / 类型）。
+            # 前端手动修正窗口用这几个字段预填，避免拿 B 库英文名去搜。
+            "source_title", "source_name", "source_tmdb_id", "source_media_type"]
     return [{k: getattr(x, k) for k in keys} for x in db.scalars(stmt).all()]
 
 
@@ -2811,6 +3093,16 @@ def _series_group_key(x: Resource) -> str:
     utils.work_group_key，且只用扫描阶段就有的字段，未识别单集不会被漏掉或裂成两张卡。
     """
     return work_group_key(x)
+
+
+def _year_of(title: str) -> str:
+    """从作品名里取年份（如「大军师司马懿 (2017)」→ 2017）。
+
+    v2.1.10：展示改用 A 库正确作品名后，年份也要跟着从 A 库名里取
+    （B 库英文名里往往没有年份）。
+    """
+    m = re.search(r"[\[\(\{]\s*((?:19|20)\d{2})\s*[\]\)\}]", str(title or ""))
+    return m.group(1) if m else ""
 
 
 _SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$|^S\d{1,2}$", re.I)
@@ -2874,16 +3166,28 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         g = groups.get(key)
         if g is None:
             hint = parse_media_name(x.name)
+            # v2.1.10：展示也走「映射回 A 库」口径。
+            # 标题优先用识别成功的 TMDB 正名；未识别时用 A 库正确作品名
+            # （B 库改过名的英文译名对用户没有意义）。
+            src_title = str(getattr(x, "source_title", "") or "").strip()
+            src_type = str(getattr(x, "source_media_type", "") or "").strip()
+            src_tmdb = getattr(x, "source_tmdb_id", None)
             g = groups[key] = {
                 "key": key,
-                "title": x.media_title or hint.get("primary_title") or x.name,
-                "year": str(hint.get("year") or ""),
-                "media_type": x.media_type or ("tv" if hint.get("is_tv_hint") else ""),
+                "title": x.media_title or src_title or hint.get("primary_title") or x.name,
+                "year": str(hint.get("year") or "") or _year_of(src_title),
+                "media_type": (x.media_type or src_type
+                               or ("tv" if hint.get("is_tv_hint") else "")),
                 "poster_path": x.poster_path or "",
                 "overview": x.overview or "",
                 "genres": x.genres or "",
                 "vote_average": float(x.vote_average or 0),
                 "tmdb_id": x.tmdb_id,
+                # v2.1.10：A 库映射的影视号与类型一并透出，
+                # 供前端手动修正窗口预填（不必拿 B 库英文名去搜）。
+                "source_title": src_title,
+                "source_tmdb_id": src_tmdb,
+                "source_media_type": src_type,
                 "identify_status": x.identify_status,
                 "share_url": "",
                 "share_status": "not_created",
@@ -2902,6 +3206,17 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             }
         g["count"] += 1
         g["ids"].append(x.id)
+        # v2.1.10：组内成员可能识别状态不齐（A 库映射只在部分行回填成功），
+        # 标题/影视号/类型取「组内已有的最好信息」，不因首个成员缺映射就定死。
+        if not g.get("source_title") and str(getattr(x, "source_title", "") or "").strip():
+            g["source_title"] = str(x.source_title or "").strip()
+            g["source_tmdb_id"] = getattr(x, "source_tmdb_id", None)
+            g["source_media_type"] = str(getattr(x, "source_media_type", "") or "").strip()
+        # 标题：识别成功的 TMDB 正名 > A 库正确作品名 > 目录线索 > 文件名
+        if x.media_title and g.get("title") == g.get("source_title"):
+            g["title"] = x.media_title
+        if not g.get("media_type") and x.media_type:
+            g["media_type"] = x.media_type
         if x.identify_status == "identified":
             g["identified_count"] += 1
         else:
@@ -3152,7 +3467,8 @@ async def batch_library(p: BatchLibraryInput, db: Session = Depends(get_db)):
                                              "members": len(targets)}))
                 ok += 1
             elif action == "identify":
-                r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+                # v2.1.10：手动识别走「映射回 A 库」线索，且**绕过缓存**（手动=重新解析）。
+                r = await _identify_with_source_hints(x.name, x, db)
                 if r.get("ok") and r.get("best"):
                     _apply_identification(x, r["best"], source=r["source"],
                                           note=r["reason"], hint=r["hint"])
@@ -3485,16 +3801,16 @@ def _ensure_route_channel(db: Session, route: dict):
 # key=(规范化 name, path_hint)；只缓存成功命中的结果，失败/存疑不缓存以便下次重试。
 # 进程重启后自然失效（TMDB 元数据稳定，可接受）；force/手动 identify 不经本包装函数，
 # 因此 force 永远重新解析，符合「force 才重解析」红线。
-_IDENTIFY_CACHE: dict[tuple[str, str], dict] = {}
+_IDENTIFY_CACHE: dict[tuple[str, str, int, str], dict] = {}
 _IDENTIFY_CACHE_MAX = 2000
 
 
-def _identify_cache_get(key: tuple[str, str]) -> dict | None:
+def _identify_cache_get(key: tuple[str, str, int, str]) -> dict | None:
     hit = _IDENTIFY_CACHE.get(key)
     return dict(hit) if hit is not None else None
 
 
-def _identify_cache_put(key: tuple[str, str], value: dict) -> None:
+def _identify_cache_put(key: tuple[str, str, int, str], value: dict) -> None:
     if len(_IDENTIFY_CACHE) >= _IDENTIFY_CACHE_MAX:
         # 简单有界清理：丢弃最早插入的 1/4（dict 保序），避免无界增长
         for k in list(_IDENTIFY_CACHE.keys())[:_IDENTIFY_CACHE_MAX // 4]:
@@ -3502,30 +3818,60 @@ def _identify_cache_put(key: tuple[str, str], value: dict) -> None:
     _IDENTIFY_CACHE[key] = dict(value)
 
 
-async def identify_with_a_source_fallback(name: str, x: Resource, db: Session) -> dict:
-    """阶段二：识别结果缓存 + A 库原名重试（纯本地线索，零额外依赖）。
+async def _identify_with_source_hints(name: str, x: Resource, db: Session) -> dict:
+    """按「映射回 A 库」的线索做一次识别（**不经缓存**）。
 
-    保持 tmdb.identify 的返回契约不变（ok/best/status/reason/...）。
-    失败/存疑不缓存；A 原名仅首次未命中时重试一次，同样失败则返回首次结果。
+    v2.1.10 抽出的核，供两处复用：
+      - `identify_with_a_source_fallback`：带缓存的常规路径；
+      - 手动识别 / force 批量识别：**必须绕过缓存**（红线：force 才重解析）。
     """
-    key = (str(name or "").strip().lower(), str(x.path_hint or "").strip())
-    cached = _identify_cache_get(key)
-    if cached is not None:
-        return cached
-    first = await tmdb.identify(name, db, path_hint=x.path_hint or "", use_ai=True)
+    q_name, q_hint, q_tmdb, q_type = source_query_hint(x)
+    first = await tmdb.identify(q_name or name, db, path_hint=q_hint, use_ai=True,
+                                forced_tmdb_id=q_tmdb, forced_type=q_type)
     if first and first.get("ok") and first.get("best"):
-        _identify_cache_put(key, first)
         return first
+    # 没有 A 库映射、或映射线索未命中时：用 A 库原名再试一次（纯本地线索）
     a_name = a_source_name_hint(db, x)
-    if not a_name or a_name == name:
+    if not a_name or a_name in (q_name, name):
         return first
-    retry = await tmdb.identify(a_name, db, path_hint=x.path_hint or "", use_ai=True)
+    retry = await tmdb.identify(a_name, db, path_hint=q_hint, use_ai=True,
+                                forced_tmdb_id=q_tmdb, forced_type=q_type)
     if retry and retry.get("ok") and retry.get("best"):
         retry = dict(retry)
         retry["reason"] = (str(retry.get("reason") or "") + " · A库原名回溯命中").strip(" ·")
-        _identify_cache_put(key, retry)
         return retry
     return first
+
+
+async def identify_with_a_source_fallback(name: str, x: Resource, db: Session) -> dict:
+    """识别结果缓存 + **映射回 A 库** 的识别线索（v2.1.10 起）。
+
+    保持 tmdb.identify 的返回契约不变（ok/best/status/reason/...）。
+    失败/存疑不缓存。
+
+    v2.1.10 需求：资源库识别必须用 A 库的正确影视名 + TMDB 影视号，
+    不能用改名后的 B 库名（B 库单集名是英文译名、作品目录带 · 标记，
+    拿去 TMDB 搜几乎必然零命中）。
+    线索来源（`utils.source_query_hint`）：
+      - 文件名用 A 库原名（季集线索从中解析）；
+      - 目录线索 = B 库链 + A 库作品名置于末尾（作品名用 A 库口径）；
+      - TMDB 号 + 类型来自 A 库映射。**类型必须一起给**：TMDB 的 movie/tv
+        是两套独立 ID 空间，只带号不带类型会跨命名空间串台（#247）。
+
+    没有 A 库映射时退回资源自身的文件名与目录线索（行为与改造前一致），
+    仍保留「A 库原名回溯」作为二次尝试。
+    """
+    q_name, q_hint, q_tmdb, q_type = source_query_hint(x)
+    key = (str(q_name or name or "").strip().lower(), str(q_hint).strip(),
+           int(q_tmdb or 0), str(q_type or ""))
+    cached = _identify_cache_get(key)
+    if cached is not None:
+        return cached
+    result = await _identify_with_source_hints(name, x, db)
+    if result and result.get("ok") and result.get("best"):
+        _identify_cache_put(key, result)
+        return result
+    return result
 
 
 def a_source_name_hint(db: Session, x: Resource) -> str:
@@ -3874,21 +4220,27 @@ async def tmdb_test(db: Session = Depends(get_db)):
 
 @app.get("/api/tmdb/candidates/{rid}", dependencies=ADMIN)
 async def tmdb_candidates(rid: int, media_type: str = "", db: Session = Depends(get_db)):
-    """手动匹配窗口打开时先带出候选；指定类型时只搜该类型（不回退）。"""
+    """手动匹配窗口打开时先带出候选；指定类型时只搜该类型（不回退）。
+
+    v2.1.10：候选线索改用「映射回 A 库」的正确作品名 + TMDB 影视号 + 类型，
+    不用改名后的 B 库名（B 库单集名是英文译名，搜不到）。
+    """
     x = db.get(Resource, rid)
     if not x:
         raise HTTPException(404, "资源不存在")
     mt = media_type if media_type in ("movie", "tv") else None
+    q_name, q_hint, q_tmdb, q_type = source_query_hint(x)
     try:
         if mt:
-            hint = parse_media_name(x.name, x.path_hint or "")
-            q = hint.get("primary_title") or hint.get("clean_title") or x.name
+            hint = parse_media_name(q_name or x.name, q_hint)
+            q = hint.get("primary_title") or hint.get("clean_title") or q_name or x.name
             items = await tmdb.search(q, mt, db)
             label = "电影" if mt == "movie" else "剧集"
             return {"ok": bool(items), "status": "identified" if items else "failed",
                     "source": "tmdb", "reason": f"按{label}搜索「{q}」得到 {len(items)} 个候选",
                     "hint": hint, "ai": None, "candidates": tmdb.rank(items, hint), "best": None}
-        return await tmdb.identify(x.name, db, path_hint=x.path_hint or "")
+        return await tmdb.identify(q_name or x.name, db, path_hint=q_hint,
+                                   forced_tmdb_id=q_tmdb, forced_type=q_type)
     except Exception as e:
         raise _tmdb_error(e)
 
@@ -3953,7 +4305,7 @@ async def auto_identify(rid: int, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        r = await identify_with_a_source_fallback(x.name, x, db)
+        r = await _identify_with_source_hints(x.name, x, db)
         if r["ok"] and r.get("best"):
             _apply_identification(x, r["best"], source=r["source"], note=r["reason"], hint=r["hint"])
             queued = _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
@@ -3991,7 +4343,8 @@ async def identify_all(force: bool = False, limit: int = 50, db: Session = Depen
     done = pending = queued = 0
     for x in rows:
         try:
-            r = await tmdb.identify(x.name, db, path_hint=x.path_hint or "", use_ai=True)
+            # v2.1.10：批量重识别同样走「映射回 A 库」线索；手动触发**绕过缓存**。
+            r = await _identify_with_source_hints(x.name, x, db)
             if r["ok"] and r.get("best"):
                 _apply_identification(x, r["best"], source=r["source"],
                                       note=r["reason"], hint=r["hint"])

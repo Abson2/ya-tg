@@ -59,6 +59,22 @@ class Resource(Base):
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")
     share_duration: Mapped[int] = mapped_column(Integer, default=0)
+    # v2.1.10：A 库映射回填——资源库的**识别与展示**一律用 A 库的正确作品名与
+    # TMDB 影视号，不用改名后的 B 库名（B 库单集名是英文、作品目录带 · 标记，
+    # 拿去 TMDB 搜几乎必然零命中）。
+    #   source_title      A 库正确作品名（保留年份，不含 {tmdb-} 标记）
+    #   source_name       A 库原文件名（给季集解析用）
+    #   source_tmdb_id    A 库 TMDB 影视号
+    #   source_media_type 类型（movie/tv）。**必须随影视号一起映射**：
+    #   TMDB 的 movie/tv 是两套独立 ID 空间，只带数字不带类型会跨命名空间
+    #   试探，把电影认成同名剧集（#247 的串台坑）。
+    #   source_category   A 库分类目录链（如「电影/国产」）。**类型判定最可靠的
+    #   依据**：分类目录里「电影/剧集」等词能直接定住命名空间，比从文件名猜稳。
+    source_title: Mapped[str] = mapped_column(String(512), default="")
+    source_name: Mapped[str] = mapped_column(String(512), default="")
+    source_tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_media_type: Mapped[str] = mapped_column(String(16), default="")
+    source_category: Mapped[str] = mapped_column(String(512), default="")
     revision: Mapped[int] = mapped_column(Integer, default=0)  # utime/size 变化次数
     scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -681,16 +681,30 @@ def test_share_build_has_hard_timeout_and_round_budget():
     assert "BUILDING_STALE_SECONDS" in src
 
 
-def test_rename_lock_is_separate_from_mirror_lock():
-    """改名复查不得再与镜像同步抢同一把锁。"""
+def test_rename_pending_shares_the_pipeline_gate_with_mirror():
+    """v2.1.10 口径反转：改名复查与镜像同步**共用同一把闸门**（绝不并发）。
+
+    历史（v2.1.3）：本断言曾要求「改名用独立锁、与镜像锁并行」。
+    那版治的是「抢不到就跳过」导致的饿死（镜像长跑 119 部时改名每 120 秒
+    抢不到锁直接 return → 56 部作品集体无英文名）。
+    v2.1.10 用户口径：「复制、改名、翻译、识别直到入库资源库算一轮，上一轮
+    没跑完下一轮不启动」——并发才是真冲突（同一批文件被两个任务同时改、
+    同时抢 SQLite 写锁）。病灶是「跳过」而不是「并行」，
+    因此改回同一把闸门 + **等待式**获取（不丢轮次，也不饿死）。
+    """
     src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert "_rename_lock = threading.Lock()" in src
     body = src[src.index("async def _job_rename_pending"):]
     body = body[:body.index("def _queue_trigger")]
-    assert "_rename_lock.acquire(blocking=False)" in body
-    # 只查「加锁动作」，函数文档里会提到 _mirror_lock 作为背景说明。
-    assert "_mirror_lock.acquire" not in body, "改名复查不得再抢镜像锁"
-    assert "_mirror_lock.release" not in body, "改名复查不得再动镜像锁"
+    # 等待式获取（不是「抢不到就跳过」）
+    assert "acquire_async(" in body, "改名复查必须走等待式闸门"
+    assert "PIPELINE_WAIT_SECONDS" in body
+    assert "acquire(blocking=False)" not in body.replace(
+        "都 `acquire(blocking=False)` 失败直接 return", ""), \
+        "改名复查不得再「抢不到就跳过」"
+    # 同一把闸门（闸门自身的文档串里会提到历史实现，检查具体调用点即可）
+    assert "_mirror_lock.acquire(blocking=False)" not in body
+    assert "_mirror_lock.acquire_async(" in body
+    assert "_mirror_lock.release()" in body
     assert "_recheck_gated_push(db)" in body, "改名完成后必须走门禁补偿"
 
 

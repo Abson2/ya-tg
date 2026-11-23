@@ -22,17 +22,29 @@ def test_poll_job_registered_in_lifespan():
 
 
 def test_poll_job_skips_when_lock_busy(monkeypatch):
+    """v2.1.10：复制任务轮询自己**也持闸门**（非阻塞）——忙就跳过本轮。
+
+    此前它只看 `info()["busy"]` 却不自己持锁：它正在轮询时，
+    定时镜像轮次可能同时拿到闸门开跑，两条链路并发碰同一批文件。
+    故闸门语义从「查忙不查」改为「自己也要拿」。
+    """
     calls = {"n": 0}
 
     async def fake_poll(db, r, **kw):
         calls["n"] += 1
         return {"done": 0, "failed": 0}
 
-    info = {"busy": True, "owner": "x"}
-
     class BusyLock:
+        """拿不到闸门（忙）→ 返回 False，本轮跳过。"""
+
         def info(self):
-            return info
+            return {"busy": True, "owner": "x"}
+
+        def acquire(self, blocking=True, owner=""):
+            return False
+
+        def release(self):
+            pass
 
     monkeypatch.setattr(main, "_mirror_lock", BusyLock())
     with patch.object(main.mirror, "poll_pending_tasks", fake_poll):
@@ -41,6 +53,7 @@ def test_poll_job_skips_when_lock_busy(monkeypatch):
 
 
 def test_poll_job_runs_when_idle(monkeypatch):
+    """v2.1.10：闸门空闲时轮询照常执行（并负责释放闸门）。"""
     calls = {"n": 0}
 
     async def fake_poll(db, r, **kw):
@@ -50,6 +63,12 @@ def test_poll_job_runs_when_idle(monkeypatch):
     class FakeLock:
         def info(self):
             return {"busy": False}
+
+        def acquire(self, blocking=True, owner=""):
+            return True
+
+        def release(self):
+            pass
 
     r = main.MirrorRule(name="t", source_root_id="A", target_root_id="B")
     monkeypatch.setattr(main, "_mirror_lock", FakeLock())

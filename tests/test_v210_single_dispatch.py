@@ -136,8 +136,19 @@ def test_diagnostics_endpoint_exists_and_readonly(env):
 
 
 def test_rename_hard_gate_source_guard():
-    """静态守卫：改名失败时跳过后置管线（main.py）。"""
+    """静态守卫：改名失败时的后置管线闸门（main.py）。
+
+    v2.1.10 起门禁**收敛到作品级**：整轮拦截默认关闭
+    （`RENAME_GATE_BLOCK_WHOLE_ROUND = False`）——真机上一部剧的
+    光鸭 160「假失败」曾把同轮另外 19 部健康作品全拦在门外，
+    资源库里一条都没有。「英文名没改对不推群/频道」由推送侧的作品级闸门兜底。
+
+    故此处断言的是**作品级口径**，不是旧的整轮拦截条件。
+    """
     src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
     assert "rename_gate_blocked" in src
-    assert "if do_pipeline and not rename_failed:" in src
+    assert "RENAME_GATE_BLOCK_WHOLE_ROUND = False" in src, \
+        "整轮拦截必须默认关闭（否则假失败会拖垮整轮）"
+    assert "gate_block_round = rename_failed and RENAME_GATE_BLOCK_WHOLE_ROUND" in src
+    assert "if do_pipeline and not gate_block_round:" in src
     assert "改名硬门禁" in src

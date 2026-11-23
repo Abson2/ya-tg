@@ -285,7 +285,12 @@ def test_all_long_entrypoints_are_guarded():
     # （否则后台改名复查持锁时按钮报「有任务在进行」），故这里为 4。
     # v0.9.17.2：新增 mirror_retry_files / mirror_retry_dirs 两个定向重试端点也持同一把锁 → 6
     assert src.count("with _mirror_guard():") == 6
-    assert "_mirror_lock.acquire(blocking=False)" in src  # 定时同步跳过而非排队
+    # v2.1.10：闸门改「等待式」后，非阻塞获取带了 owner 参数：
+    #   `_mirror_lock.acquire(blocking=False, owner="…")`。
+    # 定时镜像/定时扫描走 `acquire_async`（排队等待，不丢轮次）；
+    # 复制任务轮询等短任务仍用非阻塞获取（忙就跳过本轮）。
+    assert "_mirror_lock.acquire(blocking=False, owner=" in src
+    assert "_mirror_lock.acquire_async(" in src
     assert "_mirror_lock.release()" in src
 
 
@@ -362,7 +367,13 @@ def test_known_tid_unknown_type_queries_both(db):
 
 
 def test_rename_failure_does_not_block_post_sync_pipeline(db):
-    """v2.1.0 改名硬门禁：复制照常完成，改名失败则跳过后置入库识别推送。"""
+    """v2.1.10 改名门禁收敛到作品级：复制照常完成，整轮**不**被拦。
+
+    此前是整轮拦截（`rename_gate_blocked=True` → 跳过整个 post 管线），
+    真机上一部剧的**光鸭 160 假失败**把同轮另外 19 部健康作品全拦在门外、
+    资源库里一条都没有。现在整轮拦截默认关闭，「英文名没改对不推群/频道」
+    由推送侧的作品级闸门兜底。
+    """
     _rule, _media, _row = _seed(db)
     pipeline = AsyncMock(return_value={"files": 1, "identify": {"identified": 1},
                                        "queued": 1, "changes_pending": 0})
@@ -373,6 +384,7 @@ def test_rename_failure_does_not_block_post_sync_pipeline(db):
          patch("app.main._mirror_post_sync_pipeline", new=pipeline):
         out = _run(main.mirror_run(post_identify=True, db=db))
     assert out["rename"]["errors"], out
-    assert out.get("rename_gate_blocked") is True
-    assert pipeline.await_count == 0
-    assert "pipeline" not in out
+    assert out.get("rename_gate_blocked") is False, \
+        "整轮拦截必须默认关闭（单部作品的假失败不得拖垮整轮）"
+    assert pipeline.await_count == 1, "管线应照常执行（作品级闸门在推送侧兜底）"
+    assert "pipeline" in out

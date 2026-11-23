@@ -179,7 +179,8 @@ def test_identify_all_endpoint_also_marks_rate_limited(env):
                         identify_status="unidentified"))
         db.commit()
 
-        async def fake_identify(name, db_, path_hint="", use_ai=True):
+        async def fake_identify(name, db_, path_hint="", use_ai=True,
+                                 *, forced_tmdb_id=0, forced_type=""):
             from app.tmdb import TmdbRateLimited
             raise TmdbRateLimited("调用过于频繁")
 

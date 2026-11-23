@@ -84,6 +84,15 @@ _COLUMNS = {
         "share_scope": "TEXT DEFAULT 'file'",
         "share_dir_id": "TEXT DEFAULT ''",
         "share_dir_name": "TEXT DEFAULT ''",
+        # v2.1.10：A 库映射（正确作品名 + TMDB 影视号 + 类型）。
+        # 资源库识别与展示改用 A 库口径；类型必须与影视号同时存在，
+        # 否则 movie/tv 两套 ID 空间会串台。
+        "source_title": "TEXT DEFAULT ''",
+        "source_name": "TEXT DEFAULT ''",
+        "source_tmdb_id": "INTEGER",
+        "source_media_type": "TEXT DEFAULT ''",
+        # A 库分类目录链：类型判定的最可靠依据（分类目录里的「电影/剧集」直接定命名空间）。
+        "source_category": "TEXT DEFAULT ''",
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
@@ -506,6 +515,60 @@ def _recover_rate_limited_identify(db) -> int:
     return changed
 
 
+def _repair_rename_state_consistency(db) -> int:
+    """v2.1.10：修掉改名状态的自相矛盾（真机 2026-11-23）。
+
+    两个病灶：
+      1. `rename_status='done'` 却带着上一次的错误文案 —— 推送门禁只看 rename_status
+         （判定「已完成」），管理页却把错误摆出来，用户以为文件坏了
+         （真机：E06 集 done 却挂着 code=160 的错误）；
+      2. `rename_status='failed'` 且原因是「文件名已存」—— 那多半是**假失败**
+         （改名其实早已生效，只是记录没跟上），留在 failed 会一直挂在失败清单里，
+         还会把整轮后置管线拦下来（真机：一部剧的假失败 → 同轮 19 部健康作品
+         全都没入库）。
+
+    修法：
+      1. done 的行清空改名错误文案（状态已是完成，错误文案没有意义）；
+         复制错误位只在文件仍处于「已同步」时才清，避免抹掉真实的复制失败诊断；
+      2. failed 且原因是「文件名已存」的行改回待处理（''），下一轮改名会按幂等
+         逻辑核对 B 库实际名：已是目标名就直接收敛成完成态，不再报错。
+
+    只跑一次（AppConfig 标记），返回改动行数。
+    """
+    from .models import AppConfig, MirrorFile, utcnow
+    from .utils import looks_like_name_exists
+
+    marker_key = "rename_state_consistency_repair_v210"
+    if db.get(AppConfig, marker_key):
+        return 0
+    changed = 0
+    rows = db.query(MirrorFile).filter(
+        or_(MirrorFile.rename_status == "done",
+            MirrorFile.rename_status == "failed")).all()
+    for r in rows:
+        if r.rename_status == "done":
+            dirty = False
+            if (r.rename_error or "").strip():
+                r.rename_error = ""
+                dirty = True
+            if r.status == "synced" and (r.error or "").strip():
+                r.error = ""
+                dirty = True
+            if dirty:
+                r.updated_at = utcnow()
+                changed += 1
+            continue
+        # failed：只有「文件名已存」这类假失败才回退成待处理，其余真失败保持原样
+        if looks_like_name_exists(r.rename_error or ""):
+            r.rename_status = ""
+            r.rename_error = ""
+            r.updated_at = utcnow()
+            changed += 1
+    db.add(AppConfig(key=marker_key, value_enc=str(changed), updated_at=utcnow()))
+    db.commit()
+    return changed
+
+
 def migrate() -> None:
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
@@ -529,6 +592,8 @@ def migrate() -> None:
         _mark_legacy_rename_skipped(db)
         # v2.1.9：限流误标的识别失败回滚为「待重试」，让它们能被重新识别。
         _recover_rate_limited_identify(db)
+        # v2.1.10：修掉改名状态矛盾（done 带错误文案 / 160 假失败留在 failed）。
+        _repair_rename_state_consistency(db)
 
         tpl = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").first()
         # v0.9.6：去重——历史上「一键恢复默认模板」在并发 / 空表时可能写入多条同名

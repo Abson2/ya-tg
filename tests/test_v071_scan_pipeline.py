@@ -128,7 +128,8 @@ def test_post_scan_identify_and_finish_backfill(db):
     detail = {"tmdb_id": 135646, "media_type": "tv", "finish_status": "ended",
               "title": "老剧"}
 
-    async def fake_identify(name, db=None, path_hint="", use_ai=True):
+    async def fake_identify(name, db=None, path_hint="", use_ai=True,
+                         *, forced_tmdb_id=0, forced_type=""):
         return {"ok": True, "status": "identified", "source": "tmdb",
                 "reason": "", "hint": {}, "ai": None, "candidates": [best], "best": best}
 

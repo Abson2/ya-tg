@@ -127,6 +127,71 @@ NAME_MARK = "·"
 _NAME_MARKS_RE = re.compile(r"[*·]")
 
 
+def looks_like_name_exists(text: str) -> bool:
+    """文本层面的「文件名已存」判定（光鸭 code=160）。
+
+    v2.1.10 引入：改名失败原因在库里是**纯文本**（不含结构化 code），
+    历史数据迁移与展示层标签都需要按文本识别它，故放在 utils（无依赖）里共用。
+    与 `mirror._is_name_exists_error`（针对异常对象）互为补充，不重复实现。
+    """
+    raw = str(text or "")
+    low = raw.lower()
+    return ("code=160" in low or "文件名已存" in raw
+            or "文件名已存在" in raw or "name already exists" in low)
+
+
+def strip_tmdb_tag(text: str) -> str:
+    """去掉名称里的 TMDB 标记，保留其余内容（含年份）。
+
+    v2.1.10 引入：展示层要「作品名」与「影视号」分开呈现，
+    故提供只去标记、保留年份的清洗函数。
+    `大军师司马懿 (2017) {tmdb-135646}` → `大军师司马懿 (2017)`
+    """
+    out = _TMDB_TAG.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def source_query_hint(x) -> tuple[str, str, int, str]:
+    """取「映射回 A 库」的识别线索：(文件名, 目录线索, TMDB 影视号, 类型)。
+
+    v2.1.10 引入。B 库改过名：单集名是英文译名、影视主目录带 · 标记，
+    直接拿去 TMDB 搜几乎必然零命中。资源库必须用 A 库的正确剧名去认。
+
+    约定：
+      - 文件名用 **A 库原名**（`source_name`），季集线索从中解析；
+      - 目录线索 = B 库目录链 + **A 库分类目录链** + **A 库作品名置于末尾**——
+        `parse_media_name` 的 `_dir_clues` 取路径链里**最后一个**非季目录段作作品名，
+        放末尾即可让作品名用 A 库口径，季/分类目录线索仍在链里不受影响；
+      - 影视号用 A 库映射的号；**类型必须一起给**，否则 TMDB 的 movie/tv
+        是两套独立 ID 空间，只带号会跨命名空间串台（#247）。
+
+    A 库分类目录链（`source_category`，如「电影/国产」「剧集/欧美剧」）必须带进
+    目录线索：分类目录里的「电影/剧集」是**类型判定最可靠的依据**，
+    链里有它 → `parse_media_name` 的 `type_hint` 直接定住命名空间。
+
+    没有 A 库映射时退回资源自身的文件名与目录线索（行为与改造前一致）。
+    """
+    src_title = str(getattr(x, "source_title", "") or "").strip()
+    src_name = str(getattr(x, "source_name", "") or "").strip()
+    try:
+        src_tmdb = int(getattr(x, "source_tmdb_id", 0) or 0)
+    except (TypeError, ValueError):
+        src_tmdb = 0
+    src_type = str(getattr(x, "source_media_type", "") or "").strip()
+    if src_type not in ("movie", "tv"):
+        src_type = ""
+    src_cat = str(getattr(x, "source_category", "") or "").strip()
+    if src_cat == "__root__":
+        src_cat = ""
+    name = src_name or str(getattr(x, "name", "") or "")
+    path_hint = str(getattr(x, "path_hint", "") or "").strip()
+    if src_cat:
+        path_hint = (path_hint.rstrip("/\\") + "/" + src_cat) if path_hint else src_cat
+    if src_title:
+        path_hint = (path_hint.rstrip("/\\") + "/" + src_title) if path_hint else src_title
+    return name, path_hint, src_tmdb, src_type
+
+
 def normalize_work_name(s: str) -> str:
     """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
     if not s:

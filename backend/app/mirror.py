@@ -71,8 +71,10 @@ from .file_naming import (english_file_name, pinyin_title, sanitize_english_titl
                           with_conflict_suffix, work_core_title)
 from .guangya import GuangYaWebFiles, WebFileError
 from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask, Resource
-from .utils import (NAME_MARK, VIDEO_EXTS, media_identity, normalize_work_name,
-                    parse_media_name, standard_media_name, star_media_name, utcnow)
+from .utils import (NAME_MARK, VIDEO_EXTS, looks_like_name_exists,
+                   media_identity, normalize_work_name,
+                    parse_media_name, standard_media_name, star_media_name, strip_tmdb_tag,
+                    utcnow)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,31 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return ("code=127" in msg or "操作过于频繁" in str(exc)
             or "too many requests" in msg or "rate limit" in msg)
 
+
+# v2.1.10：光鸭 code=160「文件名已存」——**不是真错误，是「重复改名」**。
+# 真机取证（2026-11-23）：63 条 code160 集中在 3 部剧（大唐双龙传 25 / 大军师司马懿 22 /
+# 大唐迷雾 16），全是中文名→英文名改名。同一部剧「间隔式」成败（部分集 done、部分集 160），
+# 说明是分批/多轮改名中，**改成功的集 DB 状态没跟上**，后续轮次又拿旧中文名去改了一遍，
+# 光鸭发现目标英文名已被占用 → 报 160。
+# 与 127 限流是两码事：160 **不可重试**（重试还是占用），但**必须被识别出来**，
+# 否则统一走失败分支标 failed，把「其实已经改名成功」误报成永久失败。
+GUANGYA_NAME_EXISTS_CODE = 160
+RENAME_NAME_EXISTS_MARK = "@NAME_EXISTS_160@"  # 内层失败结果的「名已存在」标记
+
+
+def _is_name_exists_error(exc: BaseException) -> bool:
+    """识别光鸭 code=160「文件名已存」：结构化 code 优先，错误文本兜底。
+
+    与 `_is_rate_limit_error`（127）严格分开：
+      - 127 = 瞬时限流 → 指数退避重试；
+      - 160 = 目标名已存在 → **重试无用**，只能靠幂等收敛（改 DB 状态，不重复发请求）。
+    """
+    if getattr(exc, "code", None) == GUANGYA_NAME_EXISTS_CODE:
+        return True
+    msg = str(exc).lower()
+    return ("code=160" in msg or "文件名已存" in str(exc)
+            or "文件名已存在" in str(exc) or "name already exists" in msg)
+
 # v0.8.1：w.har 已取证 create_dir / rename / delete_file（含批量）。
 # 下面只保留仍未取证的转存能力；前端 JS 里虽出现 move_file / recycle_file 等路径，
 # 但没有请求体证据，仍然不实现、不猜参数。
@@ -159,6 +186,29 @@ CONFIRMED_WRITE_ENDPOINTS = [
     "POST /userres/v1/file/copy_file {fileIds,parentId} → data.taskId（仅前端 JS 契约，待 HAR 复核）",
     "POST /userres/v1/get_task_status {taskId} → data.status（w.har；status=2 完成、3 失败，detail.code≠0 失败）",
 ]
+
+def rename_error_label(text: str) -> str:
+    """把改名的原始报错翻成中性中文标签（页面只展示标签，不展示原始 code=xxx）。
+
+    红线：页面不得体现后端代码名词。原始报错里带「code=160」「code=127」这类
+    后端口径，直接透给用户等于泄露内部契约，而且「160 是什么意思」用户根本看不懂。
+    这里统一翻成人话；真正的原始文本仍留在数据库里供排查，页面只显示标签。
+    """
+    raw = str(text or "")
+    low = raw.lower()
+    if looks_like_name_exists(raw):
+        return "目标英文名已被占用（多为重复改名，系统会自动核对并重试）"
+    if ("127" in low or "操作过于频繁" in raw or "too many requests" in low
+            or "rate limit" in low):
+        return "网盘请求过于频繁（已自动退避重试）"
+    if "locked" in low or "busy" in low:
+        return "存储繁忙（已自动重试）"
+    if not raw.strip():
+        return "未记录原因"
+    cleaned = re.sub(r"code\s*=\s*\d+", "", raw, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return (cleaned[:120] or "未记录原因")
+
 
 # v0.8.1：官方 OpenAPI v1.3 §10 写接口限频 2 次/秒 → 文件操作之间至少 0.5 秒。
 # 这是硬下限，管理页只能调高，不能调低（前端 min 与后端校验双重约束）。
@@ -1855,6 +1905,76 @@ async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
     return updated
 
 
+# ---------- v2.1.10：资源库「映射回 A 库」 ----------
+
+# A 库作品目录名里带 {tmdb-135646} 标记；MirrorFile.identity 形如
+# tmdb:135646:tv:S01:E03（类型在第二段）。两者都是 A 库口径，可直接关联到资源库。
+_IDENTITY_TMDB = re.compile(r"^tmdb:(\d{2,12}):(movie|tv|unknown):", re.I)
+
+
+def tmdb_tag_id(text: str) -> int:
+    """从文本里的 {tmdb-135646} 标记取影视号（取不到返回 0）。
+
+    v2.1.10：公开给 main.py 的 A 库映射回填用。
+    """
+    m = _TMDB_TAG.search(str(text or ""))
+    return int(m.group(1)) if m else 0
+
+
+def identity_tmdb(identity: str) -> tuple[int, str]:
+    """从 MirrorFile.identity 解析 (TMDB 号, 类型)。unknown 类型不算类型。
+
+    v2.1.10：公开给 main.py 的 A 库映射回填用（同一判定口径，两处不重复实现）。
+    """
+    m = _IDENTITY_TMDB.match(str(identity or "").strip())
+    if not m:
+        return 0, ""
+    tid = int(m.group(1))
+    mtype = m.group(2).lower()
+    return (tid, "" if mtype == "unknown" else mtype)
+
+
+def source_media_type(identity: str, media, cat_path: str) -> str:
+    """判定 A 库作品的类型（movie/tv）——**必须与影视号一起用**。
+
+    v2.1.10 用户口径：「电影、电视剧要做判断识别，以免相同影号的影视识别串了」。
+    TMDB 的 movie/tv 是两套独立 ID 空间，同一个数字在两个空间里是完全不同的
+    作品（movie/283995 是《银河护卫队2》，tv/283995 是印度剧《Indrani》）。
+    只带号不带类型 → 识别时必须跨命名空间试探 → 串台。
+
+    判定优先级（越靠前越可靠）：
+      1. **MirrorFile.identity 的第二段**——同步时由
+         `parse_media_name(A库原文件名, A库完整路径)` 得出，已同时吃进
+         季集号（S01E03 → 必是剧集）、分类目录与作品名关键词，
+         是**文件级最完整**的类型证据。
+         注：identity 的类型也可能来自分类目录（若文件名无季集线索），
+         此时与第 2 条同源，不冲突。
+      2. **A 库分类目录链**（如「电影/国产」「剧集/欧美剧」）——用户自己分的类，
+         兜底 identity 判不出（unknown）时使用。
+         分类目录里出现「电影/影片/剧场版」→ movie；
+         出现「剧集/电视剧/连续剧/动漫/综艺/追更」→ tv。
+      3. MirrorMedia.media_type（镜像阶段多数为空）。
+    判不出就返回空串——**宁可不锁类型，也不猜错类型**：
+    猜错类型会把作品整个认错（比不认更糟）；不锁类型则由识别引擎按名称搜索兜底。
+    """
+    _tid, ident_type = identity_tmdb(str(identity or ""))
+    if ident_type:
+        return ident_type
+    cat = str(cat_path or "")
+    if cat:
+        if re.search(r"电影|影片|剧场版", cat):
+            return "movie"
+        if re.search(r"剧集|电视剧|连续剧|动漫|番剧|综艺|追更|季番", cat):
+            return "tv"
+    mtype = str(getattr(media, "media_type", "") or "").strip().lower()
+    if mtype in ("movie", "tv"):
+        return mtype
+    return ""
+
+
+
+
+
 # ---------- v0.8.6：B 库单集/单电影文件按英文剧名改名 ----------
 # v0.8.9：英文名解析的每个外部调用都必须有硬上限。TMDB 详情 httpx 超时 20 秒、
 # AI 模型可能更久；旧版对 media_type 未知的作品还会串行查 movie + tv 再等 AI，
@@ -2118,6 +2238,11 @@ async def _rename_one_with_backoff(api: "GuangYaWebFiles", fid: str,
                 msg = str(exc)[:300]
                 if _is_rate_limit_error(exc):
                     msg = f"{RENAME_RATE_LIMIT_MARK}{msg}"
+                # v2.1.10：160「文件名已存」打独立标记 —— 它不是限流（不可退避重试，
+                # 重试仍是占用），但必须能被主循环识别出来做幂等收敛，
+                # 否则会被当成真实失败标 failed，把「其实已改名成功」误报成永久失败。
+                elif _is_name_exists_error(exc):
+                    msg = f"{RENAME_NAME_EXISTS_MARK}{msg}"
                 return False, msg
             await asyncio.sleep(delay)
             delay = min(delay * 2, RENAME_RATE_LIMIT_BACKOFF_CAP)
@@ -2136,6 +2261,26 @@ async def _rename_concurrent(api: "GuangYaWebFiles",
     """
     return await asyncio.gather(
         *(_rename_one_with_backoff(api, fid, final) for fid, final in jobs))
+
+
+def _mark_rename_done(row: MirrorFile, fid: str, final: str) -> None:
+    """统一「B 库改名已完成」的落库字段（v2.1.10）。
+
+    真机取证（2026-11-23）：历史上这段状态有 4 处各写各的（只改
+    `rename_status` / `rename_error`，忘了清 `error`），于是出现
+    「`rename_status=done` 却带着上一次的 code=160 错误文案」这种自相矛盾状态
+    ——推送门禁只看 `rename_status`，管理页却把错误文案摆出来，用户以为文件坏了。
+
+    这里收敛成唯一入口：状态、目标名、两个错误位一次性对齐，
+    任何「判定为已完成」的路径都必须走它，杜绝同类矛盾状态再出现。
+    """
+    row.target_file_id = fid
+    row.target_name = final
+    row.rename_status, row.rename_error = "done", ""
+    # `error` 是复制错误位。文件已在 B 库且改名成功时它必须为空，
+    # 否则会出现「已完成 + 带错误」的矛盾组合。
+    row.error = ""
+    row.updated_at = utcnow()
 
 
 async def rename_mirror_files(db: Session, rule: MirrorRule, *,
@@ -2197,6 +2342,9 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
              "rename_idle_seconds": rename_idle, "rename_concurrency": rename_concurrency,
              # v1.4.1：127 限流统计
              "rate_limited": 0, "rate_limit_recovered": 0, "rate_limit_retries_queued": 0,
+             # v2.1.10：160「名已存」统计。recovered = 核对后确认「其实已改名成功」，
+             # 纠回完成态（不再算失败）；conflict = 目标名真被别的文件占用，下轮加序号重试。
+             "name_exists_recovered": 0, "name_exists_conflict": 0,
              # v0.8.9：分批续改是正常进度，不是错误，单独放 notices 前端才不会误报 warning
              "notices": [],
              "literal_ai": 0, "literal_pinyin": 0,
@@ -2213,6 +2361,9 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
     api = GuangYaWebFiles(db)
     # v1.4.1：代码=127 限流重试耗尽的文件，本轮尾部再排一次队列（不干等下一轮 120s job）
     requeue_rate_limited: list[tuple[MirrorFile, str, str, str]] = []
+    # v2.1.10：记录「本轮改名没成功的作品」，供上层把门禁收敛到作品级
+    # （一部剧改名失败不该把同轮其它作品一起拦下）。
+    failed_works: set[str] = set()
     media_q = select(MirrorMedia).where(
         MirrorMedia.rule_id == rule.id, MirrorMedia.target_dir_id != "")
     if only_pending:
@@ -2370,14 +2521,23 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 cur = fid_to_norm.get(str(fid), "")
                 if cur and cur == normalize_work_name(final):
                     # B 库当前确实已是目标英文名：只纠正 DB 状态，不重复调接口
-                    row.target_file_id = fid
-                    row.target_name = final
-                    row.rename_status, row.rename_error = "done", ""
+                    _mark_rename_done(row, fid, final)
                     stats["skipped"] += 1
                     db.commit()
                     continue
-                # 列目录不完整时不信任实际名字，退回 DB 幂等判断，防接口抖动误改
-                if not b_verified and row.target_name == final and row.rename_status == "done":
+                # v2.1.10：查不到该 fileId 的**实际名**（本次列目录里没命中它），
+                # 而 DB 记的目标名已经是本轮算出的最终名 → **不发重复请求**。
+                # 旧版这里的兜底判断挂在 `not b_verified` 上，而 b_verified 在上方
+                # 已经恒为 True（不完整时整部跳过），整段是死代码 —— 于是「DB 状态
+                # 没跟上」的行每轮都会重新发一次 rename，光鸭发现目标英文名已被
+                # 占用就回 code=160（真机 63 条）。
+                # 注意只在**查不到实际名**时才兜底：实际名已知且 ≠ 目标名时仍要改名
+                # （v088/v097 回归：DB 标 done 但 B 库文件被回滚成中文，必须重改）。
+                if (not cur
+                        and str(getattr(row, "target_name", "") or "").strip()
+                        and normalize_work_name(str(row.target_name))
+                        == normalize_work_name(final)
+                        and str(getattr(row, "rename_status", "") or "") == "done"):
                     stats["skipped"] += 1
                     continue
                 # 冲突名占位提前到准备阶段：并发发请求时同一目标名只会出现一次。
@@ -2396,6 +2556,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     row.rename_status, row.rename_error = "failed", msg
                     db.commit()
                     stats["failed"] += 1
+                    failed_works.add(str(media.title_standard or ""))
                     consecutive_failures += 1
                 except Exception:
                     try:
@@ -2413,6 +2574,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         # 修法：预算/限流类 stop_reason 不再阻断本轮已收集 jobs 的发送（发完才算停）；
         # 只有 db_error（事务已坏、必须立即止损）才在这里中断。
         # 预算仍然生效：发完 jobs 后外层作品循环因 stop_reason 停止，不会越界多改。
+        # v2.1.10：160 判定用的「B 库当前实际名」按作品缓存（None = 未取过）。
+        actual_by_fid_cache: dict[str, str] | None = None
         first = True
         for start in range(0, len(jobs), rename_concurrency):
             if stop_reason == "db_error":
@@ -2427,14 +2590,101 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                 stats["attempts"] += 1
             outcomes = await _rename_concurrent(
                 api, [(fid, final) for _row, fid, final, _fname in window])
+            # v2.1.10：本窗口若有 160「名已存」，**一次列目录批量判定**该 fileId 当前名，
+            # 避免逐条回查（63 条 160 → 63 次递归列目录，纯浪费）。
+            # 缓存按作品维度持有：只要本窗口有改名成功，B 库状态就变了，缓存必须作废
+            # （否则会把「刚改成功的文件」当成没改名，误判成真冲突）。
+            if any(ok for ok, _errmsg in outcomes):
+                actual_by_fid_cache = None
+            if any((not ok) and errmsg.startswith(RENAME_NAME_EXISTS_MARK)
+                   for ok, errmsg in outcomes):
+                if actual_by_fid_cache is None:
+                    actual_by_fid_cache = {}
+                    try:
+                        cands, _v = await _b_file_candidates(api, media)
+                        for k, v in cands.items():
+                            if ":" not in k:
+                                actual_by_fid_cache.setdefault(str(v), k)
+                    except Exception:
+                        actual_by_fid_cache = {}
+                actual_by_fid = actual_by_fid_cache
+            else:
+                actual_by_fid = {}
             for (row, fid, final, fname), (ok, errmsg) in zip(window, outcomes):
                 if not ok:
+                    # v2.1.10：光鸭 code=160「文件名已存」**不是真错误**，是「重复改名」。
+                    # 真机取证：63 条 160 集中在 3 部剧，同一部剧间隔式成败 —— 改成功的集
+                    # DB 状态没跟上，后续轮次又拿旧中文名去改了一遍，光鸭发现目标英文名
+                    # 已被占用就报 160。**重试无用**（重试仍是占用），必须做幂等收敛：
+                    # 看 B 库该 fileId 的当前名，若已是目标名 → 认定改名其实已成功，
+                    # 只纠正 DB 状态（done + 清 error），不标 failed、不计入熔断。
+                    if errmsg.startswith(RENAME_NAME_EXISTS_MARK):
+                        clean_160 = errmsg[len(RENAME_NAME_EXISTS_MARK):]
+                        current = actual_by_fid.get(str(fid), "")
+                        # 判定「这个文件其实已经改名成功了」有两种依据：
+                        #   ① 当前名 == 本轮算出的目标名（上一轮就改成了这个名字）；
+                        #   ② 当前名 == DB 里已记录的目标名（上一轮改成了带冲突后缀的
+                        #      名字，如 "-v2"，本轮算出的目标名与它不同）。
+                        # 两种都要收敛成 done，否则「其实已成功」会被永久记成失败。
+                        converged_name = ""
+                        if current:
+                            if current == normalize_work_name(final):
+                                converged_name = final
+                            elif (str(getattr(row, "target_name", "") or "").strip()
+                                  and current == normalize_work_name(str(row.target_name))):
+                                converged_name = str(row.target_name)
+                        if converged_name:
+                            # 改名其实早已生效 → 只纠正 DB 状态（done + 清两个错误位），
+                            # 不标 failed、不计入熔断、不再发请求。
+                            _mark_rename_done(row, fid, converged_name)
+                            stats["renamed"] += 1
+                            stats["name_exists_recovered"] = (
+                                stats.get("name_exists_recovered", 0) + 1)
+                            logger.info(
+                                "[mirror] rename 160 收敛为已改名 %s/%s → %s（DB 状态已纠正）",
+                                media.title_standard, fname, converged_name)
+                            try:
+                                db.commit()
+                            except Exception:
+                                try:
+                                    db.rollback()
+                                except Exception:
+                                    pass
+                                stop_reason = "db_error"
+                                break
+                            continue
+                        # 目标名确实被**别的**文件占用（或查不到）→ 这是真冲突，走冲突后缀重试，
+                        # 不标 failed（本轮不算失败，下轮用带后缀的名字再试）。
+                        stats["name_exists_conflict"] = (
+                            stats.get("name_exists_conflict", 0) + 1)
+                        failed_works.add(str(media.title_standard or ""))
+                        stats["errors"].append(
+                            f"{media.title_standard}/{fname}：目标英文名已被其他文件占用"
+                            f"（{clean_160[:120]}），下轮将改用带序号的名字")
+                        logger.warning(
+                            "[mirror] rename 160 真冲突 %s/%s：目标名 %s 已被占用",
+                            media.title_standard, fname, final)
+                        try:
+                            db.rollback()
+                            row.rename_status = "pending_visible"
+                            row.rename_error = (
+                                "目标英文名已被其他文件占用，下轮改用带序号的名字重试")
+                            db.commit()
+                        except Exception:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            stop_reason = "db_error"
+                            break
+                        continue
                     # v1.4.1：区分光鸭 127 限流与真实失败。限流不是「连续失败」，
                     # 不计入熔断阈值（否则一次风控就把整轮熔断、误伤后续正常文件）；
                     # 标 failed 可追溯，同时收集到 requeue 在本轮尾部再排一次。
                     rate_limited = errmsg.startswith(RENAME_RATE_LIMIT_MARK)
                     clean_err = errmsg[len(RENAME_RATE_LIMIT_MARK):] if rate_limited else errmsg
                     stats["failed"] += 1
+                    failed_works.add(str(media.title_standard or ""))
                     if rate_limited:
                         stats["rate_limited"] += 1
                         requeue_rate_limited.append((row, fid, final, fname))
@@ -2457,10 +2707,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                         break
                     continue
                 consecutive_failures = 0
-                row.target_file_id = fid
-                row.target_name = final
-                row.rename_status, row.rename_error = "done", ""
-                row.updated_at = utcnow()
+                _mark_rename_done(row, fid, final)
                 stats["renamed"] += 1
                 try:
                     db.commit()
@@ -2501,13 +2748,11 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                     stats["failed"] = max(0, stats["failed"] - 1)
                     stats["renamed"] += 1
                     stats["rate_limit_recovered"] += 1
-                    row.target_file_id = fid
-                    row.target_name = final
-                    row.rename_status, row.rename_error = "done", ""
-                    row.updated_at = utcnow()
+                    _mark_rename_done(row, fid, final)
                 else:
                     stats["errors"].append(f"{fname}：限流二次排队仍失败 {clean_err[:120]}")
                     row.rename_status, row.rename_error = "failed", clean_err
+                    failed_works.add(str(media.title_standard or ""))
                 try:
                     db.commit()
                 except Exception:
@@ -2517,6 +2762,8 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
                         pass
                     stop_reason = "db_error"
                     break
+    # v2.1.10：本轮改名没成功的作品清单（供上层把门禁收敛到作品级）。
+    stats["failed_works"] = sorted(w for w in failed_works if w)[:50]
     if stop_reason:
         # v0.8.9：一次性统计全局剩余（含本轮完全没触及的后续作品），只给一条
         # 明确提示。旧写法逐部累加还会在空 rows 时误用上一轮的 idx。

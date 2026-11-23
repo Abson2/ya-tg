@@ -556,23 +556,53 @@ def _manual_required(hint: dict, ai_info, ranked: list, query: str, english_alt:
 
 
 async def identify(name: str, db: Session | None = None, path_hint: str = "",
-                   use_ai: bool = True) -> dict:
+                   use_ai: bool = True, *, forced_tmdb_id: int = 0,
+                   forced_type: str = "") -> dict:
     """识别决策，返回结构化结果；不直接写库。
 
     status: identified（可自动应用）/ ambiguous（匹配存疑，转人工）/ failed（无候选）
+
+    v2.1.10：新增**类型锁定**参数 `forced_tmdb_id` / `forced_type`。
+    TMDB 的 movie / tv 是两套完全独立的 ID 空间，同一个数字在两个空间里
+    是完全不同的作品（movie/283995 是《银河护卫队2》，tv/283995 是印度剧
+    《Indrani》）。资源库改用「映射回 A 库」的影视号后，号是权威的，
+    但号本身不带类型——不锁类型就可能把电影认成同名剧集。
+    故：
+      - `forced_tmdb_id` > 0：直接按该号精确匹配，不再从文件名/目录解析取号；
+      - `forced_type` 为 movie/tv：**ID 匹配阶段锁定该命名空间**，
+        只查这一种类型（404 就当没有，绝不换类型试探）；
+        名称搜索阶段仍按目录线索推断的类型走，避免类型线索不足时搜不到。
     """
     hint = parse_media_name(name, path_hint)
+    if forced_tmdb_id:
+        hint["tmdb_id"] = int(forced_tmdb_id)
+    lock_type = forced_type if forced_type in ("movie", "tv") else ""
+    if lock_type:
+        hint["type_lock"] = lock_type
+        # v2.1.10：**名称搜索阶段也必须同向**。
+        # 此前只锁了 ID 匹配阶段，名称搜索阶段仍按 `type_hint` 走；
+        # 一旦 type_hint=unknown 就落到「双路搜索」分支——那条分支会把
+        # 电影和剧集的结果混在一起排名，正是串台的第二个入口。
+        # A 库映射的类型来自用户自己的分类目录（最权威），故直接覆盖 type_hint，
+        # 让 ID 阶段与名称阶段锁定同一个命名空间。
+        hint["type_hint"] = lock_type
+        hint["type_source"] = "source_mapping"
     ai_info = None
 
     # 1) ID 精确匹配（LitePan / TgtoDrive 目录里的 (tmdb-206484) 标记）
     if hint.get("tmdb_id"):
-        preferred = "tv" if hint["type_hint"] == "tv" else "movie"
-        # v2.1.6：类型**明确**时（如目录「电影/欧美电影」推出的 type_hint=movie）
-        # 绝不允许跨命名空间回退。
-        # TMDB 的 movie/tv 是两套独立 ID 空间，283995 在 movie 是《银河护卫队2》，
-        # 在 tv 是印度剧《Indrani》——一旦回退就是把电影串成剧集。
-        # 类型未知（type_hint=unknown）时才允许换类型试（老标记不带类型的情形）。
-        type_locked = hint["type_hint"] in ("movie", "tv")
+        # v2.1.10：类型锁定优先——外部给定类型时只查该命名空间。
+        if lock_type:
+            preferred = lock_type
+            type_locked = True
+        else:
+            preferred = "tv" if hint["type_hint"] == "tv" else "movie"
+            # v2.1.6：类型**明确**时（如目录「电影/欧美电影」推出的 type_hint=movie）
+            # 绝不允许跨命名空间回退。
+            # TMDB 的 movie/tv 是两套独立 ID 空间，283995 在 movie 是《银河护卫队2》，
+            # 在 tv 是印度剧《Indrani》——一旦回退就是把电影串成剧集。
+            # 类型未知（type_hint=unknown）时才允许换类型试（老标记不带类型的情形）。
+            type_locked = hint["type_hint"] in ("movie", "tv")
         if type_locked:
             try:
                 d = await detail(hint["tmdb_id"], preferred, db)

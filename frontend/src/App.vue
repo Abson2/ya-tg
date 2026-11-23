@@ -1280,6 +1280,11 @@ async function runMirror(mode = 'auto') {
       // v0.8.9：TMDB 查不到英文名时直接直译，必须让用户看得到走了哪条兜底
       if (r.literal_ai || r.literal_pinyin) rp.push(`无官方英文名·直译 ${r.literal_ai || 0} 部 · 拼音兜底 ${r.literal_pinyin || 0} 部`)
       if (r.no_rows) rp.push(`无待改名文件 ${r.no_rows} 部`)
+      // v2.1.10：把「重复改名核对」这类过程指标摆出来。网盘回报「文件名已存」时，
+      // 其实改名早已生效、只是记录没跟上；系统会自动核对并收敛成完成态。
+      // 不说清楚的话，用户只看到过程里反复报错，却不知道最终结果如何。
+      if (r.name_exists_recovered) rp.push(`重复改名核对 ${r.name_exists_recovered} 个（已确认为完成）`)
+      if (r.name_exists_conflict) rp.push(`名称被占用 ${r.name_exists_conflict} 个（下轮自动加序号）`)
       // v0.8.9：长剧集分批是正常进度，单独提示「下一轮自动续改」，别让用户以为改失败
       if (r.notices?.length) rp.push(String(r.notices[0]).slice(0, 160))
       if (r.errors?.length) rp.push(`首个改名错误：${String(r.errors[0]).slice(0, 140)}`)
@@ -1298,7 +1303,7 @@ async function renameMirrorFiles(force = false) {
   mirrorBusy.value = true
   try {
     const d = await api(`/mirror/rename?force=${force ? 'true' : 'false'}`, { method: 'POST' }, 300000)
-    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}` + ((d.literal_ai || d.literal_pinyin) ? ` · 无官方英文名·直译 ${d.literal_ai || 0} 部 · 拼音兜底 ${d.literal_pinyin || 0} 部` : '')
+    const msg = `改名完成 ${d.renamed || 0} 个文件：已完成跳过 ${d.skipped || 0} · 无中文跳过 ${d.ascii || 0} · 待翻译作品 ${d.untranslated || 0} · 失败 ${d.failed || 0}` + ((d.literal_ai || d.literal_pinyin) ? ` · 无官方英文名·直译 ${d.literal_ai || 0} 部 · 拼音兜底 ${d.literal_pinyin || 0} 部` : '') + (d.name_exists_recovered ? ` · 重复改名核对 ${d.name_exists_recovered} 个（已确认为完成）` : '') + (d.name_exists_conflict ? ` · 名称被占用 ${d.name_exists_conflict} 个（下轮自动加序号）` : '')
     const first = d.errors?.length ? ` · 首个错误：${String(d.errors[0]).slice(0, 140)}` : ''
     const notice = d.notices?.length ? ` · ${String(d.notices[0]).slice(0, 160)}` : ''
     if (d.failed || d.untranslated) ElMessage.warning(msg + notice + first)
@@ -1802,16 +1807,29 @@ async function clearLibrary() {
   } catch (e) { ElMessage.error(e.message) }
 }
 // 作品视图操作：用组内已识别的代表资源执行，避免对散落单集逐个操作
-function seriesRepresentative(g) { return resources.value.find(r => r.id === g.representative_id) || null }
+// v2.1.10：代表资源可能还没回填 A 库映射，此时用作品组上的映射兜底
+// （手动修正窗口要靠它预填正确剧名与影视号）。
+function seriesRepresentative(g) {
+  const hit = resources.value.find(r => r.id === g.representative_id)
+  if (!hit) return null
+  return {
+    ...hit,
+    source_title: hit.source_title || g.source_title || '',
+    source_tmdb_id: hit.source_tmdb_id || g.source_tmdb_id || 0,
+    source_media_type: hit.source_media_type || g.source_media_type || ''
+  }
+}
 // ---------- LitePan 风格「重新匹配元数据」 ----------
 const matchVisible = ref(false), matchRow = ref(null), matchType = ref('tv'), matchQuery = ref('')
 const matchCandidates = ref([]), matchSelected = ref(null), matchBusy = ref(false)
 
 const matchClue = computed(() => {
+  const src = sourceInfo(matchRow.value)
   const n = matchRow.value?.name || ''
   const ep = n.match(/S(\d{1,2})[ ._-]?E(\d{1,3})/i)
   if (ep) return `检测到季集信息 S${ep[1]}E${ep[2]}：按「剧集」识别，不会把单集当成电影`
   if (/第\d+\s*[集期话]|EP\d+|Season\s*\d+/i.test(n)) return '检测到集号/季信息：按「剧集」识别'
+  if (src.type) return `已锁定为${src.type === 'tv' ? '剧集' : '电影'}：不会把同号电影认成剧集`
   return matchType.value === 'tv' ? '当前按「剧集」搜索候选' : '当前按「电影」搜索候选'
 })
 function guessType(name) {
@@ -1841,10 +1859,25 @@ function dirTitle(path) {
   }
   return title
 }
+// v2.1.10：取「映射回 A 库」的识别线索 —— 正确作品名 + 影视号 + 类型。
+// B 库改过名（单集名是英文译名、作品目录带 · 标记），直接拿去 TMDB 搜几乎必然零命中。
+// 注意：返回给用户的只有「作品名 / 影视号 / 电影·剧集」，
+// 不暴露任何后端字段名。
+function sourceInfo(row) {
+  const r = row || {}
+  const title = String(r.source_title || '').trim()
+  const tmdbId = Number(r.source_tmdb_id || 0) || 0
+  const type = (r.source_media_type === 'movie' || r.source_media_type === 'tv') ? r.source_media_type : ''
+  return { title, tmdbId, type }
+}
 async function openMatch(row) {
   matchRow.value = row
-  matchType.value = (row.media_type === 'movie' || row.media_type === 'tv') ? row.media_type : guessType(row.name)
-  matchQuery.value = dirTitle(row.path_hint) || cleanName(row.media_title || row.name)
+  const src = sourceInfo(row)
+  // 类型优先用 A 库映射的类型（权威），其次已识别类型，最后按文件名猜。
+  matchType.value = src.type
+    || ((row.media_type === 'movie' || row.media_type === 'tv') ? row.media_type : guessType(row.name))
+  // 搜索词优先用 A 库正确作品名；没有映射才退回目录线索 / 已识别名。
+  matchQuery.value = src.title || dirTitle(row.path_hint) || cleanName(row.media_title || row.name)
   matchCandidates.value = []
   matchTried.value = []
   matchTranslated.value = []
@@ -2707,7 +2740,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.9 · Asia/Shanghai</span>
+          <span>v2.1.10 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3133,7 +3166,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="A 库原名" min-width="200"/>
               <el-table-column prop="target" label="目标英文名" min-width="200"/>
-              <el-table-column label="失败原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
+              <el-table-column label="未完成原因" min-width="280"><template #default="s"><span style="color:#c0392b">{{ s.row.error_label || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
             <!-- v2.1.4：按钮不再随清单为空自动消失——否则用户清空后就再也无法从界面
                  手动恢复（只剩「重新解析英文名并改名」一条路）。清单为空时按钮禁用，
@@ -4514,7 +4547,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
       <!-- LitePan 风格「重新匹配元数据」：类型 + 片名/ID + 海报候选 + 应用匹配 / 无匹配 -->
       <el-dialog v-model="matchVisible" title="重新匹配元数据" width="760px" top="7vh" :close-on-click-modal="false">
-        <div class="match-path"><small>作品文件</small><b>{{ matchRow?.name }}</b><small v-if="matchRow?.path_hint" style="margin-top:6px">目录线索：{{ matchRow.path_hint }} · 默认按中文剧名搜索</small></div>
+        <div class="match-path"><small>作品文件</small><b>{{ matchRow?.name }}</b><small v-if="matchRow?.path_hint" style="margin-top:6px">目录线索：{{ matchRow.path_hint }} · 默认按中文剧名搜索</small><small v-if="sourceInfo(matchRow).title" style="margin-top:6px">原库剧名：{{ sourceInfo(matchRow).title }}<template v-if="sourceInfo(matchRow).tmdbId"> · 影视号 #{{ sourceInfo(matchRow).tmdbId }}</template><template v-if="sourceInfo(matchRow).type"> · {{ sourceInfo(matchRow).type === 'tv' ? '剧集' : '电影' }}</template></small></div>
         <div class="match-controls">
           <el-select v-model="matchType" style="width:112px"><el-option label="剧集" value="tv"/><el-option label="电影" value="movie"/></el-select>
           <el-input v-model="matchQuery" placeholder="填中文片名 / 外语片名 / TMDB ID 后点「搜索」" clearable @keyup.enter="searchMatch(false)"/>
