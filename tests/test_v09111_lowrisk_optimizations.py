@@ -80,7 +80,8 @@ def test_scanned_at_updates_when_fingerprint_changes():
         row2, created2, change2 = _upsert_resource(db, changed, "dir-1")
         db.commit()
         assert created2 is False
-        assert change2 is not None and change2["new"] == "200:2000"
+        # v2.1.25：变化指纹只看 size（utime 单变不算更新，见下方反证用例）。
+        assert change2 is not None and change2["new"] == "200"
         assert row2.scanned_at >= first_at
         assert int(row2.revision or 0) == first_rev + 1
         assert row2.thumbnail == "http://t/2.jpg"

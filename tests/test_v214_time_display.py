@@ -149,19 +149,36 @@ def test_frontend_has_unified_time_formatter():
 
 
 def test_frontend_time_columns_all_use_formatter():
-    """所有时间列必须走 fmtTime，不得再原样渲染 ISO 串。"""
+    """所有时间列必须走格式化函数，不得再原样渲染 ISO 串。
+
+    v2.1.26：允许的入口从 `fmtTime(` 扩到「`fmtTime(` + 三个薄封装」，因为它们
+    **内部就是调 `fmtTime`**（下面单独断言这条，不然「允许封装」就等于允许绕过）：
+      · `fmtClock(`      —— 同天只给 HH:mm，跨天补 MM-DD；
+      · `scDayClock(`    —— 只要时刻（三表数据限定当天）；
+      · `scQueueClock(`  —— 队列时间列的唯一入口（计划时间优先）。
+    仍然禁止的写法没变：模板里直接吐 `row.published_at` 这种裸字段。
+    """
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     # 原样渲染时间字段的写法（prop 指向时间列）必须全部消失
     for prop in ("published_at", "created_at", "updated_at", "scheduled_at",
                  "last_checked_at", "last_pushed_at", "started_at"):
         bad = f'prop="{prop}"'
         assert bad not in app, f"仍存在原样渲染时间列：{bad}"
-    # 这些时间字段出现在模板里时，必须包在 fmtTime(...) 中
+    # 三个薄封装的底座必须还是 fmtTime（否则「允许封装」= 允许绕过）
+    for wrapper in ("function fmtClock(value)", "function scDayClock(value)",
+                    "function scQueueClock(row)"):
+        seg = app[app.index(wrapper):]
+        seg = seg[:seg.index("\n}")]
+        assert any(x in seg for x in ("fmtTime(", "fmtClock(", "scDayClock(")), (
+            f"{wrapper} 没有走 fmtTime / fmtClock，时间格式化口径被绕开了")
+    allowed = ("fmtTime(", "fmtClock(", "scDayClock(", "scQueueClock(")
+    # 这些时间字段出现在模板里时，必须包在上面某一个入口里
     for field in ("published_at", "created_at", "updated_at", "scheduled_at",
                   "last_checked_at", "last_pushed_at", "started_at"):
         for m in re.finditer(r"\{\{[^}]*" + field + r"[^}]*\}\}", app):
             snippet = m.group(0)
-            assert "fmtTime(" in snippet, f"时间字段未走格式化函数：{snippet}"
+            assert any(fn in snippet for fn in allowed), \
+                f"时间字段未走格式化函数：{snippet}"
 
 
 def test_frontend_has_no_raw_iso_time_output():

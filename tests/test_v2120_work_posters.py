@@ -106,8 +106,13 @@ def test_falls_back_to_older_snapshot_when_latest_poster_empty():
 
 
 def test_picks_first_non_empty_across_many_versions():
+    """快照兜底路径：实时资源取不到海报时，仍按版本倒序取第一个非空。
+
+    v2.1.25 起「实时资源优先」，所以这里把资源本身的海报清空，专测快照兜底
+    这条路的顺序（否则会被实时值抢先命中，测不到兜底）。
+    """
     with SessionLocal() as db:
-        r = _res(db)
+        r = _res(db, poster="")
         wk = utils.work_group_key(r)
     with SessionLocal() as db:
         _lv(db, wk, version_no=1, poster="/old.jpg", resource_ids=[r.id])
@@ -167,8 +172,9 @@ def test_fallback_does_not_leak_poster_between_works():
 # ③ 最新快照有海报 → 直接用
 # --------------------------------------------------------------------------
 def test_latest_snapshot_poster_wins_over_older():
+    """快照兜底内部：多版本都有海报时取最新那一版（实时资源无海报的场景）。"""
     with SessionLocal() as db:
-        r = _res(db)
+        r = _res(db, poster="")
         wk = utils.work_group_key(r)
     with SessionLocal() as db:
         _lv(db, wk, version_no=1, poster="/old.jpg", resource_ids=[r.id])

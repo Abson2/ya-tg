@@ -58,7 +58,9 @@ def _dir_name(item: dict) -> str:
 def _upsert_resource(db: Session, item: dict, parent: str,
                      path_hint: str = "", dir_chain: list[str] | None = None
                      ) -> tuple[Resource, bool, dict | None]:
-    """返回 (资源, 是否新增, 变化信息)。同一 fileId 只保留一行；utime/size 变化记入 revision。
+    """返回 (资源, 是否新增, 变化信息)。同一 fileId 只保留一行；**size 变化**记入 revision。
+
+    v2.1.25：变化判定只看 size，utime 单变不算更新（详见下面的指纹注释）。
 
     v0.8.0：内容变化时返回指纹变更信息，交给 _record_change_events 按作品合并成
     一次「内容更新」事件。这里**不重建分享、不入推送队列**——已分享影视内容变化
@@ -105,8 +107,22 @@ def _upsert_resource(db: Session, item: dict, parent: str,
         row = Resource(file_id=fid, scanned_at=utcnow(), **values)
         db.add(row)
     else:
-        old_fp = f"{int(row.size or 0)}:{int(row.utime or 0)}"
-        new_fp = f"{size}:{utime}"
+        # v2.1.25 真缺陷修复（刚入库被当追更·治触发源）：**指纹不含 utime**。
+        #
+        # 原指纹 = `size:utime`。utime 是网盘侧的元数据修改时间，任何一次重扫、
+        # 重同步、平台侧触碰都可能让它单独跳动，而**文件内容一个字都没变**：
+        # 真机证据——同一批 252 条「内容更新」事件里 141 条属于 size 完全不变、
+        # utime 抖动几十秒的假更新，真正的连载剧更新只有 2 条。这些假事件走到
+        # `process_change_events` 就把刚入库的作品当成追更又推了一遍。
+        #
+        # 指纹只反映**内容身份**：size。真实内容变化（重压/换源/补集）必然伴随
+        # size 变化，仍能被正确识别；utime 单变一律不算更新（行上的 utime 照常
+        # 刷新，只是不再参与是否变化的判定）。
+        #
+        # 与 v2.1.6 对作品级快照指纹（`sync_library_versions`，`file_id:size`）同一
+        # 口径：两处都不能让 utime 参与「内容是否变化」的判定。
+        old_fp = str(int(row.size or 0))
+        new_fp = str(size)
         for k, v in values.items():
             setattr(row, k, v)
         if old_fp != new_fp:

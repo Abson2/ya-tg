@@ -1128,7 +1128,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.24", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.26", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1139,7 +1139,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.24", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.26", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3655,6 +3655,12 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     return out
 
 
+# v2.1.25：被「存量排期优先」拦下的追更事件用这个哨兵值标记（queue_id 正常存
+# 队列项 id，0 = 待处理）。置成 -1 之后该事件既不会反复被本函数捞起重算，也
+# 不会被看板当成「待处理变更事件」计数，还会进入日志保留策略的清理范围。
+DIST_EVENT_BLOCKED = -1
+
+
 def process_change_events(db: Session, *, publish: bool = True) -> dict:
     """v0.8.0：把扫描批次产生的「内容更新」事件转成一次作品级更新推送。
 
@@ -3663,15 +3669,39 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
     - 仅由「立即扫描 / 重新扫描库 / 定时扫描」调用。v0.8.5 的镜像同步管线刻意不调用
       本函数：历史 queue_id=0 事件一旦在这里放开，会一次性批量补推，属用户明确禁止的群推。
     - publish=False 时只保留事件不处理（保留给未来需要延期处理的调用方）。
+
+    v2.1.25（用户口径 1）：**存量排期优先档下整条追更通道停用**。
+    追更不走 `dispatch`，是这里把队列项复活成 pending 的独立通道，`conflict_policy`
+    的排序与门禁本来都管不到它 —— 于是「存量模式不推新片」这个口径在追更上完全不成立。
+    现在：`prefer_backlog` 下全部拦截、**不建任何任务也不记账**（不重复登 v2 追更
+    任务、不动队列项、不占名额），只把事件标成已拦截。作品下次轮到存量轮转时，
+    自然会带着最新内容再推一次 —— 这正是用户要的「下一次轮转检测到更新可重推」。
     """
     events = list(db.scalars(select(DistributionEvent).where(
         DistributionEvent.queue_id == 0)).all())
     stats = {"events": len(events), "queued": 0, "share_reused": 0, "skipped": 0,
-             "deferred": 0}
+             "deferred": 0, "blocked": 0}
     if not events:
         return stats
     if not publish:
         stats["deferred"] = len(events)
+        return stats
+    # v2.1.25：存量排期优先 → 追更全部拦下（判定层见 share_center_v2.update_push_suppressed）
+    try:
+        from . import share_center_v2 as _sc_v2
+        suppressed = _sc_v2.update_push_suppressed(db)
+    except Exception:
+        # 配置读不到就按「不拦」处理：宁可多推一条，也不能因为一次读配置失败
+        # 让真实追更整批消失（漏推比多推更难被发现）。
+        logger.warning("[share] 读取冲突处理策略失败，追更通道按未拦截处理", exc_info=True)
+        suppressed = False
+    if suppressed:
+        for ev in events:
+            ev.queue_id = DIST_EVENT_BLOCKED
+        db.flush()
+        stats["blocked"] = len(events)
+        logger.info("[share] 冲突策略为「存量排期优先」，拦截 %d 条追更事件（不建任务、不计账）",
+                    len(events))
         return stats
     grouped: dict[str, list[Resource]] = {}
     for r in db.scalars(select(Resource)).all():

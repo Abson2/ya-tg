@@ -670,6 +670,29 @@ def instant_push_mode(db: Session) -> str:
     return "off" if policy == "prefer_backlog" else policy
 
 
+def update_push_suppressed(db: Session) -> bool:
+    """当前是否**整条停用追更即时推送**（v2.1.25）。
+
+    用户口径（2026-11-24）：「追更应该是包含在新上映、新入库模式里，存量排期不应该
+    推刚入库追更，存量排期下一次轮转检测到更新可重推」，并明确「全拦」——
+
+      · 冲突策略 = `prefer_backlog`（存量排期优先）→ **所有追更一律不即时推**，
+        作品按存量轮转的节奏走；轮转轮到它时自然会带上最新内容再推一次。
+      · 其余两档（新上映优先 / 新入库优先）→ 追更照旧即时推。
+
+    为什么需要这道闸门：追更走的是 `publish_resource` 之外的独立通道
+    （`process_change_events` 把队列项复活成 pending），它**不经过 `dispatch`**，
+    所以 `conflict_policy` 的排序与门禁都管不到它——存量模式下「说不推新片」，
+    追更却照推，用户看到的就是「存量排期还推送刚入库的东西」。
+
+    与 `instant_push_mode` 的关系：那个函数管「新片插队」，这个函数管「追更」，
+    两者在 `prefer_backlog` 下都归零，语义一致（存量模式 = 只按排期轮转）。
+    """
+    policy = _normalize_conflict_policy(
+        runtime_config.get(db, "sc_conflict_policy") or "prefer_release")
+    return policy == "prefer_backlog"
+
+
 def _normalize_conflict_policy(raw: str) -> str:
     """把配置里的冲突策略值归一化为三档之一（非法值回落默认档）。"""
     value = str(raw or "").strip().lower()
@@ -1289,6 +1312,32 @@ def _tags_for_status(tags: list[dict], status: str) -> list[dict]:
     if str(status or "") in ACTIVE_TASK_STATUS:
         return tags
     return [t for t in tags if str(t.get("key") or "") != PUSH_TAG_BACKLOG]
+
+
+# 排期类型的展示优先级（v2.1.26）。与「今日推送排期」按标签归列的顺序一致：
+# 新上映 > 新入库 > 存量排期（一部作品只归一档，不重复占位）。
+SCHEDULE_KIND_ORDER: tuple[str, ...] = (PUSH_TAG_NEW_RELEASE, PUSH_TAG_NEW_LIBRARY,
+                                        PUSH_TAG_BACKLOG)
+
+
+def _schedule_kind_of(tags: list[dict] | None) -> str:
+    """一条记录/一部作品的「排期类型」：新上映 / 新入库 / 存量排期（v2.1.26）。
+
+    为什么单独成一个字段，而不是让前端从 `tags` 里挑：
+      · `tags` 回答的是「**现在**还算不算新」——终态行被 `_tags_for_status`
+        去掉「存量排期」后会变空（用户口径：失效就消失）；
+      · `schedule_kind` 回答的是「这条**当时**是按哪一档排上的」——历史记录
+        也能看出它是新上映来的还是存量轮转来的，所以用**未裁剪**的判定结果。
+    两者都来自同一个 `_work_push_tags`，绝不在这里二次判定「新不新」。
+
+    标签一条都没有（入库时间与上映日期都判定不出）→ 返回空串，页面显示「—」，
+    不猜成「存量排期」。
+    """
+    keys = {str((t or {}).get("key") or "") for t in (tags or [])}
+    for key in SCHEDULE_KIND_ORDER:
+        if key in keys:
+            return PUSH_TAG_LABELS[key]
+    return ""
 
 
 def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, Any]:
@@ -2489,6 +2538,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 ititles = _work_titles(db, ikeys)
                 icovers = _work_posters(db, ikeys)
                 itags = _work_push_tags(db, ikeys)
+                # v2.1.25：每部作品带上自己的 TMDB 分类，「推送队列」的待排期行
+                # 才有真实分类可显示（不能拿「上新即时推送」这个通道名去当分类）。
+                icats = _work_categories(db, ikeys)
                 works: list[dict[str, Any]] = []
                 for wk in ikeys:
                     works.append({
@@ -2496,10 +2548,18 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                         "title": str(ititles.get(wk) or ""),
                         "cover": str(icovers.get(wk) or ""),
                         "tags": itags.get(wk, []),
+                        "category": str(icats.get(wk) or ""),
+                        # v2.1.26：排期类型（新上映 / 新入库 / 存量排期）——前端
+                        # 「推送队列」的待排期行直接用这个字段，不再自己从 tags 里挑。
+                        "schedule_kind": _schedule_kind_of(itags.get(wk, [])),
                         "time": "",
                     })
                 hour_items.append({
                     "category": "上新即时推送",
+                    # v2.1.25（用户口径 2）：这一项是**通道**不是 TMDB 分类 ——
+                    # 它代表「按新上映 / 新入库插队进来的那批」，与分类轮转是两回事。
+                    # 明确给 `kind`，前端据此加「插队」标记，别让人误读成题材分类。
+                    "kind": "instant",
                     "count": taken_tasks,
                     # v2.1.23：预计时间统一由 `_respread_forecast_times` 按
                     # 「时段内均分」回填；这里先留空，绝不再吐一排相同的整点。
@@ -2554,6 +2614,8 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 # v2.1.22：排期里也要看得到「新入库 / 新上映 / 存量排期」，
                 # 与推送历史 / 队列 / 任务同源（同一个 _work_push_tags）。
                 wk_tags = _work_push_tags(db, top_keys)
+                # v2.1.25：作品自带 TMDB 分类（供队列待排期行如实显示「分类」）
+                wk_cats = _work_categories(db, top_keys)
                 works: list[dict[str, Any]] = []
                 for wk in top_keys:
                     works.append({
@@ -2561,10 +2623,16 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                         "title": str(wk_titles.get(wk) or ""),
                         "cover": str(wk_covers.get(wk) or ""),
                         "tags": wk_tags.get(wk, []),
+                        "category": str(wk_cats.get(wk) or ""),
+                        # v2.1.26：排期类型，与三视图同一口径（`_schedule_kind_of`）
+                        "schedule_kind": _schedule_kind_of(wk_tags.get(wk, [])),
                         "time": "",
                     })
                 hour_items.append({
                     "category": _category_display_name(key),
+                    # v2.1.25：分类轮转产出的行，`category` 就是 TMDB 分类名
+                    "kind": "category",
+                    "category_key": key,
                     "count": built,
                     # v2.1.23：预计时间统一由 `_respread_forecast_times` 回填。
                     # `works_total` 是**未截断**的作品数——均分要按真实部数算间隔，
@@ -3727,33 +3795,79 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
     于是一律显示「无封面」—— 与「推送任务」「分享管理」两个模块的口径不一致
     （它们走 `api_tasks` / 分享记录列表，都有 cover）。现在统一走同一个
     `_work_posters`，四个地方的海报来源完全一致。
+
+    v2.1.26（用户口径 5）：三视图**只给当天（上海自然日 0-24 点）的行**。
+    用户口径是「推送历史 / 队列 / 失败都只看今天发生了什么」——跨天的旧记录
+    在这三张卡里既没有行动价值，还会把卡片的注意力从「今天」拉走。
+    历史与失败的完整记录仍在「推送任务」「分享记录」两页，不丢数据。
+
+    同时补 `scheduled_at`（队列时间列的「计划时间优先」此前一直拿不到字段，
+    后端白名单漏了它，前端只能退回创建时间）与 `schedule_kind`（排期类型）。
     """
-    def rows_for(statuses: set[str] | None) -> list[dict[str, Any]]:
+    # 当天口径：上海自然日。库里的时间统一由 `_model_dict` 转成
+    # `YYYY-MM-DD HH:mm:ss`（上海本地），所以这里直接比字符串前缀，不做时区换算。
+    today_sh = utcnow().astimezone(shanghai_tz()).strftime("%Y-%m-%d")
+    # 预取窗口：当天行按时间倒序一定排在最前，给 8 倍余量足够（够取满 limit 即可）。
+    # 取不满就**给多少算多少**——绝不拿昨天的行把表填满。
+    fetch_n = max(int(limit) * 8, 60)
+    # 队列时间口径 = 计划时间优先、没有才退创建时间（与前端 `scQueueClock` 一致）。
+    queue_clock = func.coalesce(SCPublishTask.scheduled_at, SCPublishTask.created_at)
+
+    def rows_for(statuses: set[str] | None, *, clock, day_of) -> list[dict[str, Any]]:
+        """按 `clock`（该表时间列的同一口径）倒序取，再裁到当天。
+
+        为什么按时间列排序而不是按 id：失败任务重试后 id 很小、`updated_at` 却是
+        今天，按 id 排就会把它漏在预取窗口之外。排序键与筛选键必须是同一个。
+        """
         q = select(SCPublishTask)
         if statuses:
             q = q.where(SCPublishTask.status.in_(statuses))
-        rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(limit)).all()
+        rows = db.scalars(q.order_by(clock.desc()).limit(fetch_n)).all()
         out = [{k: v for k, v in _model_dict(r).items() if k in (
             "id", "work_key", "kind", "status", "link_state", "share_url",
-            "error", "attempts", "created_at", "published_at", "updated_at")} for r in rows]
+            "error", "attempts", "created_at", "published_at", "updated_at",
+            "scheduled_at")} for r in rows]
+        # 当天过滤：`day_of` 读的就是时间列显示的那个字段，页面看到几点就是按几点判日。
+        out = [r for r in out if str(day_of(r))[:10] == today_sh][:int(limit)]
+        if not out:
+            return []
         keys = [r.get("work_key") for r in out]
         titles = _work_titles(db, keys)
         posters = _work_posters(db, keys)
         # v2.1.22：三类标签（新入库 / 新上映 / 存量排期）与「推送任务」同源
         tags = _work_push_tags(db, keys)
+        # v2.1.25（用户口径 2）：TMDB 分类单独成字段，与 `kind`（推送类型）
+        # 彻底分开——前端一列放类型、一列放分类，再不许拼在同一格。
+        cats = _task_category_names(db, [int(r.get("id") or 0) for r in out])
         for row in out:
             key = str(row.get("work_key") or "")
             row["title"] = titles.get(key, "")
             row["cover"] = posters.get(key, "")
+            cat_key, cat_name = cats.get(int(row.get("id") or 0), ("", ""))
+            row["category_key"] = cat_key
+            row["category_name"] = cat_name
+            raw_tags = tags.get(key, [])
+            # v2.1.26：排期类型用**未裁剪**的判定（历史行也能看出当时按哪档排上）
+            row["schedule_kind"] = _schedule_kind_of(raw_tags)
             # v2.1.23（用户口径 1）：**已结束**的记录不显示「存量排期」——
             # 标签失效（新上映过期）后自然会变成存量排期，但一条早就推完的历史记录
             # 上写「存量排期」没有信息量，用户要的是「失效就消失」。
-            row["tags"] = _tags_for_status(tags.get(key, []), str(row.get("status") or ""))
+            row["tags"] = _tags_for_status(raw_tags, str(row.get("status") or ""))
         return out
 
-    return {"history": rows_for({"published"}),
-            "queue": rows_for(ACTIVE_TASK_STATUS),
-            "failed": rows_for({"failed"})}
+    return {
+        # 历史：按「推送成功时间」判日（没有就退最后更新时间，与时间列一致）
+        "history": rows_for({"published"},
+                            clock=func.coalesce(SCPublishTask.published_at,
+                                                SCPublishTask.updated_at),
+                            day_of=lambda r: r.get("published_at") or r.get("updated_at")),
+        # 队列：按「计划推送时间」判日（没有就退创建时间）
+        "queue": rows_for(ACTIVE_TASK_STATUS, clock=queue_clock,
+                          day_of=lambda r: r.get("scheduled_at") or r.get("created_at")),
+        # 失败：按最后一次失败时间判日（时间列显示的就是它）
+        "failed": rows_for({"failed"}, clock=SCPublishTask.updated_at,
+                           day_of=lambda r: r.get("updated_at")),
+    }
 
 
 def _aggregate_share_stats(db: Session) -> dict[str, Any]:
@@ -4513,21 +4627,98 @@ def _task_channel_info(db: Session, task_ids: list[int]) -> dict[int, dict[str, 
     return out
 
 
+def _work_categories(db: Session, work_keys) -> dict[str, str]:
+    """按作品聚合键取 **TMDB 分类**的可读名（v2.1.25，用户口径 2）。
+
+    分类的唯一来源 = TMDB genres（`sync_library_versions` 写入 `SCWorkCategory` 的
+    归属，经 `SCCategory` 转可读名）。它与另外两个维度互不替代：
+
+      · 推送类型 —— 首次发布 / 追更 / 手动推送（`SCPublishTask.kind`，看「为什么推」）；
+      · 排期标签 —— 新上映 / 新入库 / 存量排期（`_work_push_tags`，看「排期身份」）；
+      · 分类     —— TMDB 分类（本函数，看「是什么片」）。
+
+    查不到返回空串（页面显示 `—`），绝不回退成「推送类型」去冒充分类——那正是
+    用户看到「分类列里出现追更」的由来。也不回显 `genre:xxx` 这类内部键形态。
+    """
+    out: dict[str, str] = {}
+    keys: list[str] = []
+    for raw in work_keys or []:
+        key = str(raw or "")
+        if not key or key in out:
+            continue
+        out[key] = ""
+        keys.append(key)
+    if not keys:
+        return out
+    rows = db.execute(
+        select(SCWorkCategory.work_key, SCWorkCategory.category_key)
+        .where(SCWorkCategory.work_key.in_(keys))).all()
+    wanted = {str(ck or "") for _wk, ck in rows if str(ck or "")}
+    names: dict[str, str] = {}
+    if wanted:
+        for cat in db.scalars(select(SCCategory).where(
+                SCCategory.category_key.in_(wanted))).all():
+            names[str(cat.category_key or "")] = str(cat.name or "")
+    for wk, cat_key in rows:
+        key = str(cat_key or "")
+        if key:
+            out[str(wk)] = _category_safe_name(key, names)
+    return out
+
+
+def _task_category_names(db: Session, task_ids: list[int]) -> dict[int, tuple[str, str]]:
+    """按任务 id 取该任务所属的 **TMDB 分类**（key + 可读名）。
+
+    v2.1.25（用户口径 2）：页面上的「分类」只有一个来源 —— TMDB 分类，落在
+    推送清单项上（`SCPushListItem.category_key`）。**推送类型**（首次发布 / 追更 /
+    手动推送）是另一个维度（`SCPublishTask.kind`），此前前端把两者拼在同一个
+    「分类」格子里（`追更 · 剧情`），用户看到的就是「分类列既有追更又有题材」。
+
+    查不到（清单项已清理 / 从未归类）返回空串，页面显示「未分类」——不猜。
+    """
+    out: dict[int, tuple[str, str]] = {}
+    ids = [int(x) for x in (task_ids or []) if x]
+    if not ids:
+        return out
+    rows = db.execute(
+        select(SCPublishTask.id, SCPushListItem.category_key)
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.id.in_(ids))).all()
+    if not rows:
+        return out
+    wanted = {str(k or "") for _tid, k in rows if str(k or "")}
+    names: dict[str, str] = {}
+    if wanted:
+        for cat in db.scalars(select(SCCategory).where(
+                SCCategory.category_key.in_(wanted))).all():
+            names[str(cat.category_key or "")] = str(cat.name or "")
+    for tid, cat_key in rows:
+        key = str(cat_key or "")
+        out[int(tid)] = (key, _category_safe_name(key, names) if key else "")
+    return out
+
+
 def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
     """按作品聚合键取 TMDB 海报相对路径（供前端拼缩略图）。
 
     与 `_work_titles` 同口径（资源库版本 → 实时 Resource 回查），取不到返回空串
     （前端不渲染缩略图，不占位）。
 
-    v2.1.20 修「有海报却显示无封面」：原实现两条路会同时落空。
-      ① **快照取数**：`seen` 在读到**第一条版本**（哪怕 poster 为空）后就把该 key
-         锁死，旧版本的非空海报再也读不到。用户看到的就是「资源表有海报、旧快照
-         也有，但最新快照恰好是空的 → 显示无封面」。
-         改为按 `version_no desc` 遍历、取**第一个非空** poster。
-      ② **实时资源兜底**：原实现只对 `file:` / `tmdb:` 前缀回查 `Resource`。
-         而绝大多数作品的聚合键是 `work:<归一化名>`，**一个都不回查** —— 资源表
-         里明明有 `poster_path` 也用不上。现在补 `work:` 路径：用快照自己登记的
-         `resource_ids_json` 反查 `Resource.poster_path`（比按名字匹配精确，不会串台）。
+    v2.1.25（用户口径 3）：**取数优先级整体翻过来 —— 以资源库实时值为准**。
+    真机证据（银河护卫队2）：资源库里当前资源行是 `/1vN…`，分享中心却显示 `/9RT…`。
+    原因：v2.1.20 的顺序是「先快照 metadata（版本倒序取第一个非空）→ 只有全空才
+    回查资源表」。B 库重建换过三轮资源 id，旧快照里登记的 `/9RT…` 早已不是当前
+    资源的海报，但它是非空的，于是**一命中就停**，实时值永远排不上队 → 两处不一致。
+
+    现在的优先级（与「资源库是唯一真相源」一致）：
+      ① 版本倒序 → 每个版本登记的 `resource_ids_json` 反查**实时** `Resource.poster_path`，
+         越新的快照越优先（最新快照指的就是当前资源）；取到即用；
+      ② 实时资源一条都取不到（资源被归档/删除）→ 退回快照 metadata 里登记的海报，
+         仍按版本倒序取第一个非空（v2.1.20 的兜底语义保留，不至于突然变「无封面」）；
+      ③ `file:` / `tmdb:` 前缀键没有快照，直接按文件 id / TMDB 编号回查资源表。
+
+    v2.1.20 的历史修复不要回退：`seen` 锁死第一条版本、`work:` 前缀完全不回查——
+    这两个缺陷曾导致「资源表有海报、页面却显示无封面」。
     """
     out: dict[str, str] = {}
     keys: list[str] = []
@@ -4540,32 +4731,57 @@ def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
     if not keys:
         return out
 
-    # ① 资源库版本表登记的元数据：按版本倒序，取第一个**非空** poster，
-    #    同时把每个版本的 resource_ids 收起来给 ③ 兜底用。
+    # 资源库版本表：一次查全（版本倒序），同时收集「每部作品 → 该版本登记的资源 id」
+    # 与「快照自己登记的海报」，供 ① 实时优先 / ② 快照兜底两段使用。
     rows = db.execute(
         select(SCLibraryVersion.work_key, SCLibraryVersion.version_no,
                SCLibraryVersion.metadata_json, SCLibraryVersion.resource_ids_json)
         .where(SCLibraryVersion.work_key.in_(keys))
         .order_by(SCLibraryVersion.version_no.desc())).all()
-    # work_key → [(poster, [resource_id, ...]), ...]（版本倒序）
-    versions: dict[str, list[tuple[str, list[int]]]] = {}
+    # work_key → [快照登记的海报, ...]（版本倒序）
+    snapshot_posters: dict[str, list[str]] = {}
+    # 资源 id → [work_key, ...]；want_ids 顺序 = 版本倒序 + 版本内资源顺序（越靠前越新）
+    id_to_keys: dict[int, list[str]] = {}
+    want_ids: list[int] = []
     for wk, _ver, meta_json, ids_json in rows:
+        key = str(wk or "")
+        if key not in out:
+            continue        # 不在本次查询范围（防御：脏行 / 大小写差异）
         meta = _jload(meta_json, {})
-        poster = ""
-        if isinstance(meta, dict):
-            poster = str(meta.get("poster_path") or "").strip()
+        poster = str(meta.get("poster_path") or "").strip() if isinstance(meta, dict) else ""
+        snapshot_posters.setdefault(key, []).append(poster)
         raw_ids = _jload(ids_json, [])
-        ids: list[int] = []
-        if isinstance(raw_ids, list):
-            for x in raw_ids:
-                try:
-                    ids.append(int(x))
-                except (TypeError, ValueError):
-                    continue
-        versions.setdefault(str(wk), []).append((poster, ids))
+        if not isinstance(raw_ids, list):
+            continue
+        for x in raw_ids:
+            try:
+                rid = int(x)
+            except (TypeError, ValueError):
+                continue
+            if rid not in id_to_keys:
+                id_to_keys[rid] = []
+                want_ids.append(rid)
+            if key not in id_to_keys[rid]:
+                id_to_keys[rid].append(key)
 
+    # ① 实时资源优先：按「最新快照 → 更旧快照」的资源顺序取第一个非空 poster。
+    #    走 ORM 查询，自动受全局归档过滤约束——已归档资源不会把旧海报带回来。
+    if want_ids:
+        res_map = {r.id: r for r in db.scalars(
+            select(Resource).where(Resource.id.in_(set(want_ids)))).all()}
+        for rid in want_ids:
+            res = res_map.get(rid)
+            if res is None or not res.poster_path:
+                continue
+            for key in id_to_keys.get(rid, []):
+                if not out.get(key):
+                    out[key] = str(res.poster_path)
+
+    # ② 实时取不到（资源已归档/已删）→ 退回快照登记值，版本倒序第一个非空。
     for key in keys:
-        for poster, _ids in versions.get(key, []):
+        if out.get(key):
+            continue
+        for poster in snapshot_posters.get(key, []):
             if poster:
                 out[key] = poster
                 break
@@ -4574,7 +4790,7 @@ def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
     if not missing:
         return out
 
-    # ② 回查实时资源表：file: / tmdb: 前缀（原有路径）
+    # ③ `file:` / `tmdb:` 前缀键（没有版本快照）按文件 id / TMDB 编号回查资源表。
     file_ids: list[str] = []
     tmdb_ids: list[str] = []
     for key in missing:
@@ -4597,30 +4813,6 @@ def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
                 if key.startswith("tmdb:") and key.endswith(f":{res.tmdb_id}"):
                     out[key] = str(res.poster_path)
                     break
-
-    # ③ `work:` 前缀兜底（v2.1.20 新增）：用快照登记的 resource_ids 反查资源表。
-    #    按「版本倒序 → 该版本内资源顺序」依次尝试，取第一个有 poster 的。
-    want_ids: list[int] = []
-    id_to_keys: dict[int, list[str]] = {}
-    for key in missing:
-        if not key.startswith("work:"):
-            continue
-        for _poster, ids in versions.get(key, []):
-            for rid in ids:
-                if rid not in id_to_keys:
-                    want_ids.append(rid)
-                    id_to_keys[rid] = []
-                id_to_keys[rid].append(key)
-    if want_ids:
-        res_map = {r.id: r for r in db.scalars(
-            select(Resource).where(Resource.id.in_(set(want_ids)))).all()}
-        for rid in want_ids:
-            res = res_map.get(rid)
-            if res is None or not res.poster_path:
-                continue
-            for key in id_to_keys.get(rid, []):
-                if not out.get(key):
-                    out[key] = str(res.poster_path)
     return out
 
 
@@ -4808,10 +5000,15 @@ def api_tasks(status: str = "", limit: int = 200,
     posters = _work_posters(db, [r.get("work_key") for r in items])
     # v2.1.22：三类标签（新入库 / 新上映 / 存量排期），与总览三表同源
     tags = _work_push_tags(db, [r.get("work_key") for r in items])
+    # v2.1.25（用户口径 2）：TMDB 分类（与推送类型 `kind` 分开输出）
+    cats = _task_category_names(db, [int(r.id) for r in rows])
     for row in items:
         key = str(row.get("work_key") or "")
         row["title"] = titles.get(key, "")
         row["cover"] = posters.get(key, "")
+        cat_key, cat_name = cats.get(int(row.get("id") or 0), ("", ""))
+        row["category_key"] = cat_key
+        row["category_name"] = cat_name
         # v2.1.23（用户口径 1）：终态行不显示「存量排期」，口径见 `_tags_for_status`
         row["tags"] = _tags_for_status(tags.get(key, []), str(row.get("status") or ""))
         info = channels.get(int(row["id"])) or {}
@@ -4854,6 +5051,11 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
     # v2.1.23：终态行不显示「存量排期」（口径见 `_tags_for_status`）
     item["tags"] = _tags_for_status(
         _work_push_tags(db, [key]).get(key, []), str(item.get("status") or ""))
+    # v2.1.25（用户口径 2）：详情页同样把「推送类型」与「TMDB 分类」分开给
+    cat_key, cat_name = _task_category_names(db, [int(task_id)]).get(
+        int(task_id), ("", ""))
+    item["category_key"] = cat_key
+    item["category_name"] = cat_name
     info = _task_channel_info(db, [int(task_id)]).get(int(task_id)) or {}
     item["channel_names"] = info.get("channel_names") or []
     item["group_names"] = info.get("group_names") or []

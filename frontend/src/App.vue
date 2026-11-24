@@ -280,6 +280,16 @@ function fmtClock(value) {
   const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
   return m[1] === today ? m[2] : `${m[1].slice(5)} ${m[2]}`
 }
+// v2.1.26（用户口径 5）：三表（推送历史 / 推送队列 / 推送失败）只展示**当天**的数据，
+// 时间列因此只给时刻 `HH:mm`。
+// 原来三张卡同一列三种形态：历史给 `2026-11-24 18:12`、失败给 `2026-11-24 18:12`、
+// 队列给 `18:12` —— 列宽对不齐，读完还得自己剥日期。数据既然已经限定当天，
+// 日期就是纯冗余，统一收敛到时刻。
+// 复用 `fmtClock`（时区换算只做一次），只把跨天时补的 `MM-DD ` 去掉——
+// 万一行真的跨了天（后端日界与前端时钟错一分钟），也只会少个日期，不会冒出日期。
+function scDayClock(value) {
+  return fmtClock(value).replace(/^\d{2}-\d{2} /, '')
+}
 // v2.1.3：耗时毫秒 → 人类可读（页面不出现「耗时(ms)」这种工程口径）。
 const fmtDuration = (ms) => {
   const n = Number(ms)
@@ -2495,7 +2505,34 @@ const scPaceText = computed(() => {
 function scQueueClock(row) {
   if (!row) return '—'
   if (row._src === 'plan') return String(row.plan_time || '—')
-  return fmtClock(row.scheduled_at || row.created_at)
+  return scDayClock(row.scheduled_at || row.created_at)
+}
+// v2.1.25（用户口径 2）：**「推送类型」和「分类」是两列、两个维度，任何一处都不许拼**。
+//   推送类型（来源）—— 首次发布 / 追更 / 手动推送，来自任务的 `kind`；
+//                        「待排期」行还没建任务，落库时必然是首推 → 首次发布；
+//   分类（题材）    —— 只取 TMDB 分类（后端 `_work_categories` / `_task_category_names`），
+//                        取不到给「—」，绝不拿推送类型顶替。
+// 此前队列里两种情况共用一格：在途行显示 kind、待排期行显示分类，看着就是
+// 「分类列既有追更又有题材」——那是渲染错位，不是数据错。
+function scQueueKindLabel(row) {
+  if (!row) return '—'
+  if (row._src === 'plan') return '首次发布'
+  return scKindLabel(row.kind, true)
+}
+function scQueueCategoryLabel(row) {
+  if (!row) return '—'
+  const name = String(row.category_name || row.category || '').trim()
+  return name || '—'
+}
+// v2.1.26（用户口径 5）：**排期类型**——新上映 / 新入库 / 存量排期。
+// 这是第三个维度，与「推送类型」（首次发布/追更/手动推送，看这条为什么推）和
+// 「分类」（TMDB 题材）都不同：排期类型回答的是「它在排期里归哪一档」。
+// 判定完全在后端 `_schedule_kind_of` 一处出（三视图 + 今日排期 works 都带
+// `schedule_kind`），前端只渲染；待排期行也直接透传该字段，不再自己从 tags 挑。
+function scScheduleKindLabel(row) {
+  if (!row) return '—'
+  const kind = String(row.schedule_kind || '').trim()
+  return kind || '—'
 }
 const scQueueRows = computed(() => {
   const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
@@ -2513,7 +2550,11 @@ const scQueueRows = computed(() => {
           cover: w.cover || '',
           // v2.1.22：待排期行同样带三类标签（后端 forecast 的 works 已给出）
           tags: w.tags || [],
-          category: it.category || '',
+          // v2.1.25：分类取作品自己的 TMDB 分类；「上新即时推送」是通道不是分类，
+          // 绝不拿它冒充分类（w.category 为空时宁可显示「—」）。
+          category: w.category || '',
+          // v2.1.26：排期类型同样透传后端判定，前端不再二次推导
+          schedule_kind: w.schedule_kind || '',
           status: 'planned',
           plan_time: w.time || (pad2(h.hour) + ':00'),
           _src: 'plan',
@@ -3346,7 +3387,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.24 · Asia/Shanghai</span>
+          <span>v2.1.26 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4551,7 +4592,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <template #default="s">
                           <div class="sc-fc-cats" v-if="s.row.total">
                             <div class="sc-fc-cat-line" v-for="(it, i) in s.row.items" :key="i">
-                              <span class="sc-fc-cat">{{ it.category }}</span>
+                              <!-- v2.1.25（用户口径 2）：分类列只放 TMDB 分类；插队批是
+                                   通道，带「插队」前缀以示区分（后端 `kind` 明确给出）。 -->
+                              <span class="sc-fc-cat" :class="{ 'is-src': it.kind === 'instant' }"><i v-if="it.kind === 'instant'">插队</i>{{ it.category }}</span>
                               <em>{{ it.count }} 条<template v-if="it.works_total"> · {{ it.works_total }} 部</template></em>
                             </div>
                           </div>
@@ -4588,13 +4631,21 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     </div>
                   </div>
 
-                  <!-- 设计稿底部三表：推送历史 / 推送队列 / 推送失败（真实 views 数据） -->
+                  <!-- 设计稿底部三表：推送历史 / 推送队列 / 推送失败（真实 views 数据）
+                       v2.1.26（用户口径 5）：三表**表头统一** ——
+                         时间 | 资源名称 | 分类 | 推送类型 | 排期类型 | 状态
+                       三个维度彼此独立，任何一格都不许混装：
+                         · 分类     = TMDB 题材（看是什么片）
+                         · 推送类型 = 首次发布 / 追更 / 手动推送（看这条为什么推）
+                         · 排期类型 = 新上映 / 新入库 / 存量排期（看它在排期里归哪档）
+                       时间列只给 `HH:mm`：三表数据都限定「当天」，「时间」再去区分
+                       该看 0-24 点（上海时区）内发生了什么。 -->
                   <div class="sc-dash-three sc-three-tables">
                     <div class="sc-card">
-                      <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>推送历史</h3><p>已成功推送的记录</p></div></div>
+                      <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>推送历史</h3><p>今天已成功推送的记录</p></div></div>
                       <el-table :data="scOverview.views?.history || []" stripe size="small" max-height="300">
-                        <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.published_at) }}</template></el-table-column>
-                        <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
+                        <el-table-column label="时间" width="56" show-overflow-tooltip><template #default="s">{{ scDayClock(s.row.published_at || s.row.updated_at) }}</template></el-table-column>
+                        <el-table-column label="资源名称" min-width="92" show-overflow-tooltip>
                           <template #default="s">
                             <!-- v2.1.23（用户口径 6）：三类标签放到**剧名左侧**、同一行，
                                  与「推送记录」的阅读顺序一致（先看是什么片子，再看标签）。
@@ -4607,18 +4658,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                             </div>
                           </template>
                         </el-table-column>
-                        <el-table-column label="分类" width="80"><template #default="s">{{ scKindLabel(s.row.kind, true) }}</template></el-table-column>
-                        <el-table-column label="结果" width="76"><template #default="s"><span class="sc-dot-state published">成功</span></template></el-table-column>
+                        <el-table-column label="分类" width="72" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueCategoryLabel({ ...s.row, _src: 'task' }) }}</template>
+                        </el-table-column>
+                        <el-table-column label="推送类型" width="74" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueKindLabel({ ...s.row, _src: 'task' }) }}</template>
+                        </el-table-column>
+                        <el-table-column label="排期类型" width="78" show-overflow-tooltip>
+                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="64" show-overflow-tooltip>
+                          <template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template>
+                        </el-table-column>
                       </el-table>
-                      <div v-if="!(scOverview.views?.history || []).length" class="empty">暂无推送历史</div>
+                      <div v-if="!(scOverview.views?.history || []).length" class="empty">今天还没有推送成功记录</div>
                     </div>
                     <div class="sc-card">
-                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>在途任务 + 今日待排期（按发布规则推进）</p></div></div>
+                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>今天在途任务 + 今日待排期（按发布规则推进）</p></div></div>
                       <el-table :data="scQueueRows" stripe size="small" max-height="300">
-                        <el-table-column label="时间" width="96" show-overflow-tooltip>
+                        <el-table-column label="时间" width="56" show-overflow-tooltip>
                           <template #default="s">{{ scQueueClock(s.row) }}</template>
                         </el-table-column>
-                        <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
+                        <el-table-column label="资源名称" min-width="92" show-overflow-tooltip>
                           <template #default="s">
                             <!-- v2.1.23：标签在剧名左侧（在途行与「待排期」预测行都带） -->
                             <div class="sc-title-row">
@@ -4629,23 +4690,33 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                             </div>
                           </template>
                         </el-table-column>
-                        <el-table-column label="分类" width="90" show-overflow-tooltip>
-                          <template #default="s">{{ s.row._src === 'plan' ? (s.row.category || '未分类') : scKindLabel(s.row.kind, true) }}</template>
+                        <!-- v2.1.25（用户口径 2）：**「推送类型」与「分类」彻底分开两列**。
+                             此前一列「分类」里，在途任务行显示 `kind`（首次/追更/手动）、
+                             待排期行显示 TMDB 分类 —— 同一列两种维度，用户看到的就是
+                             「分类列既有追更又有题材」。 -->
+                        <el-table-column label="分类" width="72" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueCategoryLabel(s.row) }}</template>
                         </el-table-column>
-                        <el-table-column label="状态" width="92">
+                        <el-table-column label="推送类型" width="74" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueKindLabel(s.row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="排期类型" width="78" show-overflow-tooltip>
+                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="64">
                           <template #default="s">
                             <span v-if="s.row._src === 'plan'" class="sc-dot-state warn">待排期</span>
                             <span v-else>{{ scTaskStatusLabel(s.row.status) }}</span>
                           </template>
                         </el-table-column>
                       </el-table>
-                      <div v-if="!scQueueRows.length" class="empty">当前无在途任务，也没有待排期作品</div>
+                      <div v-if="!scQueueRows.length" class="empty">今天既无在途任务，也没有待排期作品</div>
                     </div>
                     <div class="sc-card">
-                      <div class="sc-card-head"><span class="sc-ico">✕</span><div><h3>推送失败</h3><p>推送失败的记录，可逐条重试</p></div></div>
+                      <div class="sc-card-head"><span class="sc-ico">✕</span><div><h3>推送失败</h3><p>今天推送失败的记录，可逐条重试</p></div></div>
                       <el-table :data="scOverview.views?.failed || []" stripe size="small" max-height="300">
-                        <el-table-column label="时间" min-width="120" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
-                        <el-table-column label="资源名称" min-width="130" show-overflow-tooltip>
+                        <el-table-column label="时间" width="56" show-overflow-tooltip><template #default="s">{{ scDayClock(s.row.updated_at) }}</template></el-table-column>
+                        <el-table-column label="资源名称" min-width="86" show-overflow-tooltip>
                           <template #default="s">
                             <!-- v2.1.23：标签在剧名左侧，三表口径一致 -->
                             <div class="sc-title-row">
@@ -4656,8 +4727,25 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                             </div>
                           </template>
                         </el-table-column>
-                        <el-table-column prop="error" label="失败原因" min-width="120" show-overflow-tooltip/>
-                        <el-table-column label="操作" width="66"><template #default="s"><button class="sc-link-btn" @click="scTaskAction(s.row.id, 'retry')">重试</button></template></el-table-column>
+                        <el-table-column label="分类" width="72" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueCategoryLabel({ ...s.row, _src: 'task' }) }}</template>
+                        </el-table-column>
+                        <el-table-column label="推送类型" width="74" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueKindLabel({ ...s.row, _src: 'task' }) }}</template>
+                        </el-table-column>
+                        <el-table-column label="排期类型" width="78" show-overflow-tooltip>
+                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                        </el-table-column>
+                        <!-- v2.1.26：失败原因并入「状态」列（表头与另两表统一）。
+                             只给一个「失败」标签会让这张卡失去唯一的信息量，
+                             所以状态列 = 失败 + 原因（超长由 tooltip 兜住）。 -->
+                        <el-table-column label="状态" min-width="96" show-overflow-tooltip>
+                          <template #default="s">
+                            <span class="sc-dot-state bad">失败</span>
+                            <span v-if="s.row.error" class="sc-fail-reason">{{ s.row.error }}</span>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="操作" width="50"><template #default="s"><button class="sc-link-btn" @click="scTaskAction(s.row.id, 'retry')">重试</button></template></el-table-column>
                       </el-table>
                       <div v-if="!(scOverview.views?.failed || []).length" class="empty">无失败任务</div>
                     </div>
@@ -4713,10 +4801,16 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </div>
                         <div class="sc-media-text">
                           <b>{{ s.row.share_title || '未命名作品' }}</b>
-                          <small>{{ s.row.kind==='force' ? '手动推送' : (s.row.kind==='first' ? '电影/剧' : '追更') }} · {{ s.row.category_name || '未分类' }}</small>
+                          <!-- v2.1.25（用户口径 2）：这一行只留**推送类型**
+                               （首次发布 / 追更 / 手动推送）。原先把「电影/剧」当类型
+                               显示，那是媒体形态不是推送类型，已纠正；分类移到独立列。 -->
+                          <small>{{ scKindLabel(s.row.kind, true) }}</small>
                         </div>
                       </div>
                     </template>
+                  </el-table-column>
+                  <el-table-column label="分类" width="92" show-overflow-tooltip>
+                    <template #default="s">{{ s.row.category_name || '—' }}</template>
                   </el-table-column>
                   <el-table-column prop="share_code" label="分享码" min-width="120" show-overflow-tooltip/>
                   <el-table-column label="发布时间" min-width="150" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
@@ -4749,7 +4843,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div><span>作品</span><b>{{ scSelectedDetail.share_title || '—' }}</b></div>
                 <div><span>分享码</span><b>{{ scSelectedDetail.share_code || '—' }}</b></div>
                 <div><span>任务编号</span><b>#{{ scSelectedDetail.id }}</b></div>
-                <div><span>类型</span><b>{{ scKindLabel(scSelectedDetail.kind, true) }}</b></div>
+                <div><span>推送类型</span><b>{{ scKindLabel(scSelectedDetail.kind, true) }}</b></div>
                 <div><span>所属分类</span><b>{{ scSelectedDetail.category_name || '未分类' }}</b></div>
                 <div><span>当前状态</span><b>{{ scSelectedDetail.link_status_label || '待校验' }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scSelectedDetail.share_url || '—' }}</b></div>
@@ -4983,7 +5077,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <span v-else class="hint">—</span>
                     </template>
                   </el-table-column>
-                  <el-table-column label="类型" width="86"><template #default="s">{{ scKindLabel(s.row.kind) }}</template></el-table-column>
+                  <!-- v2.1.25（用户口径 2）：类型与分类分列，标题也随之明确成「推送类型」，
+                       避免和「分类」混读。分类只取 TMDB 分类（后端 category_name）。 -->
+                  <el-table-column label="推送类型" width="86"><template #default="s">{{ scKindLabel(s.row.kind) }}</template></el-table-column>
+                  <el-table-column label="分类" width="92" show-overflow-tooltip>
+                    <template #default="s">{{ s.row.category_name || '—' }}</template>
+                  </el-table-column>
                   <el-table-column prop="share_url" label="分享记录" min-width="160" show-overflow-tooltip/>
                   <el-table-column label="推送目标" width="96"><template #default="s">{{ s.row.link_label || '待建链' }}</template></el-table-column>
                   <el-table-column label="状态" width="90"><template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template></el-table-column>
@@ -5182,7 +5281,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="sc-detail-kv">
                 <div><span>作品</span><b>{{ scDetailTask.title || '未命名作品' }}</b></div>
                 <div><span>状态</span><b>{{ scTaskStatusLabel(scDetailTask.status) }}</b></div>
-                <div><span>类型</span><b>{{ scKindLabel(scDetailTask.kind) }}</b></div>
+                <div><span>推送类型</span><b>{{ scKindLabel(scDetailTask.kind) }}</b></div>
+                <div><span>所属分类</span><b>{{ scDetailTask.category_name || '未分类' }}</b></div>
                 <div><span>推送渠道</span><b>{{ scDetailTask.target_summary || '—' }}</b></div>
                 <div><span>链接状态</span><b>{{ scDetailTask.link_label || '待建链' }}</b></div>
                 <div><span>尝试次数</span><b>{{ scDetailTask.attempts }}</b></div>
@@ -5793,6 +5893,9 @@ button{font-family:inherit}
 .sc-dot-state.muted{background:var(--yg-bg);color:var(--yg-muted)}
 .sc-dot-state.warn{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
 .sc-dot-state.bad{background:var(--yg-tone-red-bg);color:var(--yg-tone-red-fg)}
+/* v2.1.26：失败表的「状态」列 = 失败标签 + 失败原因（表头与另两表统一后，
+   失败原因不再单独占一列，但仍要能一眼看见，超长由单元格 tooltip 兜住）。 */
+.sc-fail-reason{margin-left:5px;font-size:11px;color:var(--yg-muted);word-break:break-all}
 .sc-health-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .sc-health{border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:14px;text-align:left;cursor:pointer;position:relative;transition:.2s;background:var(--yg-surface)}
 .sc-health:hover{transform:translateY(-2px);box-shadow:var(--yg-shadow-lg)}
@@ -6330,6 +6433,12 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-cat-line em{font-style:normal;font-size:10.5px;color:var(--yg-muted);white-space:nowrap}
 .sc-fc-cat{display:inline-block;padding:0 7px;border-radius:6px;background:var(--yg-tone-blue-bg);
   color:var(--yg-tone-blue-fg);font-size:11px;line-height:18px;white-space:nowrap}
+/* v2.1.25（用户口径 2）：「上新即时推送」这一项是**通道**不是 TMDB 分类——
+   分类列里出现的必须只有题材。给插队批一个中性底 + 「插队」前缀，
+   与分类色区分开，避免再被读成「有个分类叫上新即时推送」。 */
+.sc-fc-cat.is-src{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
+.sc-fc-cat.is-src i{font-style:normal;margin-right:5px;padding:0 4px;border-radius:4px;
+  background:var(--yg-tone-amber-fg);color:var(--yg-surface);font-size:10px;line-height:15px}
 .sc-fc-works{display:flex;flex-wrap:wrap;gap:3px 10px}
 .sc-fc-w{font-size:11.5px;line-height:1.75;color:var(--yg-ink);
   max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
