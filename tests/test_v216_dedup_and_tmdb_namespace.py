@@ -487,7 +487,7 @@ def test_detail_by_id_any_does_not_fallback_to_tv_on_transient_error():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append(media_type)
         if media_type == "movie":
             raise RuntimeError("TMDB 请求失败 HTTP 503")
@@ -509,7 +509,7 @@ def test_detail_by_id_any_does_not_fallback_on_rate_limit():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append(media_type)
         raise tmdb.TmdbRateLimited("限流")
 
@@ -525,7 +525,7 @@ def test_detail_by_id_any_may_fallback_to_tv_on_404():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append(media_type)
         if media_type == "movie":
             raise tmdb.TmdbNotFound("TMDB 无此资源（HTTP 404）：/movie/283995")
@@ -578,7 +578,7 @@ def test_identify_type_locked_to_movie():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append((tmdb_id, media_type))
         if media_type == "movie":
             return _item("银河护卫队2", "movie", tmdb_id, "2017",
@@ -604,11 +604,11 @@ def test_identify_type_locked_movie_404_does_not_return_tv():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append(media_type)
         raise tmdb.TmdbNotFound("TMDB 无此资源（HTTP 404）")
 
-    async def fake_search(title, media_type=None, db=None, scenario=None):
+    async def fake_search(title, media_type=None, db=None, scenario=None, **kwargs):
         calls.append(f"search:{media_type}")
         return []
 
@@ -630,7 +630,7 @@ def test_identify_unknown_type_still_may_cross_namespace():
 
     calls = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append(media_type)
         if media_type == "movie":
             raise tmdb.TmdbNotFound("404")

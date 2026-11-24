@@ -275,7 +275,7 @@ def _patch_tmdb(monkeypatch, *, movie_ok=True, tv_ok=True):
     calls: list[tuple[int, str]] = []
     searched: list[tuple[str, str]] = []
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         calls.append((int(tmdb_id), media_type))
         if media_type == "movie" and movie_ok:
             return {"tmdb_id": int(tmdb_id), "media_type": "movie",
@@ -285,7 +285,7 @@ def _patch_tmdb(monkeypatch, *, movie_ok=True, tv_ok=True):
                     "title": "Indrani", "name": "Indrani"}
         raise tmdb.TmdbNotFound("404")
 
-    async def fake_search(q, media_type, db=None):
+    async def fake_search(q, media_type, db=None, **kwargs):
         searched.append((str(q), media_type))
         return []
 
@@ -341,7 +341,7 @@ def test_identify_lock_type_applies_to_name_stage(monkeypatch):
     from app import tmdb
     searched: list[tuple[str, str]] = []
 
-    async def fake_search(q, mt, db=None):
+    async def fake_search(q, mt, db=None, **kwargs):
         searched.append((str(q), mt))
         return []
 

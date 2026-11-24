@@ -70,6 +70,17 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _today_noon_utc():
+    """今天（上海）12:00 对应的 UTC —— 无论几点跑都落在当天之内。
+
+    v2.1.33：给「今天排的」这类用例当时刻锚点用。原来写 `_now() + 1 小时`，
+    在 23:00 之后跑全量会跨到第二天，被「只给当天」的过滤正当滤掉，看着像 bug。
+    """
+    now_sh = datetime.now(timezone.utc).astimezone(sc2.shanghai_tz())
+    return now_sh.replace(hour=12, minute=0, second=0,
+                          microsecond=0).astimezone(timezone.utc)
+
+
 def _work(db, *, title="银河护卫队2", file_id="f-1", release_date="",
           media_type="movie", finish_status="", entry_days_ago=0, with_snapshot=True):
     """造一部作品：资源 + （可选）库快照 + 分类归属。"""
@@ -183,7 +194,11 @@ def test_queue_uses_scheduled_at_and_shows_today_only():
         _res, wk_y = _work(db, title="昨天排的", file_id="f-qy")
         _res2, wk_t = _work(db, title="今天排的", file_id="f-qt")
         _task(db, wk_y, status="planned", scheduled_at=_now() - timedelta(days=1))
-        _task(db, wk_t, status="planned", scheduled_at=_now() + timedelta(hours=1))
+        # v2.1.33：原来写 `_now() + 1 小时`，在 23:00 之后跑全量时会跨到**第二天**
+        # （上海时间），被「只给当天」的过滤正当地滤掉 → 断言假红。
+        # 本机 23:10 跑全量时就是这么撞上的。改成固定「今天 12:00（上海）」，
+        # 无论几点跑都落在当天，且仍是「未来的点」不会影响排序断言。
+        _task(db, wk_t, status="planned", scheduled_at=_today_noon_utc())
         views = sc2._aggregate_views(db)
     titles = [r["title"] for r in views["queue"]]
     assert titles == ["今天排的"], f"队列只给今天的计划，实际 {titles}"

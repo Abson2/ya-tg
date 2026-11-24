@@ -96,7 +96,7 @@ def test_directory_name_is_primary_title():
 def test_chinese_dir_wins_and_english_fallback_never_autopicks():
     calls = []
 
-    async def fake_search(title, media_type=None, db=None):
+    async def fake_search(title, media_type=None, db=None, **kwargs):
         calls.append(title)
         if title == "谷雨":
             return [_item("谷雨", "tv", 88888, "2026", "/poster.jpg")]
@@ -109,7 +109,7 @@ def test_chinese_dir_wins_and_english_fallback_never_autopicks():
     assert r["ok"] and r["best"]["tmdb_id"] == 88888
     assert r["best"]["title"] == "谷雨" and calls[0] == "谷雨"
 
-    async def only_english(title, media_type=None, db=None):
+    async def only_english(title, media_type=None, db=None, **kwargs):
         return [_item("The Silent Noise", "tv", 314531, "2019")] if "Silent" in title else []
 
     with patch.object(tmdb, "search", only_english):
@@ -119,7 +119,7 @@ def test_chinese_dir_wins_and_english_fallback_never_autopicks():
 
 
 def test_english_title_is_replaced_by_chinese_display_name():
-    async def fake_search(title, media_type=None, db=None):
+    async def fake_search(title, media_type=None, db=None, **kwargs):
         return [_item("The Silent Storm", "tv", 88888, "2026")] if title == "谷雨" else []
 
     with patch.object(tmdb, "search", fake_search):
@@ -133,7 +133,7 @@ def test_multilingual_search_returns_posters_and_translated_queries():
         return {"ok": True, "queries": ["The Silent Storm", "グーユー"],
                 "message": "已生成外语标题"}
 
-    async def fake_search(title, media_type=None, db=None):
+    async def fake_search(title, media_type=None, db=None, **kwargs):
         if title == "谷雨":
             return [_item("谷雨", "tv", 88888, "2026", "/p.jpg")]
         if title == "The Silent Storm":

@@ -56,7 +56,7 @@ def test_parse_media_name_type_hints():
 
 def test_tv_hint_never_falls_back_to_movie():
     """用户截图：The.Silent.Storm.S01E04 被误配成电影 Cavalcade d'amour (TMDB #279155)。"""
-    async def fake_search(title, media_type=None, db=None):
+    async def fake_search(title, media_type=None, db=None, **kwargs):
         if media_type == "tv":
             return [_item("The Silent Storm", "tv", 1001, "2026")]
         if media_type == "movie":
@@ -70,7 +70,7 @@ def test_tv_hint_never_falls_back_to_movie():
     assert r["best"]["media_type"] == "tv" and r["best"]["tmdb_id"] == 1001
     assert all(c["media_type"] == "tv" for c in r["candidates"])
 
-    async def empty(title, media_type=None, db=None):
+    async def empty(title, media_type=None, db=None, **kwargs):
         return []
 
     with patch.object(tmdb, "search", empty):
@@ -79,7 +79,7 @@ def test_tv_hint_never_falls_back_to_movie():
 
 
 def test_tmdb_id_tag_exact_match():
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         return _item("诛仙", media_type, tmdb_id, "2022", ["动画", "奇幻"], ["CN"])
 
     with patch.object(tmdb, "detail", fake_detail):
@@ -89,7 +89,7 @@ def test_tmdb_id_tag_exact_match():
 
 
 def test_unknown_type_ambiguous_goes_manual():
-    async def fake_both(title, db=None):
+    async def fake_both(title, db=None, **kwargs):
         return [_item("Inception", "movie", 27205, "2010"),
                 _item("Inception", "tv", 99999, "2010")]
 
@@ -157,7 +157,7 @@ def test_manual_match_no_match_and_ai_config():
         p = c.post("/api/ai/parse", headers=H, json={"name": "诛仙.S01E04.2022.mkv"})
     assert p.status_code == 200 and p.json()["ok"] is True and p.json()["type"] == "tv"
 
-    async def fake_detail(tmdb_id, media_type, db=None):
+    async def fake_detail(tmdb_id, media_type, db=None, **kwargs):
         return _item("诛仙", media_type, tmdb_id, "2022", ["动画", "奇幻"], ["CN"])
 
     with patch.object(tmdb, "detail", fake_detail):

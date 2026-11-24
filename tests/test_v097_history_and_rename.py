@@ -269,7 +269,10 @@ def test_private_chat_reply_keyboard_on_start():
     assert [x for row in rows for x in row] == ["求片", "投稿", "搜索", "打赏", "建议/反馈"]
     assert kb["resize_keyboard"] is True and kb["one_time_keyboard"] is False
     src = (ROOT / "backend/app/bot_listener.py").read_text(encoding="utf-8")
-    assert "reply_markup=main_reply_keyboard()" in src
+    # v2.1.33：/start 等处改为先算 main_kb（私聊才给、群聊不给），
+    # 断言从「字面量 reply_markup=main_reply_keyboard()」放宽为「主键盘确有下发」。
+    assert "main_reply_keyboard()" in src
+    assert "reply_markup=main_kb" in src
     # v0.9.8：用户改口径——需要把其它项目残留的底部指令栏同步/清空为当前项目。
     # 这里只校验同步函数用 setMyCommands 且只用当前项目的英文指令，不再断言"绝不调用"。
     assert "def sync_bot_command_menu" in src

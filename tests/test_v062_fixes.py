@@ -77,7 +77,7 @@ def test_real_directory_title_still_wins():
 def test_site_dir_filename_hit_auto_identified():
     import asyncio
 
-    async def fake_search(query, mt, db=None):
+    async def fake_search(query, mt, db=None, **kwargs):
         return [_candidate()] if "Tian" in query else []
 
     with patch.object(tmdb, "search", fake_search), \
