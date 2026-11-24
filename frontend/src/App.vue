@@ -399,7 +399,7 @@ const scTaskStatusOptions = computed(() => {
 })
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
-const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN', scan_min_interval: '', scan_max_calls: '', bot_min_interval: '', bot_max_calls: '', rate_window_seconds: '' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
+const tmdbStatus = ref({}), tmdbForm = ref({ api_key: '', bearer_token: '', language: 'zh-CN', scan_min_interval: '', scan_max_calls: '', bot_min_interval: '', bot_max_calls: '', manual_min_interval: '', manual_max_calls: '', rate_window_seconds: '' }), tmdbTesting = ref(false), tmdbSaving = ref(false)
 const aiStatus = ref({}), aiForm = ref({ enabled: false, base_url: '', api_key: '', model: '', prompt: '', timeout: 30 }), aiSaving = ref(false), aiTesting = ref(false)
 const aiParseName = ref(''), aiParseResult = ref(null)
 const typeFilter = ref(''), identifyFilter = ref('')
@@ -753,6 +753,8 @@ async function loadTmdb() {
     tmdbForm.value.scan_max_calls = r.scan_max_calls ?? ''
     tmdbForm.value.bot_min_interval = r.bot_min_interval ?? ''
     tmdbForm.value.bot_max_calls = r.bot_max_calls ?? ''
+    tmdbForm.value.manual_min_interval = r.manual_min_interval ?? ''
+    tmdbForm.value.manual_max_calls = r.manual_max_calls ?? ''
     tmdbForm.value.rate_window_seconds = r.rate_window_seconds ?? ''
   } catch (e) {}
 }
@@ -2530,6 +2532,19 @@ function scFcRowClass({ row }) {
   return hour != null && Number(row.hour) === hour ? 'is-now' : ''
 }
 // 本时段的整体节奏（后端 pace 给出，口径 = 时段分钟 ÷ 部数，除不尽四舍五入）。
+// v2.1.33（真机 #1）：「22 点时段明明有排期队列，今日推送排期却是空的」。
+//
+// 真因不是调度坏了，是**两张表回答的是不同问题**：排期表只预测「还没建任务、
+// 还排得进来的作品」（后端从分类游标往后看），22:00 这一批一旦建成任务、游标
+// 前移，本时段在预测里就自然为空；而任务本身是好好的，就在下面的推送队列里。
+// 调度逻辑不动（用户已确认不需要改），要补的是这句解释——否则用户看到的是
+// 「有时段、有队列、排期表却空」，第一反应必然是「排期丢了」。
+const scForecastEmptyText = computed(() => {
+  if (scForecastLoading.value) return '排期中…'
+  const n = (scOverview.value.views?.queue || []).length
+  if (n) return `本时段没有待建排期了：任务已建成（在途 ${n} 条），见下方「推送队列」`
+  return '今日暂无排期'
+})
 const scPaceText = computed(() => {
   const p = scForecast.value.pace || {}
   const n = Number(p.interval_minutes || 0)
@@ -2546,6 +2561,13 @@ const scPaceText = computed(() => {
 function scQueueClock(row) {
   if (!row) return '—'
   if (row._src === 'plan') return String(row.plan_time || '—')
+  // v2.1.33（真机 #3）：这一列原来一律取 `scheduled_at` —— 那个字段写的是
+  // **建任务那一刻**，不是「计划什么时候推」。22:00 建的任务 22:30 才发出去，
+  // 队列上却写 22:00，看着就是「超时未推送」。
+  // 现在分三种：已发 → 实际发送时间；还没发 → 后端按匀速节奏反推的预计放行时刻；
+  // 两者都没有（本时段没算出节奏）→ 退回原口径。
+  if (row.published_at) return scDayClock(row.published_at)
+  if (row.expect_release_at) return scDayClock(row.expect_release_at)
   return scDayClock(row.scheduled_at || row.created_at)
 }
 // v2.1.25（用户口径 2）：**「推送类型」和「分类」是两列、两个维度，任何一处都不许拼**。
@@ -3456,7 +3478,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.32 · Asia/Shanghai</span>
+          <span>v2.1.33 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4673,7 +4695,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-table :data="scFcRows" stripe size="small" max-height="330"
                               ref="scFcBodyRef" class="sc-fc-table"
                               :row-class-name="scFcRowClass"
-                              :empty-text="scForecastLoading ? '排期中…' : '今日暂无排期'">
+                              :empty-text="scForecastEmptyText">
                       <el-table-column label="时间" width="104">
                         <template #default="s">
                           <div class="sc-fc-clock">{{ pad2(s.row.hour) }}:00</div>
@@ -4769,7 +4791,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div v-if="!(scOverview.views?.history || []).length" class="empty">今天还没有推送成功记录</div>
                     </div>
                     <div class="sc-card">
-                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>今天在途任务 + 今日待排期（按发布规则推进）</p></div></div>
+                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>今天在途任务 + 今日待排期（按发布规则推进）；还没发出去的行显示<b>预计放行时刻</b></p></div></div>
                       <el-table :data="scQueueRows" stripe size="small" max-height="300">
                         <el-table-column label="时间" width="56" show-overflow-tooltip>
                           <template #default="s">{{ scQueueClock(s.row) }}</template>
@@ -5444,16 +5466,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
           <!-- v0.9.8：按场景独立限流，Bot 默认更保守防恶意刷 -->
           <div class="panel">
-            <div class="panel-head"><h3>调用限流（防止 TMDB 账号被风控）</h3><span class="hint">两个场景独立统计，留空保持默认；保存配置即刻生效</span></div>
+            <div class="panel-head"><h3>调用限流（防止 TMDB 账号被风控）</h3><span class="hint">三个场景独立统计，留空保持默认；保存配置即刻生效</span></div>
             <p class="hint" style="margin:0 0 14px">
               <b>Bot 场景</b>用于私聊求片/投稿的候选搜索，对外暴露、默认间隔久频次低，避免被恶意刷导致 TMDB 账号异常；
-              <b>资源库识别</b>用于内部扫描识别，可更宽松。超出间隔或频次时本次不请求 TMDB，自动降级。
+              <b>资源库识别</b>用于内部扫描识别，可更宽松；<b>手动搜索</b>是你自己在后台点搜索/重新识别，
+              单独计一份额度，不会因为批量识别在跑就被挡住。超出间隔或频次时本次不请求 TMDB，自动降级。
             </p>
             <div class="form-grid">
               <div><small>识别 · 最小间隔（秒）</small><el-input v-model="tmdbForm.scan_min_interval" placeholder="默认 0.2"/></div>
               <div><small>识别 · 每窗口最大次数</small><el-input v-model="tmdbForm.scan_max_calls" placeholder="默认 60"/></div>
               <div><small>Bot · 最小间隔（秒）</small><el-input v-model="tmdbForm.bot_min_interval" placeholder="默认 3"/></div>
               <div><small>Bot · 每窗口最大次数</small><el-input v-model="tmdbForm.bot_max_calls" placeholder="默认 20"/></div>
+              <div><small>手动搜索 · 最小间隔（秒）</small><el-input v-model="tmdbForm.manual_min_interval" placeholder="默认 1"/></div>
+              <div><small>手动搜索 · 每窗口最大次数</small><el-input v-model="tmdbForm.manual_max_calls" placeholder="默认 30"/></div>
               <div><small>统计窗口（秒）</small><el-input v-model="tmdbForm.rate_window_seconds" placeholder="默认 60"/></div>
             </div>
             <div class="connect-actions" style="margin-top:16px">
@@ -5461,7 +5486,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </div>
             <p class="hint" style="margin-top:12px">
               当前生效：识别 {{ tmdbStatus.rate_limit?.scan_min_interval || '0.2' }}s / {{ tmdbStatus.rate_limit?.scan_max_calls || '60' }} 次；
-              Bot {{ tmdbStatus.rate_limit?.bot_min_interval || '3' }}s / {{ tmdbStatus.rate_limit?.bot_max_calls || '20' }} 次（每 {{ tmdbStatus.rate_limit?.rate_window_seconds || '60' }}s）。
+              Bot {{ tmdbStatus.rate_limit?.bot_min_interval || '3' }}s / {{ tmdbStatus.rate_limit?.bot_max_calls || '20' }} 次；
+              手动搜索 {{ tmdbStatus.rate_limit?.manual_min_interval || '1' }}s / {{ tmdbStatus.rate_limit?.manual_max_calls || '30' }} 次（每 {{ tmdbStatus.rate_limit?.rate_window_seconds || '60' }}s）。
             </p>
           </div>
 

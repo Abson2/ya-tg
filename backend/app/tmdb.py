@@ -106,6 +106,21 @@ _RATE_LOCK = threading.Lock()
 _RATE_STATE: dict[str, dict] = {}
 SCAN = "scan"
 BOT = "bot"
+# v2.1.33：后台「手动搜索 / 重新匹配」独立成桶。
+# 起因：手动搜索走的是 SCAN 档（0.2 秒 / 60 次 60 秒），和批量识别共用同一份配额。
+# 批量识别在跑的时候，管理员点一次搜索就是第 61 次调用 → 直接被拒，界面报
+# 「TMDB 调用过于频繁」，而实际上 TMDB 那边什么都没发生。人手动点搜索的频率
+# 天然很低（一分钟几次到头），给它单独一份配额完全够用，也不会挤占批量识别。
+MANUAL = "manual"
+# 限流提示是要给人看的，绝不能把内部场景键（scan/bot/manual）拼进文案，
+# 那是后端代码名词。这里给一份中文标签，取不到时退回中性说法。
+SCENARIO_LABELS = {SCAN: "资源库识别", BOT: "Bot 交互", MANUAL: "手动搜索"}
+
+
+def scenario_label(scenario: str) -> str:
+    """把内部场景键翻成中文，供限流/报错文案使用（页面不得出现英文场景名）。"""
+    return SCENARIO_LABELS.get(str(scenario or ""), "接口调用")
+
 
 
 def reset_rate_limiters() -> None:
@@ -122,6 +137,9 @@ def _rate_cfg(db: Session, scenario: str) -> tuple[float, int, int]:
         if scenario == BOT:
             interval = num("tmdb_bot_min_interval", float)
             max_calls = num("tmdb_bot_max_calls", int)
+        elif scenario == MANUAL:
+            interval = num("tmdb_manual_min_interval", float)
+            max_calls = num("tmdb_manual_max_calls", int)
         else:
             interval = num("tmdb_scan_min_interval", float)
             max_calls = num("tmdb_scan_max_calls", int)
@@ -250,7 +268,9 @@ async def _get(path: str, params: dict, db: Session | None = None,
     # v0.9.8：按场景限流。bot 场景（私聊求片/投稿候选搜索）默认更保守，
     # 被限流时本次不发出 TMDB 请求，调用方按空结果降级。
     if db is not None and not check_rate_limit(db, scenario):
-        raise TmdbRateLimited(f"TMDB {scenario} 场景调用过于频繁，已被限流，请稍后再试。")
+        # v2.1.33：文案用中文场景名，不把内部键（scan/bot/manual）露给用户
+        raise TmdbRateLimited(
+            f"TMDB {scenario_label(scenario)}调用过于频繁，已被限流，请稍后再试。")
     # 剧名优先中文：所有端点统一带 language，避免漏传时 TMDB 返回英文原名
     params = {**params, "language": params.get("language") or c["language"] or "zh-CN"}
     headers = {"accept": "application/json"}
@@ -398,7 +418,7 @@ async def search_both(title: str, db: Session | None = None,
     out: list[dict] = []
     for mt in ("tv", "movie"):
         try:
-            out.extend(await search(title, mt, db, scenario))
+            out.extend(await search(title, mt, db, scenario=scenario))
         except TmdbAuthError:
             raise
         except Exception:
@@ -406,9 +426,11 @@ async def search_both(title: str, db: Session | None = None,
     return out
 
 
-async def detail(tmdb_id: int, media_type: str, db: Session | None = None) -> dict:
+async def detail(tmdb_id: int, media_type: str, db: Session | None = None, *,
+                 scenario: str = SCAN) -> dict:
+    """按 ID 取详情。v2.1.33：`scenario` 供后台手动路径传 MANUAL（不再与批量共桶）。"""
     language = credentials(db)["language"]
-    data = await _get(f"/{media_type}/{int(tmdb_id)}", {"language": language}, db)
+    data = await _get(f"/{media_type}/{int(tmdb_id)}", {"language": language}, db, scenario)
     return _normalize(data, media_type)
 
 
@@ -428,7 +450,8 @@ async def english_title(tmdb_id: int, media_type: str, db: Session | None = None
 
 
 async def detail_by_id_any(tmdb_id: int, preferred: str = "movie",
-                           db: Session | None = None) -> tuple[dict | None, str]:
+                           db: Session | None = None, *,
+                           scenario: str = SCAN) -> tuple[dict | None, str]:
     """ID 精确匹配：先试首选类型，再试另一类型（有些标记不带类型）。
 
     v2.1.6 真实缺陷修复（银河护卫队2 被识别成 Indrani）：
@@ -456,7 +479,7 @@ async def detail_by_id_any(tmdb_id: int, preferred: str = "movie",
         # 瞬态失败时在同一类型上重试（最多 2 次尝试）。
         for attempt in range(2):
             try:
-                d = await detail(tmdb_id, mt, db)
+                d = await detail(tmdb_id, mt, db, scenario=scenario)
                 if d and d.get("tmdb_id"):
                     return d, mt
                 # 该类型下拿不到有效详情 → 视为「这个命名空间没有」，换类型试。
@@ -528,14 +551,14 @@ def rank(candidates: list[dict], hint: dict) -> list[dict]:
 
 
 async def _search_with_retry(query: str, media_type: str, alt_query: str,
-                             db: Session | None) -> list[dict]:
-    c = await search(query, media_type, db)
+                             db: Session | None, scenario: str = SCAN) -> list[dict]:
+    c = await search(query, media_type, db, scenario=scenario)
     if not c and alt_query and alt_query.strip() != query:
-        c = await search(alt_query.strip(), media_type, db)
+        c = await search(alt_query.strip(), media_type, db, scenario=scenario)
     if not c and " " in query:
         short = " ".join(query.split()[:2])
         if short and short != query:
-            c = await search(short, media_type, db)
+            c = await search(short, media_type, db, scenario=scenario)
     return c
 
 
@@ -560,7 +583,7 @@ def _manual_required(hint: dict, ai_info, ranked: list, query: str, english_alt:
 
 async def identify(name: str, db: Session | None = None, path_hint: str = "",
                    use_ai: bool = True, *, forced_tmdb_id: int = 0,
-                   forced_type: str = "") -> dict:
+                   forced_type: str = "", scenario: str = SCAN) -> dict:
     """识别决策，返回结构化结果；不直接写库。
 
     status: identified（可自动应用）/ ambiguous（匹配存疑，转人工）/ failed（无候选）
@@ -608,7 +631,7 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
             type_locked = hint["type_hint"] in ("movie", "tv")
         if type_locked:
             try:
-                d = await detail(hint["tmdb_id"], preferred, db)
+                d = await detail(hint["tmdb_id"], preferred, db, scenario=scenario)
             except TmdbAuthError:
                 raise
             except TmdbNotFound:
@@ -616,7 +639,8 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
                 d = None
             actual = preferred if d else ""
         else:
-            d, actual = await detail_by_id_any(hint["tmdb_id"], preferred, db)
+            d, actual = await detail_by_id_any(hint["tmdb_id"], preferred, db,
+                                               scenario=scenario)
         if d:
             d["score"] = 1.0
             return {"ok": True, "status": "identified", "source": "id",
@@ -664,16 +688,16 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
     # 3) 类型明确：只搜该类型。剧集绝不回退电影（修复 S01E04 被识别成电影）
     if hint["type_hint"] in ("tv", "movie"):
         mt = hint["type_hint"]
-        candidates = await _search_with_retry(query, mt, alt_query, db)
+        candidates = await _search_with_retry(query, mt, alt_query, db, scenario)
         if not candidates and translated_queries:
             for tq in translated_queries:
-                candidates = await _search_with_retry(tq, mt, "", db)
+                candidates = await _search_with_retry(tq, mt, "", db, scenario)
                 if candidates:
                     translated_used = tq
                     break
         fallback_used = False
         if not candidates and english_alt:
-            candidates = await _search_with_retry(english_alt, mt, "", db)
+            candidates = await _search_with_retry(english_alt, mt, "", db, scenario)
             fallback_used = bool(candidates)
         if not candidates:
             return {"ok": False, "status": "failed", "source": "none",
@@ -722,18 +746,18 @@ async def identify(name: str, db: Session | None = None, path_hint: str = "",
                 "hint": hint, "ai": ai_info, "candidates": ranked, "best": best}
 
     # 4) 类型未知：双路搜索 + 评分，分数接近就转人工，绝不乱猜
-    candidates = await search_both(query, db)
+    candidates = await search_both(query, db, scenario=scenario)
     fallback_used = False
     if not candidates and alt_query and alt_query.strip() != query:
-        candidates = await search_both(alt_query.strip(), db)
+        candidates = await search_both(alt_query.strip(), db, scenario=scenario)
     if not candidates and translated_queries:
         for tq in translated_queries:
-            candidates = await search_both(tq, db)
+            candidates = await search_both(tq, db, scenario=scenario)
             if candidates:
                 translated_used = tq
                 break
     if not candidates and english_alt:
-        candidates = await search_both(english_alt, db)
+        candidates = await search_both(english_alt, db, scenario=scenario)
         fallback_used = bool(candidates)
     if not candidates:
         return {"ok": False, "status": "failed", "source": "none",
@@ -816,11 +840,15 @@ def tmdb_url(media_type: str, tmdb_id: int) -> str:
 
 async def search_multilingual(title: str, media_type: str | None = None, year: str = "",
                               translations: list[str] | None = None,
-                              db: Session | None = None) -> dict:
+                              db: Session | None = None, *,
+                              scenario: str = SCAN) -> dict:
     """手动识别：中文标题 + 自动翻译出的英/日/韩标题分别搜 TMDB，合并去重复选。
 
     返回带 poster_url 的候选（电影/剧集海报墙）、翻译出的外语标题与实际尝试过的查询词。
     AI 未配置时仍用中文原名直搜，不影响手动匹配可用性。
+
+    v2.1.33：`scenario` 供后台手动路径传 MANUAL —— 一次手搜最多打 5 条查询，
+    共桶时很容易在批量识别跑批期间被自己的配额挡住。
     """
     from . import ai_assist
 
@@ -846,8 +874,9 @@ async def search_multilingual(title: str, media_type: str | None = None, year: s
     tried: list[dict] = []
     for q, lang in queries[:5]:
         try:
-            rows = (await search(q, media_type, db) if media_type in ("movie", "tv")
-                    else await search_both(q, db))
+            rows = (await search(q, media_type, db, scenario=scenario)
+                    if media_type in ("movie", "tv")
+                    else await search_both(q, db, scenario))
         except TmdbAuthError:
             raise
         except Exception:

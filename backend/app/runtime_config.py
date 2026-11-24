@@ -34,6 +34,13 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "tmdb_scan_max_calls": ("tmdb_scan_max_calls", "60"),         # 每窗口最大调用数
     "tmdb_bot_min_interval": ("tmdb_bot_min_interval", "3"),      # Bot 场景：默认间隔 3 秒
     "tmdb_bot_max_calls": ("tmdb_bot_max_calls", "20"),           # Bot 场景：每窗口 20 次
+    # v2.1.33：手动搜索独立档。原来后台手动搜索落 scan 档，和批量识别抢同一份
+    # 配额 —— 批量跑起来时管理员点一次搜索就被拒。人手动点的频率天然很低，
+    # 这里给 1 秒 / 30 次：够点，又不会真把 TMDB 打穿。
+    # 不照搬 Bot 档的 3 秒 / 20 次：那个数字是防脚本刷的，用在后台自己人身上
+    # 就变成「每搜一次干等 3 秒」。
+    "tmdb_manual_min_interval": ("tmdb_manual_min_interval", "1"),  # 后台手动搜索：最小间隔秒
+    "tmdb_manual_max_calls": ("tmdb_manual_max_calls", "30"),       # 后台手动搜索：每窗口 30 次
     "tmdb_rate_window_seconds": ("tmdb_rate_window_seconds", "60"),  # 频次统计窗口
     # AI 辅助识别：OpenAI 兼容接口，用户可自定义服务端与模型
     "ai_enabled": ("ai_enabled", "false"),

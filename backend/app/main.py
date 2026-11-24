@@ -1129,7 +1129,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.32", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.33", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1140,7 +1140,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.32", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.33", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -5100,6 +5100,9 @@ class TmdbConfigInput(BaseModel):
     scan_max_calls: str = ""
     bot_min_interval: str = ""
     bot_max_calls: str = ""
+    # v2.1.33：后台手动搜索 / 重新匹配独立档（不再与批量识别共桶）
+    manual_min_interval: str = ""
+    manual_max_calls: str = ""
     rate_window_seconds: str = ""
 
 
@@ -5111,6 +5114,8 @@ def tmdb_status(db: Session = Depends(get_db)):
         "scan_max_calls": runtime_config.get(db, "tmdb_scan_max_calls"),
         "bot_min_interval": runtime_config.get(db, "tmdb_bot_min_interval"),
         "bot_max_calls": runtime_config.get(db, "tmdb_bot_max_calls"),
+        "manual_min_interval": runtime_config.get(db, "tmdb_manual_min_interval"),
+        "manual_max_calls": runtime_config.get(db, "tmdb_manual_max_calls"),
         "rate_window_seconds": runtime_config.get(db, "tmdb_rate_window_seconds"),
     }
     return out
@@ -5128,6 +5133,8 @@ def tmdb_config_save(p: TmdbConfigInput, db: Session = Depends(get_db)):
                        ("scan_max_calls", "tmdb_scan_max_calls"),
                        ("bot_min_interval", "tmdb_bot_min_interval"),
                        ("bot_max_calls", "tmdb_bot_max_calls"),
+                       ("manual_min_interval", "tmdb_manual_min_interval"),
+                       ("manual_max_calls", "tmdb_manual_max_calls"),
                        ("rate_window_seconds", "tmdb_rate_window_seconds")):
         raw = getattr(p, field, "").strip()
         if raw:
@@ -5166,13 +5173,16 @@ async def tmdb_candidates(rid: int, media_type: str = "", db: Session = Depends(
         if mt:
             hint = parse_media_name(q_name or x.name, q_hint)
             q = hint.get("primary_title") or hint.get("clean_title") or q_name or x.name
-            items = await tmdb.search(q, mt, db)
+            # v2.1.33：后台点「重新识别」是人在等结果，走独立的手动档，
+            # 不再和批量识别抢同一份限额
+            items = await tmdb.search(q, mt, db, scenario=tmdb.MANUAL)
             label = "电影" if mt == "movie" else "剧集"
             return {"ok": bool(items), "status": "identified" if items else "failed",
                     "source": "tmdb", "reason": f"按{label}搜索「{q}」得到 {len(items)} 个候选",
                     "hint": hint, "ai": None, "candidates": tmdb.rank(items, hint), "best": None}
         return await tmdb.identify(q_name or x.name, db, path_hint=q_hint,
-                                   forced_tmdb_id=q_tmdb, forced_type=q_type)
+                                   forced_tmdb_id=q_tmdb, forced_type=q_type,
+                                   scenario=tmdb.MANUAL)
     except Exception as e:
         raise _tmdb_error(e)
 
@@ -5187,9 +5197,11 @@ async def tmdb_search(q: str, media_type: str = "", db: Session = Depends(get_db
     try:
         m = re.fullmatch(r"(?:tmdb[-_:= ]?)?(\d{2,12})", raw, re.I)
         if m:
-            d, _ = await tmdb.detail_by_id_any(int(m.group(1)), mt or "movie", db)
+            # v2.1.33：手动搜索走独立档，不与批量识别共桶
+            d, _ = await tmdb.detail_by_id_any(int(m.group(1)), mt or "movie", db,
+                                              scenario=tmdb.MANUAL)
             return [d] if d else []
-        return await tmdb.search(raw, mt, db)
+        return await tmdb.search(raw, mt, db, scenario=tmdb.MANUAL)
     except Exception as e:
         raise _tmdb_error(e)
 
@@ -5203,7 +5215,7 @@ async def identify(rid: int, p: IdentifyInput, db: Session = Depends(get_db)):
     if not x:
         raise HTTPException(404, "资源不存在")
     try:
-        d = await tmdb.detail(p.tmdb_id, p.media_type, db)
+        d = await tmdb.detail(p.tmdb_id, p.media_type, db, scenario=tmdb.MANUAL)
         _apply_identification(x, d, source="manual", note=p.note or "手动匹配",
                               hint=parse_media_name(x.name, x.path_hint or ""))
         queued = _after_identify_dispatch(db, x)  # 阶段二：灰度开关选新链/旧链
@@ -6567,7 +6579,7 @@ async def tmdb_translate_search(p: TranslateSearchInput, db: Session = Depends(g
     try:
         return await tmdb.search_multilingual(
             p.title.strip(), p.media_type if p.media_type in ("movie", "tv") else None,
-            p.year, None, db)
+            p.year, None, db, scenario=tmdb.MANUAL)
     except Exception as e:
         raise _tmdb_error(e)
 

@@ -2063,36 +2063,62 @@ async def poll_once(db: Session) -> dict:
     return stats
 
 
+def _is_private_chat(user_id: str, chat_id: str) -> bool:
+    """私聊判定：Telegram 私聊的 chat.id 恒等于 user.id；群 / 频道是负数或与之不等。
+
+    Reply 键盘只该出现在私聊：群里的 Reply 键盘会把整个群聊的输入区顶上去，
+    而且 `selective` 只对 @Bot 的那一条生效，其它人看到的是一个失灵的键盘。
+    """
+    return bool(user_id) and str(chat_id or "") == str(user_id or "")
+
+
 async def _dispatch_reply(db: Session, token: str, chat_id: str, text: str,
                           action: str, reply: str, user_id: str) -> None:
-    """把 handle_text 的回复按 action 分派到合适的发送方式（从 poll_once 抽出，保持原语义）。"""
+    """把 handle_text 的回复按 action 分派到合适的发送方式（从 poll_once 抽出，保持原语义）。
+
+    v2.1.33：私聊的「回主菜单」分支统一走 `main_kb`，并补上 `else` 兜底。
+
+    起因是真机反馈「Reply 里看不到第 5 个按钮」。Telegram 的 Reply 键盘是
+    **客户端本地状态**：每个 chat 只记住最后一次收到的 reply_markup，Bot 这边
+    改了键盘内容，已存在的会话不会自动更新。原来只有 `/start` 和 `/help` 会重发，
+    于是「加一个按钮」对老用户等于没发生——他得自己想明白要再发一次 /start。
+    现在任意一条私聊的普通回复都会把最新主菜单带回去，用户不必知道这个机制。
+
+    顺带修掉两个同源缺口：
+      - `/帮助`（中文）原来在 handle_text 里同样返回 action="help"，
+        但这里只认 `/start` `/help` 两个字符串 → 中文帮助拿不到键盘；
+      - `/start xxx`（带 payload）因 `text.strip()... in (...)` 是精确比较而漏掉，
+        改成只看 action，不再看原文。
+    """
+    private = _is_private_chat(user_id, chat_id)
+    main_kb = main_reply_keyboard() if private else None
     if action.startswith("search_cards:"):
         await _reply(db, token, chat_id, reply,
-                     reply_markup=end_flow_keyboard() if _flow_get(user_id) else None)
+                     reply_markup=end_flow_keyboard() if _flow_get(user_id) else main_kb)
         ids = [int(x) for x in action.split(":", 1)[1].split(",") if x.isdigit()]
         await _send_search_cards(db, token, chat_id, ids)
     elif action.startswith("donate_photo:"):
         await _send_photo(db, token, chat_id, action.split(":", 1)[1], reply)
-    elif action == "help" and text.strip().lower().split("@")[0] in ("/start", "/help"):
-        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+    elif action == "help":
+        await _reply(db, token, chat_id, reply, reply_markup=main_kb)
     elif action in ("want_pick", "contribute_pick"):
         sess = _pick_get(user_id)
         kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
         await _reply(db, token, chat_id, reply, reply_markup=kb)
     elif action == "flow_end":
-        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+        await _reply(db, token, chat_id, reply, reply_markup=main_kb)
     elif action in ("feedback", "feedback_denied"):
         # v2.1.32：留言已收下 / 验证失败退出 —— 都要把 5 个按钮的主菜单还回去
-        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+        await _reply(db, token, chat_id, reply, reply_markup=main_kb)
     elif action == "unrecognized":
         # v0.9.16 #277：非指令内容纠正提示，附主菜单引导用户走正确入口
-        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+        await _reply(db, token, chat_id, reply, reply_markup=main_kb)
     elif action in ("flow_want", "flow_contribute", "flow_search", "contribute_await_url"):
         await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
     elif _flow_get(user_id) or _pick_get(user_id):
         await _reply(db, token, chat_id, reply, reply_markup=end_flow_keyboard())
     else:
-        await _reply(db, token, chat_id, reply)
+        await _reply(db, token, chat_id, reply, reply_markup=main_kb)
 
 
 # ==================== v0.9.15 #277：智能添加（getChat 解析） ====================

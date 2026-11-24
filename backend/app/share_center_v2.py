@@ -1285,20 +1285,34 @@ def _period_pace(db: Session, now: datetime) -> dict[str, Any]:
     return out
 
 
-def _period_released(db: Session, pace: dict[str, Any]) -> int:
-    """本时段**已经放出去**的作品数（distinct work_key，口径见 `PACE_RELEASED_STATUS`）。"""
+def _period_released_works(db: Session, pace: dict[str, Any]) -> set[str]:
+    """本时段**已经放出去**的作品集合（口径见 `PACE_RELEASED_STATUS`）。
+
+    v2.1.33：原来只有一个返回「部数」的 `_period_released`，dispatch 只能拿它
+    跟 `due` 比大小，回答不了「**这一条**任务的 work_key 是不是已经放过了」——
+    于是同一部剧的第二个渠道被当成超额，整轮 `break`，固定多等一个 interval。
+    改成返回集合，配额判断用 `len()`，同作品判断用 `in`。
+    """
     start_sh = pace["period_start"]
     end_sh = pace["period_end"]
     try:
-        return int(db.scalar(
-            select(func.count(func.distinct(SCPublishTask.work_key)))
+        rows = db.execute(
+            select(SCPublishTask.work_key)
             .where(SCPublishTask.scheduled_at.isnot(None),
                    SCPublishTask.scheduled_at >= start_sh.astimezone(timezone.utc),
                    SCPublishTask.scheduled_at < end_sh.astimezone(timezone.utc),
-                   SCPublishTask.status.in_(PACE_RELEASED_STATUS))) or 0)
+                   SCPublishTask.work_key.isnot(None),
+                   SCPublishTask.work_key != "",
+                   SCPublishTask.status.in_(PACE_RELEASED_STATUS))).all()
+        return {str(r[0]) for r in rows if r and r[0]}
     except Exception:
         db.rollback()
-        return 0
+        return set()
+
+
+def _period_released(db: Session, pace: dict[str, Any]) -> int:
+    """本时段**已经放出去**的作品数（distinct work_key，口径见 `PACE_RELEASED_STATUS`）。"""
+    return len(_period_released_works(db, pace))
 
 
 def _tags_for_status(tags: list[dict], status: str) -> list[dict]:
@@ -2426,20 +2440,30 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     today_counts = ({k: _category_today_count(db, k) for k in kept_keys}
                     if cycle_day_max else {})
 
-    # 当前小时已经提交掉多少（与 dispatch 同口径：status >= submitted 且按 scheduled_at 落在本小时）
+    # 当前小时已经提交掉多少**部**（与 dispatch 同口径：status >= submitted、
+    # 按 scheduled_at 落在本小时、distinct work_key）。
+    # v2.1.33：原来数的是任务条数，同一部剧推群 + 频道会被算成两部，
+    # 预测视图就会比实际少放一部——与 dispatch 改成同口径。
     hour_start_utc = utcnow().replace(minute=0, second=0, microsecond=0)
-    submitted_this_hour = 0
+    submitted_keys_hour: set[str] = set()
     if hourly_cap:
-        submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
-            SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
-            SCPublishTask.scheduled_at >= hour_start_utc)) or 0)
+        try:
+            rows = db.execute(select(SCPublishTask.work_key).where(
+                SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
+                SCPublishTask.work_key.isnot(None),
+                SCPublishTask.work_key != "",
+                SCPublishTask.scheduled_at >= hour_start_utc)).all()
+            submitted_keys_hour = {str(r[0]) for r in rows if r and r[0]}
+        except Exception:
+            db.rollback()
+            submitted_keys_hour = set()
 
     def _quota(h: int) -> int:
-        """该小时还剩多少推送额度（匀速口径）。"""
+        """该小时还剩多少推送额度（匀速口径，单位=部）。"""
         if not hourly_cap:
             return 10 ** 9
         if h == now_sh.hour:
-            return max(0, _hourly_due(hourly_cap, now_sh.minute) - submitted_this_hour)
+            return max(0, _hourly_due(hourly_cap, now_sh.minute) - len(submitted_keys_hour))
         return hourly_cap
 
     # 候选基：只看每部作品的最新快照，同一作品不因多版本重复占位
@@ -2945,16 +2969,41 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
     except (TypeError, ValueError):
         hourly_cap = 0
     hour_start = now.replace(minute=0, second=0, microsecond=0)
-    submitted_this_hour = 0
+    # v2.1.33：整小时额度的计量单位从「条」改成「部」（distinct work_key）。
+    #
+    # 真机反馈：「同一部影视推送群和频道，时间差较大，没有同步」。根因就在这里——
+    # 一部剧要推「频道 + 群」两条任务，旧口径按**条**算额度（默认每小时 3 条），
+    # 于是第 1 条占掉一个名额，第 2 条立刻被判成超额：`stats["throttled"]` 之后
+    # `break` 掉整轮，要等到下一个匀速放行点（cap=3 时下一个是第 20 分钟）
+    # 才能出去 —— 用户看到的就是同一部剧群和频道差了半小时。
+    #
+    # 用户口径一直是「部」：`max_works_per_run` 按部、改名预算单位也是部。
+    # 所以这里只算本小时已提交的作品数，同一部剧的第二条渠道不占额外名额。
+    submitted_keys_hour: set[str] = set()
     if hourly_cap:
-        submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
-            SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
-            SCPublishTask.scheduled_at >= hour_start)) or 0)
+        try:
+            rows = db.execute(select(SCPublishTask.work_key).where(
+                SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
+                SCPublishTask.work_key.isnot(None),
+                SCPublishTask.work_key != "",
+                SCPublishTask.scheduled_at >= hour_start)).all()
+            submitted_keys_hour = {str(r[0]) for r in rows if r and r[0]}
+        except Exception:
+            db.rollback()
+            submitted_keys_hour = set()
     # v2.1.23：时段匀速（用户口径 4）——「本时段 2 小时、4 部 → 30 分钟一部」。
     # 分母是**部数**（distinct work_key），不是任务数：同一部剧推频道 + 群是两条任务，
     # 但同时出去才对；按条算会把间隔砍半。
     # 与上面的每小时上限**并存取更严**：上限是绝对闸门，匀速是节奏。
     pace = _period_pace(db, now)
+    # v2.1.33：本时段已放行的**作品集合**（不是条数）。
+    # 用集合而不是数字，才能回答「这条任务的 work_key 是不是已经在里面了」——
+    # 同一部剧的第二条渠道直接放行、不再占名额、也不会把整轮 break 掉。
+    released_works: set[str] = (set() if pace["due"] is None
+                               else _period_released_works(db, pace))
+    # 已经在别处（别的渠道）本轮被挡下的作品：它的其余渠道同样不发，
+    # 免得同一部剧一半出去一半留着。
+    blocked_works: set[str] = set()
     for task_index, task in enumerate(tasks):
         # v2.1.3：单轮墙钟预算。超预算就把剩余任务留给下一轮（它们仍是
         # planned/ready，下一轮自然被捞起）——绝不让一轮跑到十几分钟，
@@ -2967,12 +3016,18 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 原来 `submitted_this_hour >= hourly_cap` 会让整点一到就把 cap 部全推出去，
         # 后面 59 分钟静默——用户口径是「每时段均匀分配」，所以改成按进度放行：
         # cap=3 → 第 0/20/40 分钟各 1 部。cap=0 时不限（_hourly_due 返回大数）。
-        if (hourly_cap and task.kind != FORCE_TASK_KIND
-                and submitted_this_hour >= _hourly_due(hourly_cap, now.minute)):
-            # v2.1.21：手动强推例外——用户点按钮就是要在当下发出去，
-            # 不能被「上新即时推送每小时上限」卡住（自动调度照旧受限）。
-            stats["throttled"] += 1
-            break
+        #
+        # v2.1.33：同作品豁免 —— 本小时已经提交过的作品，它的第二条渠道
+        # （频道 / 群）不再走额度判断；被挡时从 `break` 改成 `continue`，
+        # 否则后面同作品的那条也被一起停掉，正是「群和频道不同步」的形状。
+        if hourly_cap and task.kind != FORCE_TASK_KIND:
+            wk = str(task.work_key or "")
+            if wk not in submitted_keys_hour:
+                if len(submitted_keys_hour) >= _hourly_due(hourly_cap, now.minute):
+                    # v2.1.21：手动强推例外——用户点按钮就是要在当下发出去，
+                    # 不能被「上新即时推送每小时上限」卡住（自动调度照旧受限）。
+                    stats["throttled"] += 1
+                    continue
         item = db.get(SCPushListItem, task.list_item_id)
         lv = db.get(SCLibraryVersion, item.library_version_id) if item else None
         if not item or not lv:
@@ -3067,10 +3122,33 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # **不消耗额度**的分支一起挡掉：用户看到的是 `paced` 而不是 `skipped`，
         # 统计口径就错了（真机表现为"明明该跳过却什么都没做"）。
         # 手动强推豁免：用户点按钮就要在当下发出去。
-        if (pace["due"] is not None and task.kind != FORCE_TASK_KIND
-                and _period_released(db, pace) >= pace["due"]):
-            stats["paced"] += 1
-            break
+        # v2.1.33：**同一部作品多个目标同轮放行**（真机 #3「22 点推送的八仙，
+        # 队列显示 22:00、实际 22:30」与 #4「群和频道时间差较大」同一个根因）。
+        #
+        # 旧写法是「`_period_released(db, pace) >= pace["due"]` 就 break」：
+        #   · `_period_released` 数的是 distinct work_key（部数），口径没错；
+        #   · 但判断落在**每一条任务**上——同一部剧的第 2 条渠道（群 / 频道）
+        #     看着「部数已满」就被判超额，然后 `break` 掉整轮，
+        #     固定要多等一个 interval 才能出去。
+        #   实测 22:00、n_works=4 → interval=30：846 放行、847（同作品另一渠道）
+        #   被 break，一直等到 22:30 才走。
+        #
+        # 现在改三步判断：
+        #   ① 这个 work_key 本轮已被挡 → 同作品其余渠道一起跳过（不计重复额度）；
+        #   ② 这个 work_key 本时段已放行 → 直接放行，不占名额（就是「同轮同步」）；
+        #   ③ 否则按部数判额度，满了只把这个作品记进 blocked，不 break 整轮——
+        #      后面若有别的作品早先已放行、它的第二渠道仍能跟上。
+        if pace["due"] is not None and task.kind != FORCE_TASK_KIND:
+            wk = str(task.work_key or "")
+            if wk in blocked_works:
+                stats["paced"] += 1
+                continue
+            if wk not in released_works:
+                if len(released_works) >= pace["due"]:
+                    blocked_works.add(wk)
+                    stats["paced"] += 1
+                    continue
+                released_works.add(wk)
         reuse_link = (str(task.share_url or "").strip()
                       and str(task.link_state or "") not in INVALID_LINK_STATES)
         if reuse_link:
@@ -3182,7 +3260,9 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
                                   response_json=_jdump({"queue_channel_id": channel.id})))
         db.commit()
         stats["submitted"] += 1
-        submitted_this_hour += 1
+        # v2.1.33：按「部」记账 —— 同一部剧的第二条渠道（群 / 频道）落进同一个
+        # work_key，不额外占本小时额度。
+        submitted_keys_hour.add(str(task.work_key or ""))
     return stats
 
 
@@ -3915,6 +3995,45 @@ def _aggregate_hot_works(db: Session, limit: int = 5) -> dict[str, Any]:
     return {"items": items, "metric": "TMDB 评分", "note": "按已落库的 TMDB 评分排序，非设计稿示例热度值"}
 
 
+def _mark_expect_release(db: Session, rows: list[dict[str, Any]]) -> None:
+    """给还**没发出去**的队列行补一个「预计放行时刻」（v2.1.33）。
+
+    真机 #3：「22 点推送的八仙，超时未推送（推送队列显示 22 点，实际排期时间是
+    22 点 30）」。根因不在调度，而在**时间列取错了字段**：`scheduled_at` 写的是
+    `utcnow()`——建这条任务的那一刻，不是「计划什么时候推」。队列拿它当推送时间
+    显示，看上去自然永远是「已到点却没发」。
+
+    这里按匀速节奏反推一个可解释的时刻：
+        预计 = 时段起点 + (本时段已放行部数 + 该作品在待发队列里的序号) × interval
+    已发出去的行不设这个字段，前端直接用实际发送时间。
+    """
+    now = utcnow()
+    try:
+        pace = _period_pace(db, now)
+    except Exception:
+        db.rollback()
+        return
+    if pace.get("due") is None or not int(pace.get("interval") or 0):
+        return
+    released = _period_released_works(db, pace)
+    start_sh = pace["period_start"]
+    interval = int(pace["interval"])
+    # 待发作品的先后：按队列时间排；同一作品只算一次（它的多条渠道一起走）
+    pending: dict[str, int] = {}
+    for r in sorted(rows, key=lambda x: str(x.get("scheduled_at") or x.get("created_at") or "")):
+        wk = str(r.get("work_key") or "")
+        if not wk or wk in released or wk in pending:
+            continue
+        pending[wk] = len(released) + len(pending)
+    for r in rows:
+        wk = str(r.get("work_key") or "")
+        idx = pending.get(wk)
+        if idx is None:
+            continue
+        at = start_sh + timedelta(minutes=interval * idx)   # type: ignore[operator]
+        r["expect_release_at"] = at.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
     """推送三视图：历史(published)/队列(active)/失败(failed)真实任务行。
 
@@ -3940,7 +4059,8 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
     # 队列时间口径 = 计划时间优先、没有才退创建时间（与前端 `scQueueClock` 一致）。
     queue_clock = func.coalesce(SCPublishTask.scheduled_at, SCPublishTask.created_at)
 
-    def rows_for(statuses: set[str] | None, *, clock, day_of) -> list[dict[str, Any]]:
+    def rows_for(statuses: set[str] | None, *, clock, day_of,
+                 with_expect: bool = False) -> list[dict[str, Any]]:
         """按 `clock`（该表时间列的同一口径）倒序取，再裁到当天。
 
         为什么按时间列排序而不是按 id：失败任务重试后 id 很小、`updated_at` 却是
@@ -3984,6 +4104,9 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
             # 标签失效（新上映过期）后自然会变成存量排期，但一条早就推完的历史记录
             # 上写「存量排期」没有信息量，用户要的是「失效就消失」。
             row["tags"] = _tags_for_status(raw_tags, str(row.get("status") or ""))
+        # v2.1.33：只给「推送队列」补预计放行时刻（历史/失败两张表看的是既成事实）
+        if with_expect:
+            _mark_expect_release(db, out)
         return out
 
     return {
@@ -3994,7 +4117,8 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
                             day_of=lambda r: r.get("published_at") or r.get("updated_at")),
         # 队列：按「计划推送时间」判日（没有就退创建时间）
         "queue": rows_for(ACTIVE_TASK_STATUS, clock=queue_clock,
-                          day_of=lambda r: r.get("scheduled_at") or r.get("created_at")),
+                          day_of=lambda r: r.get("scheduled_at") or r.get("created_at"),
+                          with_expect=True),
         # 失败：按最后一次失败时间判日（时间列显示的就是它）
         "failed": rows_for({"failed"}, clock=SCPublishTask.updated_at,
                            day_of=lambda r: r.get("updated_at")),
