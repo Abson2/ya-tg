@@ -2035,10 +2035,25 @@ def plan_engine(db: Session) -> dict[str, int]:
         # 只取**每部作品的最新快照**：同一作品有多个版本时，旧版本不该各占一个候选位。
         latest_ids = (select(func.max(SCLibraryVersion.id))
                       .group_by(SCLibraryVersion.work_key))
+        # v2.1.35（真机：「全天排期很空」）：**在库过滤必须放在 SQL 层**。
+        #
+        # 根因：`SCLibraryVersion` / `SCWorkCategory` 不会随资源库清理而删——作品被
+        # 移出资源库后，这两张表的记录还在，成了「死快照」。候选原先只按 id 升序
+        # 无过滤地取 `work_limit` 条（这个数由**发布规则**配，缺省才回落 50），
+        # 死快照照样占名额；而循环里的
+        # `work_key not in live_keys` 判断在**这道 SQL 之后**才执行，于是只要前
+        # 50 条恰好都是死快照，本轮就一个任务都建不出来，`task_count` 一直是 0，
+        # `work_limit` 永远轮不到后面的活作品——用户看到的就是「排期很空」。
+        #
+        # 把过滤提到 SQL 层，`work_limit` 才真正落在在库作品上。`live_keys` 仍是
+        # `_live_work_keys` 实时扫 Resource 派生的唯一事实依据，不新增记录状态字段，
+        # 也**不碰游标回退**（红线：游标永不回退，`rewind_cursor_for_work` 原样保留）。
+        # 参数规模：live_keys 千级，SQLite 3.50 的绑定上限 32766，余量充足。
         base_q = (select(SCLibraryVersion)
                   .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
                   .where(SCWorkCategory.category_key == category.category_key)
-                  .where(SCLibraryVersion.id.in_(latest_ids)))
+                  .where(SCLibraryVersion.id.in_(latest_ids))
+                  .where(SCLibraryVersion.work_key.in_(live_keys)))
         versions = list(db.scalars(
             base_q.where(SCLibraryVersion.id > cursor.last_library_version_id)
             .order_by(SCLibraryVersion.id).limit(work_limit)).all())
@@ -2510,6 +2525,23 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     quiet_start = int(cycle.get("quiet_start") or 0)
     quiet_end = int(cycle.get("quiet_end") or 0)
 
+    # v2.1.35（用户口径）：时、日、周、月与分类的推送上限**一律由发布规则给**，
+    # 代码里不写死任何一个数字。这里把 `plan_engine` 开头那道日/周/月额度门禁
+    # （`_cycle_quota_gate`，读的是发布规则的 `cycle_plan.day_max/week_max/month_max`
+    # 与休止窗口）也接到预测侧来 —— 此前只有实跑消费它，于是额度吃满时出现
+    # 「实跑 0 部、排期表照旧预测一堆」的同屏矛盾（v2.1.19 红线：预测与实跑同口径）。
+    quota_blocked, quota_code = _cycle_quota_gate(db, cycle)
+    quota_reason = {
+        "day_quota": "今日推送部数已达发布规则上限",
+        "week_quota": "本周推送部数已达发布规则上限",
+        "month_quota": "本月推送部数已达发布规则上限",
+        "weekly_rest": "已到本周休止时段，普通排期暂停",
+        "monthly_rest": "已到本月休止日，普通排期暂停",
+    }.get(quota_code, "已达发布规则上限")
+    if quota_blocked:
+        out["notes"].append(
+            f"{quota_reason}，今天不再往下排；已建好的任务照常显示。")
+
     live_keys = _live_work_keys(db)
     slots = _SlotIndex(db, live_keys=live_keys)
 
@@ -2571,7 +2603,15 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         q = (select(SCLibraryVersion)
              .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
              .where(SCWorkCategory.category_key == cat_key)
-             .where(SCLibraryVersion.id.in_(latest_ids)))
+             .where(SCLibraryVersion.id.in_(latest_ids))
+             # v2.1.35（真机「全天排期很空」）：**在库过滤必须放在 SQL 层**。
+             # 快照表不随资源库清理删除，作品移出资源库后 SCLibraryVersion /
+             # SCWorkCategory 记录仍在（「死快照」）。它们按 id 升序排在前面，
+             # 发布规则里配的 `work_limit` 名额被它们吃掉 → picks 全空 → 排 0 部。
+             # 循环内的 `wk not in live_keys` 校验在 SQL 之后才跑，救不回来。
+             # 这里加过滤让 50 个名额全给在库作品，游标一次越过整个死区。
+             # live_keys 为空时 in_([]) 生成恒假条件 → 返回空，是正确行为，勿特判。
+             .where(SCLibraryVersion.work_key.in_(live_keys)))
         if after_id is not None:
             q = q.where(SCLibraryVersion.id > after_id)
         q = q.order_by(SCLibraryVersion.id)
@@ -2683,6 +2723,15 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                                      "items": built_items,
                                      "blocked": "" if built_items else "静默保护时段"})
                 continue
+
+        # v2.1.35：日/周/月额度或休止窗口命中时，本小时不再预测（已建任务照常显示）。
+        # 上限值全部来自发布规则，这里只做「如实留空 + 说明卡在哪」。
+        if quota_blocked:
+            out["today_total"] += built_count
+            out["hours"].append({"hour": h, "total": built_count,
+                                 "items": built_items,
+                                 "blocked": "" if built_items else quota_reason})
+            continue
 
         cats = kept
         bound_key = str(getattr(win, "category_key", "") or "") if win else ""

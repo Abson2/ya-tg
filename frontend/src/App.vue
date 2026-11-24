@@ -236,11 +236,17 @@ const scTaskStatusLabel = (status) => ({
 // v2.1.21：推送类型中文化。此前全站写的是 `kind==='first' ? '首次' : '追更'`
 // 的二选一，手动强推（force）会被当成「追更」显示——用户手动点的那次推送
 // 在历史里被标成追更，语义直接错。收敛成一个函数，三态各自如实。
+//
+// v2.1.35（用户口径）：三张表（推送历史 / 推送队列 / 推送失败）的推送类型必须是
+// **同一个词**。原先 `first` 分长短两套（`short` → 「首次」、默认 → 「首次发布」），
+// 于是「推送队列」里的待排期行和「推送任务」页显示「首次发布」，历史与失败显示
+// 「首次」——同一个含义两种写法，用户当场就指出来了。现在统一成「首次」。
+// `short` 形参保留只为不动既有调用点，**不再影响文案**（first 的两种取值合并成一种）。
 const scKindLabel = (kind, short = false) => ({
-  first: short ? '首次' : '首次发布',
+  first: '首次',
   update: '追更',
   force: '手动推送',
-}[kind || ''] || '首次发布')
+}[kind || ''] || '首次')
 // v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）。
 // 判定完全在后端 `_work_push_tags` 一处出（今日推送排期 / 推送历史 / 推送队列 /
 // 推送任务四处共用），前端只渲染，绝不在两端各算一套口径。
@@ -2571,15 +2577,17 @@ function scQueueClock(row) {
   return scDayClock(row.scheduled_at || row.created_at)
 }
 // v2.1.25（用户口径 2）：**「推送类型」和「分类」是两列、两个维度，任何一处都不许拼**。
-//   推送类型（来源）—— 首次发布 / 追更 / 手动推送，来自任务的 `kind`；
-//                        「待排期」行还没建任务，落库时必然是首推 → 首次发布；
+//   推送类型（来源）—— 首次 / 追更 / 手动推送，来自任务的 `kind`；
+//                        「待排期」行还没建任务，落库时必然是首推 → 首次；
 //   分类（题材）    —— 只取 TMDB 分类（后端 `_work_categories` / `_task_category_names`），
 //                        取不到给「—」，绝不拿推送类型顶替。
 // 此前队列里两种情况共用一格：在途行显示 kind、待排期行显示分类，看着就是
 // 「分类列既有追更又有题材」——那是渲染错位，不是数据错。
 function scQueueKindLabel(row) {
   if (!row) return '—'
-  if (row._src === 'plan') return '首次发布'
+  // v2.1.35（用户口径）：待排期行原来单给「首次发布」，三张表里就它一个写法不同。
+  // 排队即首次，与真实任务行同一个词。
+  if (row._src === 'plan') return '首次'
   return scKindLabel(row.kind, true)
 }
 function scQueueCategoryLabel(row) {
@@ -2588,7 +2596,7 @@ function scQueueCategoryLabel(row) {
   return name || '—'
 }
 // v2.1.26（用户口径 5）：**排期类型**——新上映 / 新入库 / 存量排期。
-// 这是第三个维度，与「推送类型」（首次发布/追更/手动推送，看这条为什么推）和
+// 这是第三个维度，与「推送类型」（首次/追更/手动推送，看这条为什么推）和
 // 「分类」（TMDB 题材）都不同：排期类型回答的是「它在排期里归哪一档」。
 // 判定完全在后端 `_schedule_kind_of` 一处出（三视图 + 今日排期 works 都带
 // `schedule_kind`），前端只渲染；待排期行也直接透传该字段，不再自己从 tags 挑。
@@ -3478,7 +3486,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.34 · Asia/Shanghai</span>
+          <span>v2.1.35 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4753,7 +4761,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                          时间 | 资源名称 | 分类 | 推送类型 | 排期类型 | 状态
                        三个维度彼此独立，任何一格都不许混装：
                          · 分类     = TMDB 题材（看是什么片）
-                         · 推送类型 = 首次发布 / 追更 / 手动推送（看这条为什么推）
+                         · 推送类型 = 首次 / 追更 / 手动推送（看这条为什么推）
                          · 排期类型 = 新上映 / 新入库 / 存量排期（看它在排期里归哪档）
                        时间列只给 `HH:mm`：三表数据都限定「当天」，「时间」再去区分
                        该看 0-24 点（上海时区）内发生了什么。 -->
@@ -4924,7 +4932,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <div class="sc-media-text">
                           <b>{{ s.row.share_title || '未命名作品' }}</b>
                           <!-- v2.1.25（用户口径 2）：这一行只留**推送类型**
-                               （首次发布 / 追更 / 手动推送）。原先把「电影/剧」当类型
+                               （首次 / 追更 / 手动推送）。原先把「电影/剧」当类型
                                显示，那是媒体形态不是推送类型，已纠正；分类移到独立列。 -->
                           <small>{{ scKindLabel(s.row.kind, true) }}</small>
                         </div>
