@@ -8,7 +8,15 @@ const SESSION_KEY = 'ya_tg_session'
 const password = ref('')                                    // 仅登录框临时持有，登录后清空
 const sessionToken = ref(localStorage.getItem(SESSION_KEY) || '')
 const sessionRemaining = ref(0)                             // 剩余未活跃秒数（轮询会话状态）
-const authed = ref(false)
+// v2.1.29（用户口径 1）：`authed` 由布尔改为**三态**，根治「刷新页面先闪一下」。
+//   false —— 确定未登录（本地没有 token）
+//   null  —— 会话恢复中（有 token，正等 /auth/status 回来），首帧只渲染中性骨架屏
+//   true  —— 已登录
+// 旧写法初值恒为 false：首帧必然走「登录页」分支，等 onMounted 里 `await load()`
+// 回来才切到主界面 —— 用户看到的就是「刷新一下先闪登录页」（现场口径 1）。
+// 现在：没有 token 直接落 false（首帧就是登录页，不再抖）；有 token 先落 null，
+// 等结果回来一次性落定，绝不会出现「先见主界面再弹回登录页」。
+const authed = ref(sessionToken.value ? null : false)
 // v0.9.13 #252：刷新后保留当前页面。审核中心已删除，历史残留值回退到概览。
 const TAB_STORAGE_KEY = 'ya_tg_current_tab'
 const _savedTab = localStorage.getItem(TAB_STORAGE_KEY) || '概览'
@@ -3351,9 +3359,14 @@ onMounted(async () => {
   tick(); clockTimer = setInterval(tick, 1000)
   localStorage.removeItem('ya_tg_password')  // v0.9.20：清理历史版本遗留的明文密码
   // v0.9.20：有 token 则尝试恢复会话（load 会验证 token 有效性；过期自动回登录页）
+  // v2.1.29：三态落定——成功 true、失败**必须显式**落 false，
+  // 否则 `null` 会一直停在骨架屏（旧布尔版靠初值 false 兜底，改三态后必须自己收口）。
   if (sessionToken.value) {
     try { await load(); authed.value = true }
-    catch (e) { sessionToken.value = ''; localStorage.removeItem(SESSION_KEY) }
+    catch (e) {
+      sessionToken.value = ''; localStorage.removeItem(SESSION_KEY)
+      authed.value = false
+    }
   }
   // 会话状态 30s 轮询一次（只读，不刷新活跃时间），剩余时间到期由服务端 401 强制退出
   sessionPollTimer = setInterval(pollSession, 30000)
@@ -3364,7 +3377,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 </script>
 
 <template>
-  <div v-if="!authed" class="login-screen">
+  <!-- v2.1.29（用户口径 1）：会话恢复中只渲染中性骨架屏。
+       恢复期既不是登录页也不是主界面，落定后才切一次，视觉上不再来回跳。 -->
+  <div v-if="authed === null" class="boot-screen" aria-busy="true">
+    <img class="brand-logo lg" src="/logo.svg" alt="Ya-TG"/>
+    <div class="boot-text">正在恢复会话…</div>
+  </div>
+
+  <div v-else-if="authed === false" class="login-screen">
     <div class="login-deco d1"></div><div class="login-deco d2"></div>
     <div class="login-card">
       <div class="login-brand"><img class="brand-logo lg" src="/logo.svg" alt="Ya-TG"/><div><h1>Ya-TG</h1><p>光鸭资源分发工作台</p></div></div>
@@ -3395,7 +3415,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.28 · Asia/Shanghai</span>
+          <span>v2.1.29 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -6128,6 +6148,13 @@ button{font-family:inherit}
 .preview-box{border:1px dashed var(--yg-line);border-radius:12px;padding:14px;background:var(--yg-surface)}.preview-title{font-size:11px;color:var(--yg-muted);margin-bottom:8px}.preview-body{font-size:13px;white-space:pre-wrap;line-height:1.7;min-height:60px}
 .mt{margin-top:12px}.ml{margin-left:18px}
 .login-screen{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,var(--yg-bg) 0%,var(--yg-surface) 60%,var(--yg-tone-teal-bg) 100%);position:relative;overflow:hidden}
+/* v2.1.29（用户口径 1）：会话恢复中的中性骨架屏。
+   背景与登录页同一套渐变，所以「骨架 → 登录页」视觉上是原地不动；
+   「骨架 → 主界面」也只是一次淡入，不存在先闪一下再跳的情况。 */
+.boot-screen{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:linear-gradient(135deg,var(--yg-bg) 0%,var(--yg-surface) 60%,var(--yg-tone-teal-bg) 100%)}
+.boot-screen .brand-logo.lg{animation:bootPulse 1.15s ease-in-out infinite}
+.boot-text{font-size:12px;color:var(--yg-muted);letter-spacing:.5px}
+@keyframes bootPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.94)}}
 .login-deco{position:absolute;border-radius:50%;filter:blur(2px)}.login-deco.d1{width:420px;height:420px;background:rgba(91,91,214,.10);top:-140px;left:-100px}.login-deco.d2{width:360px;height:360px;background:rgba(25,179,166,.11);bottom:-120px;right:-80px}
 .login-card{width:400px;max-width:90vw;background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:22px;padding:34px;box-shadow:var(--yg-shadow-lg);z-index:1}
 .login-brand{display:flex;align-items:center;gap:14px}.login-brand h1{margin:0;font-size:24px;letter-spacing:-.5px}.login-brand p{margin:3px 0 0;color:var(--yg-muted);font-size:12px}
@@ -6289,6 +6316,90 @@ button{font-family:inherit}
   .media-grid{gap:8px}
   .series-card .media-actions .el-button{font-size:10px;padding:4px 6px}
   .stat-card{padding:14px}
+}
+
+/* ============ v2.1.29（用户口径 2）：以 iPhone 15 Pro 为基准的手机适配 ============
+   基准机型：iPhone 15 Pro，浏览器 Edge 手机版，CSS 视口 393×852（15 Pro Max 430×932）。
+   ≤430 一档同时覆盖这两台，且**只调布局尺寸，不动结构**：9 个 tab、4 个子页、
+   三表 6 列、每个按钮都保留，不隐藏任何入口（隐藏入口属于删功能）。
+
+   逐条对着真机会出问题的地方改：
+   ① 100vh 在移动浏览器里永远按「地址栏收起后」的最大高度算 → 底部被 Home 指示条
+      盖住一截。统一补 100dvh（不支持 dvh 的浏览器自动回落到前一条 100vh）。
+   ② 灵动岛 / Home 指示条需要 env(safe-area-inset-*)，配套 index.html 的
+      viewport-fit=cover（不加则 env() 恒为 0，等于白写）。
+   ③ 顶栏 + 导航两条都 sticky 会叠在一起吃掉约 160px 竖屏空间，手机上只留导航吸顶。
+   ④ 三表 6 列合计 436px > 393px：靠 el-table 自身横向滑动，卡片内边距和字号收紧，
+      让「资源名称」那列还有 92px 可读宽度（不至于只剩省略号）。
+   ⑤ Element Plus 的 size="small" 按钮只有 24px 高，手指点不准 → 统一抬到 32-34px。 */
+@media (max-width:430px){
+  /* ① 动态视口高度 */
+  .app-shell{min-height:100vh;min-height:100dvh}
+  .login-screen,.boot-screen{min-height:100vh;min-height:100dvh}
+  /* ② 安全区：导航让开灵动岛，底部内容让开 Home 指示条 */
+  html{-webkit-text-size-adjust:100%}
+  body{overflow-x:hidden}
+  .sidebar{padding-top:env(safe-area-inset-top)}
+  .content{padding:12px 10px calc(30px + env(safe-area-inset-bottom))}
+  .login-screen{padding:calc(16px + env(safe-area-inset-top)) 14px calc(16px + env(safe-area-inset-bottom))}
+  /* ③ 只留导航吸顶：顶栏改为随页面滚走，竖向多出 56px 给内容 */
+  .topbar{position:static;height:auto;min-height:44px;padding:6px 10px;gap:6px;
+          padding-left:calc(10px + env(safe-area-inset-left));padding-right:calc(10px + env(safe-area-inset-right))}
+  .top-actions{gap:5px;flex-wrap:nowrap}
+  .top-actions .el-button{min-height:30px;padding:5px 8px;font-size:12px}
+  .crumb{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* 顶部横排导航：9 个入口横向滑，不换行、不隐滚动条以外的东西 */
+  .nav-groups{padding:6px 8px;gap:4px;scrollbar-width:none}
+  .nav-groups::-webkit-scrollbar{display:none}
+  .nav-item{min-height:36px;padding:7px 10px;font-size:12px;gap:6px}
+  .nav-item .ico{width:14px;height:14px}
+  /* ④ 三表：内边距 / 字号收紧，表格靠自身横向滑动 */
+  .sc-dash,.sc-three-tables{gap:12px}
+  .sc-card{padding:14px 12px;border-radius:12px}
+  .sc-card-head{gap:8px}
+  .sc-card-head h3{font-size:14px}
+  .sc-card-head p{font-size:11px}
+  .sc-three-tables .el-table{font-size:11px}
+  .sc-three-tables .el-table .cell{padding:0 4px;line-height:1.42}
+  .sc-three-tables .el-table th.el-table__cell>.cell{font-size:11px}
+  .sc-title-text{max-width:100%}
+  /* KPI / 统计卡：手机上一律两列（六列在 393px 会被压成一堆竖排的窄条） */
+  .sc-kpi-grid,.sc-kpi-six,.sc-stat-row,.stat-grid,.stats-cards,.pipeline-flow{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .sc-kpi-six .sc-kpi,.sc-kpi{padding:12px;gap:10px;min-height:64px}
+  .sc-kpi-six .sc-kpi-ico{width:32px;height:32px;font-size:15px}
+  .sc-kpi-six .sc-kpi-body b{font-size:19px}
+  .sc-kpi-body small{font-size:11px}
+  /* 图表：环形图竖排，别把三张卡撑成三屏 */
+  .sc-dash-three .sc-trend-svg{flex:none;height:132px;min-height:132px}
+  .sc-ratio-wrap{flex-direction:column;align-items:stretch;gap:10px;min-height:0}
+  .sc-donut{width:104px;height:104px;align-self:center}
+  .sc-ratio-legend{width:100%}
+  .sc-fc-works,.sc-fc-cat-line{flex-wrap:wrap}
+  .sc-fc-table{font-size:11px}
+  /* ⑤ 触控目标：手指点得准 */
+  .el-button{min-height:34px}
+  .el-button--small{min-height:32px;padding:7px 10px}
+  .el-input__wrapper,.el-select__wrapper,.el-textarea__inner{min-height:34px}
+  .el-checkbox,.el-radio{min-height:30px}
+  .sc-link-btn{padding:7px 8px}
+  .sc-seg button{padding:6px 9px}
+  .pager-row .el-pagination .el-pager li,.pager-row .el-pagination button{min-width:30px;height:30px}
+  /* 模板里写死 px 宽度的控件（分享管理 280/130px）在 393 屏会横向溢出 → 各占一整行。
+     用 !important 压过内联 style，只影响窄屏，PC 端宽度原样不动。 */
+  .sc-form-row,.inline-form,.discover-bar{gap:8px}
+  .sc-form-row>.el-input,.sc-form-row>.el-select,.sc-form-row>.el-button,
+  .head-tools .el-input,.head-tools .el-select{width:100%!important;flex:1 1 100%;margin-left:0!important}
+  .sc-form-row .el-button+.el-button{margin-left:0}
+  .sc-cycle-grid{gap:12px 16px}
+  /* 弹窗 / 抽屉：几乎满屏，别留空白挤内容（详情仍是隐藏式弹窗，未改成页面） */
+  .el-dialog{width:94%!important;margin-top:4vh!important}
+  .el-dialog__body{padding:14px}
+  .el-drawer.rtl,.el-drawer.ltr{width:92%!important}
+  /* 登录卡片：400px 固定宽在手机上要撑满 */
+  .login-card{width:100%;max-width:100%;padding:24px 18px;border-radius:18px}
+  .login-brand h1{font-size:21px}
+  .login-hint{font-size:11px;line-height:1.6}
+  .login-foot{font-size:10px}
 }
 /* v0.9.14 #258：自动发现群组 / 多目标路由 */
 .discover-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
