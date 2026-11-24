@@ -2710,6 +2710,12 @@ async function scRun() {
       `可清理的失败任务 ${pre.tasks_invalid || 0} 个`,
       `待排队 ${pre.plannable || 0} 个推送目标（一部作品推一个渠道算一个）；另有 ${pre.blocked_pushed || 0} 个已推过且链接仍有效，不会重推。`,
     ]
+    // v2.1.31：这些是被队列行顶掉、永远等不到回执的任务，页面一直显示「已提交」
+    // 不动，用户看起来就像「没推成功」。本次会归档成「已跳过投递」（不删记录）。
+    if (pre.tasks_orphan) {
+      lines.push(`另有 ${pre.tasks_orphan} 个任务卡在「已提交」等不到回执`
+        + `（同一作品在同一渠道已有成功投递），本次会归档为「已跳过投递」。`)
+    }
     if (!pre.hour_allowed) {
       lines.push('当前时段没有命中分类排期窗口：本次只做清理，任务到各自时段再排。')
     }
@@ -2730,6 +2736,8 @@ async function scRun() {
       `清除已推标记 ${d.marks_reset || 0} 条`,
       `重排 ${q.items || 0} 项 / ${q.tasks || 0} 个任务`,
     ]
+    // v2.1.31：只有真归档了才提，避免每次都在提示里塞一个「0 个」。
+    if (d.orphans_closed) done.push(`归档重复投递 ${d.orphans_closed} 个`)
     ElMessage.success(`手动扫描完成：${done.join(' · ')}`)
     await loadSc(); return d
   } catch (e) {
@@ -3415,7 +3423,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.30 · Asia/Shanghai</span>
+          <span>v2.1.31 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

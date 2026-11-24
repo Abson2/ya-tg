@@ -3224,6 +3224,64 @@ async def run_cycle(db: Session, limit: int = 20) -> dict[str, Any]:
         _CYCLE_LOCK.release()
 
 
+def _orphan_submitted_tasks(db: Session, *, limit: int = 200) -> list[SCPublishTask]:
+    """找出「已被同渠道后续任务顶掉、永远等不到回写」的 submitted 任务。
+
+    v2.1.31 存量回收。判据（三条同时成立才算，宁可漏不可错杀）：
+      ① 本任务还停在 `submitted`（已交给队列、但没拿到终态）；
+      ② 同作品同渠道有一条 `published` 兄弟任务；
+      ③ 那条兄弟任务的 `published_at` **不早于**本任务的 `created_at`
+         —— 说明是本任务入队之后才投出去的，能代表「这次投递」已经发生。
+
+    为什么不能只按「没有队列行指向它」判：队列行会被归档/复用，单看引用会误伤。
+    命中后不物理删除，只归档为 `skipped`（页面显示「已跳过投递」），历史行与
+    执行记录全保留 —— 与全站「清理一律归档」的口径一致。
+    """
+    rows = list(db.scalars(
+        select(SCPublishTask).where(SCPublishTask.status == "submitted")
+        .order_by(SCPublishTask.id).limit(int(limit))).all())
+    out: list[SCPublishTask] = []
+    for task in rows:
+        item_id = int(task.list_item_id or 0)
+        if not item_id:
+            continue
+        chat_id = db.scalar(select(SCPushListItem.chat_id).where(SCPushListItem.id == item_id))
+        if not chat_id:
+            continue
+        done = db.scalar(
+            select(func.count()).select_from(SCPublishTask)
+            .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+            .where(SCPushListItem.chat_id == str(chat_id),
+                   SCPublishTask.work_key == str(task.work_key or ""),
+                   SCPublishTask.status == "published",
+                   SCPublishTask.id != int(task.id),
+                   SCPublishTask.published_at.is_not(None),
+                   SCPublishTask.published_at >= task.created_at))
+        if done:
+            out.append(task)
+    return out
+
+
+def _close_orphan_submitted(db: Session, tasks: list[SCPublishTask]) -> int:
+    """把孤儿 submitted 任务归档为 `skipped`，返回条数。
+
+    与 `mark_result` 成功收口兄弟任务**同一语义**（都是「这个作品在这个渠道已经
+    发出去了，本条不该再投」），所以同样写一条 `skipped` 执行记录留痕 ——
+    只改状态不写记录，事后就查不出是谁把它归档的、为什么归档。
+    """
+    now = utcnow()
+    for task in tasks:
+        task.status = "skipped"
+        task.error = ("同作品同渠道已由另一条任务发出，本条重复投递跳过"
+                      "（队列行被复用导致回写缺失，已由手动扫描回收）")[:1000]
+        task.updated_at = now
+        db.add(SCPublishExecution(task_id=task.id, stage="send", status="skipped",
+                                  started_at=now, finished_at=now,
+                                  response_json=_jdump({"reason": "orphan_submitted",
+                                                        "recovered_by": "repair_cycle"})))
+    return len(tasks)
+
+
 async def repair_cycle(db: Session, *, dry_run: bool = True,
                        limit: int = 50) -> dict[str, Any]:
     """手动扫描（v2.1.18 升级）：体检 → 自愈 → 重排 → 推送。
@@ -3249,6 +3307,9 @@ async def repair_cycle(db: Session, *, dry_run: bool = True,
     live = _live_work_keys(db)
     task_pairs, task_total = _scan_invalid_tasks(db)
     link_pairs, link_total = _scan_invalid_links(db)
+    # v2.1.31：顺手把「被队列行顶掉、永远等不到回写」的 submitted 孤儿任务捞出来。
+    # 存量库里这些行会一直显示「已提交」不动，用户看起来就像「没推成功」。
+    orphans = _orphan_submitted_tasks(db, limit=limit)
     version = _active_version(db)
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
 
@@ -3283,6 +3344,7 @@ async def repair_cycle(db: Session, *, dry_run: bool = True,
         "links_total": link_total,
         "tasks_invalid": len(task_pairs),
         "tasks_total": task_total,
+        "tasks_orphan": len(orphans),
         "plannable": plannable,
         "blocked_pushed": blocked_pushed,
         "blocked_active": blocked_active,
@@ -3306,6 +3368,10 @@ async def repair_cycle(db: Session, *, dry_run: bool = True,
     try:
         tasks_done = cleanup_invalid_tasks(db)
         links_done = cleanup_invalid_links(db)
+        # v2.1.31：孤儿 submitted 一并归档（不删行，只改状态 + 留痕原因）
+        orphans_closed = _close_orphan_submitted(db, orphans)
+        if orphans_closed:
+            db.commit()
         cursors_reset = 0
         sync: dict[str, int] = {}
         plan: dict[str, int] = {}
@@ -3325,6 +3391,7 @@ async def repair_cycle(db: Session, *, dry_run: bool = True,
         "dry_run": False,
         "cleaned_links": int(links_done.get("cleaned") or 0),
         "cleaned_tasks": int(tasks_done.get("cleaned") or 0),
+        "orphans_closed": int(orphans_closed),
         "marks_reset": (int(links_done.get("marks_reset") or 0)
                         + int(tasks_done.get("marks_reset") or 0)),
         "cursors_reset": cursors_reset,
@@ -3378,15 +3445,44 @@ def claim_tasks(db: Session, worker: str, limit: int = 20) -> list[SCPublishTask
     return claimed
 
 
+def _sibling_tasks(db: Session, task: SCPublishTask, *, status: str) -> list[SCPublishTask]:
+    """同一「作品 × 渠道」下、指定状态的**其它**任务。
+
+    v2.1.31（地道战「看着没推成功」根治）：队列行是按 `(resource_id, channel_id)`
+    唯一的（`uq_resource_channel`），一条队列行同时只能记住**一个** task.id
+    （`q.event_id = task.id`）。同一作品在一轮里既有 first 又有 update、又指向
+    同一个渠道时，后提交的那条会把 `q.event_id` 顶掉，前一条任务就永远等不到回写
+    ——真机证据：地道战 6 条任务只对应 2 条队列项，115 带 event_id=804、
+    116 带 event_id=656，于是 655 / 802 双双停在 submitted 永不终结。
+
+    这里按 (work_key, chat_id) 归组：渠道用清单项的 chat_id 认，任务本身没有
+    渠道字段（`sc_publish_tasks` 只存 list_item_id）。
+    """
+    item_id = int(task.list_item_id or 0)
+    if not item_id:
+        return []
+    chat_id = db.scalar(select(SCPushListItem.chat_id).where(SCPushListItem.id == item_id))
+    if not chat_id:
+        return []
+    return list(db.scalars(
+        select(SCPublishTask)
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPushListItem.chat_id == str(chat_id),
+               SCPublishTask.work_key == str(task.work_key or ""),
+               SCPublishTask.status == status,
+               SCPublishTask.id != int(task.id))).all())
+
+
 def mark_result(db: Session, task_id: int, success: bool, error: str = "") -> dict[str, Any]:
     task = db.get(SCPublishTask, task_id)
     if not task:
         return {"ok": False, "reason": "任务不存在"}
+    now = utcnow()
     task.status = "published" if success else "failed"
     task.error = "" if success else error[:1000]
-    task.updated_at = utcnow()
+    task.updated_at = now
     if success:
-        task.published_at = utcnow()
+        task.published_at = now
         task.lease_owner = ""
         task.lease_expires_at = None
     execution = db.scalar(
@@ -3396,13 +3492,29 @@ def mark_result(db: Session, task_id: int, success: bool, error: str = "") -> di
     )
     if not execution:
         execution = SCPublishExecution(task_id=task_id, stage="send", status="running",
-                                       started_at=utcnow())
+                                       started_at=now)
         db.add(execution)
     execution.status = "success" if success else "failed"
     execution.error = "" if success else error[:1000]
-    execution.finished_at = utcnow()
+    execution.finished_at = now
+    # v2.1.31：**成功时把同组被顶掉的任务一起收口**。
+    # 队列行被后来的任务复用后，先前那条任务收不到回执；而这条消息其实已经把
+    # 「这个作品在这个渠道」投出去了，所以它不是失败、也不该再投一次 —— 按
+    # v2.1.6 已有的语义标成 `skipped`（页面显示「已跳过投递」）。
+    # 只在成功时做：失败时队列行会原地重试，兄弟任务要留着等重试结果。
+    closed = 0
+    if success:
+        for peer in _sibling_tasks(db, task, status="submitted"):
+            peer.status = "skipped"
+            peer.error = f"同作品同渠道已由任务 #{task.id} 发出，本次重复投递跳过"[:1000]
+            peer.updated_at = now
+            db.add(SCPublishExecution(task_id=peer.id, stage="send", status="skipped",
+                                      started_at=now, finished_at=now,
+                                      response_json=_jdump({"reason": "superseded_by",
+                                                            "task_id": int(task.id)})))
+            closed += 1
     db.commit()
-    return {"ok": True, "status": task.status}
+    return {"ok": True, "status": task.status, "siblings_closed": closed}
 
 
 # ---------------------------------------------------------------------------

@@ -615,8 +615,10 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
             if not complete:
                 prepass["skipped"] += 1
                 continue
+            # v2.1.31：只比 size 段 —— utime 单变不算内容变化（见 `_fp_size` 注释）
             changed_fp = sum(1 for r in rows if r.source_file_id in a_source_fps
-                             and a_source_fps[r.source_file_id] != str(r.fingerprint or ""))
+                             and _fp_size(a_source_fps[r.source_file_id])
+                             != _fp_size(str(r.fingerprint or "")))
             # 只在「该作品本轮会被选」的范围内做 B 库核对，控制接口开销
             candidates, verified = await api_b_candidates_safe(api, media)
             if not verified:
@@ -833,7 +835,29 @@ def _is_video(name: str) -> bool:
 
 
 def _fingerprint(item: dict) -> str:
+    """A 库文件的指纹串。
+
+    ⚠️ v2.1.31：**这个格式不能改**（仍是 `size:utime`）——库里 `mirror_files.fingerprint`
+    存的就是它，改格式会让全部存量行与新值对不上，被当成「A 库新文件」整库重拷一遍。
+    变化判定要剔除 utime 的话，走 `_fp_size()` 只比 size 段，见下面的比较点。
+    """
     return f"{int(item.get('fileSize', 0) or 0)}:{int(item.get('utime', 0) or 0)}"
+
+
+def _fp_size(value: str) -> str:
+    """取指纹里的 **size 段**，即「内容身份」。
+
+    v2.1.31（地道战假追更·治触发源 2）：utime 是网盘侧元数据修改时间，任何一次
+    重扫/触碰都可能让它单独跳动。它一旦变了，`(fileId, 指纹)` 就命中不了 → 本轮
+    把文件当成「A 库新内容」→ 重新复制一份到 B 库 → B 库 fileId 变 → 作品级快照
+    指纹（`sync_library_versions` 里的 `file_id:size`）跟着变 → 新版本 → **假追更**。
+    这条链路绕过了 scanner 的 size-only 判定，是另一个独立入口。
+
+    与 scanner（v2.1.25）、`sync_library_versions`（v2.1.6）统一为「内容身份 =
+    file_id + size」：这里只比 size 段，utime 一律不参与判定。
+    兼容两种存量写法：老格式 `size:utime` 与新口径 `size`。
+    """
+    return str(value or "").split(":", 1)[0]
 
 
 def _b_names(row: MirrorFile) -> list[str]:
@@ -1349,10 +1373,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             # 旧版把 copying / failed / unknown 也一起塞进 existing 判 unchanged，
             # 上一轮复制没成功的文件会被永久跳过、再点同步也没用——
             # 表现就是「B 库目录建好了、命名也对，里面却是空的」。
-            synced_rows = {(m.source_file_id, m.fingerprint): m
+            # v2.1.31：索引键改用「size 段」，老库存量 `size:utime` 与新值也能对上，
+            # 不会因为 utime 抖动被当成新文件重拷（详见 `_fp_size`）。
+            synced_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
                            for m in all_rows if m.status == "synced"}
             synced_identities = {m.identity for m in all_rows if m.status == "synced"}
-            retry_rows = {(m.source_file_id, m.fingerprint): m
+            retry_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
                           for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
             # v0.8.7 补上另一半：DB 标记 synced **也不等于** B 库真的有文件。
             # 用户实测「B 库影视文件夹下为空目录」反复出现，根因是文件被删 /
@@ -1413,14 +1439,15 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 if not fid or not _is_video(fname):
                     continue
                 fp = _fingerprint(item)
-                if (fid, fp) in synced_rows:
+                fp_size = _fp_size(fp)
+                if (fid, fp_size) in synced_rows:
                     stats["unchanged"] += 1
                     continue
                 # v2.1.4：A 库出现了本轮的新内容（指纹未命中）——即便这部作品曾被
                 # 「清空待处理清单」标记为 ignored，也必须解除标记、重新解析英文名，
                 # 否则它会永远停留在「永不翻译」状态，新集数也永远改不成英文名。
                 has_new_source_file = True
-                row = retry_rows.pop((fid, fp), None)
+                row = retry_rows.pop((fid, fp_size), None)
                 if row is not None:
                     # 复用旧记录重新复制，不新建行：避免唯一键冲突与历史留痕膨胀
                     identity = row.identity

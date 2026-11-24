@@ -234,7 +234,11 @@ A_ROOT, B_ROOT, A_WORK, B_WORK = "A_ROOT", "B_ROOT", "A_W1", "B_W1"
 class FakeMirrorAPI:
     """可控的 A/B 目录树；记录复制请求，验证 status=2 之外的状态不猜含义。"""
 
-    fp = 1
+    fp = 1        # A 文件的 utime（网盘侧元数据时间）
+    # v2.1.31：内容身份只看**大小**。此前这里只有 `fp` 一个可变量、又直接当 utime 用，
+    # 等于用「utime 变了」冒充「内容变了」—— 那正是假追更的根因（utime 一抖就重拷，
+    # B 库 fileId 变 → 快照指纹变 → 判成新版本）。现在大小独立可控，两种情况分开验。
+    size = 100
     copies = []
     task_status = 2
     # v0.8.7：模拟「复制任务落地后 B 库作品目录里真的有文件」。旧假 API 永远返回
@@ -252,7 +256,8 @@ class FakeMirrorAPI:
                               "fileName": "侠客行 (2001) {tmdb-135646}"}], "total": 1}
         if parent_id == A_WORK:
             return {"list": [{"fileId": "F1", "resType": 1, "fileName": "X.S01E01.mkv",
-                              "fileSize": 100, "utime": self.fp, "parentId": A_WORK}], "total": 1}
+                              "fileSize": self.size, "utime": self.fp,
+                              "parentId": A_WORK}], "total": 1}
         if parent_id == B_ROOT:
             return {"list": [{"fileId": B_WORK, "resType": 2,
                               "fileName": "侠*客*行 *(2001) {tmdb-135646}"}], "total": 1}
@@ -263,7 +268,7 @@ class FakeMirrorAPI:
     async def copy_file(self, file_ids, parent_id):
         self.copies.append((list(file_ids), parent_id))
         self.b_files.append({"fileId": f"BF{len(self.b_files) + 1}", "resType": 1,
-                             "fileName": "X.S01E01.mkv", "fileSize": 100,
+                             "fileName": "X.S01E01.mkv", "fileSize": self.size,
                              "utime": self.fp, "parentId": parent_id})
         return "TASK1"
 
@@ -296,7 +301,16 @@ def test_mirror_incremental_and_never_pushes_tg(db):
         assert second["new"] == 0 and second["unchanged"] == 1, second  # 无变化不重复复制
         assert len(FakeMirrorAPI.copies) == 1
 
-        FakeMirrorAPI.fp = 9  # A 文件内容变化
+        # v2.1.31 反证：utime 单独跳一下**不算**内容变化，不得重拷。
+        # 旧版这里就是拿 fp（=utime）当「内容变了」，于是每次网盘侧触碰都会重拷一遍，
+        # B 库 fileId 跟着变 → 作品快照指纹变 → 用户看到的是「追更」。
+        FakeMirrorAPI.fp = 9
+        touched = asyncio.run(mirror.sync_rule(db, r))
+        assert touched["new"] == 0 and touched["changed"] == 0, touched
+        assert len(FakeMirrorAPI.copies) == 1, "只改了 utime，不该重新复制"
+
+        # 真正的内容变化：大小变了 → 必须重拷一次，旧行标 superseded 不删除。
+        FakeMirrorAPI.size = 200
         third = asyncio.run(mirror.sync_rule(db, r))
         assert third["new"] == 1 and third["changed"] == 1, third
         rows = list(db.scalars(select(MirrorFile)).all())

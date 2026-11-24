@@ -26,6 +26,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _offline():
+    """v2.1.31：切断候选交互的 Telegram 网络出口。
+
+    这三条用例原本会经 `_handle_pick → _edit_or_send → _api` 真发一次
+    `editMessageText`（token 是假值「tok」）。本地网络正常时请求很快被
+    Telegram 驳回、用例照过；一旦外网抖动就整条抛 `httpx.ConnectTimeout`
+    —— v2.1.31 发版时真踩过一次，全量跑了两遍才定位到是它。
+    这些用例只验证「会话态是否清掉 / 业务是否落库」，不验证网络，故统一断开。
+    """
+    return patch.object(bot_listener, "_edit_or_send",
+                        new=AsyncMock(return_value="pick"))
+
+
 @pytest.fixture
 def session():
     migrate()
@@ -70,7 +83,7 @@ def test_want_plain_title_returns_candidates(session):
 
 def test_want_pick_lands_tmdb_fields(session):
     bot_listener._pick_set("u2", "want", "十万狂花入梦来", CANDIDATES)
-    with patch.object(bot_listener, "answerCallbackQuery", create=True):
+    with patch.object(bot_listener, "answerCallbackQuery", create=True), _offline():
         with patch.object(bot_listener.tgto, "upsert_keyword",
                           new=AsyncMock(return_value={"ok": True})):
             out = _run(bot_listener._handle_pick(
@@ -85,7 +98,7 @@ def test_want_pick_lands_tmdb_fields(session):
 
 def test_contribute_pick_then_link(session):
     bot_listener._pick_set("u3", "contribute", "十万狂花入梦来", CANDIDATES)
-    with patch.object(bot_listener, "answerCallbackQuery", create=True):
+    with patch.object(bot_listener, "answerCallbackQuery", create=True), _offline():
         _run(bot_listener._handle_pick(
             session, "tok", "pk.contribute.0", uid="u3", chat_id="c3", message_id=1))
     assert session.query(UserContribution).count() == 0  # 等链接
@@ -120,7 +133,7 @@ def test_want_tmdb_unavailable_degrades_to_direct(session):
 
 def test_pick_cancel_and_skip_clear_session(session):
     bot_listener._pick_set("u6", "want", "x", CANDIDATES)
-    with patch.object(bot_listener, "answerCallbackQuery", create=True):
+    with patch.object(bot_listener, "answerCallbackQuery", create=True), _offline():
         _run(bot_listener._handle_pick(
             session, "tok", "pk.want.cancel", uid="u6", chat_id="c6", message_id=1))
     assert bot_listener._pick_get("u6") is None
