@@ -8,6 +8,46 @@
 
 ---
 
+## v2.1.21 (2026-11-24)
+
+> 修一个「推了但页面上没有」的问题：手动推送的鹿鼎记没进推送任务、推送历史。
+>
+> 推送本身是成功的——`push_queue` 13/14 两条都 `sent`、`push_sent` 审计 6191/6192 都在、消息真的发出去了。断在**记录写错了表**：手动推送入口还在调 `share_center.shadow_register(kind="force")`，写的是旧链的 `share_tasks`；而「推送任务 / 推送历史 / 推送队列」三个卡片读的是 `sc_publish_tasks`。双写期两张表没打通，手动推送的记录永远不出现在这三个模块里（自动推送走 v2，所以能在历史看到）。
+>
+> 现在 force 也写 v2 的两张表，交给 v2 的 dispatch / publisher 接管。回滚 `IMAGE_TAG=v2.1.20`。
+
+### ① 手动推送改登记 v2 的 force 任务
+
+- 新增 `share_center_v2.register_force_tasks(db, resource, channel_ids)`：建一条 `sc_push_list_items`（`source_kind="force"`）+ 每个目标渠道一条 `sc_publish_tasks`（`kind="force"`，`priority=1000` 排最前）。
+- `main.publish_resource` 不再调 `shadow_register`，改调它；响应新增 `tasks_registered`（本次登记了几条，如实回显，查不到快照就是 0 而不是编一个数）。
+- 手动强推用的清单按自然日复用一条（`force:YYYYMMDD`），不会每点一次就堆一条空清单。
+- 同一作品反复手动推送时**复活同一条清单项**——`dedup_key` 有唯一约束，另插会撞键；任务行各自新建，历史互不覆盖。
+- 旧表 `share_tasks` 只保留历史行，不再新增 force 记录（清理只归档、不物理删除的规矩不变）。
+
+### ② force 不占首推名额，但绕过推送门禁
+
+- **不占名额**：`_SlotIndex` 只载入 `source_kind="first"` 的清单项，force 项不进索引。所以手动推过的作品之后仍会按发布规则正常排首推，不会被这次手动动作永久占掉名额。
+- **绕过门禁**：手动是用户明确的动作，海报 / 资料 / 识别 / 目录 / 英文名这几项不拦（这是 v0.9.11 起手动推送的既有口径）。自动任务照旧逐项受约束。
+- **不受每小时上限约束**：`sc_quick_publish_hourly_limit` 只夹自动任务，手动点了就要在当下发出去。
+- **重推靠端点保证，不靠 dispatch 开例外**：`publish_resource` 在建 force 任务**之前**先把同 (资源, 渠道) 的队列行重置为 `pending`，dispatch 的「已 sent 永不重发」于是天然不会拦住手动动作。**没有**给 force 开「已 sent 可重发」的口子——一旦开了，任何卡在 `planned` 的 force 任务都会在下一次周期把已发出的消息再推一遍（泰迪熊2 双推就是这个形状）。
+
+### ③ 队列项不再挂旧链
+
+- `_ensure_pending_q` 重置队列行时一并把 `share_task_id` 归零。残留的旧链 id 会让 publisher 把它当「分享中心项」、要求 `status_ext=accepted` 才发——手动强推就永远发不出去（v1.5.1 真机同款卡点）。
+- dispatch 提交时照旧写 `push_reason="sc_v2"` + `event_id=task.id`，publisher 据此把发送结果回写到任务行，`published_at` / `error` / 执行记录全部可见。
+
+### ④ 前端：推送类型从二选一改成三态
+
+- 全站原先写死 `kind === 'first' ? '首次' : '追更'`——手动强推会被当成「追更」显示，语义直接错。收敛成 `scKindLabel()`：首次发布 / 追更 / 手动推送。
+- 「推送类型」筛选补一项「手动推送」，页面仍不出现任何后端代码名词。
+
+### ⑤ 测试
+
+- 新增 `tests/test_v2121_force_task_v2.py`（16 项）：写进 v2 两张表 / 旧表不再新增 force 行 / 队列视图与历史视图都看得到 / 反复推送复用清单项不撞唯一键 / `_SlotIndex` 仍判「从未首推」且 `plan_engine` 之后照常排首推 / force 绕过门禁而自动任务仍被拦 / 提交到队列时是 v2 语义（`push_reason=sc_v2`、`event_id`、`share_task_id=0`）/ 多渠道各一条 / 缓存链接复用与空值不编造 / 拿不到快照时零行 / **端点级**：`publish_resource` 之后三个卡片真有这条。
+- **反证**：把登记换回旧实现（`shadow_register` 写 `share_tasks`），三个视图立刻全空、`sc_publish_tasks` 零行、旧表多一条——正是线上「推了但看不到」的形状，证明这组断言确实覆盖了缺陷。
+
+---
+
 ## v2.1.20 (2026-11-24)
 
 > 两个「看得见但对不上」的问题：① 有海报的作品在「推送任务」「分享管理」里显示「无封面」；② 「推送队列」一条数据都没有，而旁边的「今日推送排期」明明列着一堆作品。本版把取图逻辑修好，并把队列与排期并成同一条口径。回滚 `IMAGE_TAG=v2.1.19`。

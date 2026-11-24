@@ -172,6 +172,14 @@ const scTaskStatusLabel = (status) => ({
   // 名额随之释放，作品按排期重新进队列（不是「失败」，失败是还会原地重试）。
   invalid: '无效推送',
 }[status || ''] || status || '—')
+// v2.1.21：推送类型中文化。此前全站写的是 `kind==='first' ? '首次' : '追更'`
+// 的二选一，手动强推（force）会被当成「追更」显示——用户手动点的那次推送
+// 在历史里被标成追更，语义直接错。收敛成一个函数，三态各自如实。
+const scKindLabel = (kind, short = false) => ({
+  first: short ? '首次' : '首次发布',
+  update: '追更',
+  force: '手动推送',
+}[kind || ''] || '首次发布')
 // v2.1.6：执行记录里的「阶段 / 状态」同样中文化，页面不得直出内部枚举名。
 const scExecStageLabel = (stage) => ({
   build: '建分享', submit: '提交队列', send: '发送',
@@ -2558,7 +2566,7 @@ function scExportTasks() {
   const head = ['任务ID', '资源名称', '类型', '状态', '链接态', '分享链接', '重试次数', '最后执行时间', '错误原因']
   const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`
   const body = rows.map(r => [
-    r.id, r.title || r.work_key || '', r.kind === 'first' ? '首次发布' : '追更',
+    r.id, r.title || r.work_key || '', scKindLabel(r.kind),
     r.status || '', r.link_state || '', r.share_url || '',
     r.attempts ?? 0, fmtTime(r.updated_at, true), r.error || '',
   ].map(esc).join(','))
@@ -3039,7 +3047,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.20 · Asia/Shanghai</span>
+          <span>v2.1.21 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4225,7 +4233,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <el-table :data="scOverview.views?.history || []" stripe size="small" max-height="300">
                         <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.published_at) }}</template></el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
-                        <el-table-column label="分类" width="80"><template #default="s">{{ s.row.kind === 'first' ? '首次' : '追更' }}</template></el-table-column>
+                        <el-table-column label="分类" width="80"><template #default="s">{{ scKindLabel(s.row.kind, true) }}</template></el-table-column>
                         <el-table-column label="结果" width="76"><template #default="s"><span class="sc-dot-state published">成功</span></template></el-table-column>
                       </el-table>
                       <div v-if="!(scOverview.views?.history || []).length" class="empty">暂无推送历史</div>
@@ -4241,7 +4249,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
                         <el-table-column label="分类" width="90" show-overflow-tooltip>
-                          <template #default="s">{{ s.row._src === 'plan' ? (s.row.category || '未分类') : (s.row.kind === 'first' ? '首次' : '追更') }}</template>
+                          <template #default="s">{{ s.row._src === 'plan' ? (s.row.category || '未分类') : scKindLabel(s.row.kind, true) }}</template>
                         </el-table-column>
                         <el-table-column label="状态" width="92">
                           <template #default="s">
@@ -4314,7 +4322,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </div>
                         <div class="sc-media-text">
                           <b>{{ s.row.share_title || '未命名作品' }}</b>
-                          <small>{{ s.row.kind==='first' ? '电影/剧' : '追更' }} · {{ s.row.category_name || '未分类' }}</small>
+                          <small>{{ s.row.kind==='force' ? '手动推送' : (s.row.kind==='first' ? '电影/剧' : '追更') }} · {{ s.row.category_name || '未分类' }}</small>
                         </div>
                       </div>
                     </template>
@@ -4350,7 +4358,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div><span>作品</span><b>{{ scSelectedDetail.share_title || '—' }}</b></div>
                 <div><span>分享码</span><b>{{ scSelectedDetail.share_code || '—' }}</b></div>
                 <div><span>任务编号</span><b>#{{ scSelectedDetail.id }}</b></div>
-                <div><span>类型</span><b>{{ scSelectedDetail.kind==='first'?'首次':'追更' }}</b></div>
+                <div><span>类型</span><b>{{ scKindLabel(scSelectedDetail.kind, true) }}</b></div>
                 <div><span>所属分类</span><b>{{ scSelectedDetail.category_name || '未分类' }}</b></div>
                 <div><span>当前状态</span><b>{{ scSelectedDetail.link_status_label || '待校验' }}</b></div>
                 <div><span>分享链接</span><b style="word-break:break-all">{{ scSelectedDetail.share_url || '—' }}</b></div>
@@ -4517,7 +4525,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-option label="群" value="group"/>
                   </el-select>
                   <el-select v-model="scTaskTypeFilter" size="small" style="width:120px">
-                    <el-option label="推送类型 全部" value="全部"/><el-option label="首次" value="first"/><el-option label="追更" value="update"/>
+                    <el-option label="推送类型 全部" value="全部"/><el-option label="首次" value="first"/><el-option label="追更" value="update"/><el-option label="手动推送" value="force"/>
                   </el-select>
                   <el-button size="small" type="primary">查询</el-button>
                   <el-button size="small" @click="scClearQueueFilter">清除筛选</el-button>
@@ -4547,7 +4555,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </div>
                         <div class="sc-media-text">
                           <b>{{ s.row.title || '未命名作品' }}</b>
-                          <small>{{ s.row.kind==='first' ? '首次发布' : '追更' }} · 编号 {{ s.row.id }}</small>
+                          <small>{{ scKindLabel(s.row.kind) }} · 编号 {{ s.row.id }}</small>
                         </div>
                       </div>
                     </template>
@@ -4560,7 +4568,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <span v-else class="hint">—</span>
                     </template>
                   </el-table-column>
-                  <el-table-column label="类型" width="86"><template #default="s">{{ s.row.kind==='first'?'首次发布':'追更' }}</template></el-table-column>
+                  <el-table-column label="类型" width="86"><template #default="s">{{ scKindLabel(s.row.kind) }}</template></el-table-column>
                   <el-table-column prop="share_url" label="分享记录" min-width="160" show-overflow-tooltip/>
                   <el-table-column label="推送目标" width="96"><template #default="s">{{ s.row.link_label || '待建链' }}</template></el-table-column>
                   <el-table-column label="状态" width="90"><template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template></el-table-column>
@@ -4759,7 +4767,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="sc-detail-kv">
                 <div><span>作品</span><b>{{ scDetailTask.title || '未命名作品' }}</b></div>
                 <div><span>状态</span><b>{{ scTaskStatusLabel(scDetailTask.status) }}</b></div>
-                <div><span>类型</span><b>{{ scDetailTask.kind==='first'?'首次发布':'追更' }}</b></div>
+                <div><span>类型</span><b>{{ scKindLabel(scDetailTask.kind) }}</b></div>
                 <div><span>推送渠道</span><b>{{ scDetailTask.target_summary || '—' }}</b></div>
                 <div><span>链接状态</span><b>{{ scDetailTask.link_label || '待建链' }}</b></div>
                 <div><span>尝试次数</span><b>{{ scDetailTask.attempts }}</b></div>

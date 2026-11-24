@@ -1632,6 +1632,120 @@ def plan_engine(db: Session) -> dict[str, int]:
     return {"lists": 1, "items": item_count, "tasks": task_count}
 
 
+# ---------------------------------------------------------------------------
+# v2.1.21 手动强推（force）改走 v2 任务表
+#
+# 真机问题（2026-11-24）：「手动推送的鹿鼎记没进推送任务、推送历史」。
+# 推送本身是成功的（push_queue 13/14 已 sent、push_sent 审计 6191/6192 都在），
+# 断在**记录写错了表**：`main.publish_resource` 调
+# `share_center.shadow_register(kind="force")` 写旧链的 `share_tasks`，而
+# 「推送任务 / 推送历史 / 推送队列」三个卡片读的是 `sc_publish_tasks` ——
+# 双写期两张表没打通，手动推送的记录永远不出现在这三个模块里
+# （自动推送走 v2，所以能在历史看到）。
+#
+# 现在 force 也写 `sc_push_list_items` + `sc_publish_tasks`，交给 v2 的
+# dispatch / publisher 正常接管：三个模块与自动推送完全同源，链接状态、
+# 失败重试、执行记录一并可用。旧表 `share_tasks` 只保留历史行，不再新增。
+# ---------------------------------------------------------------------------
+FORCE_TASK_KIND = "force"
+# 手动强推优先级：dispatch 按 priority desc 取任务，手动动作必须排在最前。
+FORCE_TASK_PRIORITY = 1000
+
+
+def _force_push_list(db: Session, version_id: int) -> SCPushList:
+    """手动强推用的清单：按自然日复用一条，避免每次手动推送都新建空清单。"""
+    day_key = datetime.now(shanghai_tz()).strftime("%Y%m%d")
+    list_key = f"force:{day_key}"[:128]
+    row = db.scalar(select(SCPushList).where(SCPushList.list_key == list_key))
+    if row is None:
+        row = SCPushList(list_key=list_key, name=f"手动推送 · {day_key}",
+                         status="active", source=FORCE_TASK_KIND,
+                         plan_version_id=version_id)
+        db.add(row)
+        db.flush()
+    else:
+        row.status = "active"
+    return row
+
+
+def register_force_tasks(db: Session, resource: Resource,
+                         channel_ids: list[int]) -> list[SCPublishTask]:
+    """把「手动强推」登记成 v2 的清单项 + 发布任务，返回新建的任务行。
+
+    与 `plan_engine` 生成的首推任务走同一套表与同一条 dispatch 管道，区别只在：
+      · `kind="force"`、`priority` 最高（手动动作排最前）；
+      · **不占首推名额**：`_SlotIndex` 只载入 `source_kind="first"` 的清单项，
+        force 项不进索引 —— 所以手动推过的作品之后仍会按发布规则正常排首推，
+        不会被这次手动动作永久占掉名额；
+      · 已在该渠道推过的作品要能重推：由**端点侧**保证——`publish_resource` 在建
+        force 任务之前先把同 (资源, 渠道) 的队列行重置为 pending，dispatch 的
+        「已 sent 永不重发」于是不会拦住手动动作（不给 force 开例外，否则卡住的
+        force 任务会把已发出的消息再推一遍）。
+
+    查不到快照（`sc_library_versions` 里没有该作品）时返回空列表：v2 的 dispatch
+    必须有「清单项 + 快照」才能解析代表资源。调用方仍会把队列项直发出去兜底，
+    只是这次不会出现在三个卡片里 —— 这是如实降级，不伪造记录。
+    """
+    if not channel_ids:
+        return []
+    work_key = utils.work_group_key(resource)
+    lv = db.scalar(select(SCLibraryVersion)
+                   .where(SCLibraryVersion.work_key == work_key)
+                   .order_by(SCLibraryVersion.id.desc()))
+    if lv is None:
+        return []
+    version = _active_version(db)
+    version_id = int(version.id) if version else 0
+    push_list = _force_push_list(db, version_id)
+    category = db.scalar(select(SCWorkCategory).where(SCWorkCategory.work_key == work_key))
+    category_key = str(category.category_key if category else "") or "genre:unknown"
+    # 已有有效分享链接就复用，不重建：建链接有真实副作用（网盘里会多一条分享记录）。
+    cached_url = str(getattr(resource, "share_url", "") or "")
+    cached_ok = bool(cached_url
+                     and str(getattr(resource, "share_status", "") or "") == "active")
+    created: list[SCPublishTask] = []
+    for channel_id in channel_ids:
+        channel = db.get(Channel, int(channel_id))
+        if not channel:
+            continue
+        chat_id = str(channel.chat_id or "")
+        target_type = "group" if chat_id.startswith("-") else "channel"
+        dedup = f"force:{work_key}:{channel_id}"[:255]
+        item = db.scalar(select(SCPushListItem).where(SCPushListItem.dedup_key == dedup))
+        if item is not None:
+            # 复活旧清单项：`dedup_key` 是唯一约束，另插一条会撞唯一键。
+            # 历史任务行与执行记录一条不动（清理只归档、不物理删除）。
+            item.list_id = push_list.id
+            item.library_version_id = lv.id
+            item.category_key = category_key
+            item.target_type = target_type
+            item.bot_id = channel.bot_id or 0
+            item.chat_id = chat_id
+            item.status = "planned"
+        else:
+            item = SCPushListItem(
+                list_id=push_list.id, work_key=work_key,
+                library_version_id=lv.id, category_key=category_key,
+                target_type=target_type, bot_id=channel.bot_id or 0,
+                chat_id=chat_id, dedup_key=dedup,
+                source_kind=FORCE_TASK_KIND, status="planned",
+            )
+            db.add(item)
+        db.flush()
+        task = SCPublishTask(
+            list_item_id=item.id, work_key=work_key, plan_version_id=version_id,
+            kind=FORCE_TASK_KIND, status="planned", priority=FORCE_TASK_PRIORITY,
+            scheduled_at=utcnow(),
+            share_url=cached_url if cached_ok else "",
+            link_state="active" if cached_ok else "unknown",
+        )
+        db.add(task)
+        db.flush()
+        created.append(task)
+    db.commit()
+    return created
+
+
 def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                       per_hour_top: int = 4) -> dict[str, Any]:
     """当天剩余时段的推送排期预测。**只读**：不写库、不建任务、不发消息。
@@ -2163,7 +2277,10 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 原来 `submitted_this_hour >= hourly_cap` 会让整点一到就把 cap 部全推出去，
         # 后面 59 分钟静默——用户口径是「每时段均匀分配」，所以改成按进度放行：
         # cap=3 → 第 0/20/40 分钟各 1 部。cap=0 时不限（_hourly_due 返回大数）。
-        if hourly_cap and submitted_this_hour >= _hourly_due(hourly_cap, now.minute):
+        if (hourly_cap and task.kind != FORCE_TASK_KIND
+                and submitted_this_hour >= _hourly_due(hourly_cap, now.minute)):
+            # v2.1.21：手动强推例外——用户点按钮就是要在当下发出去，
+            # 不能被「上新即时推送每小时上限」卡住（自动调度照旧受限）。
             stats["throttled"] += 1
             break
         item = db.get(SCPushListItem, task.list_item_id)
@@ -2190,7 +2307,13 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 门禁未过的任务**不建分享、不入队、不算失败**——它只是「还没准备好」，
         # 保持 planned + 下轮重试，等改名 / 补齐后再由计划引擎重新排期。
         # 中文原因写进 task.error（页面只展示中文，不出现任何后端字段名）。
-        gate = evaluate_push_gate(db, str(task.work_key or ""), _rep_resolver.work_members(lv))
+        if task.kind == FORCE_TASK_KIND:
+            # v2.1.21：手动强推绕过推送门禁（海报 / 资料 / 识别成功 / 目录已整理 /
+            # 文件名已英文）。这是 v0.9.11 起手动推送的既有口径——门禁只约束自动调度，
+            # 手动是用户明确的动作，拦下来只会让人以为「点了没反应」。
+            gate = {"passed": True, "reason": ""}
+        else:
+            gate = evaluate_push_gate(db, str(task.work_key or ""), _rep_resolver.work_members(lv))
         if not gate["passed"]:
             task.status = "planned"
             task.error = gate["reason"]
@@ -2227,6 +2350,11 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 不依赖复活这条已 sent 的首推队列行；手动强制重推走 main 的独立通道。
         existing_q = db.scalar(select(QueueItem).where(
             QueueItem.resource_id == rep.id, QueueItem.channel_id == channel.id))
+        # 注（v2.1.21）：「手动强推要能重推」由端点侧保证——`publish_resource` 在建
+        # force 任务**之前**就把同 (资源, 渠道) 的队列行重置为 pending，于是这里的
+        # 「已 sent 永不重发」天然不会拦住手动动作。**不在这里给 force 开例外**：
+        # 一旦开了，任何卡在 planned 的 force 任务都会在下一次 run_cycle 把已发出的
+        # 消息再推一遍（真机泰迪熊2 双推就是这个形状）。
         if existing_q is not None and str(existing_q.status or "") == "sent":
             task.status = "skipped"
             task.error = "该资源在此渠道已推送过，跳过重复投递"

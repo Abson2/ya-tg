@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.20", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.21", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.20", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.21", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -5958,8 +5958,13 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
             # pending 立即重推。旧逻辑只重置 review/failed，用户第一次推成功后反复点
             # 都显示「已入队 0 条」，误以为按钮无反应。
             q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+            # v2.1.21：手动推送不再挂旧链 share_tasks。残留的 share_task_id 会让
+            # publisher 把它当「分享中心项」、要求 status_ext=accepted 才发
+            # ——手动强推就永远发不出去（v1.5.1 真机同款卡点）。
+            q.share_task_id = 0
         else:
-            db.add(QueueItem(resource_id=x.id, channel_id=channel_id, status="pending"))
+            db.add(QueueItem(resource_id=x.id, channel_id=channel_id,
+                             status="pending", share_task_id=0))
         return True
 
     # v0.9.11：目录路由（频道 + 群）——手动强制动作，绕过海报闸门但尊重目录匹配。
@@ -5994,28 +5999,27 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
     # v1.1：autoflush=False，上面新 add 的 QueueItem 必须先 flush 才能被下面查询看到，
     # 否则 force 任务 channel_targets=[] → submit_to_dispatch 返回 0 → 强推消息发不出去。
     db.flush()
-    # 四模块重构：手动强推登记 force 任务（force 不去重、优先级最高）
+    ch_ids = sorted({q.channel_id for q in db.scalars(select(QueueItem).where(
+        QueueItem.resource_id == x.id, QueueItem.status == "pending")).all()})
+    # v2.1.21：手动强推改登记 **v2 的 force 任务**（写 sc_publish_tasks）。
+    #
+    # 真机问题：「手动推送的鹿鼎记没进推送任务、推送历史」。推送其实成功了
+    # （push_queue 13/14 已 sent、push_sent 审计 6191/6192 都在），断在记录写错了表：
+    # 旧实现调 share_center.shadow_register(kind="force") 写旧链的 share_tasks，
+    # 而这三个卡片读的是 sc_publish_tasks —— 双写期两张表没打通，手动推送的记录
+    # 永远不出现在这三个模块里（自动推送走 v2，所以能在历史看到）。
+    #
+    # 现在 force 也写 v2 表，交给 v2 的 dispatch / publisher 接管：链接状态、失败重试、
+    # 执行记录一并可用，三个模块与自动推送完全同源。
+    force_tasks: list = []
+    force_error = ""
     try:
-        from . import share_center
-        ch_ids = sorted({q.channel_id for q in db.scalars(select(QueueItem).where(
-            QueueItem.resource_id == x.id, QueueItem.status == "pending")).all()})
-        force_task = share_center.shadow_register(db, x, kind="force", channel_ids=ch_ids)
-        if force_task is not None:
-            for q in db.scalars(select(QueueItem).where(
-                    QueueItem.resource_id == x.id, QueueItem.status == "pending")).all():
-                q.share_task_id = force_task.id
-                q.push_reason = "force"
-                # v1.5.1 P0：手动强推入队项必须立刻置为可消费的 submitted——
-                # 否则 share_task_id 有值但 status_ext='' 的项会被 publisher 的
-                # 交接闸门过滤（有 share_task_id 且非 accepted → 永不发送）。
-                # 真机「资源库手动推送推不出去」即此因：点推送排队成功，但项卡在空 ext。
-                # force 是手动强制动作（预置 share_url 可为空=无链接推送），
-                # 交接置 submitted 后由 worker 原子领取，不依赖 force 任务本轮 run_cycle。
-                q.status_ext = "submitted"
-                q.accept_worker = ""
-                q.accepted_at = None
-    except Exception:
-        pass
+        from . import share_center_v2 as _sc_v2
+        force_tasks = _sc_v2.register_force_tasks(db, x, ch_ids)
+    except Exception as exc:
+        # 登记失败不吞掉：如实回给前端；下面仍会把队列项直发出去，消息不丢。
+        force_error = f"登记推送任务失败：{str(exc)[:200]}"
+        logger.exception("[publish] 手动强推登记 v2 任务失败")
     db.commit()
     result = await process_queue(limit=50)
     # v0.6.2：把本次入队项的即时结果带回前端，避免"点了没反应"的错觉。
@@ -6036,7 +6040,12 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
     payload.pop("skipped", None)
     if reason:
         detail = [*detail, {"channel_id": 0, "status": "skipped", "error": reason}]
-    return {**payload, "ok": True, "queued": added, "detail": detail, "skipped": skipped}
+    if force_error:
+        detail = [*detail, {"channel_id": 0, "status": "failed", "error": force_error}]
+    # v2.1.21：如实回显本次登记了几条推送任务（= 本次会出现在「推送任务」里的条数）。
+    # 查不到作品快照时为 0，此时只能走队列直发，不伪造任务行。
+    return {**payload, "ok": True, "queued": added, "detail": detail, "skipped": skipped,
+            "tasks_registered": len(force_tasks)}
 
 
 @app.put("/api/bots/{bid}", dependencies=ADMIN)
