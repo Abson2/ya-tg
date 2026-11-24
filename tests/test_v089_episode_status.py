@@ -119,9 +119,11 @@ def test_returning_series_shows_updated_to_and_progress(db):
     text = _render(db)
     # v0.9.0：剧集状态改为季集标签「更新至 S01E12 · 连载中」
     assert "更新至 S01E12 · 连载中" in text, text
-    # v2.1.23：版式与用户参考图对齐——季集标签整行用【】包住（参考图【S01E04 · 完结】），
-    # 不再带「📡 分集:」这个行头。
-    assert "【更新至 S01E12 · 连载中】" in text, text
+    # v2.1.24：剧集更新这一行改**折叠展示**（用户口径：影视信息 / 剧集更新 / 简介
+    # 都折叠），行头是「📡 剧集更新:」，内容包在 <blockquote expandable> 里；
+    # 不再有 v2.1.23 的【】书名号包法。
+    assert "📡 剧集更新:\n<blockquote expandable>更新至 S01E12 · 连载中</blockquote>" in text, text
+    assert "【更新至 S01E12 · 连载中】" not in text, text
     assert "📡 分集:" not in text, text
 
 

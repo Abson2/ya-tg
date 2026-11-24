@@ -265,8 +265,14 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "channel_link": esc(runtime_config.get(db, "tg_channel_link") or ""),
         "group_link": esc(runtime_config.get(db, "tg_group_link") or ""),
         "version": esc(version),
-        # v2.1.22：分享码（默认图文「🔗 分享」行用）
+        # v2.1.22：分享码（分享码变量保留，供自定义模板使用；内置默认版式已去掉
+        # 这一行 —— v2.1.24 用户口径：「👤 分享：这个字段去掉」）
         "share_code": share_code,
+        # v2.1.24：影视信息折叠块用的**一行**串（技术规格 · 大小）。
+        # 为什么不拼在模板里：渲染器只支持 {{#if}}、没有 {{else}}，「有版本没大小」
+        # 这种组合要写两层嵌套；先在 ctx 里合成一个变量，模板判一次就够。
+        "spec_line": esc(" · ".join(
+            [x for x in (version, human_size(total_size)) if x])),
         # v0.9.9 #202：用户新样式分项变量（来源/画质/编码/音频从文件名解析，上映时间取 TMDB）
         "source": esc(spec.get("source")),
         "quality": esc(spec.get("quality")),
@@ -317,7 +323,37 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
             text = (body + "\n" + tags_line + "\n" + share_line).strip()
         else:
             text = (text.rstrip() + "\n" + tags_line).strip()
-    return text[:1000], text[:1000]
+    return _clip_html(text[:1000]), _clip_html(text[:1000])
+
+
+def _clip_html(text: str) -> str:
+    """补齐被截断时未闭合的 HTML 标签（v2.1.24）。
+
+    为什么需要：v2.1.24 的默认版式把「影视信息 / 剧集更新 / 简介」放进了
+    `<blockquote expandable>…</blockquote>`。一旦 1000 字截断点落在块内，
+    `</blockquote>` 就丢了 —— Telegram 会以「can't parse entities」整条拒发。
+
+    做法：先把结尾的半个标签切掉，再用**栈**还原嵌套顺序，逆序补闭合。
+    不能用「按固定顺序逐个补」：嵌套（如 `<blockquote><a>…`）下会补成
+    `</blockquote></a>` 这种非法结构，Telegram 同样整条拒发。
+    """
+    if not text:
+        return text
+    cut = text
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:                      # 结尾是半个标签：丢掉它
+        cut = cut[:lt]
+    stack: list[str] = []
+    for m in re.finditer(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>", cut):
+        closing, name = m.group(1), m.group(2).lower()
+        if name == "br":             # 自闭合，不用补
+            continue
+        if not closing:
+            stack.append(name)
+        elif name in stack:
+            while stack and stack.pop() != name:
+                pass                 # 弹到同名标签为止（容忍中间未闭合的内层）
+    return cut + "".join(f"</{n}>" for n in reversed(stack))
 
 
 async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Channel, bot: Bot) -> tuple[bool, str, str]:

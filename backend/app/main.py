@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -1023,20 +1024,53 @@ async def lifespan(app: FastAPI):
         mr = db.scalar(select(MirrorRule).limit(1))
         mirror_minutes, mirror_enabled = ((mr.interval_minutes, mr.enabled)
                                           if mr else (60, False))
+        # 必须在这里取出来：会话关掉后 ORM 实例是 detached，再读 last_run 会抛
+        # DetachedInstanceError（属性没被加载过）。
+        mirror_last_run = mr.last_run if mr else None
     # 镜像定时任务热注册；v0.8.5 起任务内部按 auto_identify 接「入库→识别→推送」，
     # 推送走分发规则与作品级去重，不单独注册群发任务
+    #
+    # v2.1.24：这里原来是 `try: ... except Exception: pass` —— 注册失败被**静默吞掉**，
+    # 页面无任何痕迹，用户只能看到「同步没按间隔跑」。现在失败必落日志 + 审计。
+    # 成功注册后还要判断「停机期间是否错过窗口」：错过就补跑一轮（镜像同步是幂等
+    # 全量比对，补最新一轮即可，不必补 N 次）。
     if mirror_enabled:
         try:
             _schedule_mirror_job(mirror_minutes, True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("[mirror] 启动注册定时同步失败（定时同步不会运行）：%s", exc,
+                         exc_info=True)
+            try:
+                with SessionLocal() as db:
+                    add_audit(db, "mirror_schedule_failed", target_type="mirror",
+                              detail=json_dumps({"phase": "startup",
+                                                 "interval_minutes": mirror_minutes,
+                                                 "error": f"{type(exc).__name__}: {exc}"}))
+                    db.commit()
+            except Exception:        # 审计写不进去也不能挡住启动
+                pass
+        else:
+            if _mirror_missed_window(mirror_last_run, mirror_minutes):
+                try:
+                    scheduler.add_job(
+                        _scheduled_mirror, "date",
+                        run_date=utcnow() + timedelta(seconds=MIRROR_CATCHUP_DELAY_SECONDS),
+                        id=MIRROR_CATCHUP_JOB_ID, replace_existing=True,
+                        misfire_grace_time=3600)
+                    logger.info("[mirror] 启动时发现已错过同步窗口 → %s 秒后补跑一轮",
+                                MIRROR_CATCHUP_DELAY_SECONDS)
+                except Exception as exc:
+                    logger.warning("[mirror] 启动补跑注册失败（不影响定时任务本身）：%s", exc)
     if enabled:
         try:
             scheduler.add_job(_scheduled_scan, CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
                               args=[root], id="global_scan", replace_existing=True,
-                              max_instances=1, coalesce=True)
-        except Exception:
-            pass
+                              max_instances=1, coalesce=True,
+                              # v2.1.24：同 mirror_sync —— 默认 1 秒宽限会把「晚到」
+                              # 的定时扫描直接丢掉。扫描是幂等的，给足 300 秒。
+                              misfire_grace_time=300)
+        except Exception as exc:
+            logger.error("[scan] 启动注册定时扫描失败（定时扫描不会运行）：%s", exc)
     _schedule_queue_worker(queue_trigger)
     # 四模块重构：分享中心调度（v1.1 默认开启，5s 一轮缩短入队→建分享→提交的延迟窗口）
     scheduler.add_job(_job_share_center, "interval", seconds=5, id="share_center",
@@ -1094,7 +1128,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.23", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.24", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1139,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.23", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.24", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1456,7 +1490,9 @@ def save_scan_task(p: ScanConfig, db: Session = Depends(get_db)):
         scheduler.remove_job("global_scan")
     if p.enabled:
         scheduler.add_job(_scheduled_scan, trigger, args=[root_id], id="global_scan", replace_existing=True,
-                          max_instances=1, coalesce=True)
+                          max_instances=1, coalesce=True,
+                          # v2.1.24：默认 misfire_grace_time=1 秒会把晚到的定时扫描丢掉
+                          misfire_grace_time=300)
     return {"ok": True, "cron": cron, "interval_minutes": _cron_to_interval(cron),
             "timezone": "Asia/Shanghai"}
 
@@ -1471,13 +1507,82 @@ def _mirror_rule(db: Session, create: bool = False) -> MirrorRule | None:
     return r
 
 
+# v2.1.24：镜像定时任务的 job id 与「补跑」参数集中在这里。
+# 真机问题（2026-11-24）：同步间隔设 15 分钟，但 14:02 起 last_run 一直停在 13:47，
+# 后台明明在跑、镜像界面却「同步执行中」卡住，30 分钟没有任何一轮定时同步触发。
+# 排查结论：注册点只有启动（main.py:1028）与保存配置（:1850）两处，且启动那处是
+# `try: ... except Exception: pass` —— 注册失败被**静默吞掉**，页面也无从查看
+# 「下次同步时间」，于是「定时没注册」和「刚跑过」在页面上长得一模一样。
+MIRROR_JOB_ID = "mirror_sync"
+MIRROR_CATCHUP_JOB_ID = "mirror_sync_catchup"
+MIRROR_MIN_INTERVAL_MINUTES = 5
+# 补跑延后 20 秒：让 lifespan 里其余 job 与 DB 迁移先稳定，别和启动抢写锁。
+MIRROR_CATCHUP_DELAY_SECONDS = 20
+# **本版最关键的根因修复**：APScheduler 3.11 的 `misfire_grace_time` 默认是
+# **1 秒**（实测 job_defaults = {'misfire_grace_time': 1, ...}）。只要这次触发
+# 晚到 1 秒以上，APScheduler 就把它当「过期触发」**直接丢掉**，只在日志里留一行
+# "Run time of job ... was missed by ..."。本容器里镜像一轮要跑几十分钟、事件循环
+# 还被同步 DB 调用占着，定时镜像晚到几秒是常态 —— 于是「定时从来不跑，但手动点
+# 立即同步完全正常」（手动路径根本不经过调度器）。这就是 last_run 一直不动的真相。
+# 镜像同步是幂等全量比对，晚一小时跑也完全无害，所以宽限给足（下限 300 秒，
+# 与间隔同宽但封顶 1 小时；coalesce=True 保证堆积的多次触发只会补跑一轮）。
+MIRROR_MISFIRE_GRACE_FLOOR_SECONDS = 300
+MIRROR_MISFIRE_GRACE_CAP_SECONDS = 3600
+
+
+def _mirror_misfire_grace(minutes: int) -> int:
+    """该间隔下允许「晚多久仍然开跑」（秒）。见上面 misfire_grace_time 的说明。"""
+    span = max(MIRROR_MIN_INTERVAL_MINUTES, int(minutes or 0)) * 60
+    return int(min(MIRROR_MISFIRE_GRACE_CAP_SECONDS,
+                   max(MIRROR_MISFIRE_GRACE_FLOOR_SECONDS, span)))
+
+
 def _schedule_mirror_job(minutes: int, enabled: bool) -> None:
-    if scheduler.get_job("mirror_sync"):
-        scheduler.remove_job("mirror_sync")
+    if scheduler.get_job(MIRROR_JOB_ID):
+        scheduler.remove_job(MIRROR_JOB_ID)
     if enabled:
         scheduler.add_job(_scheduled_mirror,
-                          IntervalTrigger(minutes=max(5, int(minutes)), timezone="Asia/Shanghai"),
-                          id="mirror_sync", replace_existing=True, max_instances=1, coalesce=True)
+                          IntervalTrigger(minutes=max(MIRROR_MIN_INTERVAL_MINUTES, int(minutes)),
+                                          timezone="Asia/Shanghai"),
+                          id=MIRROR_JOB_ID, replace_existing=True,
+                          max_instances=1, coalesce=True,
+                          misfire_grace_time=_mirror_misfire_grace(minutes))
+
+
+def _mirror_next_run_at() -> str | None:
+    """镜像定时任务的**下次触发时间**（上海时间字符串，未注册返回 None）。
+
+    v2.1.24：此前状态接口只有 `last_run`，用户没法区分「定时没注册」和「刚跑完」。
+    现在页面直接显示「下次自动同步：...」；未注册时如实显示「未注册」而不是留空。
+    取不到就返回 None，绝不编一个时间。
+    """
+    try:
+        job = scheduler.get_job(MIRROR_JOB_ID)
+        if not job:
+            return None
+        next_run = getattr(job, "next_run_time", None)
+        if not next_run:
+            return None
+        return next_run.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:                 # 状态接口不能因为一个时间字段整页 500
+        return None
+
+
+def _mirror_missed_window(last_run, minutes: int, *, now=None) -> bool:
+    """启动时判断「上一轮到现在是否已经超过一个间隔」——超了就补跑一轮。
+
+    v2.1.24：进程停机/重启期间错过的轮次此前**不会补**，IntervalTrigger 从启动时刻
+    重新计时，于是「重启一次 = 往后顺延一个间隔」。对 15 分钟档还行，对 6 小时档
+    就是半天不跑。这里补一次（不是补 N 次 —— 镜像同步是幂等全量比对，补最新一轮就够）。
+    从未跑过（last_run 为空）且已启用 → 也该立刻跑一轮，否则新库永远等第一个间隔。
+    """
+    if not minutes:
+        return False
+    now = now or utcnow()
+    last = as_utc(last_run)
+    if last is None:
+        return True
+    return (now - last) >= timedelta(minutes=max(MIRROR_MIN_INTERVAL_MINUTES, int(minutes)))
 
 
 def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
@@ -1635,7 +1740,14 @@ async def _scheduled_mirror() -> None:
     还没彻底结束，本轮定时镜像不并发启动，而是排队等它结束再跑（不丢轮次）。
     """
     if not await _mirror_lock.acquire_async("定时镜像", timeout=PIPELINE_WAIT_SECONDS):
-        logger.info("[mirror] 等待上一轮任务结束超时，本轮定时镜像放弃")
+        # v2.1.24：这条原来是 logger.info —— 「本轮定时镜像放弃」这种**真正丢轮次**
+        # 的事件在默认 INFO 级别下和噪声没区别，排查时根本看不见。升为 WARNING 并
+        # 带上占用者与等待时长，页面侧还能从 last_run 不往前走间接看出来。
+        info = _mirror_lock.info() or {}
+        logger.warning("[mirror] 等待上一轮任务结束超时（%s 秒），本轮定时镜像放弃；"
+                       "当前占用者：%s，已占用 %s 秒",
+                       PIPELINE_WAIT_SECONDS, info.get("owner") or "未知",
+                       info.get("held_seconds"))
         return
     _mirror_lock.set_owner("定时镜像")
     try:
@@ -1799,6 +1911,11 @@ def mirror_config_get(db: Session = Depends(get_db)):
         "last_run": r.last_run if r else None,
         "last_status": r.last_status if r else "never",
         "last_message": r.last_message if r else "",
+        # v2.1.24：定时任务的下次触发时间（上海时间）。用户排查「间隔失效」时，
+        # 原来只有 last_run 可看 —— 「定时没注册」和「刚跑过」在页面上长得一样。
+        # 未注册返回 None，前端据此如实显示「定时未注册」，不留空也不编时间。
+        "next_run_at": _mirror_next_run_at(),
+        "schedule_registered": scheduler.get_job(MIRROR_JOB_ID) is not None,
         "confirmed_endpoints": mirror.CONFIRMED_WRITE_ENDPOINTS,
         "unverified_endpoints": mirror.UNVERIFIED_ENDPOINTS,
         "note": ("v0.8.6：A 库只读且目录名不变；B 库分类目录按原名 1:1 镜像、影视主目录按 · 约定命名，"
@@ -1847,8 +1964,17 @@ def mirror_config_save(p: MirrorConfigInput, db: Session = Depends(get_db)):
                                  "max_works_per_run": r.max_works_per_run,
                                  "mirror_mode": mode}))
     db.commit()
-    _schedule_mirror_job(r.interval_minutes, r.enabled)
-    return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes}
+    # v2.1.24：注册失败不能静默（原来直接抛 500，配置已提交但用户不知道定时没生效；
+    # 更糟的是启动路径那边直接 pass）。现在配置照存，把失败原因**如实回给前端**。
+    schedule_error = ""
+    try:
+        _schedule_mirror_job(r.interval_minutes, r.enabled)
+    except Exception as exc:
+        logger.error("[mirror] 保存配置后注册定时同步失败：%s", exc, exc_info=True)
+        schedule_error = f"{type(exc).__name__}: {exc}"
+    return {"ok": True, "enabled": r.enabled, "interval_minutes": r.interval_minutes,
+            "next_run_at": _mirror_next_run_at(),
+            "schedule_error": schedule_error}
 
 
 @contextmanager
@@ -3168,6 +3294,13 @@ def mirror_status(db: Session = Depends(get_db)):
         # v0.9.6：镜像互斥锁状态（谁在跑、跑了多久），前端据此提示「后台任务运行中」，
         # 避免用户点「立即同步」撞上静默的后台改名复查后只看到一句 409。
         "lock": _mirror_lock.info(),
+        # v2.1.24：定时同步的调度可见性。用户排查「间隔 15 分钟却半天不跑」时，
+        # 原来页面上只有 last_run ——「定时没注册」和「刚跑过」长得一模一样。
+        # 这里给「下次触发时间」与「是否真的注册了」，前端据此三态如实展示。
+        "schedule": {"registered": scheduler.get_job(MIRROR_JOB_ID) is not None,
+                     "next_run_at": _mirror_next_run_at(),
+                     "interval_minutes": int(r.interval_minutes or 0) if r else 0,
+                     "enabled": bool(r.enabled) if r else False},
         # v0.9.8 #195：全流程节点 + 同步进度，首页/镜像页据此展示流程条与进度
         "pipeline": pipeline,
         # v2.1.11：进度唯一口径 —— 分子分母与右侧文字同源（部数口径）。

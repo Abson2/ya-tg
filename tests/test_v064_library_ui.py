@@ -130,11 +130,14 @@ def test_cancel_share_clears_url_and_siblings():
 
 # ---------- 4. 模板整剧展示 ----------
 def test_default_template_is_series_oriented():
-    # v2.1.23：默认图文版式（🎬 标题 / 📺 TMDB / ⭐ 评分 / 💿 画质 / 🎞 版本 /
-    # 💾 大小 / 👤 分享 / 【季集】 / 📝 简介 / 🏷 标签）
+    # v2.1.24：默认图文版式（🎬 标题 / 📺 TMDB / ⭐ 评分 / 📽 影视信息（折叠）/
+    # 📡 剧集更新（折叠）/ 📖 简介（折叠）/ 🏷 标签 / 分享链接）
     assert "🏷 标签: {{tags}}" in DEFAULT_TEMPLATE
     assert "资源：" not in DEFAULT_TEMPLATE and "{{filename}}" not in DEFAULT_TEMPLATE
-    assert "{{quality}}" in DEFAULT_TEMPLATE and "{{episode_status}}" in DEFAULT_TEMPLATE
+    # 技术规格与大小已合并成 spec_line 折叠块（不再有独立的 {{quality}} 行），
+    # 但「整剧展示 + 季集标签」这条 v0.6.4 的原始口径没变
+    assert "{{spec_line}}" in DEFAULT_TEMPLATE
+    assert "{{episode_status}}" in DEFAULT_TEMPLATE
 
 
 def test_version_spec_extracts_full_spec():

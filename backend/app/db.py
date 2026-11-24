@@ -455,16 +455,20 @@ _COLUMNS = {
 # 追更剧「📡 更新至 S01E07 · 连载中」，完结剧「📡 S01E24 · 完结」，
 # 进度由 episode_progress（N/M）单独承载；episode_count 为「已收录」，避免重复。
 # v0.9.9 #202：默认模板改为用户指定样式（纯文字按钮标签，不做 inline 按钮）。
-# v2.1.22 重写为「默认图文」（用户口径：「优化内置模版，仅保留默认图文与自定义」）：
-# 版式按用户给的参考图逐行对齐——标题 / TMDB / 评分 / 画质 / 版本 / 大小 /
-# 分享 / 分集 / 简介 / 标签。每行都用 {{#if}} 包住，取不到就整行不出现，
-# 绝不输出「画质: 」这种空值行。
+# v2.1.22 重写为「默认图文」（用户口径：「优化内置模版，仅保留默认图文与自定义」）。
+# v2.1.24 按用户参考图再对齐一次，与 v2.1.23 的差异**只有两处**（用户原话）：
+#   ① `👤 分享：` 这个字段去掉（分享链接本身仍在最后一行，只是不再单独报分享码）；
+#   ② 影视信息 / 剧集更新 / 简介 三块改成**折叠展示** —— Telegram 侧唯一的折叠手段
+#      是 `<blockquote expandable>`，没有别的写法。
+# 每行都用 {{#if}} 包住，取不到就整行（含折叠块）不出现，绝不输出「画质: 」空值行。
 #
 # 依据全部来自真实字段（由 publisher._build_message 的 ctx 提供）：
 #   tmdb_id（TMDB 影视号）/ vote_plain（TMDB 评分，整数优先）/
-#   quality（文件名解析出的分辨率·HDR 等）/ version（画质·来源·编码·音轨合并串）/
-#   size / share_code（分享链接尾段分享码）/ episode_status（季集标签）/
-#   overview / tags（#片名 #类型 #地区 #分类）。
+#   spec_line（技术规格 · 大小合并成一行的折叠内容）/ episode_status（季集标签）/
+#   overview / tags（#片名 #类型 #地区 #分类）/ share_url。
+#   注意 spec_line 是 ctx 里的**合成变量**（publisher 用 version + size 拼好），
+#   不是模板变量：渲染器只支持 {{#if}}、没有 {{else}}，「有版本没大小」这种组合
+#   要在模板里写两层嵌套，所以先在 ctx 侧合成，模板判一次就够。
 #
 # 关于参考图里的「豆瓣评分」：系统**没有豆瓣数据源**（全仓无豆瓣接入），
 # 写进模板只能永久显示「暂无」，属于占位假数据，因此不放这一行。
@@ -473,22 +477,19 @@ DEFAULT_TEMPLATE = (
     "🎬 <b>{{title}}{{#if year}} ({{year}}){{/if}}</b>\n"
     "{{#if tmdb_id}}\n📺 TMDB: {{tmdb_id}}\n{{/if}}"
     "{{#if vote_plain}}⭐ TMDB评分: {{vote_plain}}/10\n{{/if}}"
-    "{{#if quality}}💿 画质: {{quality}}\n{{/if}}"
-    "{{#if version}}🎞 版本: {{version}}\n{{/if}}"
-    "{{#if size}}💾 大小: {{size}}\n{{/if}}"
-    "{{#if share_code}}👤 分享: {{share_code}}\n{{/if}}"
-    "{{#if episode_status}}\n【{{episode_status}}】\n{{/if}}"
-    "{{#if overview}}\n📝 简介: {{overview}}\n{{/if}}"
+    "{{#if spec_line}}\n📽 影视信息:\n<blockquote expandable>{{spec_line}}</blockquote>\n{{/if}}"
+    "{{#if episode_status}}\n📡 剧集更新:\n<blockquote expandable>{{episode_status}}</blockquote>\n{{/if}}"
+    "{{#if overview}}\n📖 简介:\n<blockquote expandable>{{overview}}</blockquote>\n{{/if}}"
     "{{#if tags}}\n🏷 标签: {{tags}}\n{{/if}}"
     "{{share_url}}"
 )
-# v2.1.23：当前默认图文的指纹（存量模板升级判定用；改版式时同步改这里）。
+# v2.1.24：当前默认图文的指纹（存量模板升级判定用；改版式时同步改这里）。
 #
-# 为什么换成「🏷 标签:」：v2.1.22 的指纹是「🎞 版本:」，而 v2.1.22 那版内容里也有
-# 这一行 —— 老指纹对**新旧两版都成立**，升级判定会直接 return False，存量库永远
-# 停在旧版式上（用户看到的「内置模板和我给的参考图有出入」就是这么来的）。
-# 「🏷 标签:」只有 v2.1.23 版式才有（旧版是「🏷 {{tags}}」，无「标签:」前缀）。
-CURRENT_DEFAULT_MARK = "🏷 标签:"
+# 为什么换成 `<blockquote expandable>`：v2.1.23 的指纹是「🏷 标签:」，而这一行在
+# v2.1.24 版式里**还在** —— 用旧指纹做判定，存量库会直接 return False，永远停在
+# 平铺版式上（v2.1.23 踩过同一个坑：`🎞 版本:` 对新老两版都成立）。
+# 折叠标签只有 v2.1.24 才有，是唯一不重叠的特征。
+CURRENT_DEFAULT_MARK = "<blockquote expandable>"
 
 # v0.9.6：内置模板预设（供管理页下拉一键载入，不落库；用户载入后可改可另存）。
 # v2.1.22 收敛：内置**只保留「默认图文」一条**（用户口径：「优化内置模版，仅保留
@@ -543,15 +544,19 @@ def _is_legacy_default(content: str) -> bool:
 def _needs_template_upgrade(content: str) -> bool:
     """判断存量默认模板是否需要升级到当前版本。
 
-    覆盖五类：
+    覆盖七类（按判定顺序）：
       1) v0.5.x/v0.6.0 老模板（含单集文件名/type= 调试行）；
       2) v0.6.4 整剧模板（含 🎬，但缺 v0.6.5 新增的 {{episode_count}} 行）；
       3) v0.6.5~v0.8.8 默认模板（含 v0.8.9 之前的集数行原句，缺剧集状态行）；
       4) v0.9.9 #202：v0.8.9 旧默认模板（含 {{episode_status}} 但无新样式特征
          {{buttons_text}} / 🆔 TMDB ID），升级到用户指定的新样式；
       5) v2.1.22：v0.9.9 旧默认图文（🖼️ + {{buttons_text}} + 🆔 TMDB ID 三特征同时
-         命中）升级到新的「默认图文」版式（🎞 版本: 行）。
-    自定义模板一律不动：第 3/4/5 类都用「旧默认骨架特征同时命中 + 无新样式特征」
+         命中）升级到新的「默认图文」版式；
+      6) v2.1.23：v2.1.22 版式（🆔 TMDB: + 🖥 画质: + 📦 大小: + 🏷 {{tags}}）
+         升级到与用户参考图对齐的版式；
+      7) v2.1.24：v2.1.23 的平铺图文（🏷 标签: + 👤 分享: / 【季集】）升级到折叠版式
+         （影视信息 / 剧集更新 / 简介 三块 <blockquote expandable>，去分享行）。
+    自定义模板一律不动：各类都用「旧默认骨架特征同时命中 + 无新样式特征」
     判断，用户自己改过内容的模板缺这些组合标记，不会被覆盖。
     """
     c = content or ""
@@ -566,6 +571,14 @@ def _needs_template_upgrade(content: str) -> bool:
     # 这一组，不会被覆盖。
     if ("🆔 TMDB: {{tmdb_id}}" in c and "🖥 画质:" in c
             and "📦 大小:" in c and "🏷 {{tags}}" in c):
+        return True
+    # v2.1.24：v2.1.23 那一版内置图文要升级到折叠版式（影视信息 / 剧集更新 / 简介
+    # 三块用 <blockquote expandable> 折叠，并去掉 `👤 分享:` 行）。
+    # 特征取「v2.1.23 独有的两处骨架」+ `🏷 标签:`（确认是 v2.1.22 之后的行）：
+    #   - `👤 分享: {{share_code}}`：只有 v2.1.23 版式有；
+    #   - `【{{episode_status}}】`：v2.1.24 已改成折叠块，不再有这对书名号。
+    # 两处任一命中即可（用户可能自己删掉了分享行）。更老的版式凑不齐 `🏷 标签:`。
+    if "🏷 标签:" in c and ("👤 分享: {{share_code}}" in c or "【{{episode_status}}】" in c):
         return True
     # v2.1.22：v0.9.9 的默认图文（内置那一套）三特征同时命中才升级；
     # 用户改过的模板很难同时保留这三个标记，不会被覆盖。

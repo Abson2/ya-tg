@@ -69,19 +69,32 @@ def test_preset_endpoint_returns_single_builtin():
 # ---- ② 版式逐行 ----
 def test_default_template_matches_reference_layout():
     t = DEFAULT_TEMPLATE
-    # v2.1.23：按用户参考图重新对齐——🎬 标题 / 📺 TMDB / ⭐ 评分 / 💿 画质 /
-    # 🎞 版本 / 💾 大小 / 👤 分享 / 【季集】 / 📝 简介 / 🏷 标签:
+    # v2.1.24：按用户参考图再对齐一次——🎬 标题 / 📺 TMDB / ⭐ 评分 / 📽 影视信息（折叠）/
+    # 📡 剧集更新（折叠）/ 📖 简介（折叠）/ 🏷 标签 / 分享链接。
+    # 与 v2.1.23 的差异只剩两处（用户原话）：
+    #   ① 去掉 `👤 分享:`；
+    #   ② 影视信息 / 剧集更新 / 简介 三块改成 **折叠展示**（Telegram `<blockquote expandable>`）。
     for token in ("🎬 <b>{{title}}", "📺 TMDB: {{tmdb_id}}",
                   "⭐ TMDB评分: {{vote_plain}}/10",
-                  "💿 画质: {{quality}}", "🎞 版本: {{version}}",
-                  "💾 大小: {{size}}", "👤 分享: {{share_code}}",
-                  "【{{episode_status}}】", "📝 简介: {{overview}}",
+                  "📽 影视信息:", "📡 剧集更新:", "📖 简介:",
                   "🏷 标签: {{tags}}"):
         assert token in t, token
+    # 三个折叠块：开标签紧跟在文案后（换行是为了 Telegram 渲染不串行）
+    assert t.count("<blockquote expandable>") == 3, t
+    assert t.count("</blockquote>") == 3, t
+    for block in ("📽 影视信息:\n<blockquote expandable>{{spec_line}}</blockquote>",
+                  "📡 剧集更新:\n<blockquote expandable>{{episode_status}}</blockquote>",
+                  "📖 简介:\n<blockquote expandable>{{overview}}</blockquote>"):
+        assert block in t, block
+    # 用户口径：👤 分享 这个字段去掉（分享链接本身仍保留在最后一行）
+    assert "👤" not in t and "{{share_code}}" not in t
+    assert "{{share_url}}" in t
     # 参考图里的「豆瓣评分」系统没有数据源，写进去只能永久显示「暂无」→ 不放
     assert "豆瓣" not in t
     # 用户口径：分集那一行不要再带「共 N 集」这类冗余计数
-    assert "共 " not in t and "集" not in t.replace("【{{episode_status}}】", "")
+    # （注意 `剧集更新` 本身就含「集」字，不能再用「整段不含集」当判据）
+    assert "共 " not in t
+    assert "更新至" not in t and "集数" not in t
 
 
 def test_missing_fields_drop_whole_line():

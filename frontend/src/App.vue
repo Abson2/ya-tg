@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QRCode from 'qrcode'
 
@@ -48,86 +48,66 @@ const scActiveList = ref(null) // 当前展开明细的清单（卡片内交互�
 // 今日推送排期预测（v2.1.19）：发布规则是调动存量、有序推送的中枢，
 // 所以除了已有的「推送历史」，还要能看到「今天接下来推什么、几点推」。
 // 单独异步加载：预测要扫作品快照和名额索引，不能拖慢仪表盘首屏。
-const scForecast = ref({ hours: [], blocked: [], notes: [], today_total: 0, overflow: 0, backlog: 0, page: { from_hour: null, to_hour: 24, next_hour: null, has_more: false, partial: false, segments: 2 } })
+const scForecast = ref({ hours: [], blocked: [], notes: [], today_total: 0, overflow: 0, backlog: 0 })
 const scForecastLoading = ref(false)
-// v2.1.23（用户口径 6）：排期按「时段」分批加载。首屏只排当前时段（2 小时），
-// 点「加载下一时段」再追加下一段 —— 一次性把 12 段全排完，后端要扫一遍全天候选，
-// 页面要白等好几秒。分页**只在「看」**：推送与建任务照旧全天连续进行。
-const scFcMoreLoading = ref(false)   // 「加载下一时段」按钮自己的 loading
-const scFcLoadedCount = ref(0)       // 已加载的时段数
-const scFcCount = ref(0)             // 已加载时段合计推送条数（各段 today_total 求和）
+// v2.1.24（用户口径 1a）：**取消分时段加载**。一次拿今天剩余全部时段，列表用
+// 固定高度的滚动区承载，打开时自动把「当前时段」滚到顶上（临近时段自动上移）。
+// v2.1.23 的「加载下一时段」按钮已删除 —— 用户实测那样更麻烦，滚动条才是正解。
 let _scForecastInFlight = false
-async function loadScForecast(opts = {}) {
+// 记录「这一次预测是基于哪个钟点算的」，用来推算当前小时（不依赖客户端时区）
+let _fcBase = null
+let _fcScrolledHour = null
+async function loadScForecast() {
   if (_scForecastInFlight) return
-  const page = scForecast.value.page || {}
-  const append = !!opts.append && page.next_hour != null
-  const fromHour = append ? Number(page.next_hour) : null
   _scForecastInFlight = true
-  if (append) scFcMoreLoading.value = true
-  else scForecastLoading.value = true
+  scForecastLoading.value = true
   try {
-    const d = await api('/sc/forecast?paged=1' + (fromHour != null ? `&from_hour=${fromHour}` : '')) || {}
-    if (!append) {
-      scForecast.value = d
-      scFcLoadedCount.value = 1
-      scFcCount.value = Number(d.today_total || 0)
-      loadScForecastFull()      // 不 await：队列要全天，排期卡片仍只显示当前段
-      return
-    }
-    // 追加：只拼 hours（按小时去重、升序），其余字段以最新一次响应为准
-    const prev = scForecast.value || {}
-    const seen = new Set((prev.hours || []).map(h => Number(h.hour)))
-    const merged = (prev.hours || []).concat((d.hours || []).filter(h => !seen.has(Number(h.hour))))
-    merged.sort((a, b) => Number(a.hour) - Number(b.hour))
-    scForecast.value = { ...prev, ...d, hours: merged }
-    scFcLoadedCount.value += 1
-    scFcCount.value += Number(d.today_total || 0)
+    const d = await api('/sc/forecast') || {}
+    scForecast.value = d
+    const h = Number(d.now_hour)
+    _fcBase = isFinite(h)
+      ? { hour: h, minute: Number(d.now_minute || 0), at: Date.now() }
+      : null
+    _fcScrolledHour = null
+    await nextTick()
+    scFcScrollToNow(true)
   } catch (_) {
     // 预测失败不影响其它卡片；留空并让模板显示「暂无排期」
-    if (!append) {
-      scForecast.value = { hours: [], blocked: [], notes: [], page: { next_hour: null, has_more: false } }
-      scFcLoadedCount.value = 0
-      scFcCount.value = 0
-    } else {
-      ElMessage.warning('下一时段没加载出来，稍后再点一次')
-    }
+    scForecast.value = { hours: [], blocked: [], notes: [] }
+    _fcBase = null
   } finally {
     scForecastLoading.value = false
-    scFcMoreLoading.value = false
     _scForecastInFlight = false
   }
 }
-function scForecastLoadMore() { loadScForecast({ append: true }) }
-// v2.1.23：排期卡片按段加载只影响「看」，但「推送队列」要的是**今天一整天**的
-// 待推清单（上一版刚把队列改成「在途 + 今日待排期」，只给一段会让队列莫名变短）。
-// 所以首屏那段出来之后，后台再静默拉一次全天预测，只喂队列，不碰排期卡片的
-// 分段视图。两条请求互不等待：首屏快，队列稍后补齐。
-const scForecastFull = ref({ hours: [] })
-let _scForecastFullInFlight = false
-async function loadScForecastFull() {
-  if (_scForecastFullInFlight) return
-  _scForecastFullInFlight = true
-  try {
-    const d = await api('/sc/forecast')      // 不带 paged = 全天（原有行为）
-    scForecastFull.value = d || { hours: [] }
-  } catch (_) {
-    scForecastFull.value = { hours: [] }     // 拉不到就退回用已加载的段，不冒充全天
-  } finally {
-    _scForecastFullInFlight = false
-  }
+// 当前小时 = 加载时的钟点 + 已经过去的分钟（跨小时自动进位）
+function scFcCurrentHour() {
+  if (!_fcBase) return null
+  const elapsed = Math.floor((Date.now() - _fcBase.at) / 60000)
+  return _fcBase.hour + Math.floor((_fcBase.minute + elapsed) / 60)
 }
-// 还有后续时段可加载？以及按钮该写哪两个钟点。
-const scFcHasMore = computed(() => {
-  const p = scForecast.value.page || {}
-  return p.has_more === true && p.next_hour != null
-})
-const scFcMoreLabel = computed(() => {
-  const p = scForecast.value.page || {}
-  const n = Number(p.next_hour)
-  if (p.next_hour == null || !isFinite(n)) return '加载下一时段'
-  const seg = Number(p.segments || 2)
-  return `加载下一时段 ${pad2(n)}:00–${pad2(Math.min(24, n + seg))}:00`
-})
+// 把「当前时段」滚到表格顶部；`force=false` 时只在本小时变了才动，
+// 否则用户手动往上翻会被每分钟拽回去。
+// v2.1.24：排期改用 el-table（和「推送队列」同一套表格），滚动容器是
+// Element Plus 内部的 `.el-scrollbar__wrap`，行元素在 `.el-table__body` 里。
+// 拿不到容器/行就**安静退出**并把 `_fcScrolledHour` 留空 —— 下一分钟的 tick
+// 会再试一次（表格首帧可能还没挂载完），比在这里 dead-loop 重试安全。
+function scFcScrollToNow(force = false) {
+  const hour = scFcCurrentHour()
+  if (hour == null) return
+  if (!force && hour === _fcScrolledHour) return
+  const root = scFcBodyRef.value && scFcBodyRef.value.$el
+  if (!root) return
+  const wrap = root.querySelector('.el-scrollbar__wrap')
+  if (!wrap) return
+  const idx = (scForecast.value.hours || []).findIndex(h => Number(h.hour) === hour)
+  if (idx < 0) return
+  const trs = wrap.querySelectorAll('.el-table__body tr')
+  const tr = trs[idx]
+  if (!tr) return
+  wrap.scrollTop = Math.max(0, tr.offsetTop)
+  _fcScrolledHour = hour
+}
 function pad2(n) { return String(Number(n) || 0).padStart(2, '0') }
 // 发布总览：左侧子导航 + KPI 点击筛选 + 任务详情（全部基于 /api/sc/* 真实数据）
 const scSubNav = ref('发布总览')
@@ -197,19 +177,8 @@ const SC_PUSH_PROGRESS_ITEMS = [
 const SC_PUSHED_STATUS = ['published']
 const SC_UNPUSHED_STATUS = ['planned', 'ready', 'building', 'submitted',
   'accepted', 'publishing', 'failed']
-const scFilteredTasks = computed(() => {
-  let rows = scTasks.value
-  const f = scTaskStatusFilter.value
-  if (f === 'pending') rows = rows.filter(r => ['planned', 'ready'].includes(r.status))
-  else if (f === 'inflight') rows = rows.filter(r => ['submitted', 'accepted', 'publishing', 'building'].includes(r.status))
-  else if (f) rows = rows.filter(r => r.status === f)
-  // v2.1.23：推送进度二分档（已推送 / 未推送），与上面的状态下拉是「与」关系
-  const p = scPushProgressFilter.value
-  if (p === 'pushed') rows = rows.filter(r => SC_PUSHED_STATUS.includes(r.status))
-  else if (p === 'unpushed') rows = rows.filter(r => SC_UNPUSHED_STATUS.includes(r.status))
-  if (scLinkFilter.value) rows = rows.filter(r => (r.link_state || 'unknown') === scLinkFilter.value)
-  return rows
-})
+// v2.1.24：过滤实现只留 `scTaskViewRows` 一处（v2.1.23 这里还有个 scFilteredTasks，
+// 但表格根本没用它 —— 那就是「筛选标签无效」的根因，已删）。
 // v2.1.1：分享管理改用独立真实端点 /sc/share-records（此前复用了 overview.views，
 // 导致「全部记录 36 / 待核验 146」这类口径对不上的数字）。
 const scShareRecords = ref([])
@@ -299,6 +268,18 @@ const fmtTime = (value, withSeconds = false) => {
   const base = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
   return withSeconds ? `${base}:${pad(d.getSeconds())}` : base
 }
+// v2.1.24（用户口径 4）：**同一天只给 HH:mm，跨天才补 MM-DD**。
+// 队列里「待排期」行给 18:00、在途任务行给 2026-11-24 18:00，同一列两种维度，
+// 左边对不齐也没法按时间比先后；统一后整列宽度一致，今天的一律是时刻。
+function fmtClock(value) {
+  const full = fmtTime(value)
+  const m = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/.exec(full)
+  if (!m) return full
+  const now = new Date()
+  const pad = n => String(n).padStart(2, '0')
+  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+  return m[1] === today ? m[2] : `${m[1].slice(5)} ${m[2]}`
+}
 // v2.1.3：耗时毫秒 → 人类可读（页面不出现「耗时(ms)」这种工程口径）。
 const fmtDuration = (ms) => {
   const n = Number(ms)
@@ -334,6 +315,13 @@ const scTaskViewRows = computed(() => {
   if (f === 'pending') rows = rows.filter(r => ['planned', 'ready'].includes(r.status))
   else if (f === 'inflight') rows = rows.filter(r => ['submitted', 'accepted', 'publishing', 'building'].includes(r.status))
   else if (f) rows = rows.filter(r => r.status === f)
+  // v2.1.24（用户口径 3）：**推送进度二分档真正接进来**。
+  // v2.1.23 把它写在了另一个 computed（`scFilteredTasks`）里，而「推送任务」表
+  // 用的是这个 computed —— 于是按钮点了没反应（渲染的永远是全量）。
+  // 现在只保留这一处实现：已推送 / 未推送 与状态、渠道、链接筛选是「与」关系。
+  const p = scPushProgressFilter.value
+  if (p === 'pushed') rows = rows.filter(r => SC_PUSHED_STATUS.includes(r.status))
+  else if (p === 'unpushed') rows = rows.filter(r => SC_UNPUSHED_STATUS.includes(r.status))
   if (scLinkFilter.value) rows = rows.filter(r => (r.link_state || 'unknown') === scLinkFilter.value)
   // v2.1.4：推送渠道筛选（全部 / 仅频道 / 仅群）
   const c = scTaskChannelFilter.value
@@ -420,7 +408,7 @@ const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, mirror_mode: 'full', interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {} })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {}, schedule: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 // v2.1.11：三处折叠组各用独立 v-model——此前共用同一个 mirrorDiagOpen，
 // 展开一个会收起另一个，用户刚展开「问题诊断」又发现「清单」被关掉了。
@@ -1146,6 +1134,8 @@ const previewDemo = {
   filename: '罪案之法.S01E04.2026.2160p.WEB-DL.H265.SDR.DDP5.1.mkv',
   resolution: '2160P',
   version: '2160p · WEB-DL · H.265 · SDR · DDP 5.1',
+  // v2.1.24：影视信息折叠块用的合并串（技术规格 · 大小），由后端 ctx.spec_line 给出
+  spec_line: '2160p · WEB-DL · H.265 · SDR · DDP 5.1 · 34.7 GB',
   season_label: '第1季',
   episode_count: '4', size: '34.7 GB', share_url: 'https://share.example/xxx',
   tmdb_id: '332839',
@@ -1192,6 +1182,12 @@ const previewText = computed(() => {
   }
   t = t.replace(/\{\{#if\s+\w+\}\}/g, '').replace(/\{\{\/if\}\}/g, '')
   for (const [k, v] of Object.entries(previewDemo)) t = t.split('{{' + k + '}}').join(v)
+  // v2.1.24：折叠块（真机是 Telegram 的可展开引用）在纯文本预览里用「▸ 」逐行标出，
+  // 让用户看得出哪几块会被折叠、折叠后默认只露第一行。
+  t = t.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/g,
+    (_m, body) => String(body).split('\n')
+      .map(x => '▸ ' + x)
+      .join('\n'))
   t = t.replace(/<[^>]+>/g, '')          // 预览按纯文本看，去掉 <b> 这类 HTML 标签
   const jump = previewJumpLine.value
   if (jump) {
@@ -1568,8 +1564,14 @@ async function saveMirror() {
     const body = { ...mirrorCfg.value,
       file_idle_seconds: Number(mirrorCfg.value.file_idle_seconds) || 1.0,
       max_works_per_run: Number(mirrorCfg.value.max_works_per_run) || 0 }
-    await api('/mirror/config', { method: 'POST', body: JSON.stringify(body) })
-    ElMessage.success('镜像设置已保存')
+    const r = await api('/mirror/config', { method: 'POST', body: JSON.stringify(body) })
+    // v2.1.24：注册定时任务失败时配置仍会保存，但必须**明确告诉用户**定时没生效——
+    // 原来这种情况不是静默就是直接 500，用户只会看到「同步没按间隔跑」。
+    if (r && r.schedule_error) {
+      ElMessage.warning(`设置已保存，但定时任务注册失败：${r.schedule_error}。定时同步不会运行，请检查后重新保存。`)
+    } else {
+      ElMessage.success('镜像设置已保存')
+    }
     await load()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorSaving.value = false }
@@ -2442,23 +2444,39 @@ const scInstantModeText = computed(() => {
   return `上新即时推送已启用（${lane}）：当前没有符合条件的新作品。`
 })
 
-// v2.1.23（用户口径 1）：排期行的时间不要再逐个铺开。
-// 一段里 20 部作品就是 20 个时刻，用「、」连起来会变成 18:00、18:06、18:12……
-// 一长串，把剧名挤到屏幕外，看起来像一堆乱码。这里只报「跨度 + 节奏」：
-//   单条 → 18:00；多条 → 18:00–19:30 · 每 10 分钟 1 部
-// 每部剧自己的时刻由下面逐部那一行给出（后端 `_respread_forecast_times` 已算好）。
-function _hm(text) {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(String(text || '').trim())
-  return m ? (Number(m[1]) * 60 + Number(m[2])) : null
+// v2.1.24（用户口径 1b/1c）：排期表与「推送队列」用**同一套表格**（el-table + stripe
+// + size=small + max-height），观感、行高、斑马纹、tooltip 行为都自动一致。
+//
+// 列＝「时间 | 分类 | 新上映 | 新入库 | 存量排期」，一行 = 一个小时：
+//   · 时间列给钟点 + 「每 N 分钟 1 部」（后端 `pace_minutes` 按 2 小时时段算好），
+//     不再报「18:24–18:42」这种跨小时跨度（跟左侧钟点不是一套坐标，看着就错位）；
+//   · 分类列给该小时的分类与「N 条 · M 部」；
+//   · 后三列是作品，按标签归列，每部后面跟推送时刻「黑豹2（18:12）」。
+//
+// 作品归列规则：新上映 > 新入库 > 存量排期（一部作品只出现一次，不重复占位）；
+// 没有标签的（既没入库时间也没上映信息）归存量列 —— 那是它在排期里的来路，
+// 但**不改变「判不出就留空」**的口径。
+const scFcBodyRef = ref(null)
+function scFcSplit(works) {
+  const out = { rel: [], lib: [], old: [] }
+  for (const w of (works || [])) {
+    const keys = (w.tags || []).map(t => t.key)
+    if (keys.includes('new_release')) out.rel.push(w)
+    else if (keys.includes('new_library')) out.lib.push(w)
+    else out.old.push(w)
+  }
+  return out
 }
-function scForecastSpan(it) {
-  const ts = (it && it.times) || []
-  if (!ts.length) return ''
-  if (ts.length === 1) return ts[0]
-  const first = ts[0], last = ts[ts.length - 1]
-  const a = _hm(first), b = _hm(ts[1])
-  const step = (a !== null && b !== null && b > a) ? (b - a) : 0
-  return step ? `${first}–${last} · 每 ${step} 分钟 1 部` : `${first}–${last}`
+// 表格行 = 小时 + 三组作品。预先算好再喂表格，避免在模板里对同一行重复分桶三遍。
+const scFcRows = computed(() => (scForecast.value.hours || []).map(h => {
+  const works = []
+  for (const it of (h.items || [])) works.push(...(it.works || []))
+  return { ...h, groups: scFcSplit(works) }
+}))
+// 当前小时的行加底色，配合「自动滚到当前时段」一起找得着。
+function scFcRowClass({ row }) {
+  const hour = scFcCurrentHour()
+  return hour != null && Number(row.hour) === hour ? 'is-now' : ''
 }
 // 本时段的整体节奏（后端 pace 给出，口径 = 时段分钟 ÷ 部数，除不尽四舍五入）。
 const scPaceText = computed(() => {
@@ -2469,14 +2487,21 @@ const scPaceText = computed(() => {
   return `每 ${hours} 小时为一个时段，本时段每 ${n} 分钟推 1 部（共 ${Number(p.works || 0)} 部）`
 })
 
+// v2.1.24（用户口径 4）：队列时间列统一口径——**同一天只给 HH:mm，跨天才补 MM-DD**。
+// 原来「待排期」行只给 `18:00`、在途任务行给 `2026-11-24 18:00`，同一列两种维度，
+// 左边对不齐、也没法按时间比大小（截图里就是这么错位的）。
+// 排期行本来就是今天的 `HH:mm`，直接透出；任务行取「计划时间」优先（队列问的是
+// 「什么时候推」），没有计划时间才退到创建时间。
+function scQueueClock(row) {
+  if (!row) return '—'
+  if (row._src === 'plan') return String(row.plan_time || '—')
+  return fmtClock(row.scheduled_at || row.created_at)
+}
 const scQueueRows = computed(() => {
   const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
   const have = new Set(rows.map(r => String(r.work_key || '')))
   const plan = []
-  // 队列用**全天**预测（后台补拉那份）；还没到就用已加载的段兜底，绝不空着。
-  const fullHours = scForecastFull.value.hours || []
-  const planHours = fullHours.length ? fullHours : (scForecast.value.hours || [])
-  for (const h of planHours) {
+  for (const h of (scForecast.value.hours || [])) {
     for (const it of (h.items || [])) {
       for (const w of (it.works || [])) {
         const wk = String(w.work_key || '')
@@ -3267,6 +3292,10 @@ async function verifyPushBot() {
 function tick() {
   clock.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
   if (authed.value && smsStatus.value && smsStatus.value.logged_in) updateCountdown()
+  // v2.1.24（用户口径 1a）：排期看板「临近时段自动上移」——跨到新的整点那一刻，
+  // 把当前时段滚到列表顶部。`scFcScrollToNow()` 内部只在小时真的变了才动，
+  // 不会把正在往上翻历史的用户每分钟拽回来。
+  if (authed.value) scFcScrollToNow()
 }
 
 onMounted(async () => {
@@ -3317,7 +3346,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.23 · Asia/Shanghai</span>
+          <span>v2.1.24 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3605,6 +3634,21 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <button v-for="v in (mirrorCfg.interval_presets || [])" :key="v" class="preset-btn" :class="{on: mirrorCfg.interval_minutes === v}" @click="mirrorCfg.interval_minutes = v">{{ intervalLabel(v) }}</button>
               </div>
             </div>
+            <!-- v2.1.24：把「下次自动同步」摆出来。用户排查「间隔设了 15 分钟却半天不跑」
+                 时，页面上只有上次同步时间可看 —— 「定时没注册」和「刚跑过」长得一模一样，
+                 只能靠猜。这里如实区分三态：有下次时间 / 已注册待计算 / 未注册（告警）。 -->
+            <div class="mirror-sched" v-if="mirrorStatus.schedule?.enabled">
+              <template v-if="mirrorStatus.schedule.next_run_at">
+                <span class="mirror-sched-dot on"></span>下次自动同步 <b>{{ mirrorStatus.schedule.next_run_at }}</b><span v-if="mirrorStatus.schedule.interval_minutes">（{{ intervalLabel(mirrorStatus.schedule.interval_minutes) }}一次）</span>
+              </template>
+              <template v-else-if="mirrorStatus.schedule.registered">
+                <span class="mirror-sched-dot"></span>定时已注册，正在计算下次触发时间…
+              </template>
+              <template v-else>
+                <span class="mirror-sched-dot warn"></span><b>定时任务未注册</b> —— 未注册期间不会有任何定时同步，重新点一次「保存设置」即可恢复。
+              </template>
+            </div>
+            <div class="mirror-sched" v-else-if="mirrorStatus.schedule"><span class="mirror-sched-dot"></span>定时同步已关闭，只会在手动点击时执行。</div>
             <div class="form-grid">
               <div class="field inline"><label>启用定时同步</label><el-switch v-model="mirrorCfg.enabled"/></div>
               <div class="field inline"><label>B 库主目录带 · 命名</label><el-switch v-model="mirrorCfg.star_naming"/></div>
@@ -4469,12 +4513,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div class="sc-fc-sum">
                         <span v-if="scForecastLoading && !(scForecast.hours || []).length" class="sc-fc-loading">排期中…</span>
                         <template v-else>
-                          <template v-if="scFcLoadedCount > 1">
-                            已加载 <b>{{ scFcLoadedCount }}</b> 个时段 · 合计 <b>{{ scFcCount }}</b> 条推送
-                          </template>
-                          <template v-else>
-                            <b>{{ scForecast.works_total || 0 }}</b> 部作品 · <b>{{ scFcCount }}</b> 条推送
-                          </template>
+                          <b>{{ scForecast.works_total || 0 }}</b> 部作品 · <b>{{ scForecast.today_total || 0 }}</b> 条推送
                           <em v-if="scForecast.overflow"> · 另有 <b>{{ scForecast.overflow }}</b> 条排不进今天</em>
                         </template>
                       </div>
@@ -4488,50 +4527,62 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <span class="sc-fc-pace-dot"></span>{{ scPaceText }}
                     </div>
                     <div v-if="scForecast.reason" class="sc-fc-warn">{{ scForecast.reason }}</div>
-                    <div class="sc-fc-list" v-if="(scForecast.hours || []).length">
-                      <div class="sc-fc-row" v-for="h in scForecast.hours" :key="h.hour">
-                        <div class="sc-fc-hour">{{ pad2(h.hour) }}:00</div>
-                        <div class="sc-fc-body">
-                          <template v-if="h.total">
-                            <div class="sc-fc-item" v-for="(it, i) in h.items" :key="i">
+                    <!-- v2.1.24（用户口径 1a/1b/1c）：固定高度滚动区 + 与「推送队列」**同一套表格**。
+                         用户先要表头四列，中间纠正过一次「不是改成表格、保留 2.22 风格」，
+                         随后又明确：「如果和推送队列的表格样式一样，可以接受」——
+                         所以这里就用 `el-table + stripe + size=small + max-height`，
+                         与下面「推送队列」的观感完全一致（同一套 Element Plus 表格，
+                         行高、斑马纹、tooltip 行为都自动对齐）。
+                           · 时间列固定：钟点 + 「每 N 分钟 1 部」（不再报跨小时跨度）；
+                           · 分类列：分类 + 条数 · 部数；
+                           · 新上映 / 新入库 / 存量排期 三列：作品按标签归列，
+                             每部后面跟推送时刻「黑豹2（18:12）」，存量列最宽（作品最多）。 -->
+                    <el-table :data="scFcRows" stripe size="small" max-height="330"
+                              ref="scFcBodyRef" class="sc-fc-table"
+                              :row-class-name="scFcRowClass"
+                              :empty-text="scForecastLoading ? '排期中…' : '今日暂无排期'">
+                      <el-table-column label="时间" width="104">
+                        <template #default="s">
+                          <div class="sc-fc-clock">{{ pad2(s.row.hour) }}:00</div>
+                          <div class="sc-fc-pace-mini" v-if="s.row.pace_minutes">每 {{ s.row.pace_minutes }} 分钟 1 部</div>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="分类" width="150">
+                        <template #default="s">
+                          <div class="sc-fc-cats" v-if="s.row.total">
+                            <div class="sc-fc-cat-line" v-for="(it, i) in s.row.items" :key="i">
                               <span class="sc-fc-cat">{{ it.category }}</span>
-                              <!-- v2.1.23（用户口径 1）：时间不再逐个铺开。
-                                   此前这里把每部作品的时刻用「、」连成一长串，18:00、18:00、
-                                   18:00…… 一屏全是重复时间，看着像乱码，剧名被挤到很远的右边。
-                                   现在只报**时段跨度 + 节奏**（18:00–19:30 · 每 10 分钟 1 部），
-                                   每部剧的具体时刻放到下面逐部那一行。 -->
-                              <span class="sc-fc-span" v-if="scForecastSpan(it)">{{ scForecastSpan(it) }}</span>
-                              <span class="sc-fc-count">{{ it.count }} 条<template v-if="it.works_total"> · {{ it.works_total }} 部</template></span>
+                              <em>{{ it.count }} 条<template v-if="it.works_total"> · {{ it.works_total }} 部</template></em>
                             </div>
-                            <!-- v2.1.22：排期里逐部给出三类标签（哪部是新入库、哪部是新上映、
-                                 哪部是存量补排），与推送历史/队列/任务同一套判定。 -->
-                            <div class="sc-fc-works" v-for="(w, wi) in (h.items || [])" :key="'w' + wi">
-                              <template v-if="(w.works || []).length">
-                                <div class="sc-fc-work" v-for="(wk, ki) in w.works" :key="ki">
-                                  <!-- v2.1.23：标签在剧名左侧（口径 6），顺序 = 标签 → 剧名 → 时刻 -->
-                                  <span v-if="(wk.tags || []).length" class="sc-rec-tags inline">
-                                    <span v-for="t in wk.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
-                                  </span>
-                                  <span class="sc-fc-work-name">{{ wk.title || '未命名作品' }}</span>
-                                  <span class="sc-fc-work-time" v-if="wk.time">{{ wk.time }}</span>
-                                </div>
-                              </template>
-                            </div>
-                          </template>
-                          <span v-else class="sc-fc-idle">{{ h.blocked || '—' }}</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div v-else-if="!scForecastLoading" class="empty">今日暂无排期</div>
-                    <!-- v2.1.23（用户口径 6）：排完一段再加载下一段，不一次性重排全天。
-                         按钮文案直接给下一段的钟点，用户知道点一下会多出哪两小时。 -->
-                    <div class="sc-fc-more" v-if="scFcHasMore">
-                      <el-button size="small" :loading="scFcMoreLoading" @click="scForecastLoadMore()">{{ scFcMoreLabel }}</el-button>
-                      <span class="sc-fc-more-hint">按时段分批排，先看眼前这两小时</span>
-                    </div>
-                    <div class="sc-fc-done" v-else-if="(scForecast.hours || []).length && !scForecastLoading">
-                      今天所有时段已排完
-                    </div>
+                          </div>
+                          <span v-else class="sc-fc-idle">{{ s.row.blocked || '—' }}</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="新上映" min-width="170">
+                        <template #default="s">
+                          <div class="sc-fc-works" v-if="s.row.groups.rel.length">
+                            <span class="sc-fc-w" v-for="(w, i) in s.row.groups.rel" :key="i">{{ w.title || '未命名作品' }}<em v-if="w.time">（{{ w.time }}）</em></span>
+                          </div>
+                          <span v-else class="sc-fc-none">—</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="新入库" min-width="170">
+                        <template #default="s">
+                          <div class="sc-fc-works" v-if="s.row.groups.lib.length">
+                            <span class="sc-fc-w" v-for="(w, i) in s.row.groups.lib" :key="i">{{ w.title || '未命名作品' }}<em v-if="w.time">（{{ w.time }}）</em></span>
+                          </div>
+                          <span v-else class="sc-fc-none">—</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="存量排期" min-width="260">
+                        <template #default="s">
+                          <div class="sc-fc-works" v-if="s.row.groups.old.length">
+                            <span class="sc-fc-w" v-for="(w, i) in s.row.groups.old" :key="i">{{ w.title || '未命名作品' }}<em v-if="w.time">（{{ w.time }}）</em></span>
+                          </div>
+                          <span v-else class="sc-fc-none">—</span>
+                        </template>
+                      </el-table-column>
+                    </el-table>
                     <div class="sc-fc-notes" v-if="(scForecast.notes || []).length">
                       <span v-for="(n, i) in scForecast.notes" :key="i">{{ n }}</span>
                     </div>
@@ -4564,11 +4615,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>在途任务 + 今日待排期（按发布规则推进）</p></div></div>
                       <el-table :data="scQueueRows" stripe size="small" max-height="300">
-                        <el-table-column label="时间" min-width="120" show-overflow-tooltip>
-                          <template #default="s">
-                            <span v-if="s.row._src === 'plan'">预计 {{ s.row.plan_time }}</span>
-                            <span v-else>{{ fmtTime(s.row.created_at) }}</span>
-                          </template>
+                        <el-table-column label="时间" width="96" show-overflow-tooltip>
+                          <template #default="s">{{ scQueueClock(s.row) }}</template>
                         </el-table-column>
                         <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
                           <template #default="s">
@@ -5611,6 +5659,13 @@ button{font-family:inherit}
 .panel-foot{display:flex;gap:10px;margin-top:22px;padding-top:18px;border-top:1px dashed var(--yg-line);flex-wrap:wrap}
 /* v0.9.6：镜像锁占用提示——后台改名复查静默持锁时，让用户知道为何「立即同步」会 409 */
 .mirror-lock-tip{display:flex;align-items:center;gap:10px;margin-top:16px;padding:10px 14px;background:var(--yg-tone-amber-bg);border:1px solid var(--yg-line);border-radius:10px;color:var(--yg-tone-amber-fg);font-size:12px;line-height:1.7}
+/* v2.1.24：定时同步的「下次触发时间」——三态（正常 / 已注册待计算 / 未注册告警） */
+.mirror-sched{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:2px 0 10px;
+  font-size:12px;line-height:1.7;color:var(--yg-muted)}
+.mirror-sched b{color:var(--yg-ink);font-weight:700}
+.mirror-sched-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--yg-tone-slate-fg)}
+.mirror-sched-dot.on{background:var(--yg-tone-green-fg,var(--yg-primary))}
+.mirror-sched-dot.warn{background:var(--yg-tone-amber-fg)}
 .batch-control-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px;padding:10px 14px;background:var(--yg-tone-blue-bg);border:1px solid var(--yg-line);border-radius:10px;font-size:12px}
 .batch-control-row .hint{color:var(--yg-muted)}
 /* v0.9.0：镜像同步页分区治理——状态数字按语义分组，配置/接口改成结构化 chip */
@@ -6263,17 +6318,29 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-sum em{font-style:normal;color:var(--yg-tone-amber-fg)}
 .sc-fc-loading{color:var(--yg-muted)}
 .sc-fc-warn{margin:0 0 10px;padding:9px 12px;border-radius:10px;background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg);font-size:12px;line-height:1.55}
-.sc-fc-list{max-height:330px;overflow:auto;border-top:1px solid var(--yg-line)}
-.sc-fc-row{display:flex;gap:12px;padding:8px 2px;border-bottom:1px solid var(--yg-line)}
-.sc-fc-row:last-child{border-bottom:0}
-.sc-fc-hour{flex:none;width:54px;font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--yg-primary)}
-.sc-fc-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
-.sc-fc-item{display:flex;gap:10px;align-items:baseline;min-width:0;font-size:12px}
-.sc-fc-cat{flex:none;padding:0 7px;border-radius:6px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);font-size:11px;line-height:18px}
-.sc-fc-time{flex:none;color:var(--yg-tone-amber-fg);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace}
-/* v2.1.23：时间只报「跨度 + 节奏」，不再逐部铺开（18:00、18:00… 那种乱象） */
-.sc-fc-span{flex:none;color:var(--yg-tone-amber-fg);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
-.sc-fc-count{flex:none;color:var(--yg-muted);font-size:11.5px;white-space:nowrap}
+/* v2.1.24（用户口径 1a/1b/1c）：今日推送排期表——与「推送队列」同一套 el-table
+   （stripe + size=small + max-height），下面只补列内排版，不覆盖组件外观。
+   固定高度滚动由 el-table 的 max-height 承担；当前时段整行加底色，配合
+   自动滚动一眼就能找到「现在推什么」。 */
+.sc-fc-table{margin-top:2px}
+.sc-fc-clock{font:600 12.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--yg-primary)}
+.sc-fc-pace-mini{margin-top:2px;font-size:10.5px;line-height:1.45;color:var(--yg-muted)}
+.sc-fc-cats{display:flex;flex-direction:column;gap:3px}
+.sc-fc-cat-line{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.sc-fc-cat-line em{font-style:normal;font-size:10.5px;color:var(--yg-muted);white-space:nowrap}
+.sc-fc-cat{display:inline-block;padding:0 7px;border-radius:6px;background:var(--yg-tone-blue-bg);
+  color:var(--yg-tone-blue-fg);font-size:11px;line-height:18px;white-space:nowrap}
+.sc-fc-works{display:flex;flex-wrap:wrap;gap:3px 10px}
+.sc-fc-w{font-size:11.5px;line-height:1.75;color:var(--yg-ink);
+  max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sc-fc-w em{font-style:normal;color:var(--yg-tone-amber-fg);
+  font:11px ui-monospace,SFMono-Regular,Menlo,monospace}
+.sc-fc-none{color:var(--yg-muted);font-size:11.5px}
+.sc-fc-idle{color:var(--yg-muted);font-size:12px}
+.sc-fc-table .el-table__row.is-now{background:var(--yg-tone-blue-bg)}
+.sc-fc-table .el-table__row.is-now td{background:transparent}
+.sc-fc-table .el-table__row.is-now .el-table__cell:first-child{box-shadow:2px 0 0 var(--yg-primary) inset}
+.sc-fc-notes{margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--yg-muted)}
 /* v2.1.23：本时段匀速节奏提示条 */
 .sc-fc-pace{margin:0 0 8px;font-size:12px;color:var(--yg-muted);display:flex;align-items:center;gap:6px}
 .sc-fc-pace-dot{width:6px;height:6px;border-radius:50%;background:var(--yg-tone-teal-fg,var(--yg-primary));flex:none}
@@ -6283,11 +6350,6 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-title{flex:1;min-width:0;color:var(--yg-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sc-fc-title em{font-style:normal;color:var(--yg-muted)}
 .sc-fc-idle{color:var(--yg-muted);font-size:12px}
-.sc-fc-notes{margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--yg-muted)}
-/* v2.1.23（用户口径 6）：排期按时段分批加载——底部「加载下一时段」按钮与收尾行。 */
-.sc-fc-more{margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.sc-fc-more-hint{font-size:11.5px;color:var(--yg-muted)}
-.sc-fc-done{margin-top:10px;font-size:11.5px;color:var(--yg-muted)}
 /* v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）。
    四个模块（今日推送排期 / 推送历史 / 推送队列 / 推送任务）共用同一套样式；
    颜色全部走 --yg-tone-* token，深色主题下自动跟随（本文件 dark 段已重定义）。 */
@@ -6297,11 +6359,6 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-rec-tag.lib{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
 .sc-rec-tag.rel{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
 .sc-rec-tag.old{background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}
-/* 排期面板逐部明细：名称 + 预计时间 + 标签一行放下 */
-.sc-fc-works{display:flex;flex-direction:column;gap:3px}
-.sc-fc-work{display:flex;align-items:center;gap:8px;min-width:0;font-size:11.5px;color:var(--yg-muted)}
-.sc-fc-work-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--yg-ink)}
-.sc-fc-work-time{flex:none;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--yg-tone-amber-fg)}
 /* v2.1.22：排期面板顶部一句档位说明（插队是否生效、有几部插队） */
 .sc-fc-instant{display:flex;align-items:center;gap:6px;margin:2px 0 8px;font-size:11.5px;color:var(--yg-muted)}
 .sc-fc-instant-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--yg-tone-slate-fg)}

@@ -1317,6 +1317,8 @@ def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, A
                 period_entries.setdefault(psh, []).append((it, w))
     pace_info: dict[str, Any] = {"period_hours": HOUR_SEGMENT_HOURS,
                                  "interval_minutes": 0, "works": 0}
+    # 时段起点小时 → 该时段的间隔分钟数（回写到每个 hour 上，见函数末尾）
+    period_interval: dict[int, int] = {}
     for psh, entries in period_entries.items():
         start = now_sh.replace(hour=psh, minute=0, second=0, microsecond=0)
         end = start + timedelta(hours=HOUR_SEGMENT_HOURS)
@@ -1348,6 +1350,14 @@ def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, A
         if not pace_info["interval_minutes"]:
             pace_info["interval_minutes"] = interval
             pace_info["works"] = count
+        period_interval[psh] = interval
+    # v2.1.24（用户口径 1c）：把「每 N 分钟 1 部」回写到**每个小时**上。
+    # 前端表头只有四列、时间列固定，节奏文案跟着左侧时间列走（不再报
+    # 「18:24–18:42」这种跨小时的跨度，那串数字对用户没有信息量）。
+    # 同一时段内的小时共用一个 interval —— 与 `_period_pace` 同源，不另算一套。
+    for h in hours:
+        hour = int(h.get("hour") or 0)
+        h["pace_minutes"] = int(period_interval.get(hour - hour % HOUR_SEGMENT_HOURS) or 0)
     return pace_info
 
 
@@ -2256,9 +2266,7 @@ def register_force_tasks(db: Session, resource: Resource,
 
 
 def forecast_schedule(db: Session, *, scan_limit: int = 4000,
-                      per_hour_top: int = 4,
-                      from_hour: int | None = None,
-                      paged: bool = False) -> dict[str, Any]:
+                      per_hour_top: int = 4) -> dict[str, Any]:
     """当天剩余时段的推送排期预测。**只读**：不写库、不建任务、不发消息。
 
     用户口径（v2.1.19）：发布规则不只是「分流规则」，而是调动资源库存量、有序推送的
@@ -2292,16 +2300,10 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         # v2.1.22：插队档位与插队作品数（off 时为 0，前端据此说明"全量按排期轮转"）
         "instant_mode": "off",
         "instant_works": 0,
-        # v2.1.23（用户口径 6）：分时段取数——从哪个小时开始模拟、这次覆盖到哪。
-        # 不传 `paged` → 从当前小时算到 24 点（保持既有行为，一次看全天）。
-        # `paged=True` → 只算**一个排期时段**（`HOUR_SEGMENT_HOURS` 小时）：
-        #   首屏不带 `from_hour` 取「当前时段」，要看下一段再带 `from_hour` 来取。
-        # 单次请求少模拟几个小时，首屏更快、后端少扫几轮候选。
-        # **只影响「看」的范围，不影响「推」**：`plan_engine` 照旧把当日任务建满，
-        # `dispatch` 照旧连续往外发 —— 推送不分页。
-        "page": {"from_hour": None, "to_hour": 24, "next_hour": None,
-                 "has_more": False, "partial": False,
-                 "segments": HOUR_SEGMENT_HOURS},
+        # v2.1.24（用户口径 1a）：**取消分时段加载**，一次算出今天剩余全部时段，
+        # 前端用固定高度的滚动区展示（打开时自动滚到当前时段）。
+        # v2.1.23 的分段取数（`paged` / `from_hour` / `page`）已删除 ——
+        # 用户实测「点一下才多两小时」不如直接给全天，滚动条本来就能解决长度问题。
     }
 
     version = _active_version(db)
@@ -2440,36 +2442,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
             out["instant_works"] = len(instant_rows)
 
     # ---- 逐小时模拟 ----
-    # v2.1.23（用户口径 6）：分时段取数。「排期完成后再加载下一页」——先排
-    # 14:00-16:00，用户点「加载下一时段」再排 16:00-18:00，不要一次性全量重排。
-    # 目的有两个：单次请求少模拟几小时（首屏快、后端轻），以及不让几百部作品
-    # 一次性堆在同一张表里。
-    seg = max(1, int(HOUR_SEGMENT_HOURS))
-    if paged:
-        base = int(now_sh.hour)
-        if from_hour is not None:
-            try:
-                base = max(base, min(23, int(from_hour)))
-            except (TypeError, ValueError):
-                pass
-        # 起点不早于当前小时（不预测已经过去的整点），终点对齐到**时段末尾**：
-        # 15:30 → 15:00-16:00（只排剩下的小时），下一段从 16:00 接上，不重叠不跳空。
-        start_hour = base
-        end_hour = min(24, base - (base % seg) + seg)
-    else:
-        start_hour = int(now_sh.hour)
-        if from_hour is not None:
-            try:
-                want = int(from_hour)
-            except (TypeError, ValueError):
-                want = start_hour
-            start_hour = max(start_hour, min(23, want))
-        end_hour = 24
-    out["page"]["from_hour"] = start_hour
-    out["page"]["to_hour"] = end_hour
-    out["page"]["partial"] = end_hour < 24
-    out["page"]["has_more"] = end_hour < 24
-    out["page"]["next_hour"] = end_hour if end_hour < 24 else None
+    # v2.1.24：一次性从当前小时算到 24 点。前端用滚动区承载（不再分批加载）。
+    start_hour = int(now_sh.hour)
+    end_hour = 24
     for h in range(start_hour, end_hour):
         win = next((w for w in hour_windows
                     if int(w.start_hour or 0) <= h < int(w.end_hour or 0)), None)
@@ -2630,16 +2605,8 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 backlog_pairs.add((wk, chat_id))
         if truncated:
             break
-    if end_hour < 24:
-        # 分页时只模拟了一段：「排不进今天」「存量总量」都还没算完，报出去就是假数字。
-        # 留 None（前端隐藏那两处），等最后一个时段加载完再给真值。
-        out["overflow"] = None
-        out["backlog"] = None
-        out["notes"].append("按排期时段分批加载：已排到 %02d:00，后面还有 %d 个时段。"
-                            % (end_hour, (24 - end_hour + seg - 1) // seg))
-    else:
-        out["overflow"] = len(backlog_pairs)
-        out["backlog"] = len(backlog_pairs) + len(planned_pairs)
+    out["overflow"] = len(backlog_pairs)
+    out["backlog"] = len(backlog_pairs) + len(planned_pairs)
     if truncated:
         out["notes"].append("存量作品过多，本次只盘点到 %d 部，实际待推量可能更多。" % scan_limit)
 
@@ -4007,18 +3974,17 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/forecast")
-def api_forecast(from_hour: int | None = None, paged: bool = False,
-                 db: Session = Depends(get_db)):
+def api_forecast(db: Session = Depends(get_db)):
     """今日排期预测（v2.1.19）。
 
     为什么单独开一个端点而不塞进 `/overview`：`overview` 会调 `ensure_defaults`
     并把六张表全量聚合，本身已经重；排期预测还要扫作品快照和名额索引，合并会把
     整个仪表盘首屏拖慢。这里保持只读、按需加载，前端先渲染已有卡片再补排期。
 
-    v2.1.23：`paged=1` 支持**分时段取数**（用户口径 6）——前端先取当前时段，
-    要看下一时段再带 `from_hour` 来取，不必每次都模拟到 24 点。
+    v2.1.24：取消分时段加载（用户口径 1a），一次返回今天剩余全部时段，
+    前端用固定高度滚动区承载。参数全无 —— 少一层状态就少一类「和实跑不一致」。
     """
-    return forecast_schedule(db, from_hour=from_hour, paged=paged)
+    return forecast_schedule(db)
 
 
 @router.get("/overview")

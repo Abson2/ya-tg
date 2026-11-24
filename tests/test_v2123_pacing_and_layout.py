@@ -14,7 +14,7 @@
   ② 时段匀速：间隔 = 四舍五入(时段分钟 ÷ 部数)，站台锚定时段起点；
   ③ `_period_pace` / `_period_released` 与预测同一口径（预测不许比实跑偏快）；
   ④ 终态记录不显示「存量排期」；
-  ⑤ forecast 支持按段取数（from_hour），且**只影响取数范围、不影响推送**；
+  ⑤ forecast 一次给全天（v2.1.24 起取消 `paged` / `from_hour` 分页取数）；
   ⑥ 前端契约：标签在剧名左侧、已推送/未推送可筛、预览带示例数据。
 """
 import json
@@ -235,7 +235,11 @@ def test_respread_skips_past_segments():
 
 
 # ---------------------------------------------------------------------------
-# ⑤ forecast 分页取数：只影响「看」，不影响「推」
+# ⑤ forecast 全天一次返回（v2.1.24 起取消分页）
+#
+# v2.1.23 曾按「时段」分批取数（`paged` / `from_hour` / `page.next_hour`），
+# 用户实测后否掉了：「点一下才多两小时」比滚动条更麻烦。分页整套删除后，
+# 这里只锁「一次给全天」「签名里没有分页参数」「节奏回写到每小时」三件事。
 # ---------------------------------------------------------------------------
 def _plan(db, **cfg):
     plan = SCSharePlan(name="p", plan_type="daily", enabled=True)
@@ -278,54 +282,19 @@ def _work(db, *, title, entry_at=None, release_date="", media_type="movie",
         metadata_json=json.dumps({"title": title}), change_type="created",
         created_at=entry_at or (datetime.now(timezone.utc) - timedelta(days=100))))
     db.flush()
+    # 排期模拟走 `_candidates`，它是 join SCWorkCategory 取候选的 —— 不挂分类，
+    # 作品就永远进不了预测（表现是「造了 5 部剧、排期却全空」，极易误判成 bug）。
+    db.add(SCWorkCategory(work_key=wk, category_key="genre:剧情", media_type=media_type))
+    db.flush()
     return wk
 
 
-def test_forecast_from_hour_narrows_window_only():
-    """`from_hour` 只缩小「模拟范围」，不改写入——推送本身不分页。
+def test_forecast_returns_whole_day_in_one_call():
+    """v2.1.24（用户口径 1a）：一次给出今天剩余全部时段，不再有 `page` 字段。
 
-    v2.1.23 用户口径 5 的第一句是「排期完成后再加载下一页」，但同一轮对话里
-    用户明确纠正过「推送不是分页推送」。所以这里锁死：分页只影响**取数**，
-    `plan_engine` 照旧一次把当日任务建满。
+    只读：预测不建任务（分页删了，但「预测 ≠ 建任务」这条更要守住）。
     """
     with SessionLocal() as db:
-        ver = _plan(db)
-        db.add(SCCategory(category_key="genre:剧情", name="剧情", enabled=True, priority=0))
-        _channel(db)
-        for i in range(3):
-            _work(db, title=f"剧{i}")
-        db.commit()
-
-        full = sc2.forecast_schedule(db)
-        assert full["page"]["from_hour"] == full["now_hour"]
-        assert full["page"]["to_hour"] == 24
-
-        later = min(23, full["now_hour"] + 3)
-        part = sc2.forecast_schedule(db, from_hour=later)
-        assert part["page"]["from_hour"] == later
-        assert all(h["hour"] >= later for h in part["hours"])
-        assert len(part["hours"]) <= len(full["hours"])
-
-        # 只读：两次调用前后库内任务数不变（分页不是"分批建任务"）
-        assert db.query(SCPublishTask).count() == 0
-
-
-def test_forecast_from_hour_never_rewinds_before_now():
-    """传过去的小时不能"倒回去算"——起点永远不早于当前小时。"""
-    with SessionLocal() as db:
-        _plan(db)
-        db.add(SCCategory(category_key="genre:剧情", name="剧情", enabled=True, priority=0))
-        _channel(db)
-        _work(db, title="剧0")
-        db.commit()
-        out = sc2.forecast_schedule(db, from_hour=0)
-        assert out["page"]["from_hour"] == out["now_hour"]
-
-
-def test_forecast_paged_returns_one_segment():
-    """`paged=1` 一次只排**一个时段**（用户口径 6：排完 14-16 再加载 16-18）。"""
-    seg = int(sc2.HOUR_SEGMENT_HOURS)
-    with SessionLocal() as db:
         _plan(db)
         db.add(SCCategory(category_key="genre:剧情", name="剧情", enabled=True, priority=0))
         _channel(db)
@@ -333,76 +302,71 @@ def test_forecast_paged_returns_one_segment():
             _work(db, title=f"剧{i}")
         db.commit()
 
-        out = sc2.forecast_schedule(db, paged=True)
-        page = out["page"]
-        assert page["to_hour"] % seg == 0, "时段末尾必须落在整段边界上"
-        assert 0 < page["to_hour"] - page["from_hour"] <= seg
-        assert page["from_hour"] == out["now_hour"], "不从已经过去的整点开始预测"
-        assert len(out["hours"]) <= seg
-        assert all(page["from_hour"] <= h["hour"] < page["to_hour"]
-                   for h in out["hours"])
-
-        # 全天口径（不传 paged）保持原样，不能被分页改坏
-        full = sc2.forecast_schedule(db)
-        assert full["page"]["to_hour"] == 24
-        assert full["page"]["partial"] is False
-        assert full["page"]["has_more"] is False
-        assert full["page"]["next_hour"] is None
+        out = sc2.forecast_schedule(db)
+        assert "page" not in out, "分页字段已删除，别再吐半个 page"
+        assert out["hours"], "至少要返回当前小时"
+        assert out["hours"][0]["hour"] == out["now_hour"], "不从已经过去的整点开始预测"
+        assert out["hours"][-1]["hour"] == 23, "必须一路算到 24 点前最后一个小时"
+        # 连续、不跳空（否则前端滚动列表会缺行）
+        assert [h["hour"] for h in out["hours"]] == list(range(out["now_hour"], 24))
+        # 只读：两次调用前后库内任务数不变
+        assert db.query(SCPublishTask).count() == 0
 
 
-def test_forecast_paged_next_hour_advances_by_segment():
-    """`next_hour` 必须是下一段的起点，前端拿它去取「加载下一时段」。"""
-    seg = int(sc2.HOUR_SEGMENT_HOURS)
-    with SessionLocal() as db:
-        _plan(db)
-        _channel(db)
-        db.commit()
-        first = sc2.forecast_schedule(db, paged=True)
-        nxt = first["page"]["next_hour"]
-        if first["page"]["has_more"]:
-            assert nxt == first["page"]["to_hour"]
-            assert nxt % seg == 0
-            second = sc2.forecast_schedule(db, paged=True, from_hour=nxt)
-            assert second["page"]["from_hour"] == nxt
-            assert second["page"]["to_hour"] == min(24, nxt + seg)
-            # 两段不重叠、不跳空
-            assert second["page"]["from_hour"] == first["page"]["to_hour"]
+def test_forecast_has_no_paging_parameters():
+    """分页参数要**整套**删掉，不留半套（留半套 = 前端还会试着传）。"""
+    import inspect
+    fn_params = inspect.signature(sc2.forecast_schedule).parameters
+    for gone in ("paged", "from_hour"):
+        assert gone not in fn_params, f"forecast_schedule 还留着 {gone}"
+    api_params = inspect.signature(sc2.api_forecast).parameters
+    assert set(api_params) == {"db"}, f"api_forecast 还有多余参数：{api_params}"
 
 
-def test_forecast_paged_last_segment_closes_the_day():
-    """最后一段（22:00-24:00）要收尾：`has_more=False` 且不再给 `next_hour`。"""
-    seg = int(sc2.HOUR_SEGMENT_HOURS)
-    last = 24 - seg
-    with SessionLocal() as db:
-        _plan(db)
-        _channel(db)
-        db.commit()
-        out = sc2.forecast_schedule(db, paged=True, from_hour=last)
-        assert out["page"]["from_hour"] == last
-        assert out["page"]["to_hour"] == 24
-        assert out["page"]["has_more"] is False
-        assert out["page"]["next_hour"] is None
-        assert out["page"]["partial"] is False
-        assert isinstance(out["overflow"], int)
-        assert isinstance(out["backlog"], int)
+def test_forecast_every_hour_carries_pace_minutes():
+    """v2.1.24（用户口径 1c）：每小时都带「每 N 分钟 1 部」。
 
-
-def test_forecast_paged_does_not_report_partial_overflow():
-    """还没排到的时段不能拿半个模拟结果冒充「今天排不进 N 条」。"""
+    用户原话：「18:24–18:42 · 每 6 分钟 1 部」不用展示那么细，展示几分钟一部就行，
+    与第一列的时间段对齐 —— 所以节奏挂在**时间列**上，同一时段共用一个值。
+    """
     with SessionLocal() as db:
         _plan(db)
         db.add(SCCategory(category_key="genre:剧情", name="剧情", enabled=True, priority=0))
         _channel(db)
-        for i in range(5):
+        for i in range(4):
             _work(db, title=f"剧{i}")
         db.commit()
-        out = sc2.forecast_schedule(db, paged=True)
-        if out["page"]["partial"]:
-            assert out["overflow"] is None, "分页时不得报一个只算了一段的 overflow"
-            assert out["backlog"] is None
-            assert any("分批加载" in n for n in out["notes"])
-        # 只读：分页不是「分批建任务」
-        assert db.query(SCPublishTask).count() == 0
+
+        out = sc2.forecast_schedule(db)
+        for h in out["hours"]:
+            assert "pace_minutes" in h, f"{h['hour']} 点缺 pace_minutes"
+            assert isinstance(h["pace_minutes"], int), h["pace_minutes"]
+        paced = [h for h in out["hours"] if h["total"]]
+        assert paced, "造了 4 部剧却没有排期，用例前提不成立"
+        assert all(h["pace_minutes"] >= 1 for h in paced), \
+            [(h["hour"], h["pace_minutes"]) for h in paced]
+        # 同一时段（HOUR_SEGMENT_HOURS）内的小时共用一个值，不各算一套
+        seg = int(sc2.HOUR_SEGMENT_HOURS)
+        by_seg: dict[int, set[int]] = {}
+        for h in out["hours"]:
+            by_seg.setdefault(h["hour"] - h["hour"] % seg, set()).add(h["pace_minutes"])
+        for start, vals in by_seg.items():
+            assert len(vals) == 1, f"{start} 点起的时段出现了多个间隔：{vals}"
+
+
+def test_forecast_pace_minutes_zero_for_empty_segment():
+    """整段没排到东西 → 0（前端据此不显示节奏文案），不编一个假间隔。
+
+    注意这一条**不是**「0 冒充读不到」：0 的语义就是「本时段没有推送」，
+    与 pacing 的 interval 无值可算是两件事。
+    """
+    with SessionLocal() as db:
+        _plan(db)
+        _channel(db)
+        db.commit()
+        out = sc2.forecast_schedule(db)
+        assert all(h["pace_minutes"] == 0 for h in out["hours"]), \
+            [(h["hour"], h["pace_minutes"]) for h in out["hours"]]
 
 
 # ---------------------------------------------------------------------------
@@ -442,26 +406,21 @@ def test_frontend_preview_uses_series_sample():
     assert "⚡ " in APP_VUE
 
 
-def test_frontend_forecast_loads_segment_by_segment():
-    """排期按「时段」分批加载（用户口径 6），不是一次性重排全天。"""
-    # 请求必须显式带 paged，后端才会只排一段
-    assert "/sc/forecast?paged=1" in APP_VUE
-    # 追加逻辑：按小时去重合并 + 累加已加载段数/条数
-    assert "scForecastLoadMore" in APP_VUE
-    assert "scFcLoadedCount" in APP_VUE
-    assert "scFcCount" in APP_VUE
-    # 按钮文案要给出下一段的钟点，用户知道点一下会多出哪两小时
-    assert "加载下一时段" in APP_VUE
-    assert "scFcMoreLabel" in APP_VUE
-    # 按钮与「全部排完」不能同时出现
-    assert "scFcHasMore" in APP_VUE
-    assert "今天所有时段已排完" in APP_VUE
-    # 排期卡片分段，但「推送队列」要全天（上一版刚把队列改成「在途 + 今日待排期」，
-    # 只给一段会让队列莫名变短）→ 首屏之后后台静默补拉一次全天，只喂队列。
-    assert "loadScForecastFull" in APP_VUE
-    assert "scForecastFull" in APP_VUE
-    q = APP_VUE[APP_VUE.index("const scQueueRows"):]
-    q = q[:q.index("// ----------")]
-    assert "scForecastFull" in q, "队列没用全天预测"
-    assert "planHours" in q, "队列缺少「全天优先、已加载段兜底」的取数"
+def test_frontend_forecast_no_longer_pages():
+    """v2.1.24（用户口径 1a）：分批加载整套删除，改固定高度滚动区。
+
+    这条是**反证**：v2.1.23 的分段取数痕迹必须一处不剩。后端已经全量返回，
+    前端若还挂着「加载下一时段」按钮，用户会以为排期没排完（这就是缺陷）。
+    """
+    for gone in ("/sc/forecast?paged=1", "scForecastLoadMore", "scFcLoadMore",
+                 "scFcLoadedCount", "scFcCount", "scFcMoreLabel", "scFcHasMore",
+                 "loadScForecastFull", "scForecastFull"):
+        assert gone not in APP_VUE, f"分批加载残留：{gone}"
+    # 正向：一次性请求 + 与「推送队列」同一套 el-table + 自动滚到当前时段
+    assert "api('/sc/forecast')" in APP_VUE
+    assert 'class="sc-fc-table"' in APP_VUE
+    assert "ref=\"scFcBodyRef\"" in APP_VUE
+    assert "scFcScrollToNow" in APP_VUE
+    # 「临近时段自动上移」靠每分钟 tick 复算当前小时（不是定时器另起一套）
+    assert "if (authed.value) scFcScrollToNow()" in APP_VUE
 
