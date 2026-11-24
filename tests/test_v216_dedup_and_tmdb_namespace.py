@@ -414,6 +414,12 @@ def test_publisher_dedup_survives_second_dispatch(env, monkeypatch):
         return "sid", "https://www.guangyapan.com/s/ok"
 
     monkeypatch.setattr(sc2, "create_share_parsed", fake_create)
+    # v2.1.19：固定在本小时第 59 分，让匀速额度放满（cap=3）。
+    # 本用例验证的是**去重**（第二次进 dispatch 应 skipped），不该被分钟级节流
+    # 干扰：整点刚过时额度只放 1 部，dispatch 会先 throttled 退出，
+    # 根本走不到去重判定，stats["skipped"] 就恒为 0（假红）。
+    _frozen = sc2.utcnow().replace(minute=59, second=0, microsecond=0)
+    monkeypatch.setattr(sc2, "utcnow", lambda: _frozen)
 
     with S() as db:
         r = _teddy_resource(db)

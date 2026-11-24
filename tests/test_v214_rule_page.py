@@ -54,12 +54,20 @@ def env():
 
 
 def _add_published_at(db, category_key, moments):
-    """造指定时刻的「已成功推送」历史（真实消费结果），喂给周维度建议派生。"""
+    """造指定时刻的「已成功推送」历史（真实消费结果），喂给周维度建议派生。
+
+    **必须转成 UTC 再写**：SQLite 的 `DateTime(timezone=True)` 不保存 tzinfo，
+    写进去什么数值读回来就是什么数值（naive）。真实写入路径是 `utcnow()`（UTC），
+    所以这里也要 `.astimezone(timezone.utc)` —— 直接塞上海 aware 时间会变成
+    「上海的时刻数值被当成 UTC」，读回来整体偏 8 小时（v2.1.19 修时区时暴露）。
+    """
     from app.models import SCPublishTask, SCPushList, SCPushListItem
     pl = SCPushList(list_key=f"pl:{category_key}", name="清单", status="active")
     db.add(pl)
     db.flush()
     for i, moment in enumerate(moments):
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(timezone.utc)
         item = SCPushListItem(list_id=pl.id, work_key=f"work:{category_key}:{i}",
                               library_version_id=0, category_key=category_key,
                               dedup_key=f"d:{category_key}:{i}", target_type="group",

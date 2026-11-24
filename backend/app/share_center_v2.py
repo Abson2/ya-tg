@@ -159,6 +159,12 @@ PERMANENT_ERROR_MARKERS = (
 INVALID_TASK_STATUS = "invalid"        # 无效推送：链接作废 / 建链失败 / 资源已移除
 # 视为「链接已作废」的状态：记录仍在，但那份分享已经不能用了。
 INVALID_LINK_STATES = frozenset({CLEANED_LINK_STATE, INVALID_TASK_STATUS})
+# 计入「推送趋势」失败线的状态（v2.1.19）。
+# 只算真正的失败：failed（重试中的临时失败也算失败尝试）+ invalid（判为无效推送）。
+# 在途（ACTIVE_TASK_STATUS）、cancelled（用户主动取消）、cleaned（已归档）都**不是**
+# 失败 —— 此前「非 published 一律算 failed」把这三类全算成失败，趋势图上因此出现
+# 与真实故障无关的高峰。
+TREND_FAILED_STATUSES = frozenset({"failed", INVALID_TASK_STATUS})
 # 名额判定的三态取值
 SLOT_ACTIVE = "active"
 SLOT_VALID = "valid"
@@ -1024,6 +1030,77 @@ def _current_hour_allowed(db: Session, version: SCSharePlanVersion) -> bool:
     return _current_hour_window(db, version) is not None
 
 
+# ---------------------------------------------------------------------------
+# v2.1.19：分类排期判定的**纯函数内核**
+#
+# 为什么抽出来：`plan_engine` 里的 `_sched_allows` 闭包把 `sh_hour` 写死成「当前
+# 小时」，只能回答「此刻能不能排」。而「今日排期」要回答「10 点能不能排、14 点能
+# 不能排」，必须按任意小时求值。抽成参数化纯函数后，**实跑与预测共用同一份判据**，
+# 预测才不会和真实调度算出差。
+# ---------------------------------------------------------------------------
+def _sched_window_for(sched: SCCategorySchedule, weekday: int) -> tuple[int, int]:
+    """取该分类**某个星期几**生效的 (start_hour, end_hour)。周维度配置优先。"""
+    day_window = _week_window_for(weekday, sched.week_windows or "")
+    if day_window:
+        return int(day_window[0]), int(day_window[1])
+    return int(sched.window_start or 0), int(sched.window_end or 0)
+
+
+def _sched_allows_core(sched: SCCategorySchedule | None, *,
+                       hour: int, weekday: int,
+                       per_category_count: int,
+                       cycle_hour_max: int,
+                       cycle_day_max: int,
+                       today_count: int = 0) -> bool:
+    """纯判定：该分类在 `hour` 点这一刻是否允许排期。**不访问数据库**。
+
+    判定顺序与 `plan_engine` 原闭包逐条一致：
+      ① 没有排期行 → 放行（兼容存量，见 `_ensure_schedules` 只给 TMDB genre 建行）；
+      ② 小时不在窗口内 → 拒绝（支持跨午夜窗口）；
+      ③ 已达分类每小时上限 → 拒绝；
+      ④ 已达分类当日上限 → 拒绝。
+    """
+    if sched is None:
+        return True
+    ws, we = _sched_window_for(sched, weekday)
+    if we > ws:
+        in_win = ws <= hour < we
+    elif we < ws:
+        in_win = hour >= ws or hour < we      # 跨午夜
+    else:
+        in_win = True                          # 起止相同 = 全天
+    if not in_win:
+        return False
+    if cycle_hour_max and per_category_count >= cycle_hour_max:
+        return False
+    if cycle_day_max and today_count >= cycle_day_max:
+        return False
+    return True
+
+
+def _hourly_due(cap: int, minute: int) -> int:
+    """本小时到第 `minute` 分钟为止，累计**应放行**的任务数（匀速放行核心）。
+
+    用户口径（v2.1.19）：每时段的推送任务应当**均匀分配**，不能时间一到就一股脑推完。
+
+    原实现是「整点配额突发」——`submitted_this_hour >= cap` 一刀切：10:00:00 一到
+    就把 cap 部全部推完，之后 59 分钟静默。用户看到的就是「一到点全推出去」。
+    改成线性进度后，cap=3 落在第 0/20/40 分钟各 1 部，cap=60 每分钟 1 部。
+    这不是新增节流，只是把同一个 cap 从「整点突发」摊成「匀速」。
+    """
+    if cap <= 0:
+        return 10 ** 9          # 0/负数 = 不限，这里给个大数让调用方直接比较
+    minute = max(0, min(59, int(minute)))
+    return (cap * (minute + 1) + 59) // 60      # ceil(cap*(m+1)/60)，纯整数避免浮点
+
+
+def _uniform_minute(cap: int, index: int) -> int:
+    """匀速放行下，本小时第 `index` 部（1-based）预计落在第几分钟。"""
+    if cap <= 0:
+        return 0
+    return min(59, max(0, int(60 * (max(1, int(index)) - 1) / cap)))
+
+
 def _category_today_count(db: Session, category_key: str) -> int:
     """某分类当日已创建任务数（分类排期 daily_limit 用）。上海自然日。"""
     now_sh = datetime.now(shanghai_tz())
@@ -1382,25 +1459,15 @@ def plan_engine(db: Session) -> dict[str, int]:
     cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
     cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
     def _sched_allows(key: str, per_category_count: int) -> bool:
-        s = sched_map.get(key)
-        if not s:
-            return True  # 未配置排期行的分类保持原轮转行为（兼容存量）
-        day_window = _week_window_for(iso_weekday, s.week_windows or "")
-        ws, we = day_window if day_window else (int(s.window_start or 0), int(s.window_end or 0))
-        if we > ws:
-            in_win = ws <= sh_hour < we
-        elif we < ws:
-            in_win = sh_hour >= ws or sh_hour < we  # 跨午夜
-        else:
-            in_win = True
-        if not in_win:
-            return False
-        # v2.1.6：限流口径改为周期计划统一约束（分类行上的旧上限不再生效）
-        if cycle_hour_max and per_category_count >= cycle_hour_max:
-            return False
-        if cycle_day_max and _category_today_count(db, key) >= cycle_day_max:
-            return False
-        return True
+        # v2.1.19：判定内核外移到 `_sched_allows_core`，与「今日排期」预测共用同一份
+        # 判据——预测和实跑算出差，就等于骗用户。
+        # `today_count` 保持惰性：只有配了日上限时才查库（原闭包同样是短路才算）。
+        today = _category_today_count(db, key) if cycle_day_max else 0
+        return _sched_allows_core(sched_map.get(key), hour=sh_hour, weekday=iso_weekday,
+                                  per_category_count=per_category_count,
+                                  cycle_hour_max=cycle_hour_max,
+                                  cycle_day_max=cycle_day_max,
+                                  today_count=today)
 
     category_task_counts: dict[str, int] = {}
 
@@ -1564,6 +1631,287 @@ def plan_engine(db: Session) -> dict[str, int]:
     db.commit()
     return {"lists": 1, "items": item_count, "tasks": task_count}
 
+
+def forecast_schedule(db: Session, *, scan_limit: int = 4000,
+                      per_hour_top: int = 4) -> dict[str, Any]:
+    """当天剩余时段的推送排期预测。**只读**：不写库、不建任务、不发消息。
+
+    用户口径（v2.1.19）：发布规则不只是「分流规则」，而是调动资源库存量、有序推送的
+    中枢。所以这里回答的不是「现在有哪些任务在跑」，而是「**今天接下来会推什么、
+    几点推、还能推多少、排不上的卡在哪**」。
+
+    复刻的真实链路（与 `plan_engine` / `dispatch_ready_tasks` 同源，不另写一套判据）：
+      全局小时窗口 `SCHourWindow` → 小时窗口是否绑定单一分类 →
+      `category_limit` 分类截断 → `_sched_allows_core` 分类时段/分类上限 →
+      `_SlotIndex` 名额四态 → 在库过滤 `live_keys` → 游标有序推进 →
+      `_hourly_due` 每小时匀速额度（cap 部均匀摊到 60 分钟）。
+
+    与真实调度的**唯一区别**：这里不落库，游标推进与「已排过」都在内存里模拟。
+    所以结果是「按当前配置的预测」，实际还会受网盘限流、建链失败重试影响。
+    """
+    now_sh = utcnow().astimezone(shanghai_tz())
+    out: dict[str, Any] = {
+        "ok": True,
+        "forecast": True,
+        "generated_at": now_sh.isoformat(timespec="seconds"),
+        "now_hour": int(now_sh.hour),
+        "now_minute": int(now_sh.minute),
+        "hours": [],
+        "today_total": 0,
+        "works_total": 0,
+        "backlog": 0,
+        "overflow": 0,
+        "blocked": [],
+        "notes": [],
+        "reason": "",
+    }
+
+    version = _active_version(db)
+    if not version:
+        out["ok"] = False
+        out["reason"] = "当前没有生效中的计划版本：发布规则未生效，今天不会排期。"
+        return out
+    cfg = _jload(version.config_json, {})
+    cycle = cfg.get("cycle_plan") or {}
+    category_limit = max(1, int(cfg.get("category_limit") or 20))
+    work_limit = max(1, int(cfg.get("work_limit") or 50))
+    hour_max = int(cycle.get("hour_max") or 0)
+    cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
+    cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
+
+    # 每小时匀速额度（与 dispatch_ready_tasks 同一配置、同一算法）
+    hourly_cap = 0
+    try:
+        if str(runtime_config.get(db, "sc_quick_publish_enabled") or "true").lower() in (
+                "1", "true", "yes", "on"):
+            hourly_cap = max(0, int(
+                runtime_config.get(db, "sc_quick_publish_hourly_limit") or 0))
+    except (TypeError, ValueError):
+        hourly_cap = 0
+    out["config"] = {"category_limit": category_limit, "work_limit": work_limit,
+                     "hour_max": hour_max, "per_hour_cap": hourly_cap}
+    if not hourly_cap:
+        out["notes"].append("未设置每小时上限：任务会一到位就推出去，建议配一个每小时"
+                            "上限，排期才会在时段内摊开。")
+
+    channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
+    if not channels:
+        out["ok"] = False
+        out["reason"] = "当前没有启用中的推送渠道：没有可推送目标，今天不会排期。"
+        return out
+
+    # 静默保护：命中静默区间的小时直接跳过，预测里也如实留空。
+    quiet_on = bool(cycle.get("quiet_enabled"))
+    quiet_start = int(cycle.get("quiet_start") or 0)
+    quiet_end = int(cycle.get("quiet_end") or 0)
+
+    live_keys = _live_work_keys(db)
+    slots = _SlotIndex(db, live_keys=live_keys)
+
+    # ---- 分类字典：完全复刻 plan_engine 的选取（含 category_limit 截断）----
+    all_cats = list(db.scalars(
+        select(SCCategory).where(SCCategory.enabled.is_(True))
+        .order_by(SCCategory.priority.desc(), SCCategory.id)
+    ).all())
+    kept = all_cats[:category_limit]
+    dropped = all_cats[category_limit:]
+    kept_keys = {c.category_key for c in kept}
+
+    sched_map = {s.category_key: s for s in db.scalars(
+        select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version.id,
+                                         SCCategorySchedule.enabled.is_(True))).all()}
+    hour_windows = list(db.scalars(
+        select(SCHourWindow).where(SCHourWindow.plan_version_id == version.id,
+                                   SCHourWindow.enabled.is_(True))).all())
+    cursors = {c.category_key: int(c.last_library_version_id or 0) for c in db.scalars(
+        select(SCCategoryCursor).where(SCCategoryCursor.plan_version_id == version.id)).all()}
+    today_counts = ({k: _category_today_count(db, k) for k in kept_keys}
+                    if cycle_day_max else {})
+
+    # 当前小时已经提交掉多少（与 dispatch 同口径：status >= submitted 且按 scheduled_at 落在本小时）
+    hour_start_utc = utcnow().replace(minute=0, second=0, microsecond=0)
+    submitted_this_hour = 0
+    if hourly_cap:
+        submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
+            SCPublishTask.scheduled_at >= hour_start_utc)) or 0)
+
+    def _quota(h: int) -> int:
+        """该小时还剩多少推送额度（匀速口径）。"""
+        if not hourly_cap:
+            return 10 ** 9
+        if h == now_sh.hour:
+            return max(0, _hourly_due(hourly_cap, now_sh.minute) - submitted_this_hour)
+        return hourly_cap
+
+    # 候选基：只看每部作品的最新快照，同一作品不因多版本重复占位
+    latest_ids = (select(func.max(SCLibraryVersion.id)).group_by(SCLibraryVersion.work_key))
+
+    def _candidates(cat_key: str, after_id: int | None, limit: int | None):
+        q = (select(SCLibraryVersion)
+             .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
+             .where(SCWorkCategory.category_key == cat_key)
+             .where(SCLibraryVersion.id.in_(latest_ids)))
+        if after_id is not None:
+            q = q.where(SCLibraryVersion.id > after_id)
+        q = q.order_by(SCLibraryVersion.id)
+        if limit:
+            q = q.limit(limit)
+        return list(db.scalars(q).all())
+
+    planned_pairs: set[tuple[str, str]] = set()   # 预测中已排过的 (work_key, chat_id)
+    scanned = 0
+
+    def _picks_for(wk: str) -> list[str]:
+        """该作品现在能排的渠道 chat_id 列表（空 = 名额已占 / 不在库 / 扫到上限）。"""
+        nonlocal scanned
+        if not wk or wk not in live_keys:
+            return []
+        if scanned >= scan_limit:
+            return []
+        scanned += 1
+        picks: list[str] = []
+        for channel in channels:
+            chat_id = str(channel.chat_id or "")
+            if (wk, chat_id) in planned_pairs:
+                continue
+            dedup = f"{wk}:{channel.id}:first"[:255]
+            action, _reuse = first_dedup_plan(db, work_key=wk, chat_id=chat_id,
+                                              dedup=dedup, index=slots)
+            if action == "skip":
+                continue
+            picks.append(chat_id)
+        return picks
+
+    # ---- 逐小时模拟 ----
+    for h in range(now_sh.hour, 24):
+        win = next((w for w in hour_windows
+                    if int(w.start_hour or 0) <= h < int(w.end_hour or 0)), None)
+        if hour_windows and win is None:
+            out["hours"].append({"hour": h, "total": 0, "items": [],
+                                 "blocked": "不在可发布时段"})
+            continue
+        if quiet_on:
+            in_quiet = ((quiet_start <= h < quiet_end) if quiet_end > quiet_start
+                        else (h >= quiet_start or h < quiet_end))
+            if in_quiet:
+                out["hours"].append({"hour": h, "total": 0, "items": [],
+                                     "blocked": "静默保护时段"})
+                continue
+
+        cats = kept
+        bound_key = str(getattr(win, "category_key", "") or "") if win else ""
+        if bound_key:
+            scoped = [c for c in kept if c.category_key == bound_key]
+            if scoped:
+                cats = scoped
+
+        quota = _quota(h)
+        hour_items: list[dict[str, Any]] = []
+        hour_tasks = 0
+        cat_counts: dict[str, int] = {}
+        for cat in cats:
+            if hour_tasks >= quota:
+                break
+            key = cat.category_key
+            if not _sched_allows_core(sched_map.get(key), hour=h,
+                                      weekday=now_sh.isoweekday(),
+                                      per_category_count=cat_counts.get(key, 0),
+                                      cycle_hour_max=cycle_hour_max,
+                                      cycle_day_max=cycle_day_max,
+                                      today_count=today_counts.get(key, 0)):
+                continue
+            built = 0
+            titles: list[str] = []
+            for lv in _candidates(key, cursors.get(key, 0), work_limit):
+                if hour_tasks >= quota:
+                    break
+                if hour_max and hour_tasks >= hour_max:
+                    break
+                wk = str(lv.work_key or "")
+                picks = _picks_for(wk)
+                if not picks:
+                    # 名额已占的作品也必须越过游标，否则预测会永远卡在同一部上
+                    cursors[key] = max(cursors.get(key, 0), int(lv.id))
+                    continue
+                for chat_id in picks:
+                    if hour_tasks >= quota:
+                        break
+                    planned_pairs.add((wk, chat_id))
+                    hour_tasks += 1
+                    built += 1
+                    cat_counts[key] = cat_counts.get(key, 0) + 1
+                cursors[key] = max(cursors.get(key, 0), int(lv.id))
+                if wk not in titles:
+                    titles.append(wk)
+            if built:
+                # 该分类在本小时内的预计时间点：按 cap 匀速摊到 60 分钟
+                # 注意：变量名不能叫 slots——那是上面的 _SlotIndex，复用它会让
+                # first_dedup_plan 拿到一个时间字符串列表，名额判定直接崩。
+                minute_slots = [_uniform_minute(hourly_cap, k)
+                                for k in range(hour_tasks - built + 1, hour_tasks + 1)]
+                hour_items.append({
+                    "category": _category_display_name(key),
+                    "count": built,
+                    "times": ["%02d:%02d" % (h, m) for m in minute_slots],
+                    "titles": [t for t in _work_titles(db, titles[:per_hour_top]).values() if t],
+                    "more": max(0, len(titles) - per_hour_top),
+                })
+        total = sum(i["count"] for i in hour_items)
+        out["today_total"] += total
+        out["hours"].append({"hour": h, "total": total, "items": hour_items})
+
+    out["works_total"] = len(set(wk for wk, _ in planned_pairs))
+
+    # ---- 存量盘点：今天推不完的还有多少（受 scan_limit 保护，超限则标注「至少」）----
+    # 重新计数：上面的模拟阶段已经消耗过 scanned，若共用同一个计数器，
+    # 作品多时会被提前耗尽 → overflow 恒为 0，等于告诉用户「全推得完」的假消息。
+    scanned = 0
+    backlog_pairs: set[tuple[str, str]] = set()
+    seen_wk: set[str] = set()
+    truncated = False
+    for cat in kept:
+        for lv in _candidates(cat.category_key, None, None):
+            wk = str(lv.work_key or "")
+            if not wk or wk in seen_wk:
+                continue
+            seen_wk.add(wk)
+            if scanned >= scan_limit:
+                truncated = True
+                break
+            picks = _picks_for(wk)
+            for chat_id in picks:
+                backlog_pairs.add((wk, chat_id))
+        if truncated:
+            break
+    out["overflow"] = len(backlog_pairs)
+    out["backlog"] = len(backlog_pairs) + len(planned_pairs)
+    if truncated:
+        out["notes"].append("存量作品过多，本次只盘点到 %d 部，实际待推量可能更多。" % scan_limit)
+
+    # ---- 卡点如实上报：这才是「排不上」的真实原因 ----
+    blocked: list[dict[str, Any]] = []
+    for cat in dropped:
+        n = 0
+        for lv in _candidates(cat.category_key, None, None):
+            if str(lv.work_key or "") in live_keys:
+                n += 1
+        if n:
+            blocked.append({
+                "reason": "分类未进入调度（启用分类数超过上限 %d）" % category_limit,
+                "category": _category_display_name(cat.category_key),
+                "count": n,
+            })
+    out["blocked"] = blocked
+    if blocked:
+        out["reason"] = ("有 %d 个分类、共 %d 部作品排不进队列：分类上限是 %d，但启用中的"
+                         "分类有 %d 个——超出上限的分类不会被调度遍历，永远轮不到"
+                         "（与时段窗口无关）。"
+                         % (len(blocked), sum(b["count"] for b in blocked),
+                            category_limit, len(all_cats)))
+    elif not hour_windows:
+        out["notes"].append("未配置发布时段：全天都允许排期。")
+    return out
 
 class _RepResolver:
     """发布任务的代表资源解析器（v2.1.1）。
@@ -1794,7 +2142,11 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         if time.monotonic() - round_started > DISPATCH_ROUND_BUDGET_SECONDS:
             stats["deferred"] = len(tasks) - task_index
             break
-        if hourly_cap and submitted_this_hour >= hourly_cap:
+        # v2.1.19：本小时额度按**分钟匀速**放行，不再整点一次性放完。
+        # 原来 `submitted_this_hour >= hourly_cap` 会让整点一到就把 cap 部全推出去，
+        # 后面 59 分钟静默——用户口径是「每时段均匀分配」，所以改成按进度放行：
+        # cap=3 → 第 0/20/40 分钟各 1 部。cap=0 时不限（_hourly_due 返回大数）。
+        if hourly_cap and submitted_this_hour >= _hourly_due(hourly_cap, now.minute):
             stats["throttled"] += 1
             break
         item = db.get(SCPushListItem, task.list_item_id)
@@ -2430,7 +2782,7 @@ def apply_suggestion(db: Session, suggestion_id: int, reviewer: str = "admin",
 # ---------------------------------------------------------------------------
 
 def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
-    """推送趋势：published_at 成功计数 + created_at 失败计数，按日/周/月分桶。
+    """推送趋势：published_at 成功计数 + 失败计数，按日/周/月分桶。
 
     真实来源 sc_publish_tasks；无数据时 series 为空（前端显示空态，不画假曲线）。
 
@@ -2440,15 +2792,32 @@ def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
        day→按小时（HH:00）、week→按天、month→按天（近 30 天）。
     ② 补齐空桶——只补最近窗口内的零值桶，折线才有走势而不是孤立尖点。
        补齐的桶是真实计数 0，不是编造数据。
+
+    v2.1.19 修 bug2（用户原话：「刚才有推送，但推送趋势里面没有数据变化」）：
+    ① **时区**：库里是 `DateTime(timezone=True)`，但 SQLite 不保存 tzinfo，
+       读回来是 naive 的 **UTC** 时刻。此前 `dt.replace(tzinfo=sh)` 直接给它贴上
+       +8 标签，等于不转换 —— 北京时间 08:01 的 8 条推送全被画进 00:00 桶。
+       现统一走 `utils.as_utc(x).astimezone(sh)`（naive 一律视为 UTC，与全仓口径
+       一致，PG 的 aware 值也不受影响）。
+    ② **可视窗口**：此前「日」视图把**全部历史**按小时混桶，`sorted()` 之后
+       字符串最大的 8 个恒为 16:00~23:00，而前端只画 `slice(-8)` —— 早上、
+       中午推的东西永远进不了画面（这才是「推了看不到」的另一半原因，光修时区
+       仍不够）。现在「日」= 今天 00:00 到**当前小时**的连续桶，当前小时必在
+       末尾，前端取最后 8 个必然包含它。
+    ③ **失败口径**：此前除 published 外一律记 failed，把在途（planned/building/
+       ready/submitted/accepted/publishing）、用户取消、已归档全算成失败，
+       制造出与真实故障无关的高峰。现在只有真正的失败才计入失败线。
     """
-    rows = list(db.scalars(select(SCPublishTask)).all())
+    sh = shanghai_tz()
+    now_sh = utcnow().astimezone(sh)
     buckets: dict[str, dict[str, int]] = {}
-    sh = timezone(timedelta(hours=8))
+
+    def blank() -> dict[str, int]:
+        return {"published": 0, "failed": 0, "total": 0}
 
     def key_of(dt: datetime) -> str:
-        local = dt.astimezone(sh) if dt.tzinfo else dt.replace(tzinfo=sh)
-        if period == "hour":
-            return local.strftime("%Y-%m-%d %H:00")
+        # v2.1.19：naive = UTC（SQLite 丢 tzinfo），不能再直接 replace 成 +8
+        local = utils.as_utc(dt).astimezone(sh)
         if period == "month":
             return local.strftime("%Y-%m-%d")
         if period == "week":
@@ -2457,15 +2826,54 @@ def _aggregate_trend(db: Session, period: str = "day") -> dict[str, Any]:
         # day 视图按小时展开：一天的推送分布才有曲线形状
         return local.strftime("%H:00")
 
-    def add(label: str, field: str) -> None:
-        b = buckets.setdefault(label, {"published": 0, "failed": 0, "total": 0})
+    # 「日」视图：今天 00:00 → 当前小时，连续预置空桶（真实计数 0，不是编造）
+    day_start = now_sh.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_labels: list[str] = []
+    if period == "day":
+        day_labels = [(day_start + timedelta(hours=h)).strftime("%H:00")
+                      for h in range(int(now_sh.hour) + 1)]
+        for lbl in day_labels:
+            buckets[lbl] = blank()
+        last_label = day_labels[-1]
+    else:
+        last_label = ""
+
+    for t in db.scalars(select(SCPublishTask)).all():
+        status = str(t.status or "")
+        if status == "published":
+            field = "published"
+            moment = t.published_at or t.updated_at or t.created_at
+        elif status in TREND_FAILED_STATUSES:
+            field = "failed"
+            moment = t.updated_at or t.created_at
+        else:
+            # 在途 / 已取消 / 已归档：既不是成功也不是失败，不进趋势
+            continue
+        if not moment:
+            continue
+        if period == "day":
+            local = utils.as_utc(moment).astimezone(sh)
+            if local < day_start:
+                continue                      # 只统计今天，历史不混进同一小时桶
+            label = local.strftime("%H:00")
+            if label not in buckets:
+                # 落在「今天 00:00 ~ 当前小时」之外（时钟回拨 / 脏数据 / 未来时刻）
+                # 直接不画，不塞进任何桶 —— 静默归并会把时区这类错误掩盖成正常。
+                continue
+        else:
+            label = key_of(moment)
+        b = buckets.setdefault(label, blank())
         b[field] += 1
         b["total"] += 1
 
-    for t in rows:
-        moment = t.published_at or t.updated_at or t.created_at
-        if moment:
-            add(key_of(moment), "published" if t.status == "published" else "failed")
+    if period == "day":
+        # 桶已连续预置（含全 0 的时段），不再走下面的「单点补齐」逻辑。
+        # 但今天一条数据都没有时必须回到空 series —— 前端靠 `series.length`
+        # 显示「暂无发布记录」，给一排 0 会把它画成一条贴底的假曲线。
+        if not any(b["total"] for b in buckets.values()):
+            return {"period": period, "series": []}
+        return {"period": period,
+                "series": [{"label": k, **buckets[k]} for k in day_labels]}
 
     # v2.1.1：补齐空桶，让折线连续。单点时补一段 0 值区间，避免三角形尖峰。
     labels = sorted(buckets)
@@ -2786,6 +3194,17 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # API：前端只作为管理入口，所有按钮走真实后端
 # ---------------------------------------------------------------------------
+
+@router.get("/forecast")
+def api_forecast(db: Session = Depends(get_db)):
+    """今日排期预测（v2.1.19）。
+
+    为什么单独开一个端点而不塞进 `/overview`：`overview` 会调 `ensure_defaults`
+    并把六张表全量聚合，本身已经重；排期预测还要扫作品快照和名额索引，合并会把
+    整个仪表盘首屏拖慢。这里保持只读、按需加载，前端先渲染已有卡片再补排期。
+    """
+    return forecast_schedule(db)
+
 
 @router.get("/overview")
 def api_overview(db: Session = Depends(get_db), period: str = "day"):
@@ -3739,6 +4158,15 @@ def _scan_invalid_links(db: Session, only_ids: list[int] | None = None
     共用同一套判据（理由同 `_scan_invalid_tasks`）。
 
     返回 `(可清理项 [(task, item, 原因)], 候选总数)`。
+
+    **幂等性（v2.1.19 修 bug1）**：已被归档（`link_state=cleaned`）的记录直接跳过。
+    少了这一步，判据 ③④ 会把同一批记录**每次**都重新扫出来 —— 清理只写
+    `link_state`，不动 `status` / `error` / `work_key`，而 ③④ 恰好只看这三样。
+    用户点一次「手动扫描」报 22 条、再点还是 22 条，就是这个原因：
+    每点一次都白清一遍，还连带重复回退游标、重复清「已分享」标记。
+
+    注意 `total` 语义**不变**（范围内带链接的任务总数，含历史归档行）——
+    前端拿它当「扫描了 N 条链接」的分母；只在这里跳过判定，不缩小分母。
     """
     live = _live_work_keys(db)
     q = (select(SCPushListItem, SCPublishTask)
@@ -3750,6 +4178,9 @@ def _scan_invalid_links(db: Session, only_ids: list[int] | None = None
     out: list[tuple[SCPublishTask, SCPushListItem, str]] = []
     for item, task in rows:
         state = str(task.link_state or "unknown")
+        if state == CLEANED_LINK_STATE:
+            # 已归档：名额已回收、标记已归零，不重复清理。
+            continue
         reason = ""
         if state in ("suspicious", "inactive"):
             reason = "链接已判失效"
@@ -4278,7 +4709,7 @@ def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
     hours: dict[int, int] = {}
     for (moment,) in rows:
         if moment:
-            h = moment.astimezone(shanghai_tz()).hour
+            h = utils.as_utc(moment).astimezone(shanghai_tz()).hour
             hours[h] = hours.get(h, 0) + 1
     if not hours:
         return (0, 0)
@@ -4384,7 +4815,7 @@ def _ai_suggest_week_windows(db: Session, category_key: str) -> dict[str, Any]:
     for (moment,) in rows:
         if not moment:
             continue
-        local = moment.astimezone(shanghai_tz())
+        local = utils.as_utc(moment).astimezone(shanghai_tz())
         bucket = by_weekday.setdefault(local.isoweekday(), {})
         bucket[local.hour] = bucket.get(local.hour, 0) + 1
 

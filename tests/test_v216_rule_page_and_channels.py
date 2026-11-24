@@ -383,9 +383,12 @@ def test_suggest_source_switches_to_history(env):
                               chat_id="-1", dedup_key="d:1")
         db.add(item)
         db.flush()
+        # SQLite 丢 tzinfo → 必须写 UTC 数值（真实写入路径是 utcnow()），
+        # 否则读回来会被当成「上海时刻的数值 = UTC」，整体偏 8 小时。
         task = SCPublishTask(list_item_id=item.id, work_key="work:x", kind="first",
                              status="published", link_state="active",
-                             published_at=datetime(2026, 1, 5, 21, 30, tzinfo=sh))
+                             published_at=datetime(2026, 1, 5, 21, 30,
+                                                   tzinfo=sh).astimezone(timezone.utc))
         db.add(task)
         db.commit()
         res = sc2.api_category_schedules(db=db)

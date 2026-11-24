@@ -28,7 +28,9 @@ from sqlalchemy import delete, select
 from app import share_center_v2 as sc2
 from app.db import SessionLocal, migrate
 from app.models import (
+    AuditLog,
     Channel,
+    QueueItem,
     Resource,
     SCCategoryCursor,
     SCLibraryVersion,
@@ -41,24 +43,31 @@ WK = "work-alpha"
 WK2 = "work-beta"
 
 
+def _wipe(db):
+    """清掉本文件用到的表。
+
+    **必须含 `QueueItem` 与 `AuditLog`**：`test_after_cleanup_legacy_push_no_longer_blocks`
+    会造 `QueueItem(resource_id, channel_id, status="sent")`，而 `push_queue` 上有
+    `UNIQUE(resource_id, channel_id)`。此前这里只清 5 张 sc_* 表 + Resource/Channel，
+    前一个文件（如 test_flow）留下的 (1, 1) 队列行会把本文件直接顶成 IntegrityError。
+    单独跑这个文件是绿的，跟别的文件一起跑才红 —— 典型的测试隔离缺口，不是产品缺陷。
+    """
+    for model in (SCPublishTask, SCPushListItem, SCPushList,
+                  SCLibraryVersion, SCCategoryCursor, QueueItem, AuditLog):
+        db.execute(delete(model))
+    db.execute(delete(Resource))
+    db.execute(delete(Channel))
+    db.commit()
+
+
 @pytest.fixture(autouse=True)
 def _fresh():
     migrate()
     with SessionLocal() as db:
-        for model in (SCPublishTask, SCPushListItem, SCPushList,
-                      SCLibraryVersion, SCCategoryCursor):
-            db.execute(delete(model))
-        db.execute(delete(Resource))
-        db.execute(delete(Channel))
-        db.commit()
+        _wipe(db)
     yield
     with SessionLocal() as db:
-        for model in (SCPublishTask, SCPushListItem, SCPushList,
-                      SCLibraryVersion, SCCategoryCursor):
-            db.execute(delete(model))
-        db.execute(delete(Resource))
-        db.execute(delete(Channel))
-        db.commit()
+        _wipe(db)
 
 
 def _item(db, work_key=WK, status="planned", chat_id="-1001"):

@@ -45,6 +45,28 @@ const scCategories = ref([]), scPlans = ref({ items: [], versions: [] })
 const scCursors = ref([]), scAI = ref([]), scWindows = ref([])
 const scPacingForm = ref({ scope_key: 'global:group', target_type: 'group', default_interval_seconds: 4, min_interval_seconds: 3, max_per_minute: 0, jitter_seconds: 0 })
 const scActiveList = ref(null) // 当前展开明细的清单（卡片内交互）
+// 今日推送排期预测（v2.1.19）：发布规则是调动存量、有序推送的中枢，
+// 所以除了已有的「推送历史」，还要能看到「今天接下来推什么、几点推」。
+// 单独异步加载：预测要扫作品快照和名额索引，不能拖慢仪表盘首屏。
+const scForecast = ref({ hours: [], blocked: [], notes: [], today_total: 0, overflow: 0, backlog: 0 })
+const scForecastLoading = ref(false)
+let _scForecastInFlight = false
+async function loadScForecast() {
+  if (_scForecastInFlight) return
+  _scForecastInFlight = true
+  scForecastLoading.value = true
+  try {
+    const d = await api('/sc/forecast')
+    scForecast.value = d || {}
+  } catch (_) {
+    // 预测失败不影响其它卡片；留空并让模板显示「暂无排期」
+    scForecast.value = { hours: [], blocked: [], notes: [] }
+  } finally {
+    scForecastLoading.value = false
+    _scForecastInFlight = false
+  }
+}
+function pad2(n) { return String(Number(n) || 0).padStart(2, '0') }
 // 发布总览：左侧子导航 + KPI 点击筛选 + 任务详情（全部基于 /api/sc/* 真实数据）
 const scSubNav = ref('发布总览')
 // 顶部 tab：发布总览 → 发布规则 → 推送任务（合并原发布队列）→ 分享管理 → 阅读量
@@ -2165,6 +2187,9 @@ async function loadSc() {
   const cycle = val(12); if (cycle) scCyclePlan.value = { ...scCyclePlan.value, ...cycle }
   const sr = val(13); if (sr) scShareRecords.value = sr.items || []
   const pf = val(14); if (pf) scPreference.value = { ...scPreference.value, ...pf }
+  // v2.1.19：排期预测单独异步拉取，**不 await**——它要扫作品快照与名额索引，
+  // 塞进上面的 allSettled 会让整个仪表盘等它出结果。失败也不影响其它卡片。
+  loadScForecast()
 }
 
 // ---------- v2.1.7 #241：阅读量统计 ----------
@@ -2981,7 +3006,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.18 · Asia/Shanghai</span>
+          <span>v2.1.19 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4119,6 +4144,44 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       </div>
                       <div v-else class="empty">暂无已识别作品评分</div>
                       <button class="sc-link-btn sc-hot-more" @click="scSubNav = '分享管理'">查看候选详情 ›</button>
+                    </div>
+                  </div>
+
+                  <!-- v2.1.19：今日推送排期。发布规则是「调动存量、有序推送」的中枢，
+                       所以光有已推历史不够，还要能看见今天接下来推什么、几点推。
+                       排期由后端按真实判据预测（分类时段、名额、游标、每小时匀速额度），
+                       前端只渲染，不自己算。 -->
+                  <div class="sc-card sc-fc-card">
+                    <div class="sc-card-head">
+                      <span class="sc-ico">◷</span>
+                      <div><h3>今日推送排期</h3><p>按发布规则，今天剩余时段会推的作品与时间点</p></div>
+                      <div class="sc-fc-sum">
+                        <span v-if="scForecastLoading" class="sc-fc-loading">排期中…</span>
+                        <template v-else>
+                          <b>{{ scForecast.works_total || 0 }}</b> 部作品 · <b>{{ scForecast.today_total || 0 }}</b> 条推送
+                          <em v-if="scForecast.overflow"> · 另有 <b>{{ scForecast.overflow }}</b> 条排不进今天</em>
+                        </template>
+                      </div>
+                    </div>
+                    <div v-if="scForecast.reason" class="sc-fc-warn">{{ scForecast.reason }}</div>
+                    <div class="sc-fc-list" v-if="(scForecast.hours || []).length">
+                      <div class="sc-fc-row" v-for="h in scForecast.hours" :key="h.hour">
+                        <div class="sc-fc-hour">{{ pad2(h.hour) }}:00</div>
+                        <div class="sc-fc-body">
+                          <template v-if="h.total">
+                            <div class="sc-fc-item" v-for="(it, i) in h.items" :key="i">
+                              <span class="sc-fc-cat">{{ it.category }}</span>
+                              <span class="sc-fc-time">{{ (it.times || []).join('、') }}</span>
+                              <span class="sc-fc-title">{{ (it.titles || []).join('、') }}<em v-if="it.more"> 等 {{ it.count }} 部</em></span>
+                            </div>
+                          </template>
+                          <span v-else class="sc-fc-idle">{{ h.blocked || '—' }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-else-if="!scForecastLoading" class="empty">今日暂无排期</div>
+                    <div class="sc-fc-notes" v-if="(scForecast.notes || []).length">
+                      <span v-for="(n, i) in scForecast.notes" :key="i">{{ n }}</span>
                     </div>
                   </div>
 
@@ -5742,4 +5805,25 @@ html.dark .st-review{color:var(--yg-tone-violet-fg)}
 html.dark .st-retry{color:var(--yg-tone-red-fg)}
 html.dark .st-failed{color:var(--yg-tone-slate-fg)}
 html.dark .card-check{background:rgba(20,24,40,.9)}
+/* v2.1.19：今日推送排期。全部用 --yg-* 变量，否则深色主题下会瞎
+   （本文件 5689 行起有 dark 覆盖，硬编码颜色不跟随）。 */
+.sc-fc-card{margin-bottom:18px}
+.sc-fc-card>.sc-card-head{align-items:center;gap:10px}
+.sc-fc-sum{margin-left:auto;font-size:12px;color:var(--yg-muted);white-space:nowrap}
+.sc-fc-sum b{color:var(--yg-ink);font-size:15px;font-weight:700}
+.sc-fc-sum em{font-style:normal;color:var(--yg-tone-amber-fg)}
+.sc-fc-loading{color:var(--yg-muted)}
+.sc-fc-warn{margin:0 0 10px;padding:9px 12px;border-radius:10px;background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg);font-size:12px;line-height:1.55}
+.sc-fc-list{max-height:330px;overflow:auto;border-top:1px solid var(--yg-line)}
+.sc-fc-row{display:flex;gap:12px;padding:8px 2px;border-bottom:1px solid var(--yg-line)}
+.sc-fc-row:last-child{border-bottom:0}
+.sc-fc-hour{flex:none;width:54px;font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--yg-primary)}
+.sc-fc-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.sc-fc-item{display:flex;gap:10px;align-items:baseline;min-width:0;font-size:12px}
+.sc-fc-cat{flex:none;padding:0 7px;border-radius:6px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);font-size:11px;line-height:18px}
+.sc-fc-time{flex:none;color:var(--yg-tone-amber-fg);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace}
+.sc-fc-title{flex:1;min-width:0;color:var(--yg-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sc-fc-title em{font-style:normal;color:var(--yg-muted)}
+.sc-fc-idle{color:var(--yg-muted);font-size:12px}
+.sc-fc-notes{margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--yg-muted)}
 </style>

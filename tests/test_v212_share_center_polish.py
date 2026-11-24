@@ -413,7 +413,9 @@ def test_adopt_ai_all_writes_real_suggestion(env):
         version = sc2._active_version(db)
         item = _push_list(db, "work:剑雨", category_key="genre:动作")
         t = _task(db, item, "work:剑雨", status="published")
-        t.published_at = datetime(2026, 1, 1, 20, 30, tzinfo=SH)
+        # SQLite 丢 tzinfo → 必须写 UTC 数值（真实写入路径是 utcnow()），
+        # 直接塞上海 aware 时间会变成「上海数值被当成 UTC」，读回偏 8 小时。
+        t.published_at = datetime(2026, 1, 1, 20, 30, tzinfo=SH).astimezone(timezone.utc)
         db.commit()
         # 让该分类在偏好排名里靠前，保证有排期行
         res = sc2.api_adopt_schedule_ai_all(sc2.Payload(payload={}), db)

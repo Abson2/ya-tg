@@ -18,7 +18,15 @@ class FakeResponse:
         return {"ok": True, "result": {"message_id": 99}}
 
 
-def test_scan_to_share_to_push_flow():
+def test_scan_to_share_to_push_flow(monkeypatch):
+    # v2.1.19：把「现在」固定在本小时第 59 分，让匀速额度放满（cap=3）。
+    # 这条用例验证的是「扫描 → 建分享 → 推送」这条链路本身，不该被分钟级节流
+    # 干扰：整点刚过时 `_hourly_due(3, 分钟数)` 一次只放 1 部，会把「推 2 部」
+    # 的流程测成 1 部（假红）。节流本身由 test_v2119_paced_forecast 专门守。
+    from app import share_center_v2 as _sc2
+    _frozen = _sc2.utcnow().replace(minute=59, second=0, microsecond=0)
+    monkeypatch.setattr(_sc2, "utcnow", lambda: _frozen)
+
     migrate()
     db = SessionLocal()
     db.add(AuthToken(id=1, client_id="test-client",
