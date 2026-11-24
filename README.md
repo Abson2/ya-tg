@@ -10,7 +10,7 @@ Ya-TG 是一个跑在 Docker 里的光鸭网盘资源分发机器人：定时扫
 
 - 项目地址：https://github.com/Abson2/ya-tg
 - 官方镜像：`abson2/ya-tg`（DockerHub 公开可拉取）
-- 当前版本：v2.1.19
+- 当前版本：v2.1.20
 - 部署：一条 `docker compose up -d`
 
 ---

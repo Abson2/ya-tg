@@ -2192,6 +2192,39 @@ async function loadSc() {
   loadScForecast()
 }
 
+// v2.1.20：推送队列 = **在途任务 + 今日待排期**。
+//
+// 原先队列只取「已建出来且在途」的任务（计划还没到点建任务时它必然是空的），
+// 而排期面板是内存预测 —— 于是用户看到「排期说有 10 部、队列一条都没有」，
+// 以为两处口径打架。这里把排期预测里「今天要推、但还没建任务」的作品并进队列，
+// 用「待排期」标出来；同一作品已在途时以任务行为准，不重复占两行。
+// 标题与封面都来自后端同一套 `_work_titles` / `_work_posters`（与「推送任务」
+// 「分享管理」同源），不会出现同一部作品两处名字/封面不一致。
+const scQueueRows = computed(() => {
+  const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
+  const have = new Set(rows.map(r => String(r.work_key || '')))
+  const plan = []
+  for (const h of (scForecast.value.hours || [])) {
+    for (const it of (h.items || [])) {
+      for (const w of (it.works || [])) {
+        const wk = String(w.work_key || '')
+        if (!wk || have.has(wk)) continue
+        have.add(wk)
+        plan.push({
+          work_key: wk,
+          title: w.title || '',
+          cover: w.cover || '',
+          category: it.category || '',
+          status: 'planned',
+          plan_time: w.time || (pad2(h.hour) + ':00'),
+          _src: 'plan',
+        })
+      }
+    }
+  }
+  return rows.concat(plan)
+})
+
 // ---------- v2.1.7 #241：阅读量统计 ----------
 // 单独一个 loader，不混进 loadSc()——阅读量是**辅助能力**，
 // 它的端点失败（未配置 / 未装依赖）绝不能影响发布中心的正常加载。
@@ -3006,7 +3039,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.19 · Asia/Shanghai</span>
+          <span>v2.1.20 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4198,14 +4231,26 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div v-if="!(scOverview.views?.history || []).length" class="empty">暂无推送历史</div>
                     </div>
                     <div class="sc-card">
-                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>正在排队或推送中的记录</p></div></div>
-                      <el-table :data="scOverview.views?.queue || []" stripe size="small" max-height="300">
-                        <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
+                      <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>推送队列</h3><p>在途任务 + 今日待排期（按发布规则推进）</p></div></div>
+                      <el-table :data="scQueueRows" stripe size="small" max-height="300">
+                        <el-table-column label="时间" min-width="120" show-overflow-tooltip>
+                          <template #default="s">
+                            <span v-if="s.row._src === 'plan'">预计 {{ s.row.plan_time }}</span>
+                            <span v-else>{{ fmtTime(s.row.created_at) }}</span>
+                          </template>
+                        </el-table-column>
                         <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
-                        <el-table-column label="类型" width="76"><template #default="s">{{ s.row.kind === 'first' ? '首次' : '追更' }}</template></el-table-column>
-                        <el-table-column label="状态" width="100"><template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template></el-table-column>
+                        <el-table-column label="分类" width="90" show-overflow-tooltip>
+                          <template #default="s">{{ s.row._src === 'plan' ? (s.row.category || '未分类') : (s.row.kind === 'first' ? '首次' : '追更') }}</template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="92">
+                          <template #default="s">
+                            <span v-if="s.row._src === 'plan'" class="sc-dot-state warn">待排期</span>
+                            <span v-else>{{ scTaskStatusLabel(s.row.status) }}</span>
+                          </template>
+                        </el-table-column>
                       </el-table>
-                      <div v-if="!(scOverview.views?.queue || []).length" class="empty">当前无在途任务</div>
+                      <div v-if="!scQueueRows.length" class="empty">当前无在途任务，也没有待排期作品</div>
                     </div>
                     <div class="sc-card">
                       <div class="sc-card-head"><span class="sc-ico">✕</span><div><h3>推送失败</h3><p>推送失败的记录，可逐条重试</p></div></div>

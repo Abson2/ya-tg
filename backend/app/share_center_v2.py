@@ -1850,11 +1850,28 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 # first_dedup_plan 拿到一个时间字符串列表，名额判定直接崩。
                 minute_slots = [_uniform_minute(hourly_cap, k)
                                 for k in range(hour_tasks - built + 1, hour_tasks + 1)]
+                # v2.1.20：额外给出结构化作品项（work_key + 标题 + 封面 + 首个预计时间），
+                # 供「推送队列」直接复用 —— 三个模块（排期 / 队列 / 任务）的标题与封面
+                # 必须同源（都走 _work_titles / _work_posters），否则同一部作品在两处
+                # 显示不同名字或一处有封面一处没封面。`titles` 保留给旧调用方。
+                top_keys = titles[:per_hour_top]
+                wk_titles = _work_titles(db, top_keys)
+                wk_covers = _work_posters(db, top_keys)
+                works: list[dict[str, Any]] = []
+                for idx, wk in enumerate(top_keys):
+                    works.append({
+                        "work_key": wk,
+                        "title": str(wk_titles.get(wk) or ""),
+                        "cover": str(wk_covers.get(wk) or ""),
+                        "time": ("%02d:%02d" % (h, minute_slots[idx])
+                                 if idx < len(minute_slots) else ""),
+                    })
                 hour_items.append({
                     "category": _category_display_name(key),
                     "count": built,
                     "times": ["%02d:%02d" % (h, m) for m in minute_slots],
-                    "titles": [t for t in _work_titles(db, titles[:per_hour_top]).values() if t],
+                    "titles": [t for t in wk_titles.values() if t],
+                    "works": works,
                     "more": max(0, len(titles) - per_hour_top),
                 })
         total = sum(i["count"] for i in hour_items)
@@ -2959,7 +2976,13 @@ def _aggregate_hot_works(db: Session, limit: int = 5) -> dict[str, Any]:
 
 
 def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
-    """推送三视图：历史(published)/队列(active)/失败(failed)真实任务行。"""
+    """推送三视图：历史(published)/队列(active)/失败(failed)真实任务行。
+
+    v2.1.20：补 `cover`。此前这里只给了 `title`，前端三个表都渲染 `row.cover`，
+    于是一律显示「无封面」—— 与「推送任务」「分享管理」两个模块的口径不一致
+    （它们走 `api_tasks` / 分享记录列表，都有 cover）。现在统一走同一个
+    `_work_posters`，四个地方的海报来源完全一致。
+    """
     def rows_for(statuses: set[str] | None) -> list[dict[str, Any]]:
         q = select(SCPublishTask)
         if statuses:
@@ -2968,9 +2991,13 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
         out = [{k: v for k, v in _model_dict(r).items() if k in (
             "id", "work_key", "kind", "status", "link_state", "share_url",
             "error", "attempts", "created_at", "published_at", "updated_at")} for r in rows]
-        titles = _work_titles(db, [r.get("work_key") for r in out])
+        keys = [r.get("work_key") for r in out]
+        titles = _work_titles(db, keys)
+        posters = _work_posters(db, keys)
         for row in out:
-            row["title"] = titles.get(str(row.get("work_key") or ""), "")
+            key = str(row.get("work_key") or "")
+            row["title"] = titles.get(key, "")
+            row["cover"] = posters.get(key, "")
         return out
 
     return {"history": rows_for({"published"}),
@@ -3735,8 +3762,18 @@ def _task_channel_info(db: Session, task_ids: list[int]) -> dict[int, dict[str, 
 def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
     """按作品聚合键取 TMDB 海报相对路径（供前端拼缩略图）。
 
-    与 _work_titles 同口径（资源库版本 → 实时 Resource 回查），
-    只取**第一条非空**海报，取不到返回空串（前端不渲染缩略图，不占位）。
+    与 `_work_titles` 同口径（资源库版本 → 实时 Resource 回查），取不到返回空串
+    （前端不渲染缩略图，不占位）。
+
+    v2.1.20 修「有海报却显示无封面」：原实现两条路会同时落空。
+      ① **快照取数**：`seen` 在读到**第一条版本**（哪怕 poster 为空）后就把该 key
+         锁死，旧版本的非空海报再也读不到。用户看到的就是「资源表有海报、旧快照
+         也有，但最新快照恰好是空的 → 显示无封面」。
+         改为按 `version_no desc` 遍历、取**第一个非空** poster。
+      ② **实时资源兜底**：原实现只对 `file:` / `tmdb:` 前缀回查 `Resource`。
+         而绝大多数作品的聚合键是 `work:<归一化名>`，**一个都不回查** —— 资源表
+         里明明有 `poster_path` 也用不上。现在补 `work:` 路径：用快照自己登记的
+         `resource_ids_json` 反查 `Resource.poster_path`（比按名字匹配精确，不会串台）。
     """
     out: dict[str, str] = {}
     keys: list[str] = []
@@ -3748,48 +3785,88 @@ def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
         keys.append(key)
     if not keys:
         return out
-    # ① 资源库版本表登记的元数据
+
+    # ① 资源库版本表登记的元数据：按版本倒序，取第一个**非空** poster，
+    #    同时把每个版本的 resource_ids 收起来给 ③ 兜底用。
     rows = db.execute(
         select(SCLibraryVersion.work_key, SCLibraryVersion.version_no,
-               SCLibraryVersion.metadata_json)
+               SCLibraryVersion.metadata_json, SCLibraryVersion.resource_ids_json)
         .where(SCLibraryVersion.work_key.in_(keys))
         .order_by(SCLibraryVersion.version_no.desc())).all()
-    seen: set[str] = set()
-    for wk, _ver, meta_json in rows:
-        if wk in seen or out.get(wk):
-            continue
-        seen.add(wk)
+    # work_key → [(poster, [resource_id, ...]), ...]（版本倒序）
+    versions: dict[str, list[tuple[str, list[int]]]] = {}
+    for wk, _ver, meta_json, ids_json in rows:
         meta = _jload(meta_json, {})
-        if not isinstance(meta, dict):
-            continue
-        cand = str(meta.get("poster_path") or "").strip()
-        if cand:
-            out[wk] = cand
-    # ② 回查实时资源表
-    missing = [k for k, v in out.items() if not v]
-    if missing:
-        file_ids: list[str] = []
-        tmdb_ids: list[str] = []
-        for key in missing:
-            if key.startswith("tmdb:"):
-                tmdb_ids.append(key.split(":", 2)[-1] if key.count(":") >= 2 else "")
-            elif key.startswith("file:"):
-                file_ids.append(key.split(":", 1)[-1])
-        if file_ids:
-            for res in db.scalars(select(Resource).where(Resource.file_id.in_(file_ids))).all():
-                for key in missing:
-                    if key == f"file:{res.file_id}" and res.poster_path:
-                        out[key] = str(res.poster_path)
-        if tmdb_ids:
-            wanted = {t for t in tmdb_ids if t}
-            for res in db.scalars(select(Resource).where(
-                    Resource.tmdb_id.in_(wanted))).all() if wanted else []:
-                if not res.poster_path:
+        poster = ""
+        if isinstance(meta, dict):
+            poster = str(meta.get("poster_path") or "").strip()
+        raw_ids = _jload(ids_json, [])
+        ids: list[int] = []
+        if isinstance(raw_ids, list):
+            for x in raw_ids:
+                try:
+                    ids.append(int(x))
+                except (TypeError, ValueError):
                     continue
-                for key in missing:
-                    if key.startswith("tmdb:") and key.endswith(f":{res.tmdb_id}"):
-                        out[key] = str(res.poster_path)
-                        break
+        versions.setdefault(str(wk), []).append((poster, ids))
+
+    for key in keys:
+        for poster, _ids in versions.get(key, []):
+            if poster:
+                out[key] = poster
+                break
+
+    missing = [k for k in keys if not out.get(k)]
+    if not missing:
+        return out
+
+    # ② 回查实时资源表：file: / tmdb: 前缀（原有路径）
+    file_ids: list[str] = []
+    tmdb_ids: list[str] = []
+    for key in missing:
+        if key.startswith("tmdb:"):
+            tmdb_ids.append(key.split(":", 2)[-1] if key.count(":") >= 2 else "")
+        elif key.startswith("file:"):
+            file_ids.append(key.split(":", 1)[-1])
+    if file_ids:
+        for res in db.scalars(select(Resource).where(Resource.file_id.in_(file_ids))).all():
+            for key in missing:
+                if key == f"file:{res.file_id}" and res.poster_path:
+                    out[key] = str(res.poster_path)
+    if tmdb_ids:
+        wanted = {t for t in tmdb_ids if t}
+        for res in (db.scalars(select(Resource).where(
+                Resource.tmdb_id.in_(wanted))).all() if wanted else []):
+            if not res.poster_path:
+                continue
+            for key in missing:
+                if key.startswith("tmdb:") and key.endswith(f":{res.tmdb_id}"):
+                    out[key] = str(res.poster_path)
+                    break
+
+    # ③ `work:` 前缀兜底（v2.1.20 新增）：用快照登记的 resource_ids 反查资源表。
+    #    按「版本倒序 → 该版本内资源顺序」依次尝试，取第一个有 poster 的。
+    want_ids: list[int] = []
+    id_to_keys: dict[int, list[str]] = {}
+    for key in missing:
+        if not key.startswith("work:"):
+            continue
+        for _poster, ids in versions.get(key, []):
+            for rid in ids:
+                if rid not in id_to_keys:
+                    want_ids.append(rid)
+                    id_to_keys[rid] = []
+                id_to_keys[rid].append(key)
+    if want_ids:
+        res_map = {r.id: r for r in db.scalars(
+            select(Resource).where(Resource.id.in_(set(want_ids)))).all()}
+        for rid in want_ids:
+            res = res_map.get(rid)
+            if res is None or not res.poster_path:
+                continue
+            for key in id_to_keys.get(rid, []):
+                if not out.get(key):
+                    out[key] = str(res.poster_path)
     return out
 
 
