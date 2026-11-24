@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.17", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.18", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.17", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.18", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -5927,6 +5927,40 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         raise HTTPException(400, "还没有启用的分发规则或目录路由：请先在「分发与互动中心」完成 Bot → 频道 / 群 → 路由配置")
     added = 0
     skipped = []
+    # v2.1.18：同一请求内按「目标渠道」去重。
+    #
+    # 真机根因（线上手动推送 500，已用探针复现）：本 Session 是 autoflush=False，
+    # routes 分支 `db.add` 之后没有 flush，rules 分支的 `db.scalar` 就看不见刚加的
+    # 行 → 同一对 (resource_id, channel_id) 被 add 两次，到函数末尾统一 flush 时
+    # 撞 UNIQUE(resource_id, channel_id) → 手动推送直接 500。
+    #
+    # 实测触发条件（变体反证，不是推断）：
+    #   · 目录路由(频道+群) + 规则指向某个路由渠道 → 撞键（线上正是这套配置）
+    #   · 只有路由、无规则                      → 正常（入队 2 条）
+    #   · 规则指向路由之外的第三渠道            → 正常（入队 3 条）
+    #   · 两条启用规则指向同一渠道              → 也撞键（rules 循环内部同样漏查）
+    # 所以去重必须横跨两个分支 + 循环内的重复，只在某一个分支里补 flush 治不干净。
+    seen_channels: set[int] = set()
+
+    def _ensure_pending_q(channel_id: int) -> bool:
+        """把 (资源, 渠道) 置为待推送；返回 True 表示这个渠道本次新纳入。"""
+        if channel_id in seen_channels:
+            return False
+        seen_channels.add(channel_id)
+        q = db.scalar(select(QueueItem).where(
+            QueueItem.resource_id == x.id, QueueItem.channel_id == channel_id))
+        if not q:
+            # v2.1.11：归档行也占着唯一键，命中则复活复用而不是 INSERT（否则撞约束）。
+            from .archive import find_queue_item
+            q = find_queue_item(db, x.id, channel_id)
+        if q:
+            # v0.6.3：「立即推送」是手动强制动作，ANY 状态（含 sent/retry）都重置为
+            # pending 立即重推。旧逻辑只重置 review/failed，用户第一次推成功后反复点
+            # 都显示「已入队 0 条」，误以为按钮无反应。
+            q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
+        else:
+            db.add(QueueItem(resource_id=x.id, channel_id=channel_id, status="pending"))
+        return True
 
     # v0.9.11：目录路由（频道 + 群）——手动强制动作，绕过海报闸门但尊重目录匹配。
     if routes:
@@ -5936,18 +5970,8 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
             if not ch:
                 skipped.append(f"路由目标 {route['chat_id']} 找不到可用 Bot")
                 continue
-            q = db.scalar(select(QueueItem).where(
-                QueueItem.resource_id == x.id, QueueItem.channel_id == ch.id))
-            if q:
-                q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
-            else:
-                from .archive import find_queue_item
-                q = find_queue_item(db, x.id, ch.id)
-                if q:
-                    q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
-                else:
-                    db.add(QueueItem(resource_id=x.id, channel_id=ch.id, status="pending"))
-            added += 1
+            if _ensure_pending_q(ch.id):
+                added += 1
         if not matched:
             skipped.append("资源目录未匹配任何推送路由（可在「目录路由」把 dir_id 留空做整库推送）")
     for r in rules:
@@ -5965,22 +5989,7 @@ async def publish_resource(rid: int, db: Session = Depends(get_db)):
         if r.keyword and r.keyword.lower() not in x.name.lower():
             skipped.append(f"规则「{r.name}」限定关键词「{r.keyword}」，文件名不含该词")
             continue
-        q = db.scalar(select(QueueItem).where(
-            QueueItem.resource_id == x.id, QueueItem.channel_id == r.channel_id))
-        if q:
-            # v0.6.3：「立即推送」是手动强制动作， ANY 状态（含 sent/retry）都重置为 pending
-            # 立即重推。旧逻辑只重置 review/failed，用户第一次推成功后反复点都显示
-            # 「已入队 0 条」，误以为按钮无反应。
-            q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
-            added += 1
-        else:
-            # v2.1.11：归档行也占着唯一键，命中则复活复用而不是 INSERT（否则撞约束）
-            from .archive import find_queue_item
-            q = find_queue_item(db, x.id, r.channel_id)
-            if q:
-                q.status, q.error, q.next_retry_at, q.attempts = "pending", "", None, 0
-            else:
-                db.add(QueueItem(resource_id=x.id, channel_id=r.channel_id, status="pending"))
+        if _ensure_pending_q(r.channel_id):
             added += 1
     # v1.1：autoflush=False，上面新 add 的 QueueItem 必须先 flush 才能被下面查询看到，
     # 否则 force 任务 channel_targets=[] → submit_to_dispatch 返回 0 → 强推消息发不出去。

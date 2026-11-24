@@ -2027,6 +2027,134 @@ async def run_cycle(db: Session, limit: int = 20) -> dict[str, Any]:
         _CYCLE_LOCK.release()
 
 
+async def repair_cycle(db: Session, *, dry_run: bool = True,
+                       limit: int = 50) -> dict[str, Any]:
+    """手动扫描（v2.1.18 升级）：体检 → 自愈 → 重排 → 推送。
+
+    把用户口语里的四件事一次做完，不再要求他自己判断该点哪个按钮：
+
+      ① 清理无效链接   —— 复用「清理分享链接」的**同一套判据**（`_scan_invalid_links`）；
+      ② 清理失败任务   —— 复用「清理无效推送任务」的同一套判据（`_scan_invalid_tasks`）；
+                          只清「重试也不会成功」的，临时失败（抖动/限流）留着重试；
+      ③ 在库文件重排   —— 分类游标归零 + 被清作品的「已分享」标记归零，
+                          下一轮 `plan_engine` 按发布规则把仍在库的作品重新排进队列；
+      ④ 按发布规则推送 —— sync → plan → dispatch，与自动调度**同一条链路、同一把锁**。
+
+    为什么游标要全量归零：用户要的是「资源库里现在有的都重新排一遍」。
+    只 rewind 被清理的作品不够 —— 兜不住外部删库、旧版本遗留这类不经过 rewind
+    入口的卡死（`api_rebuild_first` 也是这个口径）。
+    归零**不会造成重复首推**：`_SlotIndex` 照样挡住「已推且链接仍有效」与在途任务，
+    这一点有 `test_v2117`/`test_v2116` 的端到端用例守着。
+
+    `dry_run=True`（默认）只体检、不写库、不推送 —— 前端必须先给用户看数字再确认。
+    **不物理删除任何行**（红线）：清理一律是状态归档，历史行与执行记录全保留。
+    """
+    live = _live_work_keys(db)
+    task_pairs, task_total = _scan_invalid_tasks(db)
+    link_pairs, link_total = _scan_invalid_links(db)
+    version = _active_version(db)
+    channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
+
+    plannable = blocked_pushed = blocked_active = 0
+    works: list[SCLibraryVersion] = []
+    if version and channels:
+        slots = _SlotIndex(db, live_keys=live)
+        works = [lv for lv in db.scalars(
+            select(SCLibraryVersion).order_by(SCLibraryVersion.id)).all()
+            if str(lv.work_key or "") in live]
+        for lv in works:
+            for channel in channels:
+                dedup = f"{lv.work_key}:{channel.id}:first"[:255]
+                state, _reuse = slots.state(
+                    str(lv.work_key or ""), str(channel.chat_id or ""), dedup)
+                if state in (SLOT_NONE, SLOT_INVALID):
+                    plannable += 1
+                elif state == SLOT_ACTIVE:
+                    blocked_active += 1
+                else:
+                    blocked_pushed += 1
+
+    win = _current_hour_window(db, version) if version else None
+    cat_key = str(getattr(win, "category_key", "") or "")
+    report: dict[str, Any] = {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "works_in_library": len(live),
+        "works_total": len(works),
+        "channels": len(channels),
+        "links_invalid": len(link_pairs),
+        "links_total": link_total,
+        "tasks_invalid": len(task_pairs),
+        "tasks_total": task_total,
+        "plannable": plannable,
+        "blocked_pushed": blocked_pushed,
+        "blocked_active": blocked_active,
+        "hour_allowed": bool(_current_hour_allowed(db, version)) if version else False,
+        "hour_category": cat_key.split(":", 1)[-1] if cat_key else "",
+    }
+    if not version:
+        report["reason"] = "当前没有生效中的计划版本：本次可以清理，但无法按发布规则排期"
+    elif not channels:
+        report["reason"] = "当前没有启用中的推送渠道：本次可以清理，但无法按发布规则排期"
+    report["plan_ready"] = bool(version and channels)
+    if dry_run:
+        report["note"] = "仅体检：未改动任何数据，也未发起推送。"
+        return report
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        return {"ok": False, "dry_run": False,
+                "reason": "自动调度正在进行，请稍后重试（避免与自动推送重复建链）"}
+    # v2.1.18：清理与排期**解耦**。清理无效链接 / 失败任务不依赖计划版本，
+    # 没有生效版本时也要照做（否则用户没配计划就永远清不掉这些垃圾）。
+    # 只有「归零游标 + 按发布规则排期 + 推送」这一段才需要版本与渠道。
+    try:
+        tasks_done = cleanup_invalid_tasks(db)
+        links_done = cleanup_invalid_links(db)
+        cursors_reset = 0
+        sync: dict[str, int] = {}
+        plan: dict[str, int] = {}
+        dispatched: dict[str, Any] = {}
+        if version:
+            cursors_reset = reset_plan_cursors(db, version.id)
+            db.commit()
+            sync = sync_library_versions(db)
+            plan = plan_engine(db)
+            dispatched = await dispatch_ready_tasks(db, limit=limit)
+        else:
+            db.commit()
+    finally:
+        _CYCLE_LOCK.release()
+
+    report.update({
+        "dry_run": False,
+        "cleaned_links": int(links_done.get("cleaned") or 0),
+        "cleaned_tasks": int(tasks_done.get("cleaned") or 0),
+        "marks_reset": (int(links_done.get("marks_reset") or 0)
+                        + int(tasks_done.get("marks_reset") or 0)),
+        "cursors_reset": cursors_reset,
+        "sync": sync,
+        "queued": plan,
+        "dispatched": dispatched,
+    })
+    return report
+
+
+@router.post("/repair")
+def api_repair(body: Payload, db: Session = Depends(get_db)):
+    """手动扫描（端点）。
+
+    `dry_run` 默认 **True**：先出体检报告，前端把数字摊给用户看过、确认后
+    再带 `dry_run=false` 调一次执行。默认值故意选安全侧 —— 这个动作会写库并真的
+    发消息，不能因为前端漏传参数就默默执行。
+    """
+    import asyncio
+    p = body.payload or {}
+    return asyncio.run(repair_cycle(
+        db,
+        dry_run=bool(p.get("dry_run", True)),
+        limit=max(1, int(p.get("limit") or 50)),
+    ))
+
+
 def claim_tasks(db: Session, worker: str, limit: int = 20) -> list[SCPublishTask]:
     """可选的新任务租约领取；当前分发队列仍以 push_queue 为执行载体。"""
     now = utcnow()
@@ -3567,31 +3695,29 @@ def _is_permanent_error(error: str) -> bool:
     return any(marker in text for marker in PERMANENT_ERROR_MARKERS)
 
 
-@router.post("/tasks/cleanup")
-def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
-    """清理无效推送任务：归档（status=cleaned），**不物理删除行**。
+def _scan_invalid_tasks(db: Session, only_ids: list[int] | None = None
+                        ) -> tuple[list[tuple[SCPublishTask, str]], int]:
+    """扫描「可清理的无效推送任务」。**只读，不写库**。
+
+    v2.1.18：把判据从端点里提出来 —— 「清理无效推送任务」按钮和「手动扫描」的
+    体检必须用同一套判据，否则两个入口给出的数字会不一致（用户没法判断信谁）。
+
+    返回 `(可清理项 [(task, 原因)], 候选总数)`。
 
     「无效」判据（全部实时派生，不编造）：
       ① 任务已被用户取消（cancelled）——调度器不再捡起它；
       ② 任务已被判为「无效推送」（invalid：建链失败 / 资源已移除 / 快照缺失）；
       ③ 任务失败，且失败原因表明**资源已从资源库移除**（重试也永远不会成功）；
       ④ 任务失败，且它背后的作品在当前资源库已查无此物。
-
-    归档后默认列表不再展示（`include_archived=true` 可查回），
-    历史行与执行记录保留，不影响推送历史与统计口径。
+    临时性失败（网络抖动 / 限流）**不在此列**，留着重试。
     """
-    p = body.payload or {}
-    only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
     live = _live_work_keys(db)
     q = select(SCPublishTask).where(SCPublishTask.status.in_(
         {"failed", "cancelled", INVALID_TASK_STATUS}))
     if only_ids:
         q = q.where(SCPublishTask.id.in_(only_ids))
     rows = db.scalars(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
-    cleaned = 0
-    skipped = 0
-    details = []
-    cleaned_works: set[str] = set()
+    out: list[tuple[SCPublishTask, str]] = []
     for task in rows:
         reason = ""
         if str(task.status or "") == "cancelled":
@@ -3602,9 +3728,54 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
             reason = "资源已从资源库移除"
         elif str(task.work_key or "") not in live:
             reason = "作品已不在资源库"
-        if not reason:
-            skipped += 1
-            continue
+        if reason:
+            out.append((task, reason))
+    return out, len(rows)
+
+
+def _scan_invalid_links(db: Session, only_ids: list[int] | None = None
+                        ) -> tuple[list[tuple[SCPublishTask, SCPushListItem, str]], int]:
+    """扫描「可清理的无效分享链接」。**只读，不写库**。与 `api_cleanup_share_records`
+    共用同一套判据（理由同 `_scan_invalid_tasks`）。
+
+    返回 `(可清理项 [(task, item, 原因)], 候选总数)`。
+    """
+    live = _live_work_keys(db)
+    q = (select(SCPushListItem, SCPublishTask)
+         .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
+         .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != ""))
+    if only_ids:
+        q = q.where(SCPublishTask.id.in_(only_ids))
+    rows = db.execute(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
+    out: list[tuple[SCPublishTask, SCPushListItem, str]] = []
+    for item, task in rows:
+        state = str(task.link_state or "unknown")
+        reason = ""
+        if state in ("suspicious", "inactive"):
+            reason = "链接已判失效"
+        elif state == INVALID_TASK_STATUS:
+            # link_state 也可能被写成 "invalid"（INVALID_LINK_STATES 含它）。
+            reason = "无效推送"
+        elif _is_permanent_error(task.error):
+            reason = "资源已从资源库移除"
+        elif str(task.work_key or item.work_key or "") not in live:
+            reason = "作品已不在资源库"
+        if reason:
+            out.append((task, item, reason))
+    return out, len(rows)
+
+
+def cleanup_invalid_tasks(db: Session, only_ids: list[int] | None = None) -> dict[str, Any]:
+    """清理无效推送任务：归档（status=cleaned），**不物理删除行**。
+
+    归档后默认列表不再展示（`include_archived=true` 可查回），
+    历史行与执行记录保留，不影响推送历史与统计口径。
+    """
+    pairs, total = _scan_invalid_tasks(db, only_ids)
+    cleaned = 0
+    details = []
+    cleaned_works: set[str] = set()
+    for task, reason in pairs:
         task.status = CLEANED_TASK_STATUS
         task.error = f"已清理：{reason}"
         task.lease_owner = ""
@@ -3621,7 +3792,7 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
     # 注意：本项目 Session 是 autoflush=False，必须先 flush，否则下面的
     # 「还有没有未清理任务」查询读不到上面刚改的 cleaned，清单项永远不会被更新。
     db.flush()
-    item_ids = {int(t.list_item_id or 0) for t in rows if int(t.list_item_id or 0) > 0}
+    item_ids = {int(t.list_item_id or 0) for t, _r in pairs if int(t.list_item_id or 0) > 0}
     for iid in sorted(item_ids):
         left = db.scalar(select(SCPublishTask.id).where(
             SCPublishTask.list_item_id == iid,
@@ -3639,8 +3810,45 @@ def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
     for wk in sorted(cleaned_works):
         rewind_cursor_for_work(db, wk)
     db.commit()
-    return {"ok": True, "cleaned": cleaned, "skipped": skipped,
+    return {"ok": True, "cleaned": cleaned, "skipped": total - cleaned,
             "marks_reset": marks_reset, "items": details}
+
+
+def cleanup_invalid_links(db: Session, only_ids: list[int] | None = None) -> dict[str, Any]:
+    """清理无效分享链接：归档（link_state=cleaned），**不物理删除行**。
+
+    只归档本地记录：**不删 B 库资源、不删远端分享、不删历史行**
+    （与 share_link.cleanup_link 的既有语义一致）。
+    """
+    pairs, total = _scan_invalid_links(db, only_ids)
+    cleaned = 0
+    details = []
+    affected_works: set[str] = set()
+    for task, item, reason in pairs:
+        # 作废链接态 → 该次推送判为无效、名额回收，作品可重新排队。
+        task.link_state = CLEANED_LINK_STATE
+        task.updated_at = utcnow()
+        cleaned += 1
+        wk = str(task.work_key or item.work_key or "")
+        if wk:
+            affected_works.add(wk)
+        details.append({"id": task.id, "reason": reason})
+    # v2.1.16：链接作废后名额已回收 → 回退游标，让作品下一轮优先回到队列。
+    # v2.1.17：资源行的「已分享」标记同步归零，否则旧队列判据仍认为推送生效。
+    marks_reset = reset_share_marks_for_works(db, affected_works)
+    for wk in sorted(affected_works):
+        rewind_cursor_for_work(db, wk)
+    db.commit()
+    return {"ok": True, "cleaned": cleaned, "skipped": total - cleaned,
+            "marks_reset": marks_reset, "items": details}
+
+
+@router.post("/tasks/cleanup")
+def api_cleanup_tasks(body: Payload, db: Session = Depends(get_db)):
+    """清理无效推送任务（端点）：判据与执行都见 `cleanup_invalid_tasks`。"""
+    p = body.payload or {}
+    only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
+    return cleanup_invalid_tasks(db, only_ids or None)
 
 
 def reset_plan_cursors(db: Session, version_id: int) -> int:
@@ -3739,61 +3947,10 @@ def api_rebuild_first(body: Payload, db: Session = Depends(get_db)):
 
 @router.post("/share-records/cleanup")
 def api_cleanup_share_records(body: Payload, db: Session = Depends(get_db)):
-    """清理无效分享链接：归档（link_state=cleaned），**不物理删除行**。
-
-    「无效」判据（全部实时派生，不编造）：
-      ① 链接状态已被本地元数据状态机判为失效
-         （suspicious / inactive）；
-      ② 作品已从资源库移除——链接指向的目录已不存在，链接必然打不开；
-      ③ 任务失败且失败原因表明资源已移除。
-
-    只归档本地记录：**不删 B 库资源、不删远端分享、不删历史行**
-    （与 share_link.cleanup_link 的既有语义一致）。
-    """
+    """清理无效分享链接（端点）：判据与执行都见 `cleanup_invalid_links`。"""
     p = body.payload or {}
     only_ids = [int(x) for x in (p.get("ids") or []) if str(x).isdigit()]
-    live = _live_work_keys(db)
-    q = (select(SCPushListItem, SCPublishTask)
-         .join(SCPublishTask, SCPublishTask.list_item_id == SCPushListItem.id)
-         .where(SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != ""))
-    if only_ids:
-        q = q.where(SCPublishTask.id.in_(only_ids))
-    rows = db.execute(q.order_by(SCPublishTask.id.desc()).limit(5000)).all()
-    cleaned = 0
-    skipped = 0
-    details = []
-    affected_works: set[str] = set()
-    for item, task in rows:
-        state = str(task.link_state or "unknown")
-        reason = ""
-        if state in ("suspicious", "inactive"):
-            reason = "链接已判失效"
-        elif state == INVALID_TASK_STATUS:
-            # v2.1.16：已被判为无效推送（建链失败 / 链接作废），一并归档。
-            reason = "无效推送"
-        elif _is_permanent_error(task.error):
-            reason = "资源已从资源库移除"
-        elif str(task.work_key or item.work_key or "") not in live:
-            reason = "作品已不在资源库"
-        if not reason:
-            skipped += 1
-            continue
-        # 作废链接态 → 该次推送判为无效、名额回收，作品可重新排队。
-        task.link_state = CLEANED_LINK_STATE
-        task.updated_at = utcnow()
-        cleaned += 1
-        wk = str(task.work_key or item.work_key or "")
-        if wk:
-            affected_works.add(wk)
-        details.append({"id": task.id, "reason": reason})
-    # v2.1.16：链接作废后名额已回收 → 回退游标，让作品下一轮优先回到队列。
-    # v2.1.17：资源行的「已分享」标记同步归零，否则旧队列判据仍认为推送生效。
-    marks_reset = reset_share_marks_for_works(db, affected_works)
-    for wk in sorted(affected_works):
-        rewind_cursor_for_work(db, wk)
-    db.commit()
-    return {"ok": True, "cleaned": cleaned, "skipped": skipped,
-            "marks_reset": marks_reset, "items": details}
+    return cleanup_invalid_links(db, only_ids or None)
 
 
 @router.post("/category-schedules/adopt-ai-all")

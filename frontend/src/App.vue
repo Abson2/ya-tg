@@ -2279,12 +2279,48 @@ async function scSwitchSubNav(key) {
   scSubNav.value = key
   if (key === '阅读量') { try { await loadScStats() } catch (e) {} }
 }
+// 手动扫描（v2.1.18 升级）：先体检，把数字摊给用户看，确认后才执行。
+// 一次点击串完四件事：清理无效链接 → 清理失败任务 → 在库作品重新排队 → 按发布规则推送。
+// 以前这里直接调 /sc/run 跑一轮调度，不体检、不清无效、不动游标——
+// 有东西卡着的时候点了没用，用户还得自己猜该点「清理任务」还是「重建首推」。
 async function scRun() {
   try {
-    const d = await api('/sc/run', { method: 'POST' })
-    ElMessage.success(`调度完成：清单 ${d.lists || 0} · 项 ${d.items || 0} · 任务 ${d.tasks || 0}`)
+    const pre = await api('/sc/repair', {
+      method: 'POST', body: JSON.stringify({ payload: { dry_run: true } }) })
+    if (pre && pre.ok === false) {
+      ElMessage.warning(String(pre.reason || '体检未完成，请稍后重试')); return pre
+    }
+    const lines = [
+      `资源库在册 ${pre.works_in_library || 0} 部作品，推送渠道 ${pre.channels || 0} 个。`,
+      `可清理的无效链接 ${pre.links_invalid || 0} 条`,
+      `可清理的失败任务 ${pre.tasks_invalid || 0} 个`,
+      `待排队 ${pre.plannable || 0} 个推送目标（一部作品推一个渠道算一个）；另有 ${pre.blocked_pushed || 0} 个已推过且链接仍有效，不会重推。`,
+    ]
+    if (!pre.hour_allowed) {
+      lines.push('当前时段没有命中分类排期窗口：本次只做清理，任务到各自时段再排。')
+    }
+    if (pre.reason) lines.push(String(pre.reason))
+    lines.push('清理只改状态、不删任何记录，也不动光鸭网盘里的文件。确认开始？')
+    await ElMessageBox.confirm(lines.join(' '), '手动扫描 · 先体检', {
+      type: 'warning', confirmButtonText: '开始清理并重排', cancelButtonText: '取消',
+    })
+    const d = await api('/sc/repair', {
+      method: 'POST', body: JSON.stringify({ payload: { dry_run: false } }) })
+    if (d && d.ok === false) {
+      ElMessage.warning(String(d.reason || '执行未完成，请稍后重试')); return d
+    }
+    const q = d.queued || {}
+    const done = [
+      `清理无效链接 ${d.cleaned_links || 0} 条`,
+      `清理失败任务 ${d.cleaned_tasks || 0} 个`,
+      `清除已推标记 ${d.marks_reset || 0} 条`,
+      `重排 ${q.items || 0} 项 / ${q.tasks || 0} 个任务`,
+    ]
+    ElMessage.success(`手动扫描完成：${done.join(' · ')}`)
     await loadSc(); return d
-  } catch (e) { ElMessage.error(String(e?.message || e)) }
+  } catch (e) {
+    if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e))
+  }
 }
 async function scTogglePause() {
   const next = !scOverview.value.paused
@@ -2945,7 +2981,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.17 · Asia/Shanghai</span>
+          <span>v2.1.18 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
