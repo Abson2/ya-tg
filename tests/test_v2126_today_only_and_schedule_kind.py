@@ -223,9 +223,14 @@ def test_stale_rows_never_pad_the_table():
 
 
 def test_today_rows_beyond_limit_are_capped():
-    """当天行多于 limit 时按时间倒序取前 limit 条（不是把旧的排前面）。"""
+    """当天行多于 limit 时按时间倒序取前 limit 条（不是把旧的排前面）。
+
+    v2.1.34：基准时刻改为「今天上海正午」。原来用 `_now()`，**凌晨 00:00–00:30**
+    跑全量时 `base - 10/20/30 分钟` 会退到昨天，被「只给当天」正当地滤掉，
+    只剩 1 条 → 假红（本机 00:03 撞上）。与 v2.1.33 那条 flaky 同一类。
+    """
     with SessionLocal() as db:
-        base = _now()
+        base = _today_noon_utc()
         for i in range(4):
             _res, wk = _work(db, title=f"今日{i}", file_id=f"f-cap-{i}")
             _task(db, wk, status="published",

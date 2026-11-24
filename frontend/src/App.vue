@@ -3478,7 +3478,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.33 · Asia/Shanghai</span>
+          <span>v2.1.34 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4707,8 +4707,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <div class="sc-fc-cats" v-if="s.row.total">
                             <div class="sc-fc-cat-line" v-for="(it, i) in s.row.items" :key="i">
                               <!-- v2.1.25（用户口径 2）：分类列只放 TMDB 分类；插队批是
-                                   通道，带「插队」前缀以示区分（后端 `kind` 明确给出）。 -->
-                              <span class="sc-fc-cat" :class="{ 'is-src': it.kind === 'instant' }"><i v-if="it.kind === 'instant'">插队</i>{{ it.category }}</span>
+                                   通道，带「插队」前缀以示区分（后端 `kind` 明确给出）。
+                                   v2.1.34：`kind=scheduled` 是**今天已经建好任务**的那批，
+                                   带「已建」前缀 + 独立配色 —— 它与预测行的区别是
+                                   「已经落库了、时间不会变」，但分类仍是真题材。 -->
+                              <span class="sc-fc-cat" :class="{ 'is-src': it.kind === 'instant', 'is-built': it.kind === 'scheduled' }"><i v-if="it.kind === 'instant'">插队</i><i v-else-if="it.kind === 'scheduled'">已建</i>{{ it.category }}</span>
                               <em>{{ it.count }} 条<template v-if="it.works_total"> · {{ it.works_total }} 部</template></em>
                             </div>
                           </div>
@@ -6658,6 +6661,11 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-cat.is-src{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
 .sc-fc-cat.is-src i{font-style:normal;margin-right:5px;padding:0 4px;border-radius:4px;
   background:var(--yg-tone-amber-fg);color:var(--yg-surface);font-size:10px;line-height:15px}
+/* v2.1.34（真机反馈）：排期表要与推送队列同口径 —— 当天已经建好任务的那批也进表，
+   用绿色（「已定」）+「已建」前缀与预测行区分。绿色是既有语义色，不新造色阶。 */
+.sc-fc-cat.is-built{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
+.sc-fc-cat.is-built i{font-style:normal;margin-right:5px;padding:0 4px;border-radius:4px;
+  background:var(--yg-tone-green-fg);color:var(--yg-surface);font-size:10px;line-height:15px}
 .sc-fc-works{display:flex;flex-wrap:wrap;gap:3px 10px}
 .sc-fc-w{font-size:11.5px;line-height:1.75;color:var(--yg-ink);
   max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

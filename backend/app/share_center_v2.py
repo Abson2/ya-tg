@@ -1381,6 +1381,12 @@ def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, A
         hour = int(h.get("hour") or 0)
         psh = hour - hour % HOUR_SEGMENT_HOURS
         for it in h.get("items") or []:
+            # v2.1.34：`kind=scheduled` 是**当天已经建好任务**的那批（真机反馈：
+            # 排期表与推送队列不一致）。它们的时间是既成事实，绝不能参与均分重排——
+            # 一旦被重写，排期表显示的时刻就又和队列对不上了，等于把刚修好的
+            # 「同口径」重新打破。这类项也不计入时段部数，否则会把预测的间隔估大。
+            if str(it.get("kind") or "") == "scheduled":
+                continue
             # `works_total` 是未截断的作品数，均分必须按真实部数算间隔
             period_counts[psh] = period_counts.get(psh, 0) + int(
                 it.get("works_total") or len(it.get("works") or []))
@@ -2338,6 +2344,93 @@ def register_force_tasks(db: Session, resource: Resource,
     return created
 
 
+def _queue_works_by_hour(db: Session, now_sh: datetime) -> tuple[dict[int, dict[str, Any]], set[str]]:
+    """当天「在途任务」按小时聚合，供排期表与推送队列同口径（v2.1.34）。
+
+    真机反馈：「今日推送排期与推送队列影视不一致」——排期表上是蜘蛛侠 / 2001 太空
+    漫游 / 阿凡达，队列里却是百变星君 / 望夫成龙。根因不是数据坏了，是**两张表在
+    回答不同的问题**：`forecast_schedule` 只做预测（从分类游标往后模拟「还能排
+    什么」），当天这批任务一旦建成、游标前移，它们就再也不会出现在预测里；而队列
+    给的是真实任务。于是同一屏里，一边是「未来可能推的」，一边是「现在排着的」，
+    用户第一反应必然是「排期丢了」。
+
+    这里把队列那侧的数据反灌回排期表，两边从此同源：
+
+      · 只取 `ACTIVE_TASK_STATUS`（在途）—— 与 `_aggregate_views` 的 queue 取数
+        完全一致。已发布的归「推送历史」、失败的归「推送失败」，不重复进排期表。
+      · 时间口径复用 `_mark_expect_release`：已发用实际发送时间，未发用按匀速节奏
+        反推的预计放行时刻 —— 与队列时间列**同一个函数算出来的**，不可能对不上。
+      · 同一部作品推群 + 频道合并成一条 —— 排期表按「部」说话，`count` 另外给出
+        条数，与「N 条 · M 部」的写法一致。
+
+    返回 `({小时: {"works": [...], "count": 条数}}, 该批全部 work_key)`。
+    """
+    today_sh = now_sh.strftime("%Y-%m-%d")
+    try:
+        rows = db.scalars(
+            select(SCPublishTask).where(SCPublishTask.status.in_(ACTIVE_TASK_STATUS))
+            .order_by(SCPublishTask.id.desc()).limit(400)).all()
+    except Exception:
+        db.rollback()
+        return {}, set()
+    out = [{k: v for k, v in _model_dict(r).items() if k in (
+        "id", "work_key", "kind", "status", "created_at", "published_at",
+        "scheduled_at")} for r in rows]
+    # 当天口径与队列一致：按 `scheduled_at`（没有就退创建时间）判上海自然日
+    out = [r for r in out
+           if str(r.get("scheduled_at") or r.get("created_at") or "")[:10] == today_sh]
+    if not out:
+        return {}, set()
+
+    # 预计放行时刻：与队列时间列同一个函数，已发布的行它不会设这个字段
+    _mark_expect_release(db, out)
+
+    def _at(r: dict[str, Any]) -> str:
+        """这一行「什么时候推」：实际发送 > 预计放行 > 原口径兜底（同前端 scQueueClock）。"""
+        return str(r.get("published_at") or r.get("expect_release_at")
+                   or r.get("scheduled_at") or r.get("created_at") or "")
+
+    first_at: dict[str, str] = {}
+    task_count: dict[str, int] = {}
+    for r in sorted(out, key=_at):
+        wk = str(r.get("work_key") or "")
+        if not wk:
+            continue
+        task_count[wk] = task_count.get(wk, 0) + 1
+        if wk not in first_at:
+            first_at[wk] = _at(r)
+    keys = list(first_at)
+    titles = _work_titles(db, keys)
+    covers = _work_posters(db, keys)
+    tags = _work_push_tags(db, keys)
+    cats = _work_categories(db, keys)
+
+    hour_map: dict[int, dict[str, Any]] = {}
+    for wk in keys:
+        at = first_at.get(wk) or ""
+        try:
+            hour = int(at[11:13])
+        except (TypeError, ValueError):
+            continue
+        kind_key, kind_label = _schedule_kind_pair(tags.get(wk, []))
+        slot = hour_map.setdefault(hour, {"works": [], "count": 0})
+        slot["works"].append({
+            "work_key": wk,
+            "title": str(titles.get(wk) or ""),
+            "cover": str(covers.get(wk) or ""),
+            "tags": tags.get(wk, []),
+            "category": str(cats.get(wk) or ""),
+            "schedule_kind": kind_label,
+            "schedule_kind_key": kind_key,
+            # 真实时刻（不做均分回填），排期表直接透出，与队列显示一致
+            "time": at[11:16],
+            # 这部作品当前在途的任务条数（群 + 频道各一条）——分类行要写「N 条 · M 部」
+            "tasks": int(task_count.get(wk) or 1),
+        })
+        slot["count"] += int(task_count.get(wk) or 1)
+    return hour_map, set(keys)
+
+
 def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                       per_hour_top: int = 4) -> dict[str, Any]:
     """当天剩余时段的推送排期预测。**只读**：不写库、不建任务、不发消息。
@@ -2458,6 +2551,11 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
             db.rollback()
             submitted_keys_hour = set()
 
+    # v2.1.34（真机反馈）：把「当天在途任务」按小时反灌进这张表 —— 排期表与推送队列
+    # 从此同源。两者回答的本是同一个问题「今天几点推哪部」，此前一个只给预测、
+    # 一个只给真实任务，于是同一屏里对不上。
+    built_by_hour, built_keys = _queue_works_by_hour(db, now_sh)
+
     def _quota(h: int) -> int:
         """该小时还剩多少推送额度（匀速口径，单位=部）。"""
         if not hourly_cap:
@@ -2488,6 +2586,10 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         """该作品现在能排的渠道 chat_id 列表（空 = 名额已占 / 不在库 / 扫到上限）。"""
         nonlocal scanned
         if not wk or wk not in live_keys:
+            return []
+        # v2.1.34：已经建好任务的作品不再参与预测 —— 它已经在排期表里以
+        # 「已排期任务」出现，再预测一遍就是同一部剧占两行、顶部数字也双计。
+        if wk in built_keys:
             return []
         if scanned >= scan_limit:
             return []
@@ -2526,21 +2628,60 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
 
     # ---- 逐小时模拟 ----
     # v2.1.24：一次性从当前小时算到 24 点。前端用滚动区承载（不再分批加载）。
+    # v2.1.34：起点往前退到「最早一条在途任务所在小时」—— 队列里可能挂着本该更早
+    # 发出、到现在还没出去的任务；不往前退，那些小时在排期表里就没有行，
+    # 「队列有、排期表没有」会原样再来一次。
     start_hour = int(now_sh.hour)
+    if built_by_hour:
+        start_hour = min(start_hour, min(built_by_hour))
     end_hour = 24
     for h in range(start_hour, end_hour):
+        # v2.1.34：本小时「已经建好任务」的那批 —— 板上钉钉的排期，排在最前。
+        # 它们不占预测额度（额度已在 submitted_keys_hour 里扣过），只做展示。
+        #
+        # 按**作品自己的 TMDB 分类**拆成多项，绝不另造一个「已排期任务」的假分类：
+        # 分类列只放题材（v2.1.25 已定的口径），这批与预测的区分靠 `kind=scheduled`
+        # （前端加「已建」前缀 + 独立配色），不靠往分类格里塞状态词。
+        built_slot = built_by_hour.get(h) or {}
+        built_items: list[dict[str, Any]] = []
+        by_cat: dict[str, list[dict[str, Any]]] = {}
+        for w in (built_slot.get("works") or []):
+            by_cat.setdefault(str(w.get("category") or ""), []).append(w)
+        for cat_name, ws in by_cat.items():
+            built_items.append({
+                "category": cat_name or "未分类",
+                "kind": "scheduled",
+                "count": sum(int(x.get("tasks") or 1) for x in ws),
+                "times": list(dict.fromkeys([x["time"] for x in ws if x.get("time")])),
+                "titles": [x["title"] for x in ws if x.get("title")],
+                "works": ws,
+                "works_total": len(ws),
+                "more": 0,
+            })
+        built_count = sum(int(i["count"]) for i in built_items)
+        # 已经过去的小时：只如实交代「确实排着的任务」，不再编预测；
+        # 连任务都没有的小时干脆不占一行，否则凌晨打开会多出一整屏空行。
+        if h < now_sh.hour:
+            if not built_items:
+                continue
+            out["today_total"] += built_count
+            out["hours"].append({"hour": h, "total": built_count, "items": built_items})
+            continue
+
         win = next((w for w in hour_windows
                     if int(w.start_hour or 0) <= h < int(w.end_hour or 0)), None)
         if hour_windows and win is None:
-            out["hours"].append({"hour": h, "total": 0, "items": [],
-                                 "blocked": "不在可发布时段"})
+            out["hours"].append({"hour": h, "total": built_count,
+                                 "items": built_items,
+                                 "blocked": "" if built_items else "不在可发布时段"})
             continue
         if quiet_on:
             in_quiet = ((quiet_start <= h < quiet_end) if quiet_end > quiet_start
                         else (h >= quiet_start or h < quiet_end))
             if in_quiet:
-                out["hours"].append({"hour": h, "total": 0, "items": [],
-                                     "blocked": "静默保护时段"})
+                out["hours"].append({"hour": h, "total": built_count,
+                                     "items": built_items,
+                                     "blocked": "" if built_items else "静默保护时段"})
                 continue
 
         cats = kept
@@ -2554,6 +2695,11 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         hour_items: list[dict[str, Any]] = []
         hour_tasks = 0
         cat_counts: dict[str, int] = {}
+        # v2.1.34：已建任务排在本小时最前（它比插队和轮转都确定），且不计入
+        # `hour_tasks` —— 额度在 `submitted_keys_hour` 里已经扣过了，重复扣会把
+        # 本小时的预测挤成 0，又变成「有队列、排期表空」。
+        if built_items:
+            hour_items.extend(built_items)
         # v2.1.22：插队项（新上映 / 新入库）排在本小时最前面，且**先占额度**。
         if h == now_sh.hour and instant_rows:
             taken: list[dict[str, Any]] = []
@@ -2689,7 +2835,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     # v2.1.23：按「排期时段」把作品的时间均分回写（用户口径 4）。
     out["pace"] = _respread_forecast_times(out["hours"], now_sh)
 
-    out["works_total"] = len(set(wk for wk, _ in planned_pairs))
+    # v2.1.34：把「已经建好任务」的作品也算进总数 —— 它们不再进 planned_pairs
+    # （_picks_for 已拦截），但确实是今天要推的，漏掉会让顶部数字比表里少。
+    out["works_total"] = len(set(wk for wk, _ in planned_pairs) | built_keys)
 
     # ---- 存量盘点：今天推不完的还有多少（受 scan_limit 保护，超限则标注「至少」）----
     # 重新计数：上面的模拟阶段已经消耗过 scanned，若共用同一个计数器，

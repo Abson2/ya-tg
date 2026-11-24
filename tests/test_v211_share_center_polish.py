@@ -481,13 +481,23 @@ def test_rep_resolver_uses_snapshot_when_valid(env):
 # 5. 趋势图分桶 + 单点补零桶
 # ---------------------------------------------------------------------------
 
-def test_trend_day_uses_hour_buckets_and_pads(env):
-    """日视图按小时分桶，单点时补零桶，折线不再是一个孤立尖峰。"""
+def test_trend_day_uses_hour_buckets_and_pads(env, monkeypatch):
+    """日视图按小时分桶，单点时补零桶，折线不再是一个孤立尖峰。
+
+    v2.1.34：把「现在」冻结到**今天上海 12:00**。日视图的桶是「今天 00:00 到当前
+    小时」的连续区间，用真实 now 的话**凌晨 00:xx 只有 1 个桶**，`len(labels) > 1`
+    必然假红（本机 00:17 撞上）。这条与 v2.1.32 / v2.1.33 那两条 flaky 同类，
+    都只在深夜跑全量时现形。
+    """
     from app import share_center_v2 as sc2
     from app.models import SCPublishTask
     S, _ = env
+    noon_sh = datetime.now(timezone.utc).astimezone(sc2.shanghai_tz()).replace(
+        hour=12, minute=0, second=0, microsecond=0)
+    fixed = noon_sh.astimezone(timezone.utc)
+    monkeypatch.setattr(sc2, "utcnow", lambda: fixed)
     with S() as db:
-        now = datetime.now(timezone.utc)
+        now = fixed
         task = SCPublishTask(list_item_id=0, work_key="work:a", kind="first",
                              status="published", created_at=now,
                              updated_at=now, published_at=now)
@@ -495,7 +505,7 @@ def test_trend_day_uses_hour_buckets_and_pads(env):
         db.commit()
         trend = sc2._aggregate_trend(db, "day")
         labels = [p["label"] for p in trend["series"]]
-        assert len(labels) > 1, "单点必须补零桶，否则画成孤立尖峰"
+        assert len(labels) == 13, f"00:00 到 12:00 应有 13 个桶，实际 {labels}"
         assert all(":" in lb for lb in labels), "日视图应按 HH:00 分桶"
         assert len(set(labels)) == len(labels), "补的桶不得与已有桶重复"
         assert sum(p["total"] for p in trend["series"]) == 1, "补的桶是真实 0，总量不变"
