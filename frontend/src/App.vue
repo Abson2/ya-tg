@@ -171,6 +171,9 @@ const scTaskStatusLabel = (status) => ({
   // v2.1.16：建分享失败 / 链接作废 / 资源已移除 → 这次推送无效。
   // 名额随之释放，作品按排期重新进队列（不是「失败」，失败是还会原地重试）。
   invalid: '无效推送',
+  // v2.1.22：归档态。清理类操作只归档不物理删除，历史行仍在（列表默认不返回），
+  // 但它必须有中文名——此前这个值不在映射里，筛选下拉直接把 `cleaned` 原样漏给用户。
+  cleaned: '已清理',
 }[status || ''] || status || '—')
 // v2.1.21：推送类型中文化。此前全站写的是 `kind==='first' ? '首次' : '追更'`
 // 的二选一，手动强推（force）会被当成「追更」显示——用户手动点的那次推送
@@ -180,6 +183,13 @@ const scKindLabel = (kind, short = false) => ({
   update: '追更',
   force: '手动推送',
 }[kind || ''] || '首次发布')
+// v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）。
+// 判定完全在后端 `_work_push_tags` 一处出（今日推送排期 / 推送历史 / 推送队列 /
+// 推送任务四处共用），前端只渲染，绝不在两端各算一套口径。
+// 后端可能返回空数组（入库时间与上映日期都不可判定）→ 页面显示「—」，不猜。
+const scPushTagTone = (key) => ({
+  new_library: 'lib', new_release: 'rel', backlog: 'old',
+}[key || ''] || 'old')
 // v2.1.6：执行记录里的「阶段 / 状态」同样中文化，页面不得直出内部枚举名。
 const scExecStageLabel = (stage) => ({
   build: '建分享', submit: '提交队列', send: '发送',
@@ -266,14 +276,39 @@ function scChannelTargetLines(row) {
   return lines
 }
 // v2.1.4：任务状态筛选下拉的选项（中文标签，不暴露内部枚举名）
+//
+// v2.1.22 去重（用户口径：「状态筛选优化，现在重复且存在无效按钮」）：
+// 旧实现把**阶段项**（待发布=待发布+待推送、推送中=提交/领取/推送/建链）和
+// **单项**（已提交 / 已成功 / 已跳过投递 / cleaned…）拼进同一个下拉，两个毛病：
+//   ① 同状态两个入口：`已提交` 既属于阶段项「推送中」又单独列一项，语义完全重复；
+//   ② `cleaned(532)` 是纯无效按钮——它是归档态，`/sc/tasks` 默认就把归档行过滤掉
+//      （`include_archived=false`），点进去必然是空表；而且标签直接漏出后端枚举名。
+// 现在每个状态只出现一次：两个阶段档负责合并视图，其成员状态不再单独列；
+// 已清理（归档）不再作为筛选项（想看归档记录走「分享管理」的归档视角）。
+const SC_TASK_STATUS_ITEMS = [
+  { value: 'pending', label: '待处理（待发布 + 待推送）',
+    members: ['planned', 'ready'] },
+  { value: 'inflight', label: '发送中（建链 / 提交 / 领取 / 推送）',
+    members: ['building', 'submitted', 'accepted', 'publishing'] },
+  { value: 'published', label: '已成功', members: ['published'] },
+  { value: 'failed', label: '失败', members: ['failed'] },
+  { value: 'cancelled', label: '已取消', members: ['cancelled'] },
+  { value: 'skipped', label: '已跳过投递', members: ['skipped'] },
+  { value: 'invalid', label: '无效推送', members: ['invalid'] },
+]
 const scTaskStatusOptions = computed(() => {
   const counts = scOverview.value.status_counts || {}
-  const order = ['planned', 'ready', 'building', 'submitted', 'accepted',
-                 'publishing', 'published', 'failed', 'cancelled', 'skipped',
-                 'invalid', 'cleaned']
-  return order
-    .filter(st => counts[st])
-    .map(st => ({ value: st, label: `${scTaskStatusLabel(st)}（${counts[st]}）` }))
+  const out = []
+  for (const it of SC_TASK_STATUS_ITEMS) {
+    const n = it.members.reduce((a, st) => a + Number(counts[st] || 0), 0)
+    // 0 条不挂入口：点了必然是空表，等于无效按钮。
+    if (!n) continue
+    // 单项状态的中文名一律取 `scTaskStatusLabel`（唯一权威，别在这里再抄一份）；
+    // 只有合并档（多个成员状态）才用 SC_TASK_STATUS_ITEMS 里的固定文案。
+    const name = it.members.length === 1 ? scTaskStatusLabel(it.members[0]) : it.label
+    out.push({ value: it.value, label: `${name}（${n}）` })
+  }
+  return out
 })
 const auth = ref({}), shareStatus = ref({}), webqr = ref(null), webqrPng = ref('')
 const smsStatus = ref({}), smsPhone = ref(''), smsCode = ref(''), smsStep = ref(1), smsBusy = ref(false)
@@ -755,11 +790,36 @@ const tplPresets = ref([]), tplPresetPick = ref('')
 function applyTplPreset() {
   const p = tplPresets.value.find(x => x.name === tplPresetPick.value)
   if (!p) return
-  tpl.value = { id: 0, name: p.name, content: p.content, enabled: true, is_default: false }
+  // v2.1.22：内置只剩「默认图文」一条，载入的目的通常是「改它」而不是「复制一份」。
+  // 所以优先载入库里那条内置模板（带 id），保存即直接改写它；
+  // 想保留原版就用左侧「另存为新模板」。
+  const builtin = (templates.value || []).find(t => t.builtin)
+  if (builtin) {
+    editTpl(builtin)
+    ElMessage.success('已载入内置「默认图文」，改完点「保存模板」直接改写它（想留原版请点「另存为新模板」）')
+    return
+  }
+  tpl.value = { id: 0, name: p.name, content: p.content, enabled: true, is_default: false, builtin: false }
   ElMessage.success('已载入内置模板，可修改后点「保存模板」另存')
 }
-function editTpl(t) { tpl.value = { id: t.id, name: t.name, content: t.content, enabled: t.enabled, is_default: t.is_default }; tplPresetPick.value = '' }
+function editTpl(t) { tpl.value = { id: t.id, name: t.name, content: t.content, enabled: t.enabled, is_default: t.is_default, builtin: !!t.builtin }; tplPresetPick.value = '' }
+// v2.1.22：另存为新模板——以当前编辑器内容为底稿，清掉 id 与「默认」勾选，
+// 保存即新增一条**自定义**模板（内置只剩「默认图文」一条，其余样式都从这里产生）。
+function newTplDraft() {
+  tpl.value = {
+    name: (tpl.value.name || '默认图文') + ' · 自定义',
+    content: tpl.value.content || '',
+    enabled: true, is_default: false, builtin: false,
+  }
+  tplPresetPick.value = ''
+  ElMessage.info('已另存为草稿，改好名称后点「保存模板」即新增一条自定义模板')
+}
 async function deleteTpl(t) {
+  // v2.1.22：内置「默认图文」不可删除（后端也会拒），这里先拦一道给出明确说法。
+  if (t.builtin) {
+    ElMessage.info('内置「默认图文」不可删除：它是系统兜底渲染的版式。需要换样式请改内容，或另存为自定义模板；要还原点「载入 默认模板」。')
+    return
+  }
   const tip = t.is_default
     ? `确认删除默认模板「${t.name}」？删除后系统会自动把另一套模板设为默认；若没有其它模板会自动恢复内置默认模板。`
     : `确认删除模板「${t.name}」？此操作不可撤销。`
@@ -963,7 +1023,9 @@ const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'sea
   'episode_status', 'episode_progress', 'updated_to_episode', 'total_episodes', 'current_episode',
   // v0.9.9 #202：用户新样式变量（来源/画质/编码/音频文件名解析，上映时间取 TMDB）
   'air_date', 'release_date', 'vote_plain', 'source', 'quality', 'video_codec', 'audio_codec',
-  'season_count', 'episode_range', 'buttons_text', 'channel_link', 'group_link']
+  'season_count', 'episode_range', 'buttons_text', 'channel_link', 'group_link',
+  // v2.1.22：默认图文「🔗 分享」行用的分享码（分享链接尾段）
+  'share_code']
 const previewDemo = {
   title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
   filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
@@ -980,6 +1042,8 @@ const previewDemo = {
   air_date: '2026-11-15', release_date: '2026-11-15', vote_plain: '9',
   source: 'Web-DL', quality: '2160p | 10bit | 60fps | SDR', video_codec: 'H265', audio_codec: 'AAC',
   season_count: '1', episode_range: 'S01 E01-E13', buttons_text: '📢 频道　👥 群组　🔍 投稿/搜索',
+  // v2.1.22：默认图文的分享码预览值
+  share_code: 'ducking',
   channel_link: '', group_link: ''
 }
 const previewText = computed(() => {
@@ -2208,6 +2272,23 @@ async function loadSc() {
 // 用「待排期」标出来；同一作品已在途时以任务行为准，不重复占两行。
 // 标题与封面都来自后端同一套 `_work_titles` / `_work_posters`（与「推送任务」
 // 「分享管理」同源），不会出现同一部作品两处名字/封面不一致。
+// v2.1.22：今日推送排期顶部的一句话档位说明。
+// 口径必须与后端 `instant_push_mode()` 一致：开关关闭、或冲突处理选「存量排期优先」，
+// 都等价于「全量按存量轮转」，不能还写着「新上映优先」。
+const scInstantModeText = computed(() => {
+  const on = isBoolOn(scBasicRules.value.quick_publish_enabled)
+  const policy = String(scBasicRules.value.conflict_policy || 'prefer_release')
+  if (!on || policy === 'prefer_backlog') {
+    return '上新即时推送未启用：全部作品按存量排期轮转，不插队。'
+  }
+  const n = Number(scForecast.value.instant_works || 0)
+  const lane = policy === 'prefer_new' ? '新上映插队、新入库按入库顺序优先' : '新上映插队立即推送，其余按排期轮转'
+  if (n > 0) {
+    return `上新即时推送已启用（${lane}）：${n} 部作品排在当前小时最前。`
+  }
+  return `上新即时推送已启用（${lane}）：当前没有符合条件的新作品。`
+})
+
 const scQueueRows = computed(() => {
   const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
   const have = new Set(rows.map(r => String(r.work_key || '')))
@@ -2222,6 +2303,8 @@ const scQueueRows = computed(() => {
           work_key: wk,
           title: w.title || '',
           cover: w.cover || '',
+          // v2.1.22：待排期行同样带三类标签（后端 forecast 的 works 已给出）
+          tags: w.tags || [],
           category: it.category || '',
           status: 'planned',
           plan_time: w.time || (pad2(h.hour) + ':00'),
@@ -2905,9 +2988,12 @@ async function verify() {
 }
 async function saveTpl() {
   try {
-    if (tpl.value.id) await api(`/templates/${tpl.value.id}`, { method: 'PUT', body: JSON.stringify(tpl.value) })
-    else await api('/templates', { method: 'POST', body: JSON.stringify(tpl.value) })
-    tpl.value = { name: '', content: '', enabled: true, is_default: false }
+    // v2.1.22：只提交后端认的四个字段（builtin 由后端判定，不能被前端改写）
+    const body = { name: tpl.value.name, content: tpl.value.content,
+                   enabled: tpl.value.enabled, is_default: tpl.value.is_default }
+    if (tpl.value.id) await api(`/templates/${tpl.value.id}`, { method: 'PUT', body: JSON.stringify(body) })
+    else await api('/templates', { method: 'POST', body: JSON.stringify(body) })
+    tpl.value = { name: '', content: '', enabled: true, is_default: false, builtin: false }
     tplPresetPick.value = ''
     ElMessage.success('模板已保存'); await load()
   } catch (e) { ElMessage.error(e.message) }
@@ -2915,8 +3001,9 @@ async function saveTpl() {
 async function restoreDefaultTpl() {
   try {
     const d = await api('/templates/default', { method: 'POST' })
-    tpl.value = { id: d.id || 0, name: '默认图文模板', content: d.content, enabled: true, is_default: true }
-    ElMessage.success('已载入整剧风格默认模板（含分类标签），已设为默认')
+    tpl.value = { id: d.id || 0, name: '默认图文模板', content: d.content, enabled: true,
+                  is_default: true, builtin: true }
+    ElMessage.success('已恢复内置「默认图文」并设为默认（TMDB / 评分 / 画质 / 版本 / 大小 / 分享 / 分集 / 简介 / 标签）')
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -3047,7 +3134,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.21 · Asia/Shanghai</span>
+          <span>v2.1.22 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4204,6 +4291,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </template>
                       </div>
                     </div>
+                    <div class="sc-fc-instant" v-if="scInstantModeText">
+                      <span class="sc-fc-instant-dot" :class="{ on: scForecast.instant_mode && scForecast.instant_mode !== 'off' }"></span>{{ scInstantModeText }}
+                    </div>
                     <div v-if="scForecast.reason" class="sc-fc-warn">{{ scForecast.reason }}</div>
                     <div class="sc-fc-list" v-if="(scForecast.hours || []).length">
                       <div class="sc-fc-row" v-for="h in scForecast.hours" :key="h.hour">
@@ -4214,6 +4304,19 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                               <span class="sc-fc-cat">{{ it.category }}</span>
                               <span class="sc-fc-time">{{ (it.times || []).join('、') }}</span>
                               <span class="sc-fc-title">{{ (it.titles || []).join('、') }}<em v-if="it.more"> 等 {{ it.count }} 部</em></span>
+                            </div>
+                            <!-- v2.1.22：排期里逐部给出三类标签（哪部是新入库、哪部是新上映、
+                                 哪部是存量补排），与推送历史/队列/任务同一套判定。 -->
+                            <div class="sc-fc-works" v-for="(w, wi) in (h.items || [])" :key="'w' + wi">
+                              <template v-if="(w.works || []).length">
+                                <div class="sc-fc-work" v-for="(wk, ki) in w.works" :key="ki">
+                                  <span class="sc-fc-work-name">{{ wk.title || '未命名作品' }}</span>
+                                  <span class="sc-fc-work-time" v-if="wk.time">{{ wk.time }}</span>
+                                  <span v-if="(wk.tags || []).length" class="sc-rec-tags inline">
+                                    <span v-for="t in wk.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                                  </span>
+                                </div>
+                              </template>
                             </div>
                           </template>
                           <span v-else class="sc-fc-idle">{{ h.blocked || '—' }}</span>
@@ -4232,7 +4335,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div class="sc-card-head"><span class="sc-ico">▤</span><div><h3>推送历史</h3><p>已成功推送的记录</p></div></div>
                       <el-table :data="scOverview.views?.history || []" stripe size="small" max-height="300">
                         <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.published_at) }}</template></el-table-column>
-                        <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
+                        <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
+                          <template #default="s">
+                            <div>{{ s.row.title }}</div>
+                            <!-- v2.1.22：新入库 / 新上映 / 存量排期 -->
+                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
+                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            </div>
+                          </template>
+                        </el-table-column>
                         <el-table-column label="分类" width="80"><template #default="s">{{ scKindLabel(s.row.kind, true) }}</template></el-table-column>
                         <el-table-column label="结果" width="76"><template #default="s"><span class="sc-dot-state published">成功</span></template></el-table-column>
                       </el-table>
@@ -4247,7 +4358,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                             <span v-else>{{ fmtTime(s.row.created_at) }}</span>
                           </template>
                         </el-table-column>
-                        <el-table-column prop="title" label="资源名称" min-width="130" show-overflow-tooltip/>
+                        <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
+                          <template #default="s">
+                            <div>{{ s.row.title }}</div>
+                            <!-- v2.1.22：在途行与「待排期」预测行都带三类标签 -->
+                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
+                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            </div>
+                          </template>
+                        </el-table-column>
                         <el-table-column label="分类" width="90" show-overflow-tooltip>
                           <template #default="s">{{ s.row._src === 'plan' ? (s.row.category || '未分类') : scKindLabel(s.row.kind, true) }}</template>
                         </el-table-column>
@@ -4264,7 +4383,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div class="sc-card-head"><span class="sc-ico">✕</span><div><h3>推送失败</h3><p>推送失败的记录，可逐条重试</p></div></div>
                       <el-table :data="scOverview.views?.failed || []" stripe size="small" max-height="300">
                         <el-table-column label="时间" min-width="120" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
-                        <el-table-column prop="title" label="资源名称" min-width="120" show-overflow-tooltip/>
+                        <el-table-column label="资源名称" min-width="130" show-overflow-tooltip>
+                          <template #default="s">
+                            <div>{{ s.row.title }}</div>
+                            <!-- v2.1.22：与历史/队列两表同源标签，三表并排不能只有一处有 -->
+                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
+                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            </div>
+                          </template>
+                        </el-table-column>
                         <el-table-column prop="error" label="失败原因" min-width="120" show-overflow-tooltip/>
                         <el-table-column label="操作" width="66"><template #default="s"><button class="sc-link-btn" @click="scTaskAction(s.row.id, 'retry')">重试</button></template></el-table-column>
                       </el-table>
@@ -4393,7 +4520,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="sc-rule-layout">
               <!-- 基础规则：上新即时推送 -->
               <div class="sc-card" v-show="scRuleTab==='基础规则'">
-                <div class="sc-card-head"><span class="sc-ico">⚡</span><div><h3>上新即时推送</h3><p>最近上架的影视有新变化立即推送；配置持久化于 app_config</p></div>
+                <div class="sc-card-head"><span class="sc-ico">⚡</span><div><h3>上新即时推送</h3><p>控制新上映 / 新入库的作品能否插队立即推送；关闭时全库按存量排期持续轮转</p></div>
                   <span class="sc-run-badge" :class="isBoolOn(scBasicRules.quick_publish_enabled)?'':'paused'"><i></i>{{ isBoolOn(scBasicRules.quick_publish_enabled)?'已启用':'已停用' }}</span></div>
                 <div class="sc-form-row">
                   <label class="hint">启用即时推送<br><el-switch v-model="scBasicRules.quick_publish_enabled" active-value="true" inactive-value="false"/></label>
@@ -4402,7 +4529,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <label class="hint">冲突处理<br><el-select v-model="scBasicRules.conflict_policy" size="small" style="width:160px"><el-option label="新上映优先" value="prefer_release"/><el-option label="新入库优先" value="prefer_new"/><el-option label="存量排期优先" value="prefer_backlog"/></el-select></label>
                   <el-button size="small" type="primary" @click="scSaveBasicRules">保存基础规则</el-button>
                 </div>
-                <p class="hint sc-source-note">冲突处理决定**同一批待推任务**的先后顺序，不改变任何配额上限：新上映优先 = 近期上映的作品先发；新入库优先 = 刚入库的作品先发；存量排期优先 = 已排期的存量作品先发。</p>
+                <p class="hint sc-source-note">
+                  <b>关闭</b>：资源库内影视全部当作存量排期，持续轮转推送，不做任何插队。<br>
+                  <b>启用 + 新上映优先</b>（默认）：新上映的作品入库完就插队立即推送，其余按排期轮转。<br>
+                  <b>启用 + 新入库优先</b>：新上映的仍插队立即推；新入库的按入库顺序优先排队；存量按排期轮转。<br>
+                  <b>启用 + 存量排期优先</b>：等同于关闭，全量按排期轮转。<br>
+                  插队只跳过「分类时段窗口」，仍然受上面的每小时上限（按分钟匀速放行）与 Telegram 发送节奏约束，不会一次性灌爆群组。
+                  有更新的作品可以反复推送，且**复用原分享链接、不重复建链**。
+                </p>
               </div>
 
               <!-- 周期计划管理：小时/日/周/月度配额 + 静默保护（真实持久化并生效）
@@ -4515,9 +4649,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <div class="sc-task-main">
                 <div class="sc-form-row">
                   <el-input v-model="scTaskSearch" size="small" clearable placeholder="按作品名称搜索" style="width:220px"/>
-                  <el-select v-model="scTaskStatusFilter" size="small" clearable placeholder="状态 全部" style="width:170px">
-                    <el-option label="待发布（待发布 + 待推送）" value="pending"/>
-                    <el-option label="推送中（提交/领取/推送/建链）" value="inflight"/>
+                  <el-select v-model="scTaskStatusFilter" size="small" clearable placeholder="状态 全部" style="width:200px">
+                    <!-- v2.1.22：每个状态只出现一次（阶段档 + 单项不再重复），
+                         全中文、带真实计数；0 条与归档态不挂入口（避免无效按钮）。 -->
                     <el-option v-for="opt in scTaskStatusOptions" :key="opt.value" :label="opt.label" :value="opt.value"/>
                   </el-select>
                   <el-select v-model="scTaskChannelFilter" size="small" clearable placeholder="渠道 全部" style="width:130px">
@@ -4556,6 +4690,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <div class="sc-media-text">
                           <b>{{ s.row.title || '未命名作品' }}</b>
                           <small>{{ scKindLabel(s.row.kind) }} · 编号 {{ s.row.id }}</small>
+                          <!-- v2.1.22：新入库 / 新上映 / 存量排期 -->
+                          <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
+                            <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                          </div>
                         </div>
                       </div>
                     </template>
@@ -4890,7 +5028,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
         </section>
 
         <section v-else-if="tab === '消息模板'" class="fade">
-          <div class="page-head"><div><h2>消息模板</h2><p>内置模板一键载入、可自定义；支持双花括号变量与可嵌套条件块；有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
+          <div class="page-head"><div><h2>消息模板</h2><p>内置只有「默认图文」一套（不可删除），默认配置同时只能有一条；不同场景的版式另存为自定义模板即可。支持双花括号变量与可嵌套条件块，有海报时自动发送图片</p></div><el-button plain @click="restoreDefaultTpl">载入 默认模板</el-button></div>
 
           <!-- v0.9.10.2：三个跳转按钮并排同一行（频道/群聊/投稿·求片），渲染层统一追加到所有模板；「获取资源」单独一行 -->
           <div class="panel" style="margin-bottom:14px">
@@ -4927,13 +5065,34 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
           <div class="two-col tpl-layout">
             <div class="panel">
-              <div class="field"><label>内置模板（一键载入，可改后另存）</label><el-select v-model="tplPresetPick" placeholder="选择一套内置模板" style="width:100%" @change="applyTplPreset"><el-option v-for="p in tplPresets" :key="p.name" :label="p.name" :value="p.name"/></el-select><small>推送只使用「默认」模板：载入后请勾选「设为默认」再保存，或保存后在下方列表点「设为默认」；只保存不设默认不会改变推送样式。</small></div>
+              <div class="field">
+                <label>内置模板（仅「默认图文」一条）</label>
+                <el-select v-model="tplPresetPick" placeholder="载入默认图文" style="width:100%" @change="applyTplPreset">
+                  <el-option v-for="p in tplPresets" :key="p.name" :label="p.name" :value="p.name"/>
+                </el-select>
+                <small>内置只保留「默认图文」这一套版式（系统要靠它兜底渲染，不可删除）。想换样式就在下面改内容后点「保存模板」改写它，或用它作底稿改完另存为自定义模板。</small>
+              </div>
               <div class="field mt"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
-              <div class="field mt"><label>消息内容</label><el-input v-model="tpl.content" type="textarea" :rows="10" placeholder="在这里编写 Telegram 消息内容"/></div>
+              <div class="field mt"><label>消息内容</label><el-input v-model="tpl.content" type="textarea" :rows="12" placeholder="在这里编写 Telegram 消息内容"/></div>
               <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch v-model="tpl.is_default" active-text="设为默认" class="ml"/></div>
+              <p class="hint">默认配置**只能有一条**：列表里带「默认」标签的那条才是实际推送用的模版。勾选「设为默认」保存后，原默认会自动让位，任何时候都有且只有一条默认。</p>
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
-              <el-button v-if="tpl.id" class="mt" plain @click="tpl = { name:'', content:'', enabled:true, is_default:false }; tplPresetPick=''">新建空模板</el-button>
-              <div class="tpl-list"><div v-for="t in templates" :key="t.id" class="mini-row tpl-mini"><span class="tpl-mini-name" @click="editTpl(t)"><b>{{ t.name }}</b><el-tag v-if="t.is_default" type="success" size="small">默认</el-tag></span><el-button size="small" text type="primary" :disabled="t.is_default" @click="setDefaultTpl(t)">设为默认</el-button><el-button size="small" text type="danger" @click="deleteTpl(t)">删除</el-button></div></div>
+              <el-button v-if="tpl.id" class="mt" plain @click="newTplDraft">另存为新模板</el-button>
+              <div class="tpl-list">
+                <div v-for="t in templates" :key="t.id" class="mini-row tpl-mini">
+                  <span class="tpl-mini-name" @click="editTpl(t)">
+                    <b>{{ t.name }}</b>
+                    <el-tag v-if="t.builtin" size="small" type="info">内置</el-tag>
+                    <el-tag v-if="t.is_default" type="success" size="small">默认</el-tag>
+                  </span>
+                  <el-button size="small" text type="primary" :disabled="t.is_default" @click="setDefaultTpl(t)">设为默认</el-button>
+                  <!-- v2.1.22：内置那条不给删（删了就没有可恢复的默认版式），
+                       按钮仍在但禁用并说明原因；自定义模板照旧可删。 -->
+                  <el-button size="small" text type="danger" :disabled="t.builtin"
+                             :title="t.builtin ? '内置模板不可删除，可改内容或「载入默认模板」还原' : ''"
+                             @click="deleteTpl(t)">删除</el-button>
+                </div>
+              </div>
             </div>
             <div class="panel">
               <div class="panel-head"><h3>可用变量</h3><span>点击插入</span></div>
@@ -5879,4 +6038,22 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-title em{font-style:normal;color:var(--yg-muted)}
 .sc-fc-idle{color:var(--yg-muted);font-size:12px}
 .sc-fc-notes{margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--yg-muted)}
+/* v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）。
+   四个模块（今日推送排期 / 推送历史 / 推送队列 / 推送任务）共用同一套样式；
+   颜色全部走 --yg-tone-* token，深色主题下自动跟随（本文件 dark 段已重定义）。 */
+.sc-rec-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.sc-rec-tags.inline{margin-top:0;flex:none}
+.sc-rec-tag{display:inline-block;padding:0 6px;border-radius:7px;font-size:10px;line-height:17px;font-weight:700;white-space:nowrap}
+.sc-rec-tag.lib{background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg)}
+.sc-rec-tag.rel{background:var(--yg-tone-amber-bg);color:var(--yg-tone-amber-fg)}
+.sc-rec-tag.old{background:var(--yg-tone-slate-bg);color:var(--yg-tone-slate-fg)}
+/* 排期面板逐部明细：名称 + 预计时间 + 标签一行放下 */
+.sc-fc-works{display:flex;flex-direction:column;gap:3px}
+.sc-fc-work{display:flex;align-items:center;gap:8px;min-width:0;font-size:11.5px;color:var(--yg-muted)}
+.sc-fc-work-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--yg-ink)}
+.sc-fc-work-time{flex:none;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--yg-tone-amber-fg)}
+/* v2.1.22：排期面板顶部一句档位说明（插队是否生效、有几部插队） */
+.sc-fc-instant{display:flex;align-items:center;gap:6px;margin:2px 0 8px;font-size:11.5px;color:var(--yg-muted)}
+.sc-fc-instant-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--yg-tone-slate-fg)}
+.sc-fc-instant-dot.on{background:var(--yg-tone-amber-fg)}
 </style>

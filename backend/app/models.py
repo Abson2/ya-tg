@@ -335,6 +335,10 @@ class MessageTemplate(Base):
     content: Mapped[str] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # v2.1.22：内置模板标记。内置「默认图文」唯一且不可删除（可改内容、可恢复），
+    # 用户自定义模板一律 builtin=0。用标记而非「按名字判断」——名字允许改，
+    # 按名字判断改完就认不出来，删保护会失效。
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

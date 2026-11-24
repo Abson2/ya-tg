@@ -187,7 +187,8 @@ def test_frontend_exposes_legacy_and_zombie_hints():
 def test_frontend_explicit_set_default_template_button():
     assert "async function setDefaultTpl" in APP
     assert "@click=\"setDefaultTpl(t)\"" in APP
-    assert "只保存不设默认不会改变推送样式" in APP
+    # v2.1.22：文案改为「默认配置**只能有一条**」，语义不变（只保存不设默认不改推送样式）
+    assert "默认配置**只能有一条**" in APP
     assert "id: d.id || 0" in APP  # 载入默认模板不再重复新建
 
 

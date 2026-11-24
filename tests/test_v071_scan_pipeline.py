@@ -83,7 +83,8 @@ def test_episode_count_includes_unidentified_episodes(db):
     db.commit()
     rep = db.scalar(select(Resource).where(Resource.file_id == "v071-e1"))
     text, _ = _build_message(db, rep, "https://share/x")
-    assert "共 36 集" in text, text
+    # v2.1.22：默认图文用「📡 分集: 更新至 S01E36 · 已收录 36 集」表达整剧集数
+    assert "已收录 36 集" in text, text
     assert "72.0GB" in text, text
 
 
@@ -99,7 +100,8 @@ def test_non_video_files_excluded_from_episode_count(db):
     db.commit()
     rep = db.scalar(select(Resource).where(Resource.file_id == "v071-v1"))
     text, _ = _build_message(db, rep, "https://share/x")
-    assert "共 2 集" in text, text
+    # v2.1.22：默认图文用「已收录 N 集」表达整剧集数
+    assert "已收录 2 集" in text, text
     assert "2.0GB" in text, text
     assert is_video_file(_res("x", "a.srt", ext=".srt")) is False
 

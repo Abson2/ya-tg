@@ -590,6 +590,74 @@ CONFLICT_POLICY_ALIASES: dict[str, str] = {
 NEW_RELEASE_WINDOW_DAYS = 30
 
 
+# ---------------------------------------------------------------------------
+# v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）
+# ---------------------------------------------------------------------------
+# 用户口径：推送记录要能一眼看出「这条为什么现在推」——是刚入库的新片、近期上映的
+# 新作，还是老片补排（存量排期）。四个地方（今日推送排期 / 推送历史 / 推送队列 /
+# 推送任务）共用同一套判定，绝不各算一套。
+#
+# 判定与「冲突处理策略」同源（同一份 release_date 窗口常量），避免两套口径打架：
+#   new_library —— 作品**首次登记进资源库**的时间落在 NEW_LIBRARY_WINDOW_DAYS 内。
+#                  取该作品最早一条库快照的登记时间（SCLibraryVersion.created_at）；
+#                  快照缺失时退到成员文件的网盘创建时间（Resource.ctime）。
+#   new_release —— TMDB 上映日期落在最近 NEW_RELEASE_WINDOW_DAYS 天内，且**已经上映**。
+#                  未来日期一律不算「新上映」——还没上映的作品不该被标成上映了。
+#   backlog     —— 前两条都不成立（且至少有一项可判定）时给「存量排期」，即老片补排。
+# 前两个标签可同时出现（刚入库又刚上映）；「存量排期」只在无其他标签时出现。
+# **拿不到就留空**：入库时间与上映日期都不可判定时，标签留空，不猜成「存量排期」。
+PUSH_TAG_NEW_LIBRARY = "new_library"
+PUSH_TAG_NEW_RELEASE = "new_release"
+PUSH_TAG_BACKLOG = "backlog"
+PUSH_TAG_LABELS: dict[str, str] = {
+    PUSH_TAG_NEW_LIBRARY: "新入库",
+    PUSH_TAG_NEW_RELEASE: "新上映",
+    PUSH_TAG_BACKLOG: "存量排期",
+}
+# 「新入库」判定窗口（天）：首次入库在这个窗口内算新入库。
+NEW_LIBRARY_WINDOW_DAYS = 7
+# 每个作品回查上映日期时最多取多少条成员资源（一页 200 条 × 上百集会把 SQL 参数打爆）。
+PUSH_TAG_MEMBER_ID_LIMIT = 30
+
+
+# ---------------------------------------------------------------------------
+# v2.1.22：上新即时推送（开关 + 三档冲突策略的**真正语义**）
+# ---------------------------------------------------------------------------
+# 用户口径：
+#   · 开关**不启用** → 资源库内影视全部当作存量排期，持续轮转推送（不插队）。
+#   · 开关**启用**后按冲突处理策略三档：
+#       prefer_release（默认）—— a. 新上映入库完 → 插队立即推；b. 其余按排期轮转。
+#       prefer_new            —— a. 新上映 → 插队立即推；b. 新入库按其入库顺序
+#                                 优先排队；c. 存量按排期轮转。
+#       prefer_backlog        —— 全量按排期轮转（等价于开关关闭）。
+#
+# 为什么需要这个通道：`plan_engine` 只按「分类时段窗口 + 分类游标（入库顺序）」
+# 生成任务，新上映的作品不看上映日期，前面排着几百部存量时，新片落地后要等
+# 很久才推得出去。冲突策略此前只在 dispatch 里做**同批次排序**，救不了这个。
+#
+# 插队 = 不受**分类时段窗口**与分类级上限约束（那是"排期"的约束），但仍受
+# 「上新即时推送每小时上限」（`sc_quick_publish_hourly_limit`，按分钟匀速放行）
+# 与 TG 发送节奏约束 —— 否则真机会被 Telegram 限流（红线）。
+INSTANT_TASK_PRIORITY = 900        # 新上映：插队，立即推
+NEW_ENTRY_TASK_PRIORITY = 800      # 新入库优先：排在存量之前，按入库顺序
+# 单轮插队上限：积压一夜后不至于一次性把队列灌爆（多出来的下一轮继续）。
+INSTANT_ROUND_LIMIT = 20
+
+
+def instant_push_mode(db: Session) -> str:
+    """当前「上新即时推送」的生效档位：`off` / `prefer_release` / `prefer_new`。
+
+    开关关闭、或策略选「存量排期优先」→ `off`（全量按排期轮转，等价于关闭）。
+    非法/空值按默认档 `prefer_release` 处理（与 `_normalize_conflict_policy` 同口径）。
+    """
+    raw_switch = str(runtime_config.get(db, "sc_quick_publish_enabled") or "true").lower()
+    if raw_switch not in ("1", "true", "yes", "on"):
+        return "off"
+    policy = _normalize_conflict_policy(
+        runtime_config.get(db, "sc_conflict_policy") or "prefer_release")
+    return "off" if policy == "prefer_backlog" else policy
+
+
 def _normalize_conflict_policy(raw: str) -> str:
     """把配置里的冲突策略值归一化为三档之一（非法值回落默认档）。"""
     value = str(raw or "").strip().lower()
@@ -1394,6 +1462,85 @@ def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
     return "create", None
 
 
+def _instant_candidates(db: Session, mode: str,
+                        limit: int = INSTANT_ROUND_LIMIT) -> list[tuple[str, int, str]]:
+    """上新即时推送的候选作品：返回 `[(work_key, 最新快照 id, lane)]`（已排好先后）。
+
+    lane = `new_release`（新上映，插队立即推）或 `new_library`（新入库，优先排队）。
+    排序口径：
+      · 新上映按**上映日期倒序**（越新的越先推）；
+      · 新入库按**首次入库时间升序**（先入库先推 —— 「按资源库入库的顺序」）。
+
+    v2.1.22 性能约束：本函数跑在 `_job_share_center` 的 5 秒周期里，所以
+      ① 只取判定要用的窄列，不加载整行 `Resource` / `SCLibraryVersion` 实体；
+      ② 最新快照只对**命中窗口的候选键**回查，不做全库 group by 后全量物化。
+    """
+    if mode == "off":
+        return []
+    now_sh = datetime.now(shanghai_tz())
+    today = now_sh.strftime("%Y-%m-%d")
+    rel_cutoff = (now_sh - timedelta(days=NEW_RELEASE_WINDOW_DAYS)).strftime("%Y-%m-%d")
+
+    ordered: list[tuple[str, str]] = []   # [(work_key, lane)]，最终先后顺序
+    seen: set[str] = set()
+
+    # ① 新上映：release_date 落在窗口内且**已经上映**（未来日期不算，不能编造）
+    newest: dict[str, str] = {}
+    rows = db.execute(select(
+        Resource.file_id, Resource.path_hint, Resource.share_dir_name,
+        Resource.media_title, Resource.tmdb_id, Resource.media_type,
+        Resource.release_date,
+    ).where(
+        Resource.release_date.isnot(None), Resource.release_date != "",
+        Resource.release_date >= rel_cutoff,
+        Resource.release_date <= today)).all()
+    for res in rows:
+        key = utils.work_group_key(res)
+        day = str(res.release_date or "")[:10]
+        if key and (key not in newest or day > newest[key]):
+            newest[key] = day
+    for key, _day in sorted(newest.items(), key=lambda kv: kv[1], reverse=True):
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((key, "new_release"))
+        if len(ordered) >= limit:
+            break
+
+    # ② 新入库（仅 prefer_new）：按**首次入库时间**升序优先排队。
+    # 「首次入库」取该作品最早一条快照的登记时间（与其他标签判定同源），
+    # 所以老片昨天更新了新版本不会被误判成新入库。
+    if mode == "prefer_new" and len(ordered) < limit:
+        lib_cutoff = utcnow() - timedelta(days=NEW_LIBRARY_WINDOW_DAYS)
+        fresh = db.execute(
+            select(SCLibraryVersion.work_key,
+                   func.min(SCLibraryVersion.created_at).label("entered"),
+                   func.max(SCLibraryVersion.id).label("lv_id"))
+            .group_by(SCLibraryVersion.work_key)
+            .having(func.min(SCLibraryVersion.created_at) >= lib_cutoff)
+            .order_by("entered", "lv_id")).all()
+        for row in fresh:
+            key = str(row.work_key or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append((key, "new_library"))
+            if len(ordered) >= limit:
+                break
+
+    # ③ 回查候选作品的**最新快照 id**（同一作品多版本时只看最新那条）。
+    # 只对候选键查询，候选数受 limit 约束，不会随库存量线性膨胀。
+    keys = [k for k, _lane in ordered]
+    lv_of: dict[str, int] = {}
+    if keys:
+        for wk, lv_id in db.execute(
+            select(SCLibraryVersion.work_key, func.max(SCLibraryVersion.id))
+            .where(SCLibraryVersion.work_key.in_(keys))
+            .group_by(SCLibraryVersion.work_key)).all():
+            lv_of[str(wk or "")] = int(lv_id)
+    return [(k, lv_of[k], lane) for k, lane in ordered if k in lv_of]
+
+
 def plan_engine(db: Session) -> dict[str, int]:
     """按活动计划版本与分类游标生成推送清单、清单项和发布任务。"""
     version = _active_version(db)
@@ -1493,6 +1640,69 @@ def plan_engine(db: Session) -> dict[str, int]:
 
     item_count = 0
     task_count = 0
+
+    # v2.1.22：上新即时推送通道——在存量轮转**之前**插队生成任务。
+    # 关闭（off）时整段跳过：资源库内影视全部当存量排期持续轮转。
+    # 插队任务**不看分类时段窗口与分类上限**（那是排期的约束），但仍受
+    # `hour_max` 单轮上限、每小时匀速额度（dispatch）与 TG 节奏约束。
+    instant_mode = instant_push_mode(db)
+    instant_lane_count = 0
+    if instant_mode != "off":
+        for work_key, lv_id, lane in _instant_candidates(db, instant_mode):
+            if hour_max and task_count >= hour_max:
+                break
+            if instant_lane_count >= INSTANT_ROUND_LIMIT:
+                break
+            if work_key in seen_works or work_key not in live_keys:
+                continue
+            lv = db.get(SCLibraryVersion, lv_id)
+            if lv is None:
+                continue
+            ownership = db.scalar(select(SCWorkCategory).where(
+                SCWorkCategory.work_key == work_key))
+            category_key = str(ownership.category_key if ownership else "") or "genre:unknown"
+            # 新上映 = 插队（立即推）；新入库 = 排到存量之前（按入库顺序）
+            priority = (INSTANT_TASK_PRIORITY if lane == "new_release"
+                        else NEW_ENTRY_TASK_PRIORITY)
+            built_any = False
+            for channel in channels:
+                target_type = "group" if str(channel.chat_id or "").startswith("-") else "channel"
+                chat_id = str(channel.chat_id or "")
+                dedup = f"{work_key}:{channel.id}:first"[:255]
+                action, reuse = first_dedup_plan(
+                    db, work_key=work_key, chat_id=chat_id, dedup=dedup, index=slots)
+                if action == "skip":
+                    continue
+                if action == "revive" and reuse is not None:
+                    item = reuse
+                    item.list_id = push_list.id
+                    item.library_version_id = lv.id
+                    item.category_key = category_key
+                    item.target_type = target_type
+                    item.bot_id = channel.bot_id or 0
+                    item.status = "planned"
+                    db.flush()
+                else:
+                    item = SCPushListItem(
+                        list_id=push_list.id, work_key=work_key,
+                        library_version_id=lv.id, category_key=category_key,
+                        target_type=target_type, bot_id=channel.bot_id or 0,
+                        chat_id=chat_id, dedup_key=dedup,
+                        source_kind="first", status="planned",
+                    )
+                    db.add(item)
+                    db.flush()
+                item_count += 1
+                db.add(SCPublishTask(
+                    list_item_id=item.id, work_key=work_key,
+                    plan_version_id=version.id, kind="first", status="planned",
+                    priority=priority, scheduled_at=utcnow()))
+                db.flush()
+                task_count += 1
+                built_any = True
+            if built_any:
+                seen_works.add(work_key)
+                instant_lane_count += 1
     for category in categories:
         # v2.1.0：分类排期限流——当前小时不在该分类排期窗口、或已达每小时上限则跳过。
         if not _sched_allows(category.category_key, category_task_counts.get(category.category_key, 0)):
@@ -1544,6 +1754,12 @@ def plan_engine(db: Session) -> dict[str, int]:
         last_pos = cursor.last_library_version_id
         built_in_batch = 0
         for lv in versions:
+            # v2.1.22：小时上限必须在**作品级**再拦一刀。此前只在渠道循环末尾
+            # `break`，于是「一部作品建完就退出渠道循环、但外层作品循环继续」——
+            # hour_max=1 时实际仍能建出 N 部，周期计划的小时上限形同虚设
+            # （插队通道加入后两档叠加，超出更明显）。
+            if hour_max and task_count >= hour_max:
+                break
             work_key = str(lv.work_key or "")
             # 自愈补扫时同一作品可能二次命中；本轮已处理过就不再重复。
             if work_key in seen_works:
@@ -1650,6 +1866,8 @@ def plan_engine(db: Session) -> dict[str, int]:
 FORCE_TASK_KIND = "force"
 # 手动强推优先级：dispatch 按 priority desc 取任务，手动动作必须排在最前。
 FORCE_TASK_PRIORITY = 1000
+# 追更（内容更新）任务：只记账、不建链——真实投递由更新事件那条队列项完成。
+UPDATE_TASK_KIND = "update"
 
 
 def _force_push_list(db: Session, version_id: int) -> SCPushList:
@@ -1666,6 +1884,87 @@ def _force_push_list(db: Session, version_id: int) -> SCPushList:
     else:
         row.status = "active"
     return row
+
+
+def _day_list(db: Session, prefix: str, name: str, version_id: int) -> SCPushList:
+    """按自然日复用一条清单（同一天多轮追加，跨天才新建）。
+
+    v2.1.22 从 `_force_push_list` 抽出：手动推送与追更都要「每天一条清单」，
+    否则每次动作都新建空清单，列表页会被空清单淹掉。
+    """
+    day_key = datetime.now(shanghai_tz()).strftime("%Y%m%d")
+    list_key = f"{prefix}:{day_key}"[:128]
+    row = db.scalar(select(SCPushList).where(SCPushList.list_key == list_key))
+    if row is None:
+        row = SCPushList(list_key=list_key, name=f"{name} · {day_key}",
+                         status="active", source=prefix, plan_version_id=version_id)
+        db.add(row)
+        db.flush()
+    else:
+        row.status = "active"
+    return row
+
+
+def register_update_task(db: Session, resource: Resource, *, channel_id: int,
+                         event_id: int = 0) -> SCPublishTask | None:
+    """把一次「内容更新（追更）」登记成 v2 任务，三个卡片才看得见（v2.1.22）。
+
+    用户口径：「无论存量 / 新入库 / 新上映，有更新可以重复推送（不重复建分享链接），
+    而且都需要在推送队列、今日推送排期、推送任务列表体现」。
+
+    与手动推送（force）的区别：
+      · 追更**复用已有分享链接**（share_url 直接抄过来、link_state=active），
+        绝不重新建链；
+      · 追更**不占首推名额**（`source_kind="update"`，`_SlotIndex` 只认 first），
+        同一作品可以随更新一推再推；
+      · 状态直接落 `submitted`：真实投递由更新事件里那条已经被置回 pending 的
+        队列项完成（见 main 的更新事件消费），这里只负责把这次追更记进 v2 账本。
+        **不落 planned**，否则 dispatch 会再发一次 → 双推。
+
+    dedup 用 `update:<work_key>:<渠道>:<事件号>`，一次更新事件一条；拿不到事件号
+    时退化为按渠道一条，仍然不会与首推/手动推送的 dedup 相撞。
+    """
+    work_key = utils.work_group_key(resource)
+    lv = db.scalar(select(SCLibraryVersion).where(SCLibraryVersion.work_key == work_key)
+                   .order_by(SCLibraryVersion.id.desc()))
+    channel = db.get(Channel, int(channel_id or 0))
+    if lv is None or channel is None:
+        return None
+    dedup = f"update:{work_key}:{int(channel_id)}:{int(event_id or 0)}"[:255]
+    if db.scalar(select(SCPushListItem).where(SCPushListItem.dedup_key == dedup)):
+        return None  # 同一事件重复消费：幂等，不重复记账
+    version = _active_version(db)
+    version_id = int(version.id) if version else 0
+    push_list = _day_list(db, "update", "追更", version_id)
+    ownership = db.scalar(select(SCWorkCategory).where(SCWorkCategory.work_key == work_key))
+    category_key = str(ownership.category_key if ownership else "") or "genre:unknown"
+    chat_id = str(channel.chat_id or "")
+    # 复用该作品当前仍有效的分享链接（不重复建链）
+    shared = db.scalar(select(SCPublishTask).where(
+        SCPublishTask.work_key == work_key,
+        SCPublishTask.share_url.isnot(None), SCPublishTask.share_url != "",
+        SCPublishTask.link_state.notin_(INVALID_LINK_STATES),
+    ).order_by(SCPublishTask.id.desc()))
+    share_url = (str(getattr(shared, "share_url", "") or "")
+                 or str(getattr(resource, "share_url", "") or ""))
+    item = SCPushListItem(
+        list_id=push_list.id, work_key=work_key, library_version_id=lv.id,
+        category_key=category_key,
+        target_type="group" if chat_id.startswith("-") else "channel",
+        bot_id=channel.bot_id or 0, chat_id=chat_id, dedup_key=dedup,
+        source_kind="update", status="planned",
+    )
+    db.add(item)
+    db.flush()
+    task = SCPublishTask(
+        list_item_id=item.id, work_key=work_key, plan_version_id=version_id,
+        kind="update", status="submitted", priority=0, scheduled_at=utcnow(),
+        share_url=share_url, link_state="active" if share_url else "unknown",
+    )
+    db.add(task)
+    db.flush()
+    db.commit()
+    return task
 
 
 def register_force_tasks(db: Session, resource: Resource,
@@ -1778,6 +2077,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         "blocked": [],
         "notes": [],
         "reason": "",
+        # v2.1.22：插队档位与插队作品数（off 时为 0，前端据此说明"全量按排期轮转"）
+        "instant_mode": "off",
+        "instant_works": 0,
     }
 
     version = _active_version(db)
@@ -1897,6 +2199,25 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
             picks.append(chat_id)
         return picks
 
+    # v2.1.22：上新即时推送的插队也要进预测。
+    # 只模拟存量轮转的话，预测会说「今天推的都是老片」，而实跑会先把新上映推出去——
+    # 预测与实跑算出差，就等于骗用户（v2.1.19 定下的红线）。这里把插队候选
+    # 按 `plan_engine` 同一份 `_instant_candidates` 取出来，占当前小时的额度，
+    # 同时把它们加进 `planned_pairs`，避免轮转模拟把它们再排一遍。
+    instant_mode = instant_push_mode(db)
+    instant_rows: list[dict[str, Any]] = []
+    if instant_mode != "off":
+        for wk, _lv_id, lane in _instant_candidates(db, instant_mode):
+            picks = _picks_for(wk)
+            if not picks:
+                continue
+            for chat_id in picks:
+                planned_pairs.add((wk, chat_id))
+            instant_rows.append({"work_key": wk, "lane": lane, "picks": len(picks)})
+        if instant_rows:
+            out["instant_mode"] = instant_mode
+            out["instant_works"] = len(instant_rows)
+
     # ---- 逐小时模拟 ----
     for h in range(now_sh.hour, 24):
         win = next((w for w in hour_windows
@@ -1924,6 +2245,44 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         hour_items: list[dict[str, Any]] = []
         hour_tasks = 0
         cat_counts: dict[str, int] = {}
+        # v2.1.22：插队项（新上映 / 新入库）排在本小时最前面，且**先占额度**。
+        if h == now_sh.hour and instant_rows:
+            taken: list[dict[str, Any]] = []
+            taken_tasks = 0
+            for row in instant_rows:
+                if hour_tasks >= quota:
+                    break
+                allowed = min(int(row["picks"]), quota - hour_tasks)
+                if allowed <= 0:
+                    break
+                hour_tasks += allowed
+                taken_tasks += allowed
+                taken.append(row)
+            if taken:
+                ikeys = [r["work_key"] for r in taken]
+                ititles = _work_titles(db, ikeys)
+                icovers = _work_posters(db, ikeys)
+                itags = _work_push_tags(db, ikeys)
+                iminutes = [_uniform_minute(hourly_cap, k)
+                            for k in range(hour_tasks - taken_tasks + 1, hour_tasks + 1)]
+                works: list[dict[str, Any]] = []
+                for idx, wk in enumerate(ikeys):
+                    works.append({
+                        "work_key": wk,
+                        "title": str(ititles.get(wk) or ""),
+                        "cover": str(icovers.get(wk) or ""),
+                        "tags": itags.get(wk, []),
+                        "time": ("%02d:%02d" % (h, iminutes[idx])
+                                 if idx < len(iminutes) else ""),
+                    })
+                hour_items.append({
+                    "category": "上新即时推送",
+                    "count": taken_tasks,
+                    "times": ["%02d:%02d" % (h, m) for m in iminutes],
+                    "titles": [t for t in ititles.values() if t],
+                    "works": works,
+                    "more": max(0, len(instant_rows) - len(taken)),
+                })
         for cat in cats:
             if hour_tasks >= quota:
                 break
@@ -1971,12 +2330,16 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 top_keys = titles[:per_hour_top]
                 wk_titles = _work_titles(db, top_keys)
                 wk_covers = _work_posters(db, top_keys)
+                # v2.1.22：排期里也要看得到「新入库 / 新上映 / 存量排期」，
+                # 与推送历史 / 队列 / 任务同源（同一个 _work_push_tags）。
+                wk_tags = _work_push_tags(db, top_keys)
                 works: list[dict[str, Any]] = []
                 for idx, wk in enumerate(top_keys):
                     works.append({
                         "work_key": wk,
                         "title": str(wk_titles.get(wk) or ""),
                         "cover": str(wk_covers.get(wk) or ""),
+                        "tags": wk_tags.get(wk, []),
                         "time": ("%02d:%02d" % (h, minute_slots[idx])
                                  if idx < len(minute_slots) else ""),
                     })
@@ -2137,6 +2500,11 @@ def _conflict_sort_key(
     返回值是「越小越先发」的排序键；无法判定时给中性值，保持原有相对顺序。
     """
     base = (-int(task.priority or 0), int(task.id or 0))
+    # v2.1.22：插队任务（新上映 900 / 新入库 800 / 手动推送 1000）的先后由计划
+    # 引擎与用户动作定好了，冲突策略的排序**不得把它们洗回存量后面**——
+    # 否则「上新即时推送」等于没开。
+    if int(task.priority or 0) >= NEW_ENTRY_TASK_PRIORITY:
+        return base
     if policy == "prefer_backlog":
         # 存量优先：scheduled_at 早的先发（早 = 已排期更久 = 存量）。
         scheduled = task.scheduled_at or task.created_at
@@ -2213,6 +2581,10 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         logger.warning("[share_center_v2] 回收卡在「建链中」的僵尸任务 %s 条", revived)
     tasks = list(db.scalars(
         select(SCPublishTask).where(SCPublishTask.status.in_({"planned", "ready", "failed"}))
+        # v2.1.22：追更任务不进 dispatch。它落库就是 submitted（只记账），真实
+        # 投递由更新事件那条已置回 pending 的队列项完成；万一用户手动把一条追更
+        # 任务重置成 planned，这里若不排除就会被当成首推再走一遍建链 → 双推 + 白建链接。
+        .where(SCPublishTask.kind != UPDATE_TASK_KIND)
         .where(or_(SCPublishTask.scheduled_at.is_(None), SCPublishTask.scheduled_at <= now))
         .where(or_(SCPublishTask.next_retry_at.is_(None), SCPublishTask.next_retry_at <= now))
         .order_by(SCPublishTask.priority.desc(), SCPublishTask.id).limit(limit)
@@ -3122,10 +3494,13 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
         keys = [r.get("work_key") for r in out]
         titles = _work_titles(db, keys)
         posters = _work_posters(db, keys)
+        # v2.1.22：三类标签（新入库 / 新上映 / 存量排期）与「推送任务」同源
+        tags = _work_push_tags(db, keys)
         for row in out:
             key = str(row.get("work_key") or "")
             row["title"] = titles.get(key, "")
             row["cover"] = posters.get(key, "")
+            row["tags"] = tags.get(key, [])
         return out
 
     return {"history": rows_for({"published"}),
@@ -3998,6 +4373,114 @@ def _work_posters(db: Session, work_keys: list[str]) -> dict[str, str]:
     return out
 
 
+def _work_push_tags(db: Session, work_keys) -> dict[str, list[dict[str, str]]]:
+    """按作品聚合键批量算「新入库 / 新上映 / 存量排期」三类标签（v2.1.22）。
+
+    四个模块（今日推送排期 / 推送历史 / 推送队列 / 推送任务）共用本函数，
+    前端只渲染 `tags`（`[{key, label}]`），不各自再算一套口径。
+
+    数据来源（全部真实字段，不编造）：
+      入库时间 —— `SCLibraryVersion.created_at` 取该作品**最早**一条（首次进库）。
+                  快照缺失时退到成员资源 `Resource.ctime`（文件进网盘的时间）。
+      上映日期 —— 成员资源 `Resource.release_date`（TMDB 首播/上映日期）取第一个非空，
+                  按 `NEW_RELEASE_WINDOW_DAYS` 窗口判定。
+    两项都不可判定时返回空列表（页面显示「—」），绝不默认标成「存量排期」。
+    """
+    out: dict[str, list[dict[str, str]]] = {}
+    keys: list[str] = []
+    for raw in work_keys or []:
+        key = str(raw or "")
+        if not key or key in out:
+            continue
+        out[key] = []
+        keys.append(key)
+    if not keys:
+        return out
+
+    # ① 入库时间 + 成员资源 id（同一 work_key 的多版本里取最早登记时间；
+    #    成员 id 只取**最新版本**那一份，代表当前内容）。
+    rows = db.execute(
+        select(SCLibraryVersion.work_key, SCLibraryVersion.version_no,
+               SCLibraryVersion.created_at, SCLibraryVersion.resource_ids_json)
+        .where(SCLibraryVersion.work_key.in_(keys))
+        .order_by(SCLibraryVersion.version_no.desc())).all()
+    entry_at: dict[str, datetime] = {}
+    member_ids: dict[str, list[int]] = {}
+    for wk, _ver, created, ids_json in rows:
+        key = str(wk or "")
+        if key not in out:
+            continue
+        stamp = utils.as_utc(created)
+        if stamp is not None:
+            cur = entry_at.get(key)
+            if cur is None or stamp < cur:
+                entry_at[key] = stamp
+        if key in member_ids:
+            continue  # 已按 version_no desc 取过最新版本
+        ids: list[int] = []
+        for raw_id in _jload(ids_json, []) or []:
+            try:
+                ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+            if len(ids) >= PUSH_TAG_MEMBER_ID_LIMIT:
+                break
+        member_ids[key] = ids
+
+    # ② 回查资源表：上映日期 + 网盘创建时间（入库时间兜底）
+    id_to_keys: dict[int, list[str]] = {}
+    for key, ids in member_ids.items():
+        for rid in ids:
+            id_to_keys.setdefault(rid, []).append(key)
+    release_raw: dict[str, str] = {}
+    ctime_at: dict[str, datetime] = {}
+    if id_to_keys:
+        for rid, rel, ctime in db.execute(
+                select(Resource.id, Resource.release_date, Resource.ctime)
+                .where(Resource.id.in_(set(id_to_keys)))).all():
+            for key in id_to_keys.get(int(rid), []):
+                rel_text = str(rel or "").strip()
+                if rel_text and not release_raw.get(key):
+                    release_raw[key] = rel_text
+                try:
+                    ctime_int = int(ctime or 0)
+                except (TypeError, ValueError):
+                    ctime_int = 0
+                if ctime_int > 0:
+                    stamp = datetime.fromtimestamp(ctime_int, timezone.utc)
+                    cur = ctime_at.get(key)
+                    if cur is None or stamp < cur:
+                        ctime_at[key] = stamp
+
+    now_utc = utcnow()
+    lib_cutoff = now_utc - timedelta(days=NEW_LIBRARY_WINDOW_DAYS)
+    now_sh = now_utc.astimezone(shanghai_tz())
+    today_sh = now_sh.date()
+    rel_cutoff = (now_sh - timedelta(days=NEW_RELEASE_WINDOW_DAYS)).date()
+
+    for key in keys:
+        tags: list[str] = []
+        entered = entry_at.get(key) or ctime_at.get(key)
+        is_new_lib = bool(entered is not None and entered >= lib_cutoff)
+        rel_text = str(release_raw.get(key) or "").strip()[:10]
+        rel_date = None
+        if rel_text:
+            try:
+                rel_date = datetime.strptime(rel_text, "%Y-%m-%d").date()
+            except ValueError:
+                rel_date = None
+        is_new_rel = bool(rel_date is not None and rel_cutoff <= rel_date <= today_sh)
+        if is_new_lib:
+            tags.append(PUSH_TAG_NEW_LIBRARY)
+        if is_new_rel:
+            tags.append(PUSH_TAG_NEW_RELEASE)
+        # 两项都判不出（没快照也没上映日期）→ 留空，不猜成存量排期。
+        if not tags and (entered is not None or rel_date is not None):
+            tags.append(PUSH_TAG_BACKLOG)
+        out[key] = [{"key": t, "label": PUSH_TAG_LABELS[t]} for t in tags]
+    return out
+
+
 @router.get("/tasks")
 def api_tasks(status: str = "", limit: int = 200,
               include_archived: bool = False, db: Session = Depends(get_db)):
@@ -4013,10 +4496,13 @@ def api_tasks(status: str = "", limit: int = 200,
     # v2.1.4：补推送渠道与海报缩略图
     channels = _task_channel_info(db, [int(r.id) for r in rows])
     posters = _work_posters(db, [r.get("work_key") for r in items])
+    # v2.1.22：三类标签（新入库 / 新上映 / 存量排期），与总览三表同源
+    tags = _work_push_tags(db, [r.get("work_key") for r in items])
     for row in items:
         key = str(row.get("work_key") or "")
         row["title"] = titles.get(key, "")
         row["cover"] = posters.get(key, "")
+        row["tags"] = tags.get(key, [])
         info = channels.get(int(row["id"])) or {}
         row["channel_names"] = info.get("channel_names") or []
         row["group_names"] = info.get("group_names") or []
@@ -4053,6 +4539,8 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
     item["title"] = titles.get(key, "")
     # v2.1.4：详情内页同样展示海报与渠道
     item["cover"] = _work_posters(db, [key]).get(key, "")
+    # v2.1.22：详情与列表同源展示三类标签
+    item["tags"] = _work_push_tags(db, [key]).get(key, [])
     info = _task_channel_info(db, [int(task_id)]).get(int(task_id)) or {}
     item["channel_names"] = info.get("channel_names") or []
     item["group_names"] = info.get("group_names") or []

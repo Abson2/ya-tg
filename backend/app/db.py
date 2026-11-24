@@ -439,6 +439,12 @@ _COLUMNS = {
         # v0.9.18.1：仅从发现列表移除的标记（不动白名单/Channel/Telegram）
         "hidden": "BOOLEAN DEFAULT 0",
     },
+    # v2.1.22：内置模板标记。内置「默认图文」是唯一的内置样式——
+    # 不可删除（删了系统就没有可恢复的默认版式），名字/内容可改。
+    # 用它而不是「按名字判断」：名字可以改，改完就认不出来了。
+    "message_templates": {
+        "builtin": "INTEGER DEFAULT 0",
+    },
 }
 
 
@@ -447,60 +453,42 @@ _COLUMNS = {
 # 追更剧「📡 更新至 S01E07 · 连载中」，完结剧「📡 S01E24 · 完结」，
 # 进度由 episode_progress（N/M）单独承载；episode_count 为「已收录」，避免重复。
 # v0.9.9 #202：默认模板改为用户指定样式（纯文字按钮标签，不做 inline 按钮）。
-# 变量全部由 publisher._build_message 的 ctx 提供：分项技术规格从文件名解析，
-# 上映时间取 TMDB release_date（无则回退 year），评分用 vote_plain（整数优先）。
+# v2.1.22 重写为「默认图文」（用户口径：「优化内置模版，仅保留默认图文与自定义」）：
+# 版式按用户给的参考图逐行对齐——标题 / TMDB / 评分 / 画质 / 版本 / 大小 /
+# 分享 / 分集 / 简介 / 标签。每行都用 {{#if}} 包住，取不到就整行不出现，
+# 绝不输出「画质: 」这种空值行。
+#
+# 依据全部来自真实字段（由 publisher._build_message 的 ctx 提供）：
+#   tmdb_id（TMDB 影视号）/ vote_plain（TMDB 评分，整数优先）/
+#   quality（文件名解析出的分辨率·HDR 等）/ version（画质·来源·编码·音轨合并串）/
+#   size / share_code（分享链接尾段分享码）/ episode_status（季集标签）/
+#   overview / tags（#片名 #类型 #地区 #分类）。
+#
+# 关于参考图里的「豆瓣评分」：系统**没有豆瓣数据源**（全仓无豆瓣接入），
+# 写进模板只能永久显示「暂无」，属于占位假数据，因此不放这一行。
+# 要显示真实豆瓣评分需先接数据源——这是已知缺口，不是漏做。
 DEFAULT_TEMPLATE = (
-    "<b>{{title}}{{#if year}} ({{year}}){{/if}} 🖼️</b>\n"
-    "{{#if type_label}}类型：{{type_label}}\n{{/if}}"
-    "{{#if tmdb_id}}🆔 TMDB ID: {{tmdb_id}}\n{{/if}}"
-    "{{#if air_date}}📅 上映时间: {{air_date}}\n{{/if}}"
-    "{{#if vote_plain}}⭐️ 评分: {{vote_plain}}{{/if}}"
-    "{{#if source}} | 💿 来源: {{source}}{{/if}}\n"
-    "{{#if quality}}📺 画质: {{quality}}\n{{/if}}"
-    "{{#if video_codec}}🎞️ 编码: {{video_codec}}{{/if}}"
-    "{{#if audio_codec}} | 🔊 音频: {{audio_codec}}{{/if}}\n"
-    "{{#if season_count}}📋 季集：共{{season_count}}季{{/if}}"
-    "{{#if episode_count}} | 共 {{episode_count}} 集{{/if}}"
-    "{{#if episode_status}}（{{episode_status}}）{{/if}}"
-    "{{#if episode_range}} {{episode_range}}{{/if}}\n"
-    "{{#if size}}📦 大小：{{size}}\n{{/if}}"
-    "{{#if overview}}📝 简介: {{overview}}\n{{/if}}"
-    "{{#if tags}}🏷️ 标签： {{tags}}\n{{/if}}"
-    "{{buttons_text}}\n"
+    "<b>{{title}}{{#if year}} ({{year}}){{/if}}</b>\n"
+    "{{#if tmdb_id}}🆔 TMDB: {{tmdb_id}}\n{{/if}}"
+    "{{#if vote_plain}}⭐ TMDB评分: {{vote_plain}}/10\n{{/if}}"
+    "{{#if quality}}🖥 画质: {{quality}}\n{{/if}}"
+    "{{#if version}}🎞 版本: {{version}}\n{{/if}}"
+    "{{#if size}}📦 大小: {{size}}\n{{/if}}"
+    "{{#if share_code}}🔗 分享: {{share_code}}\n{{/if}}"
+    "{{#if episode_status}}📡 分集: {{episode_status}}\n{{/if}}"
+    "{{#if overview}}\n📝 简介: {{overview}}\n{{/if}}"
+    "{{#if tags}}🏷 {{tags}}\n{{/if}}"
     "{{share_url}}"
 )
+# v2.1.22：当前默认图文的指纹（存量模板升级判定用；改版式时同步改这里）。
+CURRENT_DEFAULT_MARK = "🎞 版本:"
+
 # v0.9.6：内置模板预设（供管理页下拉一键载入，不落库；用户载入后可改可另存）。
-# 全部只用现有 {{变量}} 与 {{#if}} 语法，不引入新变量，兼容 publisher 渲染器。
-# 默认图文沿用 DEFAULT_TEMPLATE，另给精简 / 追更 / 纯文本三套，解决「默认图文模板重复、
-# 只有一种样式」的问题。键 name 用于下拉展示，content 用于填充编辑框。
+# v2.1.22 收敛：内置**只保留「默认图文」一条**（用户口径：「优化内置模版，仅保留
+# 默认图文与自定义」）。此前的「精简卡片 / 追更剧集（带进度）/ 纯文本分享」三套
+# 额外内置样式已删除——用户需要不同版式就走「另存为自定义模板」，不再和内置混在一起。
 TEMPLATE_PRESETS = [
-    {"name": "默认图文（整剧 · 推荐）", "content": DEFAULT_TEMPLATE},
-    {"name": "精简卡片", "content": (
-        "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
-        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
-        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
-        "{{#if vote_average}}⭐ {{vote_average}}/10\n{{/if}}"
-        "{{#if resolution}}📐 {{resolution}}\n{{/if}}"
-        "{{#if size}}💾 {{size}}\n{{/if}}"
-        "{{share_url}}"
-    )},
-    {"name": "追更剧集（带进度）", "content": (
-        "<b>🎬 {{title}}{{#if year}}（{{year}}）{{/if}}</b>\n"
-        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
-        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
-        "{{#if episode_progress}}🔢 进度 {{episode_progress}}\n{{/if}}"
-        "{{#if episode_count}}📼 已收录 {{episode_count}} 集\n{{/if}}"
-        "{{#if overview}}\n📖 {{overview}}\n\n{{/if}}"
-        "{{share_url}}"
-    )},
-    {"name": "纯文本分享", "content": (
-        "🎬 {{title}}{{#if year}}（{{year}}）{{/if}}\n"
-        "{{#if season_label}}📺 {{season_label}}\n{{/if}}"
-        "{{#if episode_status}}📡 {{episode_status}}\n{{/if}}"
-        "{{#if vote_average}}⭐ {{vote_average}}/10 · {{/if}}{{#if resolution}}{{resolution}} · {{/if}}{{#if size}}{{size}}\n{{/if}}"
-        "{{#if overview}}📖 {{overview}}\n{{/if}}"
-        "资源：{{share_url}}"
-    )},
+    {"name": "默认图文", "content": DEFAULT_TEMPLATE},
 ]
 
 # v0.6.0 旧版默认模板：仍在使用它（用户没改过）时自动升级到 v0.6.4 新版
@@ -548,19 +536,28 @@ def _is_legacy_default(content: str) -> bool:
 def _needs_template_upgrade(content: str) -> bool:
     """判断存量默认模板是否需要升级到当前版本。
 
-    覆盖四类：
+    覆盖五类：
       1) v0.5.x/v0.6.0 老模板（含单集文件名/type= 调试行）；
       2) v0.6.4 整剧模板（含 🎬，但缺 v0.6.5 新增的 {{episode_count}} 行）；
       3) v0.6.5~v0.8.8 默认模板（含 v0.8.9 之前的集数行原句，缺剧集状态行）；
       4) v0.9.9 #202：v0.8.9 旧默认模板（含 {{episode_status}} 但无新样式特征
-         {{buttons_text}} / 🆔 TMDB ID），升级到用户指定的新样式。
-    自定义模板一律不动：第 3/4 类都用「旧默认骨架特征同时命中 + 无新样式特征」
+         {{buttons_text}} / 🆔 TMDB ID），升级到用户指定的新样式；
+      5) v2.1.22：v0.9.9 旧默认图文（🖼️ + {{buttons_text}} + 🆔 TMDB ID 三特征同时
+         命中）升级到新的「默认图文」版式（🎞 版本: 行）。
+    自定义模板一律不动：第 3/4/5 类都用「旧默认骨架特征同时命中 + 无新样式特征」
     判断，用户自己改过内容的模板缺这些组合标记，不会被覆盖。
     """
     c = content or ""
     if not c:
         return False
-    if "{{buttons_text}}" in c or "🆔 TMDB ID" in c:  # 已是 v0.9.9 新版样式
+    # v2.1.22：已是当前默认图文版式 → 不动（放在最前，避免旧样式判定误伤新模板）。
+    if CURRENT_DEFAULT_MARK in c:
+        return False
+    # v2.1.22：v0.9.9 的默认图文（内置那一套）三特征同时命中才升级；
+    # 用户改过的模板很难同时保留这三个标记，不会被覆盖。
+    if "🖼️" in c and "{{buttons_text}}" in c and "🆔 TMDB ID" in c:
+        return True
+    if "{{buttons_text}}" in c or "🆔 TMDB ID" in c:  # 已是 v0.9.9 版式
         return False
     # v0.9.9 #202：v0.8.9 旧默认模板（🎬 标题 + 📡 剧集状态 + 🔗 TMDB 链接骨架）。
     # 三者同时命中、且无新样式特征，才升级——这是用户反复反馈「改了模板没生效」的根因：
@@ -795,7 +792,7 @@ def migrate() -> None:
             tpl = keeper
         if not tpl:
             db.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
-                                   enabled=True, is_default=True))
+                                   enabled=True, is_default=True, builtin=True))
             db.commit()
         elif _needs_template_upgrade(tpl.content):
             # v0.6.5：不再依赖精确字符串匹配（存量模板可能被"一键恢复"写回旧版、
@@ -803,6 +800,37 @@ def migrate() -> None:
             # 整剧模板缺集数行，都升级到当前版本；用户自定义模板不动。
             tpl.content = DEFAULT_TEMPLATE
             db.commit()
+
+        # v2.1.22：内置模板收敛（两件事，都要求"恰好一条"）
+        #   ① 内置「默认图文」打上 builtin 标记（老库这批行还没有该列）；
+        #   ② 默认模板唯一：历史上「一键恢复」/并发写入可能留下多条 is_default，
+        #      用户口径是"默认配置只能配置一条"。这里把多余的全部清掉，
+        #      优先保留内置那条；一条默认都没有时，把内置的设为默认。
+        # 只在真正有改动时 commit，避免每次启动都写库。
+        builtin_row = db.query(MessageTemplate).filter(
+            MessageTemplate.builtin.is_(True)).first()
+        if not builtin_row:
+            builtin_row = db.query(MessageTemplate).filter(
+                MessageTemplate.name == "默认图文模板").first()
+            if builtin_row:
+                builtin_row.builtin = True
+                db.commit()
+        rows = db.query(MessageTemplate).all()
+        defaults = [x for x in rows if x.is_default]
+        if len(defaults) != 1:
+            # 0 条默认：优先内置那条，其次第一条启用的；
+            # 多条默认：优先内置那条，其次最早的一条。
+            # 恰好 1 条时**一律不动**——用户把自定义模板设为默认是合法状态。
+            if defaults:
+                keeper = next((x for x in defaults if x.builtin), defaults[0])
+            elif builtin_row is not None:
+                keeper = builtin_row
+            else:
+                keeper = next((x for x in rows if x.enabled), rows[0] if rows else None)
+            if keeper is not None:
+                for x in rows:
+                    x.is_default = (x.id == keeper.id)
+                db.commit()
 
         # v0.6.5：一次性收敛升级前的旧队列残留（同剧逐集排队）。用标记确保只跑一次，
         # 避免用户手动清库重新扫描后、正常的单集队列被误合并。

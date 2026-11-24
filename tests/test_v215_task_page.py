@@ -160,7 +160,10 @@ def test_frontend_status_filter_is_chinese():
     """状态筛选下拉必须全中文，不得直出内部枚举名。"""
     app = APP_VUE.read_text(encoding="utf-8")
     assert "scTaskStatusOptions" in app, "缺少中文状态选项"
-    assert "scTaskStatusLabel(st)" in app, "状态选项未走中文映射"
+    # v2.1.22：选项结构改为「阶段档 + 单项各出现一次」，单项中文名仍走
+    # scTaskStatusLabel（唯一权威），阶段档文案写在 SC_TASK_STATUS_ITEMS 里。
+    assert "SC_TASK_STATUS_ITEMS" in app, "缺少状态项定义"
+    assert "scTaskStatusLabel(" in app, "状态选项未走中文映射"
     # 旧写法：直接拼 st + ' (' + n + ')'
     assert "'(' + n + ')'" not in app, "状态筛选仍在直出内部枚举名"
     # 中文标签齐全

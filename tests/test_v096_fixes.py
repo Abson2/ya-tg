@@ -152,7 +152,9 @@ def test_frontend_route_note_input():
 # ---- 6. 模板预设 / 去重 / 删除 ----
 def test_template_presets():
     presets = main.template_presets()
-    assert len(presets) >= 3
+    # v2.1.22：内置只保留「默认图文」一条（用户口径：仅保留默认图文与自定义）
+    assert len(presets) == 1
+    assert presets[0]["name"] == "默认图文"
     assert all("content" in p and "{{title}}" in p["content"] for p in presets)
     assert all("{{filename}}" not in p["content"] for p in presets)  # 不暴露单集文件名
 

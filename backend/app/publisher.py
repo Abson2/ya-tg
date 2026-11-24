@@ -214,6 +214,14 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
                 episode_status = f"更新至 {status_ep_tag} · 已收录 {n} 集"
     season_label = whole_season_label  # v0.6.4：整剧展示用「第N季」而非单集信息
     version = version_spec(res.name)
+    # v2.1.22：分享码——分享链接尾段（去查询串/锚点），供默认图文的「🔗 分享: xxx」行。
+    # 取不到就留空，模板里的 {{#if share_code}} 会整行不出，绝不显示「分享: 」空值。
+    share_code = ""
+    _raw_share = str(share_url or "").strip().rstrip("/")
+    if "/" in _raw_share:
+        _tail = _raw_share.rsplit("/", 1)[-1].split("?", 1)[0].split("#", 1)[0]
+        if _tail and _tail != _raw_share:
+            share_code = esc(_tail)
 
     # 标签串按「片名 · 类型 · 地区 · 分类」打标（示例：#保镖恋人 #电影 #美国 #爱情 #惊悚）
     tag_parts = [title, type_text]
@@ -257,6 +265,8 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
         "channel_link": esc(runtime_config.get(db, "tg_channel_link") or ""),
         "group_link": esc(runtime_config.get(db, "tg_group_link") or ""),
         "version": esc(version),
+        # v2.1.22：分享码（默认图文「🔗 分享」行用）
+        "share_code": share_code,
         # v0.9.9 #202：用户新样式分项变量（来源/画质/编码/音频从文件名解析，上映时间取 TMDB）
         "source": esc(spec.get("source")),
         "quality": esc(spec.get("quality")),

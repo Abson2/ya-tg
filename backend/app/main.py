@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.21", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.22", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.21", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.22", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3586,6 +3586,22 @@ def process_change_events(db: Session, *, publish: bool = True) -> dict:
                 stats["queued"] += 1
             else:
                 stats["skipped"] += 1
+        # v2.1.22：把这次「追更」登记进 v2 账本（推送任务 / 推送队列 / 推送历史
+        # 三个卡片才看得见），并把队列项标记成 v2 语义 —— 投递结果由 publisher
+        # 回写到这条任务上。分享链接**复用**，不重复建链。
+        if q is not None:
+            try:
+                from . import share_center_v2 as _sc_v2
+                v2_task = _sc_v2.register_update_task(
+                    db, rep, channel_id=int(q.channel_id), event_id=int(ev.id or 0))
+                if v2_task is not None:
+                    q.share_task_id = 0        # 不挂旧链，publisher 走 v2 回写分支
+                    q.push_reason = "sc_v2"
+                    q.event_id = int(v2_task.id)
+                    db.flush()
+            except Exception:
+                # 记账失败绝不影响这次真实投递（队列项已置 pending）。
+                logger.exception("[share] 追更登记 v2 任务失败，本次投递照常执行")
     return stats
 
 
@@ -5682,8 +5698,42 @@ def template_presets():
 
 @app.get("/api/templates", dependencies=ADMIN)
 def templates(db: Session = Depends(get_db)):
+    # v2.1.22：带上 builtin 标记——前端据此把内置「默认图文」标成不可删除，
+    # 用户自定义模板才允许删。此前没有该字段，前端只能"猜"哪条是内置。
     return [{"id": x.id, "name": x.name, "content": x.content, "enabled": x.enabled,
-             "is_default": x.is_default} for x in db.scalars(select(MessageTemplate)).all()]
+             "is_default": x.is_default, "builtin": bool(x.builtin)}
+            for x in db.scalars(select(MessageTemplate).order_by(MessageTemplate.id)).all()]
+
+
+def _ensure_single_default_template(db: Session) -> int:
+    """保证「恰好一条默认模板」——用户口径：默认配置只能配置一条（v2.1.22）。
+
+    任何写操作（新增 / 编辑 / 恢复内置 / 删除）之后都调用：把 is_default 归一到一条，
+    优先保留已是默认的那条（多条时优先内置），一条都没有就把内置的设为默认。
+    这样 publisher._template() 永远不会落到「零条默认→随手取一条启用模板」的歧义上，
+    也不会出现界面上两个「默认」标签。
+    返回被清掉的默认条数（0 表示本来就合规）。
+    """
+    db.flush()
+    rows = list(db.scalars(select(MessageTemplate).order_by(MessageTemplate.id)).all())
+    if not rows:
+        return 0
+    flagged = [x for x in rows if x.is_default]
+    if len(flagged) == 1:
+        return 0
+    if flagged:
+        keeper = next((x for x in flagged if x.builtin), flagged[0])
+    else:
+        keeper = (next((x for x in rows if x.builtin), None)
+                  or next((x for x in rows if x.enabled), rows[0]))
+    cleared = 0
+    for x in rows:
+        want = (x.id == keeper.id)
+        if bool(x.is_default) != want:
+            if x.is_default and not want:
+                cleared += 1
+            x.is_default = want
+    return cleared
 
 
 @app.post("/api/templates", dependencies=ADMIN)
@@ -5691,24 +5741,26 @@ def add_template(p: TemplateInput, db: Session = Depends(get_db)):
     if p.is_default:
         for x in db.scalars(select(MessageTemplate).where(MessageTemplate.is_default.is_(True))).all():
             x.is_default = False
-    x = MessageTemplate(**p.model_dump())
+    # v2.1.22：用户新建的一律是自定义模板（builtin 只能由内置恢复端点产生）。
+    x = MessageTemplate(**p.model_dump(), builtin=False)
     db.add(x)
     add_audit(db, "template_saved", target_type="template", detail=p.name)
+    _ensure_single_default_template(db)
     db.commit()
     return {"id": x.id}
 
 
 @app.post("/api/templates/default", dependencies=ADMIN)
 def reset_default_template(db: Session = Depends(get_db)):
-    """一键恢复 v0.6.4 整剧风格的默认模板（emoji + 海报，不含单集文件名）。"""
+    """一键恢复内置「默认图文」并设为默认（v2.1.22 版式）。"""
     # v0.9.8：first() 防止历史库多条同名时 scalar() 抛 MultipleResultsFound（500）
     x = db.scalars(select(MessageTemplate).where(MessageTemplate.name == "默认图文模板")).first()
     if not x:
         x = MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
-                            enabled=True, is_default=True)
+                            enabled=True, is_default=True, builtin=True)
         db.add(x)
     else:
-        x.content, x.enabled, x.is_default = DEFAULT_TEMPLATE, True, True
+        x.content, x.enabled, x.is_default, x.builtin = DEFAULT_TEMPLATE, True, True, True
     db.flush()
     for y in db.scalars(select(MessageTemplate).where(MessageTemplate.id != x.id)).all():
         y.is_default = False
@@ -5727,6 +5779,8 @@ def edit_template(tid: int, p: TemplateInput, db: Session = Depends(get_db)):
             y.is_default = False
     for k, v in p.model_dump().items():
         setattr(x, k, v)
+    # v2.1.22：编辑后同样强制「恰好一条默认」（用户可能把唯一的默认取消勾选）。
+    _ensure_single_default_template(db)
     add_audit(db, "template_updated", target_type="template", target_id=str(tid))
     db.commit()
     return {"ok": True}
@@ -5734,16 +5788,24 @@ def edit_template(tid: int, p: TemplateInput, db: Session = Depends(get_db)):
 
 @app.delete("/api/templates/{tid}", dependencies=ADMIN)
 def delete_template(tid: int, db: Session = Depends(get_db)):
-    """v0.9.8：删除任意模板；删掉默认模板后自动补位，保证 publisher 始终有模板可用。
+    """v0.9.8：删除模板；删掉默认模板后自动补位，保证 publisher 始终有模板可用。
 
     旧版直接禁删默认模板（400），真机上历史库存在多条默认/同名模板时，点删除偶发
     Internal Server Error。这里统一在事务内完成「删除→补默认」，任何异常转成明确
     中文 HTTPException，绝不让底层异常裸抛成 500。
+
+    v2.1.22：内置「默认图文」改为**不可删除**（用户口径：内置只保留默认图文，
+    默认配置只能一条）。删了它系统就没有可恢复的默认版式了——要换样式请改内容或
+    另存自定义模板；要还原点「载入默认模板」。用户自定义模板照旧可删。
     """
     try:
         x = db.get(MessageTemplate, tid)
         if not x:
             raise HTTPException(404, "模板不存在")
+        if x.builtin:
+            raise HTTPException(
+                400, "内置「默认图文」不可删除（系统要靠它兜底渲染）。"
+                     "需要换样式请直接改内容，或另存为自定义模板；要还原点「载入默认模板」。")
         was_default = bool(x.is_default)
         db.delete(x)
         db.flush()
@@ -5752,13 +5814,15 @@ def delete_template(tid: int, db: Session = Depends(get_db)):
         defaults = [r for r in remain if r.is_default]
         if was_default or not defaults:
             if remain:
-                keeper = defaults[0] if defaults else remain[0]
+                # v2.1.22：补位优先内置那条，其次原本的默认，最后第一条
+                keeper = (next((r for r in remain if r.builtin), None)
+                          or (defaults[0] if defaults else remain[0]))
                 for r in remain:
                     r.is_default = (r.id == keeper.id)
             else:
                 # 最后一条模板也被删：重建内置默认，避免 publisher 无模板可用
                 db.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
-                                       enabled=True, is_default=True))
+                                       enabled=True, is_default=True, builtin=True))
         add_audit(db, "template_deleted", target_type="template", target_id=str(tid))
         db.commit()
         return {"ok": True}

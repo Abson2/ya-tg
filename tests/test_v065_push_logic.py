@@ -122,7 +122,8 @@ def test_build_message_uses_whole_series_size():
     rep = db.scalar(select(Resource).where(Resource.file_id == "v065-size1"))
     text, _ = _build_message(db, rep, "https://share/x")
     assert "15.0GB" in text, text  # 3 集 × 5GB
-    assert "共 3 集" in text, text  # 整剧集数，不是单集
+    # v2.1.22：默认图文用「📡 分集: 更新至 S01E03 · 已收录 3 集」表达整剧集数与进度
+    assert "已收录 3 集" in text, text
     assert ".mkv" not in text, text  # 消息不含单集文件名
     db.close(); _clean()
 

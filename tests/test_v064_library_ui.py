@@ -130,10 +130,10 @@ def test_cancel_share_clears_url_and_siblings():
 
 # ---------- 4. 模板整剧展示 ----------
 def test_default_template_is_series_oriented():
-    # v0.9.9 #202：默认模板换为用户指定样式（🖼️ 标题 / 🏷️ 标签 / 分项技术规格）
-    assert "🖼️" in DEFAULT_TEMPLATE and "🏷️" in DEFAULT_TEMPLATE
+    # v2.1.22：默认图文版式（标题 / TMDB / 评分 / 画质 / 版本 / 大小 / 分享 / 分集 / 简介 / 标签）
+    assert "🏷 {{tags}}" in DEFAULT_TEMPLATE
     assert "资源：" not in DEFAULT_TEMPLATE and "{{filename}}" not in DEFAULT_TEMPLATE
-    assert "{{quality}}" in DEFAULT_TEMPLATE and "{{episode_range}}" in DEFAULT_TEMPLATE
+    assert "{{quality}}" in DEFAULT_TEMPLATE and "{{episode_status}}" in DEFAULT_TEMPLATE
 
 
 def test_version_spec_extracts_full_spec():
@@ -156,8 +156,9 @@ def test_build_message_hides_single_episode_filename():
     # 完整文件名 / 扩展名进入推送文案。
     assert ".mkv" not in text
     assert "The.Silent.Storm.S01E04" not in text
-    assert "🖼️" in text and "S01" in text and "2026" in text
-    assert "⭐️ 评分: 9" in text and "https://share/x" in text
+    # v2.1.22：默认图文里标题不再带 🖼️ 后缀，评分行改为「⭐ TMDB评分: N/10」
+    assert "S01" in text and "2026" in text
+    assert "⭐ TMDB评分: 9/10" in text and "https://share/x" in text
     db.close()
     _clean()
 
