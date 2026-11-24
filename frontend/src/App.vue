@@ -3415,7 +3415,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.29 · Asia/Shanghai</span>
+          <span>v2.1.30 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -6601,4 +6601,101 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-instant{display:flex;align-items:center;gap:6px;margin:2px 0 8px;font-size:11.5px;color:var(--yg-muted)}
 .sc-fc-instant-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--yg-tone-slate-fg)}
 .sc-fc-instant-dot.on{background:var(--yg-tone-amber-fg)}
+
+/* ============================================================================
+   v2.1.30 全局 UI 统一（基准 = 分享中心）
+   ---------------------------------------------------------------------------
+   问题：分享中心（v2.0 起）与其余 9 个页面是两套观感 ——
+     · 卡片头：分享中心是「30px 软紫方块 + 15px/750 标题 + 11px 副标题」，
+       旧页面是「24px 深紫渐变方块 + 16px/720 标题」；
+     · 页标题：分享中心（.sc-topbar）没有左侧竖条，旧页面（.page-head）有一条 5px 渐变竖条；
+     · 统计数字 30px vs 27px、筛选「胶囊」vs「圆角标签」、按钮 14px 字 vs 12px 字。
+   做法：**只写样式覆盖，一个模板标签都不改、一行 JS 不动** ——
+   把旧原语（.panel / .panel-head / .page-head / .stat-num / .status-tabs /
+   .link-btn）与分享中心原语收敛到同一套 token。
+   ⚠️ 空态（.empty）**不在此列**：它本来就是全站唯一一份（分享中心三表也用它），
+   再补一条同选择器会触发 v2.1.6 的「.empty 只许定义一次」守卫，且会把基准一起改了。
+   为什么不改模板：这些原语是全站共用的（.panel 42 处、.field 54 处、.hint 91 处），
+   改一处样式 10 个页面同时对齐；而重排 2000 行模板才是碰坏功能的主要风险来源，
+   本版明确不做（用户口径：布局/按钮/展示可以优化，功能不动）。
+   ============================================================================ */
+
+/* ① 卡片头：标题层级 + 图标块与分享中心完全同款。
+      旧伪元素是「深紫渐变块 + 中间一粒白点」，分享中心是用 .sc-ico 放字符图标；
+      伪元素放不了字符，所以改成「主色软底 + 中心主色实心点」——同一家族的观感。 */
+.panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.panel-head h3{margin:0;font-size:15px;font-weight:750;line-height:1.35;display:flex;align-items:center;gap:11px}
+.panel-head h3::before{
+  content:"";width:30px;height:30px;border-radius:10px;flex:none;box-shadow:none;
+  background-color:var(--yg-tone-violet-bg);
+  background-image:radial-gradient(circle at 50% 50%,var(--yg-primary) 0 3.2px,transparent 3.8px)}
+.panel-head>span{font-size:11px;color:var(--yg-muted)}
+.panel-head .hint,.panel-head p{margin:3px 0 0;font-size:11px;line-height:1.5;color:var(--yg-muted)}
+
+/* ② 页标题：分享中心 .sc-topbar 与旧 .page-head 收敛成同一个「页内标题栏」。
+      竖条直接撤掉（分享中心是基准）；两个选择器写在一起，避免以后又各自长歪。 */
+.page-head,.sc-topbar{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;
+  flex-wrap:wrap;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--yg-line)}
+.page-head h2,.sc-topbar h2{margin:0 0 5px;font-size:21px;font-weight:770;letter-spacing:-.3px;line-height:1.28}
+.page-head h2::before{display:none}
+.page-head p,.sc-topbar p{margin:0;font-size:12px;line-height:1.55;color:var(--yg-muted)}
+
+/* ③ 统计数字：概览 6 卡与分享中心 6 KPI 用同一档字号，不再一页 30px 一页 27px */
+.stat-num{font-size:27px;font-weight:780;line-height:1.08}
+.stat-label{font-size:11.5px;margin-top:5px}
+.stat-card:hover,.mini-stat:hover{transform:translateY(-2px);box-shadow:var(--yg-shadow-lg)}
+
+/* ④ 筛选条：旧 .status-tabs 的「标签墙」改成分享中心 .sc-tabbar 的胶囊组。
+      选中态也从「实心主色」改成「主色软底 + 主色字」，与 .sc-tab.active 一致。 */
+.status-tabs{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px;
+  margin-bottom:14px;background:var(--yg-surface);border:1px solid var(--yg-line);
+  border-radius:var(--yg-radius-sm);box-shadow:var(--yg-shadow)}
+.status-tab-group{gap:4px}
+.status-tab-group button{padding:7px 13px;border-radius:9px;font-size:12px;font-weight:650;background:transparent}
+.status-tab-group button.on{background:linear-gradient(135deg,var(--yg-tone-blue-bg),var(--yg-tone-violet-bg));
+  color:var(--yg-primary);box-shadow:0 2px 8px rgba(91,91,214,.12)}
+
+/* ⑤ 文字型操作按钮：任务中心的 .link-btn 与分享中心的 .sc-link-btn 合成一套 */
+.link-btn,.sc-link-btn{font-size:12px;font-weight:700;color:var(--yg-primary);padding:4px 6px;border-radius:7px}
+.link-btn:hover,.sc-link-btn:hover{background:var(--yg-tone-violet-bg);text-decoration:none}
+
+/* ⑥ 空态：**故意不动**（这是一条反向决定，别「顺手统一」）。
+      `.empty` 本来就是全站唯一一份（分享中心三表用的也是它，见上方 5754 行的
+      v2.1.6 空态统一段），所以它已经是最统一的状态。再补一条同选择器会：
+        · 触发 v2.1.6 的「.empty 只许定义一次」守卫（防「后定义胜出」的隐性覆盖）；
+        · 把分享中心一起改了 —— 统一层不该反向影响基准。 */
+
+/* ⑦ 表单：label 与说明文字字号/间距统一（分享中心 .sc-form-row 基准） */
+.field label{font-size:12px;font-weight:650;margin-bottom:6px;color:var(--yg-ink)}
+.field small{font-size:11px;line-height:1.6}
+.form-grid{gap:14px 18px}
+.hint{font-size:11px;line-height:1.75}
+
+/* ⑧ 控件：圆角、字号、表头样式全站一套（Element Plus 变量统一，改这里等于改所有表格）。
+      按钮字号也要收：旧页面用 default（14px 字），分享中心全用 small（12px 字），
+      同一屏里两种按钮摆一起就是「两个产品」。统一到 12.5 / 12 两档。 */
+.el-button{border-radius:10px;font-weight:600;font-size:12.5px}
+.el-button--small{font-size:12px}
+.el-button--large{font-size:13.5px}
+.el-input__wrapper,.el-select__wrapper,.el-textarea__inner{border-radius:10px}
+.el-table{--el-table-border-color:var(--yg-line);
+  --el-table-header-bg-color:var(--yg-bg);
+  --el-table-header-text-color:var(--yg-ink);
+  --el-table-row-hover-bg-color:var(--yg-tone-blue-bg);
+  border-radius:12px;font-size:12.5px}
+.el-table th.el-table__cell{font-weight:700;font-size:12px}
+.el-dialog{border-radius:16px}
+.el-dialog__title{font-size:15px;font-weight:750}
+.el-drawer__header{margin-bottom:14px;font-size:15px;font-weight:750}
+
+/* ⑨ 窄屏收口：本段写在所有媒体查询之后，同特异度会把 ≤680 的旧值覆盖掉，
+      所以这里把关键几条按窄屏值重述一遍（不重述就等于把手机端改回去了）。 */
+@media(max-width:680px){
+  .panel{padding:15px}
+  .panel-head{margin-bottom:13px}
+  .page-head,.sc-topbar{padding-bottom:12px;margin-bottom:14px}
+  .page-head h2,.sc-topbar h2{font-size:19px}
+  .status-tabs{gap:6px;padding:6px}
+  .stat-num{font-size:22px}
+}
 </style>
