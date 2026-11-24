@@ -869,28 +869,36 @@ async def _reply(db: Session, token: str, chat_id: str, text: str,
 
 
 async def _send_photo(db: Session, token: str, chat_id: str, photo: str,
-                      caption: str = "", parse_mode: str = "") -> None:
+                      caption: str = "", parse_mode: str = "",
+                      reply_markup: dict | None = None) -> None:
     """v0.9.12：给用户发一张图片（打赏码 / 资源海报），失败静默不影响 offset。
 
     v0.9.13 #249：搜索卡片复用 publisher._build_message() 渲染出的是 HTML（<b>/<a>），
     必须带 parse_mode=HTML 才会被 Telegram 解析；否则标签会以纯文本外泄。打赏 caption
     是纯文本，保持默认不带 parse_mode，避免文案里的 < > 触发 Telegram 解析错误。
     无海报降级 sendMessage 时同样要带 parse_mode，否则正文标签仍会外泄。
+
+    v2.1.27：新增 `reply_markup` —— 搜索卡片要和频道/群推送长得一样（分享链接是
+    `📥 获取资源` 按钮而不是正文末尾的裸链接）。降级发文字时同样带上，否则「图片挂了
+    就退回裸链接」，同一个入口又能看到两种形态。
     """
     if not photo:
-        await _reply(db, token, chat_id, caption, parse_mode=parse_mode or None)
+        await _reply(db, token, chat_id, caption, parse_mode=parse_mode or None,
+                     reply_markup=reply_markup)
         return
     payload = {"chat_id": str(chat_id), "photo": photo}
     if caption:
         payload["caption"] = caption[:1000]
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         await _api(db, token, "sendPhoto", payload)
     except Exception:
-        # 图片发送失败降级为纯文字，至少把说明送到（保留 parse_mode）
+        # 图片发送失败降级为纯文字，至少把说明送到（保留 parse_mode 与按钮）
         await _reply(db, token, chat_id, caption or "图片发送失败，请稍后重试。",
-                     parse_mode=parse_mode or None)
+                     parse_mode=parse_mode or None, reply_markup=reply_markup)
 
 
 async def _send_search_cards(db: Session, token: str, chat_id: str,
@@ -900,6 +908,10 @@ async def _send_search_cards(db: Session, token: str, chat_id: str,
     卡片正文复用 publisher 的统一渲染（海报 + 简介 + 分享），保证与频道推送的
     消息一致；这是「转发已推送卡片」的实现——不重建分享、不改队列、不私聊刷屏
     （只在用户主动搜索时回他自己的 chat）。
+
+    v2.1.27：链接呈现也要一致 —— 频道/群推送在 `tg_link_style=button` 下是
+    `📥 获取资源` 按钮并从正文剥掉纯文本链接；搜索卡片此前只传正文，于是同一部
+    作品「群里是按钮、搜索是裸链接」。现在两边都走 `publisher.share_link_presentation`。
     """
     from . import publisher  # 延迟 import，避免 publisher → bot_listener 循环依赖
     for rid in resource_ids:
@@ -907,9 +919,11 @@ async def _send_search_cards(db: Session, token: str, chat_id: str,
         if not res or not (res.share_url or "").strip():
             continue
         caption, _ = publisher._build_message(db, res, res.share_url)
+        caption, markup = publisher.share_link_presentation(db, res, caption)
         poster = tmdb.poster_url(res.poster_path) if res.poster_path else ""
         # v0.9.13 #249：卡片正文是 HTML，必须带 parse_mode=HTML，否则 <b>/<a> 外泄成代码
-        await _send_photo(db, token, chat_id, poster, caption, parse_mode="HTML")
+        await _send_photo(db, token, chat_id, poster, caption, parse_mode="HTML",
+                          reply_markup=markup)
 
 
 async def check_restriction(db: Session, token: str, tg_user_id: str) -> tuple[bool, str]:

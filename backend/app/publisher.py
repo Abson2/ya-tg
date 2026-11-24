@@ -97,6 +97,31 @@ def _template(db: Session) -> MessageTemplate | None:
                 MessageTemplate.enabled.is_(True))).first())
 
 
+def share_link_presentation(db: Session, res: Resource,
+                            caption: str) -> tuple[str, dict | None]:
+    """分享链接怎么呈现：`📥 获取资源` 按钮 / 纯文本（v2.1.27）。
+
+    为什么单独抽出来：**频道 / 群推送**与**Bot 搜索卡片**必须是同一套口径。
+    用户截图里搜索返回的卡片把链接以纯文本露在正文末尾
+    （`https://www.guangyapan.com/s/…`），而群里同一条消息是带按钮的 —— 同一个机器人
+    两个样子，看着像两个产品。根因就是这段「按 `tg_link_style` 决定按钮 + 剥掉正文
+    末尾纯文本链接」的逻辑此前只写在 `_send_telegram` 里，搜索卡片走 `_send_photo`
+    根本没经过它。
+
+    口径由 `tg_link_style` 决定（默认 `button`）：
+      · button —— 返回 inline 键盘（`📥 获取资源`），并把正文末尾那行纯文本链接**剥掉**
+                  （否则按钮 + 裸链接重复出现）；
+      · plain  —— 正文原样保留链接，不收键盘（聊天客户端会自动把它识别成可点链接）。
+    没有分享链接时两条路都原样返回，不凭空造按钮。
+    """
+    style = (runtime_config.get(db, "tg_link_style") or "button").strip()
+    url = str(getattr(res, "share_url", "") or "").strip()
+    if style != "button" or not url:
+        return caption, None
+    cleaned = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
+    return cleaned, {"inline_keyboard": [[{"text": "📥 获取资源", "url": url}]]}
+
+
 def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str]:
     """构造 Telegram 消息。v0.6.0 增加 TMDB 分类打标变量。
 
@@ -377,18 +402,13 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
         payload["photo"] = poster
     # v0.9.10.1：频道/群聊/投稿·求片 三个入口已改为正文标签式超链接（_build_message
     # 对所有模板统一追加），不再是灰底 inline 按钮；inline 键盘只保留「获取资源」。
-    keyboard_rows: list[list[dict]] = []
-    link_style = (runtime_config.get(db, "tg_link_style") or "button").strip()
-    if link_style == "button" and res.share_url:
-        keyboard_rows.append([{"text": "📥 获取资源", "url": res.share_url}])
-        # 按钮模式下去掉正文末行的纯文本链接，避免重复
-        caption = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
-        if poster:
-            payload["caption"] = caption
-        else:
-            payload["text"] = caption
-    if keyboard_rows:
-        payload["reply_markup"] = {"inline_keyboard": keyboard_rows}
+    # v2.1.27：这段「按钮 + 剥掉正文末尾纯文本链接」的判定抽到
+    # `share_link_presentation`，Bot 搜索卡片走同一个函数 —— 否则同一部作品在群里
+    # 是按钮、在私聊搜索结果是裸链接。
+    caption, markup = share_link_presentation(db, res, caption)
+    payload["caption" if poster else "text"] = caption
+    if markup:
+        payload["reply_markup"] = markup
     retry_after = None
     # v1.5.1 P0 第七次：超时可配置（默认8s，旧硬编码20s），避免单条慢请求拖垮整轮。
     try:
