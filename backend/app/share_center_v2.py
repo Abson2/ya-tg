@@ -1320,8 +1320,13 @@ SCHEDULE_KIND_ORDER: tuple[str, ...] = (PUSH_TAG_NEW_RELEASE, PUSH_TAG_NEW_LIBRA
                                         PUSH_TAG_BACKLOG)
 
 
-def _schedule_kind_of(tags: list[dict] | None) -> str:
-    """一条记录/一部作品的「排期类型」：新上映 / 新入库 / 存量排期（v2.1.26）。
+def _schedule_kind_pair(tags: list[dict] | None) -> tuple[str, str]:
+    """「排期类型」的 (key, 中文标签)（v2.1.26，v2.1.28 起同时给 key）。
+
+    为什么要把 key 也吐出去：前端要给「新入库」单独上绿色高亮（用户口径），
+    但**绝不能靠中文文案去比对**——文案一改高亮就静默失效，而且中文散在前端就等于
+    第二套口径。key 恒为 `new_release` / `new_library` / `backlog` / `""`，
+    颜色映射放在前端只做「key → 样式」，判定仍然只在后端这一处。
 
     为什么单独成一个字段，而不是让前端从 `tags` 里挑：
       · `tags` 回答的是「**现在**还算不算新」——终态行被 `_tags_for_status`
@@ -1330,14 +1335,19 @@ def _schedule_kind_of(tags: list[dict] | None) -> str:
         也能看出它是新上映来的还是存量轮转来的，所以用**未裁剪**的判定结果。
     两者都来自同一个 `_work_push_tags`，绝不在这里二次判定「新不新」。
 
-    标签一条都没有（入库时间与上映日期都判定不出）→ 返回空串，页面显示「—」，
-    不猜成「存量排期」。
+    标签一条都没有（入库时间与上映日期都判定不出）→ 返回 `("", "")`，
+    页面显示「—」，不猜成「存量排期」。
     """
     keys = {str((t or {}).get("key") or "") for t in (tags or [])}
     for key in SCHEDULE_KIND_ORDER:
         if key in keys:
-            return PUSH_TAG_LABELS[key]
-    return ""
+            return key, PUSH_TAG_LABELS[key]
+    return "", ""
+
+
+def _schedule_kind_of(tags: list[dict] | None) -> str:
+    """只要中文标签时用这个（等价 `_schedule_kind_pair(tags)[1]`）。"""
+    return _schedule_kind_pair(tags)[1]
 
 
 def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, Any]:
@@ -2543,6 +2553,7 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 icats = _work_categories(db, ikeys)
                 works: list[dict[str, Any]] = []
                 for wk in ikeys:
+                    kind_key, kind_label = _schedule_kind_pair(itags.get(wk, []))
                     works.append({
                         "work_key": wk,
                         "title": str(ititles.get(wk) or ""),
@@ -2551,7 +2562,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                         "category": str(icats.get(wk) or ""),
                         # v2.1.26：排期类型（新上映 / 新入库 / 存量排期）——前端
                         # 「推送队列」的待排期行直接用这个字段，不再自己从 tags 里挑。
-                        "schedule_kind": _schedule_kind_of(itags.get(wk, [])),
+                        # v2.1.28：同时给 key，供前端按 key 上色。
+                        "schedule_kind": kind_label,
+                        "schedule_kind_key": kind_key,
                         "time": "",
                     })
                 hour_items.append({
@@ -2618,14 +2631,16 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 wk_cats = _work_categories(db, top_keys)
                 works: list[dict[str, Any]] = []
                 for wk in top_keys:
+                    kind_key, kind_label = _schedule_kind_pair(wk_tags.get(wk, []))
                     works.append({
                         "work_key": wk,
                         "title": str(wk_titles.get(wk) or ""),
                         "cover": str(wk_covers.get(wk) or ""),
                         "tags": wk_tags.get(wk, []),
                         "category": str(wk_cats.get(wk) or ""),
-                        # v2.1.26：排期类型，与三视图同一口径（`_schedule_kind_of`）
-                        "schedule_kind": _schedule_kind_of(wk_tags.get(wk, [])),
+                        # v2.1.26：排期类型，与三视图同一口径（`_schedule_kind_pair`）
+                        "schedule_kind": kind_label,
+                        "schedule_kind_key": kind_key,
                         "time": "",
                     })
                 hour_items.append({
@@ -3848,7 +3863,11 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
             row["category_name"] = cat_name
             raw_tags = tags.get(key, [])
             # v2.1.26：排期类型用**未裁剪**的判定（历史行也能看出当时按哪档排上）
-            row["schedule_kind"] = _schedule_kind_of(raw_tags)
+            # v2.1.28：同时给 key，前端给「新入库」上绿色高亮时按 key 映射样式，
+            #           不靠中文文案比对（文案改了高亮就静默失效）。
+            kind_key, kind_label = _schedule_kind_pair(raw_tags)
+            row["schedule_kind_key"] = kind_key
+            row["schedule_kind"] = kind_label
             # v2.1.23（用户口径 1）：**已结束**的记录不显示「存量排期」——
             # 标签失效（新上映过期）后自然会变成存量排期，但一条早就推完的历史记录
             # 上写「存量排期」没有信息量，用户要的是「失效就消失」。

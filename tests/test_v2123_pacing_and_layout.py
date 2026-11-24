@@ -373,13 +373,28 @@ def test_forecast_pace_minutes_zero_for_empty_segment():
 # ⑥ 前端契约
 # ---------------------------------------------------------------------------
 def test_frontend_tags_render_left_of_title():
-    """用户口径：三类标签放在推送记录的开头、剧名左侧（不是剧名下面一行）。"""
+    """用户口径：三类标签放在剧名左侧（不是剧名下面一行）。
+
+    v2.1.28 起：**「推送历史 / 队列 / 失败」三张卡不再挂标签** —— 它们有了独立的
+    「排期类型」列，剧名前再挂一枚「新入库」就是同一信息同一行出现两次
+    （用户截图：`新入库 杨… | 新入库`）。三类标签功能没删，仍保留在「推送任务」列表
+    与「今日推送排期」里，所以这里的结构断言从「四处」收紧为「仍在用的人必须用同一个
+    结构」，并补一条反证钉死三表不再回归。
+    """
     assert ".sc-title-row" in APP_VUE
     assert ".sc-title-text" in APP_VUE
-    # 四处（历史 / 队列 / 失败 / 任务）都用同一个行结构
-    assert APP_VUE.count('class="sc-title-row"') >= 4, "标签未统一到剧名左侧"
+    # 仍在使用标签的地方（推送任务列表）必须还是「标签在剧名左侧」的同一行结构
+    assert APP_VUE.count('class="sc-title-row"') >= 1, "标签未统一到剧名左侧"
     # 不允许再出现「剧名一行、标签另起一行」的老结构
     assert '<div>{{ s.row.title }}</div>' not in APP_VUE
+    # v2.1.28 反证：三张卡的「资源名称」列不得再出现标签渲染（否则又重复）
+    for anchor, name in (('scOverview.views?.history || []', "推送历史"),
+                         ('<el-table :data="scQueueRows"', "推送队列"),
+                         ('scOverview.views?.failed || []', "推送失败")):
+        seg = APP_VUE[APP_VUE.index(anchor):]
+        seg = seg[:seg.index("</el-table>")]
+        assert "sc-rec-tags" not in seg, (
+            f"{name}的「资源名称」列又挂回了三类标签 —— 与「排期类型」列重复")
 
 
 def test_frontend_push_progress_filter_exists():

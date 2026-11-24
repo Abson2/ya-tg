@@ -311,6 +311,9 @@ def test_forecast_works_carry_schedule_kind():
     for w in works:
         assert "schedule_kind" in w, "作品项要带排期类型"
         assert w["schedule_kind"] in ("新上映", "新入库", "存量排期", "")
+        # v2.1.28：连 key 一起给，前端给「新入库」上绿色高亮时按 key 映射
+        assert "schedule_kind_key" in w, "作品项要带排期类型的 key"
+        assert w["schedule_kind_key"] in ("new_release", "new_library", "backlog", "")
 
 
 # ==========================================================================

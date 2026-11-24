@@ -2534,6 +2534,12 @@ function scScheduleKindLabel(row) {
   const kind = String(row.schedule_kind || '').trim()
   return kind || '—'
 }
+// v2.1.28（用户口径 2）：排期类型的配色。**按后端给的 key 映射，不比中文文案** ——
+// 文案一改颜色就静默失效，而中文字符串散在前端等于第二套口径。
+// 只给「新入库」上绿色高亮（用户口径）；新上映 / 存量排期保持默认文字色，
+// 不额外造色阶，避免三档各一个颜色反而看不出重点。
+const scScheduleKindTone = (row) => (row && row.schedule_kind_key === 'new_library'
+  ? 'is-new' : '')
 const scQueueRows = computed(() => {
   const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
   const have = new Set(rows.map(r => String(r.work_key || '')))
@@ -2555,6 +2561,8 @@ const scQueueRows = computed(() => {
           category: w.category || '',
           // v2.1.26：排期类型同样透传后端判定，前端不再二次推导
           schedule_kind: w.schedule_kind || '',
+          // v2.1.28：连 key 一起透传，配色按 key 走（不比对中文文案）
+          schedule_kind_key: w.schedule_kind_key || '',
           status: 'planned',
           plan_time: w.time || (pad2(h.hour) + ':00'),
           _src: 'plan',
@@ -3387,7 +3395,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.27 · Asia/Shanghai</span>
+          <span>v2.1.28 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4647,15 +4655,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <el-table-column label="时间" width="56" show-overflow-tooltip><template #default="s">{{ scDayClock(s.row.published_at || s.row.updated_at) }}</template></el-table-column>
                         <el-table-column label="资源名称" min-width="92" show-overflow-tooltip>
                           <template #default="s">
-                            <!-- v2.1.23（用户口径 6）：三类标签放到**剧名左侧**、同一行，
-                                 与「推送记录」的阅读顺序一致（先看是什么片子，再看标签）。
-                                 此前标签在剧名下一行独占一行，把行高撑高且离剧名太远。 -->
-                            <div class="sc-title-row">
-                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
-                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
-                              </span>
-                              <span class="sc-title-text">{{ s.row.title }}</span>
-                            </div>
+                            <!-- v2.1.28（用户口径 1）：**去掉剧名左侧的三类标签**。
+                                 这三张卡已经有独立的「排期类型」列了，剧名前再挂一个
+                                 「新入库」就是同一信息同一行出现两次（截图里
+                                 新入库 杨… | 新入库），除了挤掉剧名没有任何作用。
+                                 标签本身没删功能：推送记录页 / 今日推送排期里照旧显示。 -->
+                            <span class="sc-title-text">{{ s.row.title }}</span>
                           </template>
                         </el-table-column>
                         <el-table-column label="分类" width="72" show-overflow-tooltip>
@@ -4665,7 +4670,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <template #default="s">{{ scQueueKindLabel({ ...s.row, _src: 'task' }) }}</template>
                         </el-table-column>
                         <el-table-column label="排期类型" width="78" show-overflow-tooltip>
-                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                          <template #default="s">
+                            <!-- v2.1.28（用户口径 2）：标签撤出「资源名称」后，这一列
+                                 就是它唯一的落脚点，所以「新入库」在这里做绿色高亮
+                                 （与原先那枚绿色标签同一观感，只是位置换到它该在的列）。
+                                 配色按**后端给的 key** 映射，不比对中文文案。 -->
+                            <span :class="['sc-kind', scScheduleKindTone(s.row)]">{{ scScheduleKindLabel(s.row) }}</span>
+                          </template>
                         </el-table-column>
                         <el-table-column label="状态" width="64" show-overflow-tooltip>
                           <template #default="s">{{ scTaskStatusLabel(s.row.status) }}</template>
@@ -4681,13 +4692,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </el-table-column>
                         <el-table-column label="资源名称" min-width="92" show-overflow-tooltip>
                           <template #default="s">
-                            <!-- v2.1.23：标签在剧名左侧（在途行与「待排期」预测行都带） -->
-                            <div class="sc-title-row">
-                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
-                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
-                              </span>
-                              <span class="sc-title-text">{{ s.row.title }}</span>
-                            </div>
+                            <!-- v2.1.28（用户口径 1）：标签不在这里——见「排期类型」列 -->
+                            <span class="sc-title-text">{{ s.row.title }}</span>
                           </template>
                         </el-table-column>
                         <!-- v2.1.25（用户口径 2）：**「推送类型」与「分类」彻底分开两列**。
@@ -4701,7 +4707,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <template #default="s">{{ scQueueKindLabel(s.row) }}</template>
                         </el-table-column>
                         <el-table-column label="排期类型" width="78" show-overflow-tooltip>
-                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                          <template #default="s">
+                            <!-- v2.1.28（用户口径 2）：标签撤出「资源名称」后，这一列
+                                 就是它唯一的落脚点，所以「新入库」在这里做绿色高亮
+                                 （与原先那枚绿色标签同一观感，只是位置换到它该在的列）。
+                                 配色按**后端给的 key** 映射，不比对中文文案。 -->
+                            <span :class="['sc-kind', scScheduleKindTone(s.row)]">{{ scScheduleKindLabel(s.row) }}</span>
+                          </template>
                         </el-table-column>
                         <el-table-column label="状态" width="64">
                           <template #default="s">
@@ -4718,13 +4730,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <el-table-column label="时间" width="56" show-overflow-tooltip><template #default="s">{{ scDayClock(s.row.updated_at) }}</template></el-table-column>
                         <el-table-column label="资源名称" min-width="86" show-overflow-tooltip>
                           <template #default="s">
-                            <!-- v2.1.23：标签在剧名左侧，三表口径一致 -->
-                            <div class="sc-title-row">
-                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
-                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
-                              </span>
-                              <span class="sc-title-text">{{ s.row.title }}</span>
-                            </div>
+                            <!-- v2.1.28（用户口径 1）：标签不在这里——见「排期类型」列 -->
+                            <span class="sc-title-text">{{ s.row.title }}</span>
                           </template>
                         </el-table-column>
                         <el-table-column label="分类" width="72" show-overflow-tooltip>
@@ -4734,7 +4741,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <template #default="s">{{ scQueueKindLabel({ ...s.row, _src: 'task' }) }}</template>
                         </el-table-column>
                         <el-table-column label="排期类型" width="78" show-overflow-tooltip>
-                          <template #default="s">{{ scScheduleKindLabel(s.row) }}</template>
+                          <template #default="s">
+                            <!-- v2.1.28（用户口径 2）：标签撤出「资源名称」后，这一列
+                                 就是它唯一的落脚点，所以「新入库」在这里做绿色高亮
+                                 （与原先那枚绿色标签同一观感，只是位置换到它该在的列）。
+                                 配色按**后端给的 key** 映射，不比对中文文案。 -->
+                            <span :class="['sc-kind', scScheduleKindTone(s.row)]">{{ scScheduleKindLabel(s.row) }}</span>
+                          </template>
                         </el-table-column>
                         <!-- v2.1.26：失败原因并入「状态」列（表头与另两表统一）。
                              只给一个「失败」标签会让这张卡失去唯一的信息量，
@@ -5896,6 +5909,11 @@ button{font-family:inherit}
 /* v2.1.26：失败表的「状态」列 = 失败标签 + 失败原因（表头与另两表统一后，
    失败原因不再单独占一列，但仍要能一眼看见，超长由单元格 tooltip 兜住）。 */
 .sc-fail-reason{margin-left:5px;font-size:11px;color:var(--yg-muted);word-break:break-all}
+/* v2.1.28（用户口径 2）：三表的「排期类型」列。标签从剧名前撤走后，这一列是它
+   唯一的落脚点，所以「新入库」在这里做绿色高亮（原先那枚绿标签的同一观感）。
+   新上映 / 存量排期不上色，保持默认文字色 —— 三档各一色反而看不出重点。 */
+.sc-kind{font-weight:600}
+.sc-kind.is-new{color:var(--yg-tone-green-fg);font-weight:750}
 .sc-health-grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .sc-health{border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:14px;text-align:left;cursor:pointer;position:relative;transition:.2s;background:var(--yg-surface)}
 .sc-health:hover{transform:translateY(-2px);box-shadow:var(--yg-shadow-lg)}
