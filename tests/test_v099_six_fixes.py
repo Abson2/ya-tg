@@ -39,19 +39,23 @@ def test_mirror_cards_side_by_side():
 # ---------- #202 消息模板新样式 ----------
 def test_default_template_new_style_fields():
     t = DEFAULT_TEMPLATE
-    # v2.1.22：默认图文逐行对齐用户参考图（标题 / TMDB / 评分 / 画质 / 版本 /
-    # 大小 / 分享 / 分集 / 简介 / 标签）
-    for token in ("🆔 TMDB: {{tmdb_id}}", "⭐ TMDB评分: {{vote_plain}}/10",
-                  "🖥 画质: {{quality}}", "🎞 版本: {{version}}",
-                  "📦 大小: {{size}}", "🔗 分享: {{share_code}}",
-                  "📡 分集: {{episode_status}}", "📝 简介: {{overview}}",
-                  "🏷 {{tags}}", "{{share_url}}"):
+    # v2.1.23：版式再次按用户参考图逐行对齐（🎬 标题 / 📺 TMDB / ⭐ 评分 /
+    # 💿 画质 / 🎞 版本 / 💾 大小 / 👤 分享 / 【季集】 / 📝 简介 / 🏷 标签:）
+    for token in ("🎬 <b>{{title}}", "📺 TMDB: {{tmdb_id}}",
+                  "⭐ TMDB评分: {{vote_plain}}/10",
+                  "💿 画质: {{quality}}", "🎞 版本: {{version}}",
+                  "💾 大小: {{size}}", "👤 分享: {{share_code}}",
+                  "【{{episode_status}}】", "📝 简介: {{overview}}",
+                  "🏷 标签: {{tags}}", "{{share_url}}"):
         assert token in t, token
     # 每一行都要能被 {{#if}} 整行拿掉，绝不输出「画质: 」空值行
     assert t.count("{{#if") == t.count("{{/if}}")
     assert "{{else}}" not in t  # 渲染器不支持 else
     # 无数据源的字段一律不进模板（豆瓣评分：系统没有豆瓣接入）
     assert "豆瓣" not in t
+    # 旧版式的 emoji/行头不得残留（换版式时最容易漏的就是这些）
+    for old in ("🖥 画质:", "📦 大小:", "🆔 TMDB:", "📡 分集:", "🏷 {{tags}}"):
+        assert old not in t, old
 
 
 def test_render_template_matches_requested_sample():
@@ -65,21 +69,21 @@ def test_render_template_matches_requested_sample():
                size="70.09 GB", overview="剧情简介", tags="#十万狂花入梦来 #2026年 #国产剧",
                buttons_text="📢 频道　👥 群组　🔍 投稿/搜索", share_url="https://s/1")
     out = utils.render_template(DEFAULT_TEMPLATE, ctx)
-    assert "<b>十万狂花入梦来 (2026)</b>" in out
-    assert "🆔 TMDB: 261315" in out
+    assert "🎬 <b>十万狂花入梦来 (2026)</b>" in out
+    assert "📺 TMDB: 261315" in out
     assert "⭐ TMDB评分: 9/10" in out
-    assert "🖥 画质: 2160p | 10bit | 60fps | SDR" in out
+    assert "💿 画质: 2160p | 10bit | 60fps | SDR" in out
     assert "🎞 版本: 2160p · WEB-DL · H.265 · SDR · DDP 5.1" in out
-    assert "📦 大小: 70.09 GB" in out
-    assert "🔗 分享: ducking" in out
-    assert "📡 分集: 更新中" in out
+    assert "💾 大小: 70.09 GB" in out
+    assert "👤 分享: ducking" in out
+    assert "【更新中】" in out
     assert "📝 简介: 剧情简介" in out
-    assert "🏷 #十万狂花入梦来 #2026年 #国产剧" in out
+    assert "🏷 标签: #十万狂花入梦来 #2026年 #国产剧" in out
     assert out.rstrip().endswith("https://s/1")
     # 缺字段的那几行必须整行消失，不能留「分享: 」这种空壳
     out2 = utils.render_template(DEFAULT_TEMPLATE,
                                  {"title": "只有标题", "share_url": "https://s/2"})
-    assert out2 == "<b>只有标题</b>\nhttps://s/2", out2
+    assert out2 == "🎬 <b>只有标题</b>\nhttps://s/2", out2
 
 
 def test_parse_tech_spec_from_filename():

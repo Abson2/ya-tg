@@ -48,24 +48,86 @@ const scActiveList = ref(null) // 当前展开明细的清单（卡片内交互�
 // 今日推送排期预测（v2.1.19）：发布规则是调动存量、有序推送的中枢，
 // 所以除了已有的「推送历史」，还要能看到「今天接下来推什么、几点推」。
 // 单独异步加载：预测要扫作品快照和名额索引，不能拖慢仪表盘首屏。
-const scForecast = ref({ hours: [], blocked: [], notes: [], today_total: 0, overflow: 0, backlog: 0 })
+const scForecast = ref({ hours: [], blocked: [], notes: [], today_total: 0, overflow: 0, backlog: 0, page: { from_hour: null, to_hour: 24, next_hour: null, has_more: false, partial: false, segments: 2 } })
 const scForecastLoading = ref(false)
+// v2.1.23（用户口径 6）：排期按「时段」分批加载。首屏只排当前时段（2 小时），
+// 点「加载下一时段」再追加下一段 —— 一次性把 12 段全排完，后端要扫一遍全天候选，
+// 页面要白等好几秒。分页**只在「看」**：推送与建任务照旧全天连续进行。
+const scFcMoreLoading = ref(false)   // 「加载下一时段」按钮自己的 loading
+const scFcLoadedCount = ref(0)       // 已加载的时段数
+const scFcCount = ref(0)             // 已加载时段合计推送条数（各段 today_total 求和）
 let _scForecastInFlight = false
-async function loadScForecast() {
+async function loadScForecast(opts = {}) {
   if (_scForecastInFlight) return
+  const page = scForecast.value.page || {}
+  const append = !!opts.append && page.next_hour != null
+  const fromHour = append ? Number(page.next_hour) : null
   _scForecastInFlight = true
-  scForecastLoading.value = true
+  if (append) scFcMoreLoading.value = true
+  else scForecastLoading.value = true
   try {
-    const d = await api('/sc/forecast')
-    scForecast.value = d || {}
+    const d = await api('/sc/forecast?paged=1' + (fromHour != null ? `&from_hour=${fromHour}` : '')) || {}
+    if (!append) {
+      scForecast.value = d
+      scFcLoadedCount.value = 1
+      scFcCount.value = Number(d.today_total || 0)
+      loadScForecastFull()      // 不 await：队列要全天，排期卡片仍只显示当前段
+      return
+    }
+    // 追加：只拼 hours（按小时去重、升序），其余字段以最新一次响应为准
+    const prev = scForecast.value || {}
+    const seen = new Set((prev.hours || []).map(h => Number(h.hour)))
+    const merged = (prev.hours || []).concat((d.hours || []).filter(h => !seen.has(Number(h.hour))))
+    merged.sort((a, b) => Number(a.hour) - Number(b.hour))
+    scForecast.value = { ...prev, ...d, hours: merged }
+    scFcLoadedCount.value += 1
+    scFcCount.value += Number(d.today_total || 0)
   } catch (_) {
     // 预测失败不影响其它卡片；留空并让模板显示「暂无排期」
-    scForecast.value = { hours: [], blocked: [], notes: [] }
+    if (!append) {
+      scForecast.value = { hours: [], blocked: [], notes: [], page: { next_hour: null, has_more: false } }
+      scFcLoadedCount.value = 0
+      scFcCount.value = 0
+    } else {
+      ElMessage.warning('下一时段没加载出来，稍后再点一次')
+    }
   } finally {
     scForecastLoading.value = false
+    scFcMoreLoading.value = false
     _scForecastInFlight = false
   }
 }
+function scForecastLoadMore() { loadScForecast({ append: true }) }
+// v2.1.23：排期卡片按段加载只影响「看」，但「推送队列」要的是**今天一整天**的
+// 待推清单（上一版刚把队列改成「在途 + 今日待排期」，只给一段会让队列莫名变短）。
+// 所以首屏那段出来之后，后台再静默拉一次全天预测，只喂队列，不碰排期卡片的
+// 分段视图。两条请求互不等待：首屏快，队列稍后补齐。
+const scForecastFull = ref({ hours: [] })
+let _scForecastFullInFlight = false
+async function loadScForecastFull() {
+  if (_scForecastFullInFlight) return
+  _scForecastFullInFlight = true
+  try {
+    const d = await api('/sc/forecast')      // 不带 paged = 全天（原有行为）
+    scForecastFull.value = d || { hours: [] }
+  } catch (_) {
+    scForecastFull.value = { hours: [] }     // 拉不到就退回用已加载的段，不冒充全天
+  } finally {
+    _scForecastFullInFlight = false
+  }
+}
+// 还有后续时段可加载？以及按钮该写哪两个钟点。
+const scFcHasMore = computed(() => {
+  const p = scForecast.value.page || {}
+  return p.has_more === true && p.next_hour != null
+})
+const scFcMoreLabel = computed(() => {
+  const p = scForecast.value.page || {}
+  const n = Number(p.next_hour)
+  if (p.next_hour == null || !isFinite(n)) return '加载下一时段'
+  const seg = Number(p.segments || 2)
+  return `加载下一时段 ${pad2(n)}:00–${pad2(Math.min(24, n + seg))}:00`
+})
 function pad2(n) { return String(Number(n) || 0).padStart(2, '0') }
 // 发布总览：左侧子导航 + KPI 点击筛选 + 任务详情（全部基于 /api/sc/* 真实数据）
 const scSubNav = ref('发布总览')
@@ -120,12 +182,31 @@ const scCleaningTasks = ref(false), scCleaningLinks = ref(false), scAdoptingAllA
 const scRebuildingFirst = ref(false)
 const scCatForm = ref({ category_key: '', name: '', media_type: '', priority: 0 })
 const scPlanVersionForm = ref({ plan_id: 1, config: '{}' })
+// v2.1.23（用户口径 2）：推送进度二分档——「已推送 / 未推送」。
+// 为什么单开一个控件、不塞进状态下拉：下拉里已经是「阶段档 + 单项」，再塞两个
+// 覆盖全部状态的档，就又是 v2.1.22 刚修掉的「同一个状态出现在两个选项里」。
+// 二分档与状态下拉是**与**关系，可叠加（先看没推的，再按阶段细分）。
+const scPushProgressFilter = ref('')
+const SC_PUSH_PROGRESS_ITEMS = [
+  { value: '', label: '全部' },
+  { value: 'unpushed', label: '未推送' },
+  { value: 'pushed', label: '已推送' },
+]
+// 「已推送」= 真的推成功了；「未推送」= 还没成功推出去（含失败待重试）。
+// 已取消 / 已跳过投递 / 无效推送 是**明确作废**的终态，不属于这两档，只出现在「全部」。
+const SC_PUSHED_STATUS = ['published']
+const SC_UNPUSHED_STATUS = ['planned', 'ready', 'building', 'submitted',
+  'accepted', 'publishing', 'failed']
 const scFilteredTasks = computed(() => {
   let rows = scTasks.value
   const f = scTaskStatusFilter.value
   if (f === 'pending') rows = rows.filter(r => ['planned', 'ready'].includes(r.status))
   else if (f === 'inflight') rows = rows.filter(r => ['submitted', 'accepted', 'publishing', 'building'].includes(r.status))
   else if (f) rows = rows.filter(r => r.status === f)
+  // v2.1.23：推送进度二分档（已推送 / 未推送），与上面的状态下拉是「与」关系
+  const p = scPushProgressFilter.value
+  if (p === 'pushed') rows = rows.filter(r => SC_PUSHED_STATUS.includes(r.status))
+  else if (p === 'unpushed') rows = rows.filter(r => SC_UNPUSHED_STATUS.includes(r.status))
   if (scLinkFilter.value) rows = rows.filter(r => (r.link_state || 'unknown') === scLinkFilter.value)
   return rows
 })
@@ -837,6 +918,35 @@ async function setDefaultTpl(t) {
     await load()
   } catch (e) { ElMessage.error(e.message) }
 }
+// v2.1.23：编辑器里的「设为默认」开关改成**单选语义**（用户口径：只能出现一条默认设置）。
+// 此前它是个独立的 v-model 布尔量，两个模板各勾一次就能各存一条默认，是「多默认」
+// 的入口之一。现在：打开 → 立刻把这条设为默认、原默认让位（不必再点保存）；
+// 关闭 → 直接回弹并说明原因（零默认会让 publisher 落到"随手取一条"的歧义上）。
+async function onTplDefaultSwitch(val) {
+  if (!val) {
+    tpl.value.is_default = true
+    ElMessage.info('默认模板只能有一条：要给别的模板设为默认，请在那条上点「设为默认」，原默认会自动让位。')
+    return
+  }
+  if (tpl.value.is_default) return
+  if (!tpl.value.id) {
+    // 还没保存的新模板：先记在草稿上，保存时后端会把原默认让位
+    tpl.value.is_default = true
+    ElMessage.info('保存后这条将成为默认模板，原默认会自动让位')
+    return
+  }
+  try {
+    await api(`/templates/${tpl.value.id}`, { method: 'PUT',
+      body: JSON.stringify({ name: tpl.value.name, content: tpl.value.content,
+                             enabled: tpl.value.enabled, is_default: true }) })
+    tpl.value.is_default = true
+    ElMessage.success(`「${tpl.value.name}」已设为默认，原默认已让位`)
+    await load()
+  } catch (e) {
+    tpl.value.is_default = false
+    ElMessage.error(e.message)
+  }
+}
 
 let clockTimer = null, webqrTimer = null, mirrorPollTimer = null, sessionPollTimer = null
 // v0.9.10.2：进度看板实时轮询——任务运行中每 2 秒只拉 /mirror/status（不复跑整页 load），
@@ -1026,31 +1136,74 @@ const templateVars = ['title', 'overview', 'year', 'resolution', 'version', 'sea
   'season_count', 'episode_range', 'buttons_text', 'channel_link', 'group_link',
   // v2.1.22：默认图文「🔗 分享」行用的分享码（分享链接尾段）
   'share_code']
+// v2.1.23：预览示例数据改成**用户参考图那部剧集**，好让调试时的观感与真机一致
+// （此前是电影示例，导致「【季集】」「🏷 标签」这些行在预览里根本看不出来）。
+// 数据全部是示例，不参与任何真实推送；只用于让模板调试所见即所得。
 const previewDemo = {
-  title: '保镖恋人', overview: '一个西班牙富商的女儿，在纽约的生活因一次绑架发生彻底颠覆。',
-  filename: '保镖恋人.2026.2160p.WEB-DL.mkv', year: '2026', resolution: '2160P',
-  version: '2160p · WEB-DL · H.265 · 10bit · DoVi P5 · DDP Atmos 5.1', season_label: '',
-  episode_count: '36', size: '14.9GB', share_url: 'https://share.example/xxx', tmdb_id: '1440098',
-  tmdb_url: 'https://www.themoviedb.org/movie/1440098',
-  type: 'movie', type_label: '电影', origin_country: '西班牙', origin_country_code: 'ES',
-  genres: '爱情、惊悚', tags: '#保镖恋人 #电影 #西班牙 #爱情 #惊悚',
-  vote_average: '7.0', original_title: 'Marfil', season: '', episode: '',
-  episode_tag: '', media_type: 'movie',
-  episode_status: '', episode_progress: '', updated_to_episode: '',
-  total_episodes: '', current_episode: '',
-  // v0.9.9 #202：新样式预览值
-  air_date: '2026-11-15', release_date: '2026-11-15', vote_plain: '9',
-  source: 'Web-DL', quality: '2160p | 10bit | 60fps | SDR', video_codec: 'H265', audio_codec: 'AAC',
-  season_count: '1', episode_range: 'S01 E01-E13', buttons_text: '📢 频道　👥 群组　🔍 投稿/搜索',
-  // v2.1.22：默认图文的分享码预览值
+  title: '罪案之法', year: '2026',
+  original_title: 'PRAWO BESTII',
+  overview: '一名杀害儿童的罪犯即将出狱，在波兰又掀起恐慌，也让负责此案的调查人员与精神科医生之间再度爆发道德冲突。',
+  filename: '罪案之法.S01E04.2026.2160p.WEB-DL.H265.SDR.DDP5.1.mkv',
+  resolution: '2160P',
+  version: '2160p · WEB-DL · H.265 · SDR · DDP 5.1',
+  season_label: '第1季',
+  episode_count: '4', size: '34.7 GB', share_url: 'https://share.example/xxx',
+  tmdb_id: '332839',
+  tmdb_url: 'https://www.themoviedb.org/tv/332839',
+  type: 'tv', type_label: '剧集', origin_country: '波兰', origin_country_code: 'PL',
+  genres: '犯罪、剧情', tags: '#罪案之法 #剧集 #犯罪 #剧情',
+  vote_average: '6.4', season: '1', episode: '4',
+  episode_tag: 'S01E04', media_type: 'tv',
+  // 季集行：参考图是【S01E04 · 完结】，整行由模板用【】包住
+  episode_status: 'S01E04 · 完结', episode_progress: '4/4',
+  updated_to_episode: '4', total_episodes: '4', current_episode: '4',
+  air_date: '2026-11-18', release_date: '2026-11-18', vote_plain: '6.4',
+  source: 'Web-DL', quality: '2160p', video_codec: 'H265', audio_codec: 'DDP 5.1',
+  season_count: '1', episode_range: 'S01 E01-E04',
+  // 入口链接那一行由渲染层统一追加（模板里没有 {{buttons_text}}），故留空
+  buttons_text: '',
   share_code: 'ducking',
   channel_link: '', group_link: ''
 }
+// v2.1.23：预览里那行入口链接，只在**真的配了链接**时出现 —— 没配还显示就是骗人，
+// 真机不会追加这一行。
+const previewJumpLine = computed(() => {
+  const cfg = interactionCfg.value || {}
+  const parts = []
+  if (String(cfg.tg_channel_link || '').trim()) parts.push('频道')
+  if (String(cfg.tg_group_link || '').trim()) parts.push('群聊')
+  if (String(cfg.tg_bot_link || '').trim()) parts.push('投稿·求片')
+  return parts.length ? '⚡ ' + parts.join(' · ') : ''
+})
 const previewText = computed(() => {
   const raw = tpl.value.content || ''
   if (!raw) return '在左侧编写模板后显示预览'
-  let t = raw.replace(/\{\{#if\s+\w+\}\}/g, '').replace(/\{\{\/if\}\}/g, '')
+  // 预览必须**像真机渲染**（utils.render_template 同一语义），否则调试反被误导：
+  //   ① {{#if x}}...{{/if}} 里 x 为空 → 整块拿掉，不是留「画质: 」这种空壳行；
+  //   ② 条件块支持嵌套，逐层收敛；
+  //   ③ 末尾照渲染层那样追加「⚡ 频道 · 群聊 · 投稿·求片」——这行由后端统一追加，
+  //      模板里看不到，预览不给出就没法调版面。
+  let t = raw
+  for (let guard = 0; guard < 12; guard++) {
+    const next = t.replace(/\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g,
+      (_m, k, body) => (String(previewDemo[k] ?? '').trim() ? body : ''))
+    if (next === t) break
+    t = next
+  }
+  t = t.replace(/\{\{#if\s+\w+\}\}/g, '').replace(/\{\{\/if\}\}/g, '')
   for (const [k, v] of Object.entries(previewDemo)) t = t.split('{{' + k + '}}').join(v)
+  t = t.replace(/<[^>]+>/g, '')          // 预览按纯文本看，去掉 <b> 这类 HTML 标签
+  const jump = previewJumpLine.value
+  if (jump) {
+    const lines = t.split('\n')
+    const last = (lines[lines.length - 1] || '').trim()
+    if (/^https?:\/\/\S+$/.test(last)) {
+      const share = lines.pop()
+      t = lines.join('\n').replace(/\s+$/, '') + '\n' + jump + '\n' + share
+    } else {
+      t = t.replace(/\s+$/, '') + '\n' + jump
+    }
+  }
   return t
 })
 
@@ -2289,11 +2442,41 @@ const scInstantModeText = computed(() => {
   return `上新即时推送已启用（${lane}）：当前没有符合条件的新作品。`
 })
 
+// v2.1.23（用户口径 1）：排期行的时间不要再逐个铺开。
+// 一段里 20 部作品就是 20 个时刻，用「、」连起来会变成 18:00、18:06、18:12……
+// 一长串，把剧名挤到屏幕外，看起来像一堆乱码。这里只报「跨度 + 节奏」：
+//   单条 → 18:00；多条 → 18:00–19:30 · 每 10 分钟 1 部
+// 每部剧自己的时刻由下面逐部那一行给出（后端 `_respread_forecast_times` 已算好）。
+function _hm(text) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(text || '').trim())
+  return m ? (Number(m[1]) * 60 + Number(m[2])) : null
+}
+function scForecastSpan(it) {
+  const ts = (it && it.times) || []
+  if (!ts.length) return ''
+  if (ts.length === 1) return ts[0]
+  const first = ts[0], last = ts[ts.length - 1]
+  const a = _hm(first), b = _hm(ts[1])
+  const step = (a !== null && b !== null && b > a) ? (b - a) : 0
+  return step ? `${first}–${last} · 每 ${step} 分钟 1 部` : `${first}–${last}`
+}
+// 本时段的整体节奏（后端 pace 给出，口径 = 时段分钟 ÷ 部数，除不尽四舍五入）。
+const scPaceText = computed(() => {
+  const p = scForecast.value.pace || {}
+  const n = Number(p.interval_minutes || 0)
+  if (!n) return ''
+  const hours = Number(p.period_hours || 2)
+  return `每 ${hours} 小时为一个时段，本时段每 ${n} 分钟推 1 部（共 ${Number(p.works || 0)} 部）`
+})
+
 const scQueueRows = computed(() => {
   const rows = (scOverview.value.views?.queue || []).map(r => ({ ...r, _src: 'task' }))
   const have = new Set(rows.map(r => String(r.work_key || '')))
   const plan = []
-  for (const h of (scForecast.value.hours || [])) {
+  // 队列用**全天**预测（后台补拉那份）；还没到就用已加载的段兜底，绝不空着。
+  const fullHours = scForecastFull.value.hours || []
+  const planHours = fullHours.length ? fullHours : (scForecast.value.hours || [])
+  for (const h of planHours) {
     for (const it of (h.items || [])) {
       for (const w of (it.works || [])) {
         const wk = String(w.work_key || '')
@@ -2531,7 +2714,7 @@ function scFilterQueue(status, linkState) {
   scTaskStatusFilter.value = status || ''
   scLinkFilter.value = linkState || ''
 }
-function scClearQueueFilter() { scTaskStatusFilter.value = ''; scLinkFilter.value = '' }
+function scClearQueueFilter() { scTaskStatusFilter.value = ''; scLinkFilter.value = ''; scPushProgressFilter.value = '' }
 // 任务详情：调用真实端点 /sc/tasks/{id}（含执行记录），不编造
 async function scOpenTaskDetail(id) {
   try {
@@ -3134,7 +3317,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.22 · Asia/Shanghai</span>
+          <span>v2.1.23 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4284,15 +4467,25 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <span class="sc-ico">◷</span>
                       <div><h3>今日推送排期</h3><p>按发布规则，今天剩余时段会推的作品与时间点</p></div>
                       <div class="sc-fc-sum">
-                        <span v-if="scForecastLoading" class="sc-fc-loading">排期中…</span>
+                        <span v-if="scForecastLoading && !(scForecast.hours || []).length" class="sc-fc-loading">排期中…</span>
                         <template v-else>
-                          <b>{{ scForecast.works_total || 0 }}</b> 部作品 · <b>{{ scForecast.today_total || 0 }}</b> 条推送
+                          <template v-if="scFcLoadedCount > 1">
+                            已加载 <b>{{ scFcLoadedCount }}</b> 个时段 · 合计 <b>{{ scFcCount }}</b> 条推送
+                          </template>
+                          <template v-else>
+                            <b>{{ scForecast.works_total || 0 }}</b> 部作品 · <b>{{ scFcCount }}</b> 条推送
+                          </template>
                           <em v-if="scForecast.overflow"> · 另有 <b>{{ scForecast.overflow }}</b> 条排不进今天</em>
                         </template>
                       </div>
                     </div>
                     <div class="sc-fc-instant" v-if="scInstantModeText">
                       <span class="sc-fc-instant-dot" :class="{ on: scForecast.instant_mode && scForecast.instant_mode !== 'off' }"></span>{{ scInstantModeText }}
+                    </div>
+                    <!-- v2.1.23（用户口径 4/7）：本时段匀速节奏。数字由后端算好（时段分钟 ÷ 部数），
+                         前端只显示，不自己算第二套。 -->
+                    <div class="sc-fc-pace" v-if="scPaceText">
+                      <span class="sc-fc-pace-dot"></span>{{ scPaceText }}
                     </div>
                     <div v-if="scForecast.reason" class="sc-fc-warn">{{ scForecast.reason }}</div>
                     <div class="sc-fc-list" v-if="(scForecast.hours || []).length">
@@ -4302,19 +4495,25 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <template v-if="h.total">
                             <div class="sc-fc-item" v-for="(it, i) in h.items" :key="i">
                               <span class="sc-fc-cat">{{ it.category }}</span>
-                              <span class="sc-fc-time">{{ (it.times || []).join('、') }}</span>
-                              <span class="sc-fc-title">{{ (it.titles || []).join('、') }}<em v-if="it.more"> 等 {{ it.count }} 部</em></span>
+                              <!-- v2.1.23（用户口径 1）：时间不再逐个铺开。
+                                   此前这里把每部作品的时刻用「、」连成一长串，18:00、18:00、
+                                   18:00…… 一屏全是重复时间，看着像乱码，剧名被挤到很远的右边。
+                                   现在只报**时段跨度 + 节奏**（18:00–19:30 · 每 10 分钟 1 部），
+                                   每部剧的具体时刻放到下面逐部那一行。 -->
+                              <span class="sc-fc-span" v-if="scForecastSpan(it)">{{ scForecastSpan(it) }}</span>
+                              <span class="sc-fc-count">{{ it.count }} 条<template v-if="it.works_total"> · {{ it.works_total }} 部</template></span>
                             </div>
                             <!-- v2.1.22：排期里逐部给出三类标签（哪部是新入库、哪部是新上映、
                                  哪部是存量补排），与推送历史/队列/任务同一套判定。 -->
                             <div class="sc-fc-works" v-for="(w, wi) in (h.items || [])" :key="'w' + wi">
                               <template v-if="(w.works || []).length">
                                 <div class="sc-fc-work" v-for="(wk, ki) in w.works" :key="ki">
-                                  <span class="sc-fc-work-name">{{ wk.title || '未命名作品' }}</span>
-                                  <span class="sc-fc-work-time" v-if="wk.time">{{ wk.time }}</span>
+                                  <!-- v2.1.23：标签在剧名左侧（口径 6），顺序 = 标签 → 剧名 → 时刻 -->
                                   <span v-if="(wk.tags || []).length" class="sc-rec-tags inline">
                                     <span v-for="t in wk.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
                                   </span>
+                                  <span class="sc-fc-work-name">{{ wk.title || '未命名作品' }}</span>
+                                  <span class="sc-fc-work-time" v-if="wk.time">{{ wk.time }}</span>
                                 </div>
                               </template>
                             </div>
@@ -4324,6 +4523,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       </div>
                     </div>
                     <div v-else-if="!scForecastLoading" class="empty">今日暂无排期</div>
+                    <!-- v2.1.23（用户口径 6）：排完一段再加载下一段，不一次性重排全天。
+                         按钮文案直接给下一段的钟点，用户知道点一下会多出哪两小时。 -->
+                    <div class="sc-fc-more" v-if="scFcHasMore">
+                      <el-button size="small" :loading="scFcMoreLoading" @click="scForecastLoadMore()">{{ scFcMoreLabel }}</el-button>
+                      <span class="sc-fc-more-hint">按时段分批排，先看眼前这两小时</span>
+                    </div>
+                    <div class="sc-fc-done" v-else-if="(scForecast.hours || []).length && !scForecastLoading">
+                      今天所有时段已排完
+                    </div>
                     <div class="sc-fc-notes" v-if="(scForecast.notes || []).length">
                       <span v-for="(n, i) in scForecast.notes" :key="i">{{ n }}</span>
                     </div>
@@ -4337,10 +4545,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <el-table-column label="时间" min-width="130" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.published_at) }}</template></el-table-column>
                         <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
                           <template #default="s">
-                            <div>{{ s.row.title }}</div>
-                            <!-- v2.1.22：新入库 / 新上映 / 存量排期 -->
-                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
-                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            <!-- v2.1.23（用户口径 6）：三类标签放到**剧名左侧**、同一行，
+                                 与「推送记录」的阅读顺序一致（先看是什么片子，再看标签）。
+                                 此前标签在剧名下一行独占一行，把行高撑高且离剧名太远。 -->
+                            <div class="sc-title-row">
+                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
+                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                              </span>
+                              <span class="sc-title-text">{{ s.row.title }}</span>
                             </div>
                           </template>
                         </el-table-column>
@@ -4360,10 +4572,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         </el-table-column>
                         <el-table-column label="资源名称" min-width="150" show-overflow-tooltip>
                           <template #default="s">
-                            <div>{{ s.row.title }}</div>
-                            <!-- v2.1.22：在途行与「待排期」预测行都带三类标签 -->
-                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
-                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            <!-- v2.1.23：标签在剧名左侧（在途行与「待排期」预测行都带） -->
+                            <div class="sc-title-row">
+                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
+                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                              </span>
+                              <span class="sc-title-text">{{ s.row.title }}</span>
                             </div>
                           </template>
                         </el-table-column>
@@ -4385,10 +4599,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                         <el-table-column label="时间" min-width="120" show-overflow-tooltip><template #default="s">{{ fmtTime(s.row.updated_at) }}</template></el-table-column>
                         <el-table-column label="资源名称" min-width="130" show-overflow-tooltip>
                           <template #default="s">
-                            <div>{{ s.row.title }}</div>
-                            <!-- v2.1.22：与历史/队列两表同源标签，三表并排不能只有一处有 -->
-                            <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
-                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            <!-- v2.1.23：标签在剧名左侧，三表口径一致 -->
+                            <div class="sc-title-row">
+                              <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
+                                <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                              </span>
+                              <span class="sc-title-text">{{ s.row.title }}</span>
                             </div>
                           </template>
                         </el-table-column>
@@ -4658,6 +4874,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-option label="频道" value="channel"/>
                     <el-option label="群" value="group"/>
                   </el-select>
+                  <!-- v2.1.23（用户口径 2）：推送进度二分档。独立控件而非下拉选项，
+                       避免与上面的状态阶段档重复；与状态下拉叠加生效。 -->
+                  <div class="sc-prog-seg">
+                    <button v-for="o in SC_PUSH_PROGRESS_ITEMS" :key="o.value || 'all'"
+                            class="sc-prog-btn" :class="{ on: scPushProgressFilter === o.value }"
+                            @click="scPushProgressFilter = o.value">{{ o.label }}</button>
+                  </div>
                   <el-select v-model="scTaskTypeFilter" size="small" style="width:120px">
                     <el-option label="推送类型 全部" value="全部"/><el-option label="首次" value="first"/><el-option label="追更" value="update"/><el-option label="手动推送" value="force"/>
                   </el-select>
@@ -4688,12 +4911,18 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <div v-else class="sc-thumb-fallback">无封面</div>
                         </div>
                         <div class="sc-media-text">
-                          <b>{{ s.row.title || '未命名作品' }}</b>
-                          <small>{{ scKindLabel(s.row.kind) }} · 编号 {{ s.row.id }}</small>
-                          <!-- v2.1.22：新入库 / 新上映 / 存量排期 -->
-                          <div v-if="(s.row.tags || []).length" class="sc-rec-tags">
-                            <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                          <!-- v2.1.23（用户口径 6）：标签放在剧名**左侧同一行**，
+                               不再挂在剧名下面。表里一行一条任务，标签在左侧才能
+                               一眼扫出「哪些是新上映的」。
+                               底下的「推送类型 · 编号」保持不变（后端内部编号只用于
+                               定位，不体现字段名）。 -->
+                          <div class="sc-title-row">
+                            <span v-if="(s.row.tags || []).length" class="sc-rec-tags inline">
+                              <span v-for="t in s.row.tags" :key="t.key" class="sc-rec-tag" :class="scPushTagTone(t.key)">{{ t.label }}</span>
+                            </span>
+                            <b class="sc-title-text">{{ s.row.title || '未命名作品' }}</b>
                           </div>
+                          <small>{{ scKindLabel(s.row.kind) }} · 编号 {{ s.row.id }}</small>
                         </div>
                       </div>
                     </template>
@@ -5074,8 +5303,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </div>
               <div class="field mt"><label>模板名称</label><el-input v-model="tpl.name" placeholder="例如：电影发布模板"/></div>
               <div class="field mt"><label>消息内容</label><el-input v-model="tpl.content" type="textarea" :rows="12" placeholder="在这里编写 Telegram 消息内容"/></div>
-              <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch v-model="tpl.is_default" active-text="设为默认" class="ml"/></div>
-              <p class="hint">默认配置**只能有一条**：列表里带「默认」标签的那条才是实际推送用的模版。勾选「设为默认」保存后，原默认会自动让位，任何时候都有且只有一条默认。</p>
+              <div class="mt"><el-switch v-model="tpl.enabled" active-text="启用"/><el-switch class="ml" :model-value="!!tpl.is_default" active-text="设为默认" @change="onTplDefaultSwitch"/></div>
+              <p class="hint">默认模板「只能有一条」：列表里带「默认」标签的那条才是实际推送用的模版。打开这个开关会让原默认立刻让位（不需要再点保存）；关掉它无意义——要给别的模板设为默认，直接在那条上操作即可。</p>
               <el-button type="primary" class="mt" @click="saveTpl">保存模板</el-button>
               <el-button v-if="tpl.id" class="mt" plain @click="newTplDraft">另存为新模板</el-button>
               <div class="tpl-list">
@@ -5697,6 +5926,14 @@ button{font-family:inherit}
 .sc-form-row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}
 .sc-form-row .hint{margin:0;line-height:1.6}
 .sc-form-row .hint input,.sc-form-row .hint .el-select{display:block}
+/* v2.1.23：推送进度二分档（全部 / 未推送 / 已推送）。纯 CSS 分段控件，
+   不依赖组件库版本；选中态用主色描边+浅底，与页面其它胶囊标签一致。 */
+.sc-prog-seg{display:inline-flex;border:1px solid var(--yg-border);border-radius:8px;overflow:hidden;background:var(--yg-surface)}
+.sc-prog-btn{border:0;background:transparent;padding:0 12px;height:24px;line-height:24px;
+  font-size:12px;color:var(--yg-muted);cursor:pointer;transition:background .15s,color .15s}
+.sc-prog-btn+.sc-prog-btn{border-left:1px solid var(--yg-border)}
+.sc-prog-btn:hover{color:var(--yg-primary)}
+.sc-prog-btn.on{background:var(--yg-tone-violet-bg);color:var(--yg-primary);font-weight:600}
 /* v2.1.1：已删面板的 sc-pacing-now 样式随之清除。 */
 @media(max-width:1100px){.sc-stat-row{grid-template-columns:repeat(3,1fr)}}
 .media-body{padding:12px 13px}.media-body b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-body small{display:block;color:var(--yg-muted);font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{display:flex;gap:10px;margin-top:8px;color:var(--yg-primary);font-size:10px}
@@ -6034,10 +6271,23 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
 .sc-fc-item{display:flex;gap:10px;align-items:baseline;min-width:0;font-size:12px}
 .sc-fc-cat{flex:none;padding:0 7px;border-radius:6px;background:var(--yg-tone-blue-bg);color:var(--yg-tone-blue-fg);font-size:11px;line-height:18px}
 .sc-fc-time{flex:none;color:var(--yg-tone-amber-fg);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace}
+/* v2.1.23：时间只报「跨度 + 节奏」，不再逐部铺开（18:00、18:00… 那种乱象） */
+.sc-fc-span{flex:none;color:var(--yg-tone-amber-fg);font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.sc-fc-count{flex:none;color:var(--yg-muted);font-size:11.5px;white-space:nowrap}
+/* v2.1.23：本时段匀速节奏提示条 */
+.sc-fc-pace{margin:0 0 8px;font-size:12px;color:var(--yg-muted);display:flex;align-items:center;gap:6px}
+.sc-fc-pace-dot{width:6px;height:6px;border-radius:50%;background:var(--yg-tone-teal-fg,var(--yg-primary));flex:none}
+/* v2.1.23：剧名行——标签在左、剧名在右（推送记录/队列/失败/任务四处同一套） */
+.sc-title-row{display:flex;align-items:center;gap:5px;min-width:0;line-height:1.5}
+.sc-title-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sc-fc-title{flex:1;min-width:0;color:var(--yg-ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sc-fc-title em{font-style:normal;color:var(--yg-muted)}
 .sc-fc-idle{color:var(--yg-muted);font-size:12px}
 .sc-fc-notes{margin-top:10px;display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--yg-muted)}
+/* v2.1.23（用户口径 6）：排期按时段分批加载——底部「加载下一时段」按钮与收尾行。 */
+.sc-fc-more{margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.sc-fc-more-hint{font-size:11.5px;color:var(--yg-muted)}
+.sc-fc-done{margin-top:10px;font-size:11.5px;color:var(--yg-muted)}
 /* v2.1.22：推送记录三类标签（新入库 / 新上映 / 存量排期）。
    四个模块（今日推送排期 / 推送历史 / 推送队列 / 推送任务）共用同一套样式；
    颜色全部走 --yg-tone-* token，深色主题下自动跟随（本文件 dark 段已重定义）。 */

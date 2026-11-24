@@ -304,7 +304,12 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     if jump_lines:
         # 插在末尾 share_url 之前；无 share_url 则直接追加到末尾。
         # 用 「 · 」把三标签排在同一行，避免三个独占三行显得冗长。
-        tags_line = " · ".join(jump_lines)
+        #
+        # v2.1.23：行首补一个 ⚡ 符号（用户口径：这几个标签前面要加个符号，与上方的
+        # 内容格式对齐）。上面每行都是「emoji + 空格 + 字段」，这一行原先光秃秃地
+        # 从「频道」开头，视觉上是断层的。符号只加一个、加在行首，不逐个标签加，
+        # 否则三个 ⚡ 会显得更乱。
+        tags_line = "⚡ " + " · ".join(jump_lines)
         lines = text.split("\n")
         if lines and re.match(r"^https?://\S+$", lines[-1].strip()):
             share_line = lines.pop()

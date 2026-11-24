@@ -260,8 +260,12 @@ def test_force_bypasses_push_gate_but_auto_still_blocked(monkeypatch):
     # 本用例要先推 force 再轮到 auto，必须把时间钉在本小时第 59 分（额度放满），
     # 否则 auto 会被 throttled 直接 break，测不到门禁分支。
     _real_utcnow = sc2.utcnow
-    monkeypatch.setattr(sc2, "utcnow",
-                        lambda: _real_utcnow().replace(minute=59, second=0, microsecond=0))
+    # v2.1.23：冻结到**本排期时段的最后一分钟**，让时段匀速额度放满（口径见 conftest）。
+    # 注意：必须在 monkeypatch **之前**算好值——helper 内部要读 sc2.utcnow()，
+    # 先把 lambda 装上去会自己调自己，直接 RecursionError。
+    from conftest import freeze_at_period_end
+    _frozen = freeze_at_period_end(sc2)
+    monkeypatch.setattr(sc2, "utcnow", lambda: _frozen)
     with SessionLocal() as db:
         _plan(db)
         ch = _channel(db)

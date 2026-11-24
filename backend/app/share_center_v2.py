@@ -13,13 +13,13 @@ import logging
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, update, func, or_, delete
+from sqlalchemy import and_, select, update, func, or_, delete
 from sqlalchemy.orm import Session
 
 from . import runtime_config, utils
@@ -597,15 +597,26 @@ NEW_RELEASE_WINDOW_DAYS = 30
 # 新作，还是老片补排（存量排期）。四个地方（今日推送排期 / 推送历史 / 推送队列 /
 # 推送任务）共用同一套判定，绝不各算一套。
 #
-# 判定与「冲突处理策略」同源（同一份 release_date 窗口常量），避免两套口径打架：
-#   new_library —— 作品**首次登记进资源库**的时间落在 NEW_LIBRARY_WINDOW_DAYS 内。
-#                  取该作品最早一条库快照的登记时间（SCLibraryVersion.created_at）；
+# **v2.1.23 起过期口径按用户口径重定义（每日翻转，不再用固定天数窗口）**：
+#   new_library —— 「每日 0-24 小时入库在当日算新入库，24 时后转为存量」。
+#                  判据 = 该作品**首次登记进资源库**的时间落在**上海自然日的今天**。
+#                  取最早一条库快照的登记时间（SCLibraryVersion.created_at）；
 #                  快照缺失时退到成员文件的网盘创建时间（Resource.ctime）。
-#   new_release —— TMDB 上映日期落在最近 NEW_RELEASE_WINDOW_DAYS 天内，且**已经上映**。
-#                  未来日期一律不算「新上映」——还没上映的作品不该被标成上映了。
+#                  —— 不是「最近 7 天」，跨过今天 0 点就转存量。
+#   new_release —— 「新上映至官方剧集更新完结（TMDB 数据）延后一天的 0 时转为存量」。
+#                  判据按 TMDB 连载状态分两类：
+#                    · 剧集（tv）：
+#                        finish_status=returning（仍在更新）→ 算新上映，不会过期；
+#                        finish_status=ended     → 以「最后一集播出日 + 1 天 0 点」为界，
+#                                                  过了就转存量（last_air_date 缺失时
+#                                                  无法判定截止日，按已完结处理 → 不算新上映）；
+#                        finish_status 空（老数据未回填）→ 退回下面的电影口径。
+#                    · 电影（movie）：没有「更新完结」概念，沿用 NEW_RELEASE_WINDOW_DAYS
+#                      天上映窗口，且必须**已经上映**（未来日期不算）。
+#                  任何「还没上映」的作品都不算新上映——不能把没上映的标成上映了。
 #   backlog     —— 前两条都不成立（且至少有一项可判定）时给「存量排期」，即老片补排。
-# 前两个标签可同时出现（刚入库又刚上映）；「存量排期」只在无其他标签时出现。
-# **拿不到就留空**：入库时间与上映日期都不可判定时，标签留空，不猜成「存量排期」。
+# 前两个标签可同时出现（今日入库且仍在上映/更新）；「存量排期」只在无其他标签时出现。
+# **拿不到就留空**：入库时间与上映信息都不可判定时，标签留空，不猜成「存量排期」。
 PUSH_TAG_NEW_LIBRARY = "new_library"
 PUSH_TAG_NEW_RELEASE = "new_release"
 PUSH_TAG_BACKLOG = "backlog"
@@ -614,7 +625,8 @@ PUSH_TAG_LABELS: dict[str, str] = {
     PUSH_TAG_NEW_RELEASE: "新上映",
     PUSH_TAG_BACKLOG: "存量排期",
 }
-# 「新入库」判定窗口（天）：首次入库在这个窗口内算新入库。
+# 「新入库」判定窗口（天）。v2.1.23 起口径改为「上海自然日当天」，
+# 这个常量只保留给旧调用方/测试做兼容引用，判定不再用它。
 NEW_LIBRARY_WINDOW_DAYS = 7
 # 每个作品回查上映日期时最多取多少条成员资源（一页 200 条 × 上百集会把 SQL 参数打爆）。
 PUSH_TAG_MEMBER_ID_LIMIT = 30
@@ -1169,6 +1181,176 @@ def _uniform_minute(cap: int, index: int) -> int:
     return min(59, max(0, int(60 * (max(1, int(index)) - 1) / cap)))
 
 
+# ---------------------------------------------------------------------------
+# v2.1.23：排期时段匀速（用户口径 4）
+# ---------------------------------------------------------------------------
+# 用户原话：「推送影视应该每小时内均匀排布，不要到时间排期一起蜂拥推送：
+#            举例，本时段为 2 小时，有 4 部剧那么应该是 2 小时*60 分钟/4 部剧 = 30
+#            分钟推送一部，除不尽时四舍五入。」
+#
+# 关键决定：**把「部数」而不是「条数」作为分母**。同一部剧推到频道 + 群是两条任务，
+# 但用户认知里是「一部剧」，两部渠道任务同时出去才是对的；混在一起算会让间隔减半。
+#
+# 时段粒度取 `HOUR_SEGMENT_HOURS`（默认 2 小时），与分类时间排期的时段粒度一致 ——
+# 排期本身按 2 小时分段，匀速也按同一段算，两处不会各说各的。
+
+def _period_bounds(now_sh: datetime) -> tuple[datetime, datetime]:
+    """当前排期时段的 [起, 止)（上海时间，按 HOUR_SEGMENT_HOURS 对齐整点）。"""
+    start = now_sh.replace(minute=0, second=0, microsecond=0)
+    start -= timedelta(hours=int(start.hour) % HOUR_SEGMENT_HOURS)
+    return start, start + timedelta(hours=HOUR_SEGMENT_HOURS)
+
+
+def _pace_interval_minutes(period_start: datetime, period_end: datetime,
+                           count: int) -> int:
+    """时段内均分的间隔分钟数 = 四舍五入(时段分钟 / 部数)，最小 1 分钟。"""
+    if count <= 0:
+        return 0
+    total = max(1, int(round((period_end - period_start).total_seconds() / 60)))
+    return max(1, int(round(total / count)))
+
+
+def _pace_slot_times(period_start: datetime, period_end: datetime,
+                     count: int) -> list[datetime]:
+    """把 `count` 部作品均匀铺满一个时段，返回每部的预计时刻（升序）。
+
+    例：2 小时（120 分钟）/ 4 部 = 30 分钟 → 起点、+30、+60、+90。
+    除不尽按四舍五入（120/7 ≈ 17 分钟）；至少 1 分钟，避免挤在同一时刻。
+    """
+    if count <= 0:
+        return []
+    step = _pace_interval_minutes(period_start, period_end, count)
+    return [period_start + timedelta(minutes=step * i) for i in range(count)]
+
+
+# 「已经真的放出去了」的状态：这些任务会让作品的时段份额被消耗掉。
+# invalid / cancelled 不算 —— 它们没发出去，不该占用本时段的匀速额度。
+PACE_RELEASED_STATUS = frozenset(
+    {"submitted", "accepted", "publishing", "published", "failed", "skipped"})
+
+
+def _period_pace(db: Session, now: datetime) -> dict[str, Any]:
+    """算本时段的匀速额度（dispatch 用）。
+
+    返回：`period_start` / `period_end` / `n_works` / `interval` / `due`。
+    `n_works` = 本时段已建任务覆盖的作品数（按 `scheduled_at` 落段内，distinct work_key）；
+    `due`     = 到此刻应已放行的作品数 = floor(已过分钟 / interval) + 1。
+    `n_works = 0`（本时段还没排任何任务）时 `due = None`，调用方不额外限流。
+    """
+    now_sh = utils.as_utc(now).astimezone(shanghai_tz())
+    start_sh, end_sh = _period_bounds(now_sh)
+    start_utc = start_sh.astimezone(timezone.utc)
+    end_utc = end_sh.astimezone(timezone.utc)
+    out: dict[str, Any] = {"period_start": start_sh, "period_end": end_sh,
+                           "n_works": 0, "interval": 0, "due": None}
+    try:
+        n_works = int(db.scalar(
+            select(func.count(func.distinct(SCPublishTask.work_key)))
+            .where(SCPublishTask.status != CLEANED_TASK_STATUS,
+                   SCPublishTask.scheduled_at.isnot(None),
+                   SCPublishTask.scheduled_at >= start_utc,
+                   SCPublishTask.scheduled_at < end_utc)) or 0)
+    except Exception:
+        db.rollback()
+        return out
+    if n_works <= 0:
+        return out
+    interval = _pace_interval_minutes(start_sh, end_sh, n_works)
+    elapsed = max(0, int((now_sh - start_sh).total_seconds() // 60))
+    out.update({"n_works": n_works, "interval": interval,
+                "due": int(elapsed // interval) + 1})
+    return out
+
+
+def _period_released(db: Session, pace: dict[str, Any]) -> int:
+    """本时段**已经放出去**的作品数（distinct work_key，口径见 `PACE_RELEASED_STATUS`）。"""
+    start_sh = pace["period_start"]
+    end_sh = pace["period_end"]
+    try:
+        return int(db.scalar(
+            select(func.count(func.distinct(SCPublishTask.work_key)))
+            .where(SCPublishTask.scheduled_at.isnot(None),
+                   SCPublishTask.scheduled_at >= start_sh.astimezone(timezone.utc),
+                   SCPublishTask.scheduled_at < end_sh.astimezone(timezone.utc),
+                   SCPublishTask.status.in_(PACE_RELEASED_STATUS))) or 0)
+    except Exception:
+        db.rollback()
+        return 0
+
+
+def _tags_for_status(tags: list[dict], status: str) -> list[dict]:
+    """按任务状态裁剪标签：**已结束**的记录不显示「存量排期」。
+
+    用户口径 5：「新上映标签失效时，推送历史里该标签应消失」。
+    标签是实时判定的，失效后自然会从「新上映」变成「存量排期」；但「存量排期」
+    描述的是**还没推**的原因（老片补排），套在一条早就推完的历史记录上没有信息量。
+    所以终态行只保留仍然有效的「新入库 / 新上映」，其余留空 → 页面显示「—」。
+    """
+    if str(status or "") in ACTIVE_TASK_STATUS:
+        return tags
+    return [t for t in tags if str(t.get("key") or "") != PUSH_TAG_BACKLOG]
+
+
+def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, Any]:
+    """把「今日推送排期」里每部作品的预计时间改成**时段内均分**，并回写。
+
+    为什么需要这一道后处理：模拟阶段是**逐小时**跑的，同一时段跨两个小时，
+    逐小时各自摊分钟数会把「18:00-20:00 共 4 部」算成每小时各 4 部，
+    间隔直接错一半。这里按「排期时段」重新归堆后再统一算，口径与
+    `_pace_slot_times` / dispatch 完全一致（时段分钟 ÷ 部数，除不尽四舍五入）。
+
+    返回该时段的节奏摘要（`interval_minutes` / `works`），前端拿去在面板顶部
+    写「本时段每 30 分钟 1 部」，不用自己算。
+    """
+    period_counts: dict[int, int] = {}
+    period_entries: dict[int, list[tuple[dict, dict]]] = {}
+    for h in hours:
+        hour = int(h.get("hour") or 0)
+        psh = hour - hour % HOUR_SEGMENT_HOURS
+        for it in h.get("items") or []:
+            # `works_total` 是未截断的作品数，均分必须按真实部数算间隔
+            period_counts[psh] = period_counts.get(psh, 0) + int(
+                it.get("works_total") or len(it.get("works") or []))
+            for w in it.get("works") or []:
+                if not str(w.get("work_key") or ""):
+                    continue
+                period_entries.setdefault(psh, []).append((it, w))
+    pace_info: dict[str, Any] = {"period_hours": HOUR_SEGMENT_HOURS,
+                                 "interval_minutes": 0, "works": 0}
+    for psh, entries in period_entries.items():
+        start = now_sh.replace(hour=psh, minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=HOUR_SEGMENT_HOURS)
+        base = now_sh.replace(second=0, microsecond=0)
+        if base < start:
+            base = start
+        if base >= end:
+            continue          # 这个时段已经过去，不留时间点
+        count = max(len(entries), int(period_counts.get(psh) or 0))
+        # v2.1.23：间隔按「**整个时段长度** ÷ 部数」算 —— 与 dispatch 的
+        # `_period_pace` 同一个口径（那里 interval 也是全程算）。两处若一个按
+        # 全程、一个按剩余时长，预测就会比实跑偏快，等于告诉用户错的时间
+        # （v2.1.19 红线：预测与实跑算出差就是骗人）。
+        # 但**站台锚在"现在"**而不是时段起点：时段起点可能已经过去（15:07 打开页面
+        # 却显示 14:00 的站台），排期要回答的是「接下来几点推」。
+        interval = _pace_interval_minutes(start, end, count) or 1
+        slots = [base + timedelta(minutes=interval * i) for i in range(max(1, count))]
+        objs: dict[int, dict] = {}
+        item_times: dict[int, list[str]] = {}
+        for idx, (it, w) in enumerate(entries):
+            text = slots[idx].strftime("%H:%M") if idx < len(slots) else ""
+            w["time"] = text
+            objs[id(it)] = it
+            if text:
+                item_times.setdefault(id(it), []).append(text)
+        for oid, texts in item_times.items():
+            # 去重且保序：同一部剧推频道 + 群是同一个时间点，不该在行里重复铺 N 遍
+            objs[oid]["times"] = list(dict.fromkeys(texts))
+        if not pace_info["interval_minutes"]:
+            pace_info["interval_minutes"] = interval
+            pace_info["works"] = count
+    return pace_info
+
+
 def _category_today_count(db: Session, category_key: str) -> int:
     """某分类当日已创建任务数（分类排期 daily_limit 用）。上海自然日。"""
     now_sh = datetime.now(shanghai_tz())
@@ -1463,7 +1645,8 @@ def first_dedup_plan(db: Session, *, work_key: str, chat_id: str,
 
 
 def _instant_candidates(db: Session, mode: str,
-                        limit: int = INSTANT_ROUND_LIMIT) -> list[tuple[str, int, str]]:
+                        limit: int = INSTANT_ROUND_LIMIT, *,
+                        now_sh: datetime | None = None) -> list[tuple[str, int, str]]:
     """上新即时推送的候选作品：返回 `[(work_key, 最新快照 id, lane)]`（已排好先后）。
 
     lane = `new_release`（新上映，插队立即推）或 `new_library`（新入库，优先排队）。
@@ -1471,33 +1654,57 @@ def _instant_candidates(db: Session, mode: str,
       · 新上映按**上映日期倒序**（越新的越先推）；
       · 新入库按**首次入库时间升序**（先入库先推 —— 「按资源库入库的顺序」）。
 
+    `now_sh` 仅供测试注入固定时刻：v2.1.23 起「新入库」按**上海自然日**判定
+    （当天入库才算），不注入就没法稳定复现「同一天内先入库的先推」这条顺序。
+
     v2.1.22 性能约束：本函数跑在 `_job_share_center` 的 5 秒周期里，所以
       ① 只取判定要用的窄列，不加载整行 `Resource` / `SCLibraryVersion` 实体；
       ② 最新快照只对**命中窗口的候选键**回查，不做全库 group by 后全量物化。
     """
     if mode == "off":
         return []
-    now_sh = datetime.now(shanghai_tz())
+    now_sh = now_sh or datetime.now(shanghai_tz())
     today = now_sh.strftime("%Y-%m-%d")
     rel_cutoff = (now_sh - timedelta(days=NEW_RELEASE_WINDOW_DAYS)).strftime("%Y-%m-%d")
 
     ordered: list[tuple[str, str]] = []   # [(work_key, lane)]，最终先后顺序
     seen: set[str] = set()
 
-    # ① 新上映：release_date 落在窗口内且**已经上映**（未来日期不算，不能编造）
+    # ① 新上映：与 `_work_push_tags` **同一判据**（`_new_release_state`）。
+    # v2.1.23 起不再只看「上映 30 天窗口」——仍在更新的剧集首播日可能很早，
+    # 但它确实属于新上映；刚完结的剧集则按「最后一集播出日次日 0 点」过期。
     newest: dict[str, str] = {}
     rows = db.execute(select(
         Resource.file_id, Resource.path_hint, Resource.share_dir_name,
         Resource.media_title, Resource.tmdb_id, Resource.media_type,
-        Resource.release_date,
-    ).where(
-        Resource.release_date.isnot(None), Resource.release_date != "",
-        Resource.release_date >= rel_cutoff,
-        Resource.release_date <= today)).all()
+        Resource.release_date, Resource.last_air_date, Resource.finish_status,
+    ).where(or_(
+        # 电影 / 剧集状态未知：上映 30 天窗口内且已上映
+        and_(Resource.release_date.isnot(None), Resource.release_date != "",
+             Resource.release_date >= rel_cutoff,
+             Resource.release_date <= today),
+        # 剧集仍在更新
+        Resource.finish_status == "returning",
+        # 剧集刚完结：最后一集播出日 >= 今天（播出日次日 0 点才过期）
+        and_(Resource.finish_status == "ended",
+             Resource.last_air_date.isnot(None), Resource.last_air_date != "",
+             Resource.last_air_date >= today),
+    ))).all()
     for res in rows:
         key = utils.work_group_key(res)
-        day = str(res.release_date or "")[:10]
-        if key and (key not in newest or day > newest[key]):
+        if not key:
+            continue
+        if not _new_release_state(
+                release_date=str(res.release_date or ""),
+                last_air_date=str(res.last_air_date or ""),
+                finish_status=str(res.finish_status or ""),
+                media_type=str(res.media_type or ""),
+                now_sh=now_sh):
+            continue
+        # 排序键 = 该作品最近的一个「有意义的日期」：
+        # 仍在更新的剧集用最后一集播出日（更能代表「新」），其余用上映/首播日。
+        day = max(str(res.release_date or "")[:10], str(res.last_air_date or "")[:10])
+        if key not in newest or day > newest[key]:
             newest[key] = day
     for key, _day in sorted(newest.items(), key=lambda kv: kv[1], reverse=True):
         if key in seen:
@@ -1510,8 +1717,11 @@ def _instant_candidates(db: Session, mode: str,
     # ② 新入库（仅 prefer_new）：按**首次入库时间**升序优先排队。
     # 「首次入库」取该作品最早一条快照的登记时间（与其他标签判定同源），
     # 所以老片昨天更新了新版本不会被误判成新入库。
+    # v2.1.23：窗口收紧到「上海自然日的今天」——与标签口径完全一致。
     if mode == "prefer_new" and len(ordered) < limit:
-        lib_cutoff = utcnow() - timedelta(days=NEW_LIBRARY_WINDOW_DAYS)
+        today_start_sh = datetime.now(shanghai_tz()).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        lib_cutoff = today_start_sh.astimezone(timezone.utc)
         fresh = db.execute(
             select(SCLibraryVersion.work_key,
                    func.min(SCLibraryVersion.created_at).label("entered"),
@@ -2046,7 +2256,9 @@ def register_force_tasks(db: Session, resource: Resource,
 
 
 def forecast_schedule(db: Session, *, scan_limit: int = 4000,
-                      per_hour_top: int = 4) -> dict[str, Any]:
+                      per_hour_top: int = 4,
+                      from_hour: int | None = None,
+                      paged: bool = False) -> dict[str, Any]:
     """当天剩余时段的推送排期预测。**只读**：不写库、不建任务、不发消息。
 
     用户口径（v2.1.19）：发布规则不只是「分流规则」，而是调动资源库存量、有序推送的
@@ -2080,6 +2292,16 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         # v2.1.22：插队档位与插队作品数（off 时为 0，前端据此说明"全量按排期轮转"）
         "instant_mode": "off",
         "instant_works": 0,
+        # v2.1.23（用户口径 6）：分时段取数——从哪个小时开始模拟、这次覆盖到哪。
+        # 不传 `paged` → 从当前小时算到 24 点（保持既有行为，一次看全天）。
+        # `paged=True` → 只算**一个排期时段**（`HOUR_SEGMENT_HOURS` 小时）：
+        #   首屏不带 `from_hour` 取「当前时段」，要看下一段再带 `from_hour` 来取。
+        # 单次请求少模拟几个小时，首屏更快、后端少扫几轮候选。
+        # **只影响「看」的范围，不影响「推」**：`plan_engine` 照旧把当日任务建满，
+        # `dispatch` 照旧连续往外发 —— 推送不分页。
+        "page": {"from_hour": None, "to_hour": 24, "next_hour": None,
+                 "has_more": False, "partial": False,
+                 "segments": HOUR_SEGMENT_HOURS},
     }
 
     version = _active_version(db)
@@ -2106,9 +2328,8 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         hourly_cap = 0
     out["config"] = {"category_limit": category_limit, "work_limit": work_limit,
                      "hour_max": hour_max, "per_hour_cap": hourly_cap}
-    if not hourly_cap:
-        out["notes"].append("未设置每小时上限：任务会一到位就推出去，建议配一个每小时"
-                            "上限，排期才会在时段内摊开。")
+    # v2.1.23：不再提示「未设每小时上限就会一到位全推」——现在**无论如何**都按
+    # 排期时段匀速放行（口径见 `_pace_slot_times`），每小时上限只作额外的绝对闸门。
 
     channels = list(db.scalars(select(Channel).where(Channel.enabled.is_(True))).all())
     if not channels:
@@ -2219,7 +2440,37 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
             out["instant_works"] = len(instant_rows)
 
     # ---- 逐小时模拟 ----
-    for h in range(now_sh.hour, 24):
+    # v2.1.23（用户口径 6）：分时段取数。「排期完成后再加载下一页」——先排
+    # 14:00-16:00，用户点「加载下一时段」再排 16:00-18:00，不要一次性全量重排。
+    # 目的有两个：单次请求少模拟几小时（首屏快、后端轻），以及不让几百部作品
+    # 一次性堆在同一张表里。
+    seg = max(1, int(HOUR_SEGMENT_HOURS))
+    if paged:
+        base = int(now_sh.hour)
+        if from_hour is not None:
+            try:
+                base = max(base, min(23, int(from_hour)))
+            except (TypeError, ValueError):
+                pass
+        # 起点不早于当前小时（不预测已经过去的整点），终点对齐到**时段末尾**：
+        # 15:30 → 15:00-16:00（只排剩下的小时），下一段从 16:00 接上，不重叠不跳空。
+        start_hour = base
+        end_hour = min(24, base - (base % seg) + seg)
+    else:
+        start_hour = int(now_sh.hour)
+        if from_hour is not None:
+            try:
+                want = int(from_hour)
+            except (TypeError, ValueError):
+                want = start_hour
+            start_hour = max(start_hour, min(23, want))
+        end_hour = 24
+    out["page"]["from_hour"] = start_hour
+    out["page"]["to_hour"] = end_hour
+    out["page"]["partial"] = end_hour < 24
+    out["page"]["has_more"] = end_hour < 24
+    out["page"]["next_hour"] = end_hour if end_hour < 24 else None
+    for h in range(start_hour, end_hour):
         win = next((w for w in hour_windows
                     if int(w.start_hour or 0) <= h < int(w.end_hour or 0)), None)
         if hour_windows and win is None:
@@ -2263,24 +2514,24 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 ititles = _work_titles(db, ikeys)
                 icovers = _work_posters(db, ikeys)
                 itags = _work_push_tags(db, ikeys)
-                iminutes = [_uniform_minute(hourly_cap, k)
-                            for k in range(hour_tasks - taken_tasks + 1, hour_tasks + 1)]
                 works: list[dict[str, Any]] = []
-                for idx, wk in enumerate(ikeys):
+                for wk in ikeys:
                     works.append({
                         "work_key": wk,
                         "title": str(ititles.get(wk) or ""),
                         "cover": str(icovers.get(wk) or ""),
                         "tags": itags.get(wk, []),
-                        "time": ("%02d:%02d" % (h, iminutes[idx])
-                                 if idx < len(iminutes) else ""),
+                        "time": "",
                     })
                 hour_items.append({
                     "category": "上新即时推送",
                     "count": taken_tasks,
-                    "times": ["%02d:%02d" % (h, m) for m in iminutes],
+                    # v2.1.23：预计时间统一由 `_respread_forecast_times` 按
+                    # 「时段内均分」回填；这里先留空，绝不再吐一排相同的整点。
+                    "times": [],
                     "titles": [t for t in ititles.values() if t],
                     "works": works,
+                    "works_total": len(ikeys),
                     "more": max(0, len(instant_rows) - len(taken)),
                 })
         for cat in cats:
@@ -2318,12 +2569,7 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 if wk not in titles:
                     titles.append(wk)
             if built:
-                # 该分类在本小时内的预计时间点：按 cap 匀速摊到 60 分钟
-                # 注意：变量名不能叫 slots——那是上面的 _SlotIndex，复用它会让
-                # first_dedup_plan 拿到一个时间字符串列表，名额判定直接崩。
-                minute_slots = [_uniform_minute(hourly_cap, k)
-                                for k in range(hour_tasks - built + 1, hour_tasks + 1)]
-                # v2.1.20：额外给出结构化作品项（work_key + 标题 + 封面 + 首个预计时间），
+                # v2.1.20：额外给出结构化作品项（work_key + 标题 + 封面 + 预计时间），
                 # 供「推送队列」直接复用 —— 三个模块（排期 / 队列 / 任务）的标题与封面
                 # 必须同源（都走 _work_titles / _work_posters），否则同一部作品在两处
                 # 显示不同名字或一处有封面一处没封面。`titles` 保留给旧调用方。
@@ -2334,26 +2580,32 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 # 与推送历史 / 队列 / 任务同源（同一个 _work_push_tags）。
                 wk_tags = _work_push_tags(db, top_keys)
                 works: list[dict[str, Any]] = []
-                for idx, wk in enumerate(top_keys):
+                for wk in top_keys:
                     works.append({
                         "work_key": wk,
                         "title": str(wk_titles.get(wk) or ""),
                         "cover": str(wk_covers.get(wk) or ""),
                         "tags": wk_tags.get(wk, []),
-                        "time": ("%02d:%02d" % (h, minute_slots[idx])
-                                 if idx < len(minute_slots) else ""),
+                        "time": "",
                     })
                 hour_items.append({
                     "category": _category_display_name(key),
                     "count": built,
-                    "times": ["%02d:%02d" % (h, m) for m in minute_slots],
+                    # v2.1.23：预计时间统一由 `_respread_forecast_times` 回填。
+                    # `works_total` 是**未截断**的作品数——均分要按真实部数算间隔，
+                    # 若按「只展示前 4 部」来算，间隔会被估大一倍。
+                    "times": [],
                     "titles": [t for t in wk_titles.values() if t],
                     "works": works,
+                    "works_total": len(titles),
                     "more": max(0, len(titles) - per_hour_top),
                 })
         total = sum(i["count"] for i in hour_items)
         out["today_total"] += total
         out["hours"].append({"hour": h, "total": total, "items": hour_items})
+
+    # v2.1.23：按「排期时段」把作品的时间均分回写（用户口径 4）。
+    out["pace"] = _respread_forecast_times(out["hours"], now_sh)
 
     out["works_total"] = len(set(wk for wk, _ in planned_pairs))
 
@@ -2378,8 +2630,16 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 backlog_pairs.add((wk, chat_id))
         if truncated:
             break
-    out["overflow"] = len(backlog_pairs)
-    out["backlog"] = len(backlog_pairs) + len(planned_pairs)
+    if end_hour < 24:
+        # 分页时只模拟了一段：「排不进今天」「存量总量」都还没算完，报出去就是假数字。
+        # 留 None（前端隐藏那两处），等最后一个时段加载完再给真值。
+        out["overflow"] = None
+        out["backlog"] = None
+        out["notes"].append("按排期时段分批加载：已排到 %02d:00，后面还有 %d 个时段。"
+                            % (end_hour, (24 - end_hour + seg - 1) // seg))
+    else:
+        out["overflow"] = len(backlog_pairs)
+        out["backlog"] = len(backlog_pairs) + len(planned_pairs)
     if truncated:
         out["notes"].append("存量作品过多，本次只盘点到 %d 部，实际待推量可能更多。" % scan_limit)
 
@@ -2602,7 +2862,10 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
              # v2.1.16：复用已有有效分享链接的任务数（不重建链接，避免网盘堆废分享）
              "reused": 0,
              # v2.1.16：建分享失败 → 标记为「无效推送」的任务数
-             "invalid": 0}
+             "invalid": 0,
+             # v2.1.23：因「本时段匀速额度已用完」而留到下一轮的任务数
+             # （不是失败、不是门禁，是节奏——下一轮会在下一个时间点放行）
+             "paced": 0}
     # v2.1.3：单轮墙钟预算起点。
     round_started = time.monotonic()
     # v2.1.3：代表资源解析器在整轮内复用一次实时索引，避免每条任务全表扫描。
@@ -2637,6 +2900,11 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         submitted_this_hour = int(db.scalar(select(func.count(SCPublishTask.id)).where(
             SCPublishTask.status.in_({"submitted", "accepted", "published", "failed"}),
             SCPublishTask.scheduled_at >= hour_start)) or 0)
+    # v2.1.23：时段匀速（用户口径 4）——「本时段 2 小时、4 部 → 30 分钟一部」。
+    # 分母是**部数**（distinct work_key），不是任务数：同一部剧推频道 + 群是两条任务，
+    # 但同时出去才对；按条算会把间隔砍半。
+    # 与上面的每小时上限**并存取更严**：上限是绝对闸门，匀速是节奏。
+    pace = _period_pace(db, now)
     for task_index, task in enumerate(tasks):
         # v2.1.3：单轮墙钟预算。超预算就把剩余任务留给下一轮（它们仍是
         # planned/ready，下一轮自然被捞起）——绝不让一轮跑到十几分钟，
@@ -2743,6 +3011,16 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
         # 分享记录；而旧链接一旦作废，群里那条消息仍然指向它，等于白发一条。
         # 用户口径：「待推送时**若无推送链接**才重新触发分享链接」。
         # 判定「有链接」= share_url 非空 且 link_state 不是 cleaned/invalid。
+        #
+        # v2.1.23：时段匀速门禁放在**这里**——已经确认真要发条消息了才查节奏。
+        # 此前它放在循环最前面，会把「跳过重复投递 / 无效推送 / 门禁未过」这些
+        # **不消耗额度**的分支一起挡掉：用户看到的是 `paced` 而不是 `skipped`，
+        # 统计口径就错了（真机表现为"明明该跳过却什么都没做"）。
+        # 手动强推豁免：用户点按钮就要在当下发出去。
+        if (pace["due"] is not None and task.kind != FORCE_TASK_KIND
+                and _period_released(db, pace) >= pace["due"]):
+            stats["paced"] += 1
+            break
         reuse_link = (str(task.share_url or "").strip()
                       and str(task.link_state or "") not in INVALID_LINK_STATES)
         if reuse_link:
@@ -3500,7 +3778,10 @@ def _aggregate_views(db: Session, limit: int = 12) -> dict[str, Any]:
             key = str(row.get("work_key") or "")
             row["title"] = titles.get(key, "")
             row["cover"] = posters.get(key, "")
-            row["tags"] = tags.get(key, [])
+            # v2.1.23（用户口径 1）：**已结束**的记录不显示「存量排期」——
+            # 标签失效（新上映过期）后自然会变成存量排期，但一条早就推完的历史记录
+            # 上写「存量排期」没有信息量，用户要的是「失效就消失」。
+            row["tags"] = _tags_for_status(tags.get(key, []), str(row.get("status") or ""))
         return out
 
     return {"history": rows_for({"published"}),
@@ -3726,14 +4007,18 @@ def api_assign_preference_windows(body: Payload, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/forecast")
-def api_forecast(db: Session = Depends(get_db)):
+def api_forecast(from_hour: int | None = None, paged: bool = False,
+                 db: Session = Depends(get_db)):
     """今日排期预测（v2.1.19）。
 
     为什么单独开一个端点而不塞进 `/overview`：`overview` 会调 `ensure_defaults`
     并把六张表全量聚合，本身已经重；排期预测还要扫作品快照和名额索引，合并会把
     整个仪表盘首屏拖慢。这里保持只读、按需加载，前端先渲染已有卡片再补排期。
+
+    v2.1.23：`paged=1` 支持**分时段取数**（用户口径 6）——前端先取当前时段，
+    要看下一时段再带 `from_hour` 来取，不必每次都模拟到 24 点。
     """
-    return forecast_schedule(db)
+    return forecast_schedule(db, from_hour=from_hour, paged=paged)
 
 
 @router.get("/overview")
@@ -4427,21 +4712,34 @@ def _work_push_tags(db: Session, work_keys) -> dict[str, list[dict[str, str]]]:
                 break
         member_ids[key] = ids
 
-    # ② 回查资源表：上映日期 + 网盘创建时间（入库时间兜底）
+    # ② 回查资源表：上映/完结信息 + 网盘创建时间（入库时间兜底）
     id_to_keys: dict[int, list[str]] = {}
     for key, ids in member_ids.items():
         for rid in ids:
             id_to_keys.setdefault(rid, []).append(key)
-    release_raw: dict[str, str] = {}
+    rel_raw: dict[str, str] = {}
+    air_raw: dict[str, str] = {}
+    finish_raw: dict[str, str] = {}
+    type_raw: dict[str, str] = {}
     ctime_at: dict[str, datetime] = {}
     if id_to_keys:
-        for rid, rel, ctime in db.execute(
-                select(Resource.id, Resource.release_date, Resource.ctime)
+        for rid, rel, last_air, finish, mtype, ctime in db.execute(
+                select(Resource.id, Resource.release_date, Resource.last_air_date,
+                       Resource.finish_status, Resource.media_type, Resource.ctime)
                 .where(Resource.id.in_(set(id_to_keys)))).all():
             for key in id_to_keys.get(int(rid), []):
                 rel_text = str(rel or "").strip()
-                if rel_text and not release_raw.get(key):
-                    release_raw[key] = rel_text
+                if rel_text and not rel_raw.get(key):
+                    rel_raw[key] = rel_text
+                air_text = str(last_air or "").strip()
+                if air_text and not air_raw.get(key):
+                    air_raw[key] = air_text
+                finish_text = str(finish or "").strip()
+                if finish_text and not finish_raw.get(key):
+                    finish_raw[key] = finish_text
+                type_text = str(mtype or "").strip()
+                if type_text and not type_raw.get(key):
+                    type_raw[key] = type_text
                 try:
                     ctime_int = int(ctime or 0)
                 except (TypeError, ValueError):
@@ -4453,32 +4751,78 @@ def _work_push_tags(db: Session, work_keys) -> dict[str, list[dict[str, str]]]:
                         ctime_at[key] = stamp
 
     now_utc = utcnow()
-    lib_cutoff = now_utc - timedelta(days=NEW_LIBRARY_WINDOW_DAYS)
     now_sh = now_utc.astimezone(shanghai_tz())
     today_sh = now_sh.date()
-    rel_cutoff = (now_sh - timedelta(days=NEW_RELEASE_WINDOW_DAYS)).date()
-
     for key in keys:
         tags: list[str] = []
         entered = entry_at.get(key) or ctime_at.get(key)
-        is_new_lib = bool(entered is not None and entered >= lib_cutoff)
-        rel_text = str(release_raw.get(key) or "").strip()[:10]
-        rel_date = None
-        if rel_text:
-            try:
-                rel_date = datetime.strptime(rel_text, "%Y-%m-%d").date()
-            except ValueError:
-                rel_date = None
-        is_new_rel = bool(rel_date is not None and rel_cutoff <= rel_date <= today_sh)
+        # v2.1.23：= 「上海自然日的今天入库」。跨过今天 0 点就转存量，
+        # 不再用「最近 7 天」——用户口径是当日有效。
+        is_new_lib = bool(entered is not None
+                          and entered.astimezone(shanghai_tz()).date() == today_sh)
         if is_new_lib:
             tags.append(PUSH_TAG_NEW_LIBRARY)
-        if is_new_rel:
+        verdict = _new_release_state(
+            release_date=rel_raw.get(key, ""),
+            last_air_date=air_raw.get(key, ""),
+            finish_status=finish_raw.get(key, ""),
+            media_type=type_raw.get(key, ""),
+            now_sh=now_sh,
+        )
+        if verdict:
             tags.append(PUSH_TAG_NEW_RELEASE)
-        # 两项都判不出（没快照也没上映日期）→ 留空，不猜成存量排期。
-        if not tags and (entered is not None or rel_date is not None):
+        # 两项都判不出（没快照也没上映信息）→ 留空，不猜成存量排期。
+        if not tags and (entered is not None or verdict is not None):
             tags.append(PUSH_TAG_BACKLOG)
         out[key] = [{"key": t, "label": PUSH_TAG_LABELS[t]} for t in tags]
     return out
+
+
+def _parse_dt_date(text: str) -> date | None:
+    """把 `YYYY-MM-DD` 文本解析成 date；解析不了返回 None（绝不猜一个日期）。"""
+    raw = str(text or "").strip()[:10]
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _new_release_state(*, release_date: str, last_air_date: str,
+                       finish_status: str, media_type: str,
+                       now_sh: datetime) -> bool | None:
+    """该作品现在算不算「新上映」。返回值三态：
+
+      True  —— 仍在映/更新期内，标「新上映」；
+      False —— 已过映/更新期，转存量；
+      None  —— 任何可判定的日期都拿不到（无从判断，调用方据此决定是否给存量标签）。
+
+    过期口径（用户原话）：「新上映至官方剧集更新完结（TMDB 数据）延后一天的 0 时转为存量」。
+      · 剧集 + returning                 → 仍在更新，True（不会过期）；
+      · 剧集 + ended + 有最后一集播出日   → 以「播出日 + 1 天 0 点」为界，之前 True；
+      · 剧集 + ended + 无最后一集播出日   → 只知道已完结、不知何时完结 → False（不猜日期）；
+      · 电影 / 剧集状态未知              → 沿用 30 天上映窗口（电影没有连载概念）。
+    任何情况下「还没上映」（日期在未来）都不算新上映。
+    """
+    today = now_sh.date()
+    rel = _parse_dt_date(release_date)
+    is_tv = str(media_type or "").strip().lower() == "tv"
+    state = str(finish_status or "").strip().lower()
+    if is_tv and state == "returning":
+        return not (rel is not None and rel > today)
+    if is_tv and state == "ended":
+        air = _parse_dt_date(last_air_date)
+        if air is None:
+            return False
+        # 「更新完结延后一天的 0 时」→ 播出日次日 00:00 起转存量。
+        return now_sh.date() <= air
+    # 电影，或剧集状态未知：退回上映窗口口径。
+    if rel is None:
+        return None
+    if rel > today:
+        return False          # 还没上映
+    return rel >= (now_sh - timedelta(days=NEW_RELEASE_WINDOW_DAYS)).date()
 
 
 @router.get("/tasks")
@@ -4502,7 +4846,8 @@ def api_tasks(status: str = "", limit: int = 200,
         key = str(row.get("work_key") or "")
         row["title"] = titles.get(key, "")
         row["cover"] = posters.get(key, "")
-        row["tags"] = tags.get(key, [])
+        # v2.1.23（用户口径 1）：终态行不显示「存量排期」，口径见 `_tags_for_status`
+        row["tags"] = _tags_for_status(tags.get(key, []), str(row.get("status") or ""))
         info = channels.get(int(row["id"])) or {}
         row["channel_names"] = info.get("channel_names") or []
         row["group_names"] = info.get("group_names") or []
@@ -4540,7 +4885,9 @@ def api_task_detail(task_id: int, db: Session = Depends(get_db)):
     # v2.1.4：详情内页同样展示海报与渠道
     item["cover"] = _work_posters(db, [key]).get(key, "")
     # v2.1.22：详情与列表同源展示三类标签
-    item["tags"] = _work_push_tags(db, [key]).get(key, [])
+    # v2.1.23：终态行不显示「存量排期」（口径见 `_tags_for_status`）
+    item["tags"] = _tags_for_status(
+        _work_push_tags(db, [key]).get(key, []), str(item.get("status") or ""))
     info = _task_channel_info(db, [int(task_id)]).get(int(task_id)) or {}
     item["channel_names"] = info.get("channel_names") or []
     item["group_names"] = info.get("group_names") or []

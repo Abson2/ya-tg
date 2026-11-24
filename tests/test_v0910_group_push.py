@@ -170,6 +170,11 @@ def test_build_message_has_jump_tag_links_in_body(db):
     assert " · " in text
     # 旧 inline 按钮文案不再出现在正文
     assert "📢 官方频道" not in text and "🤖 机器人" not in text
+    # v2.1.23（用户口径 6）：这一行行首必须带一个符号，与上方「emoji + 空格 + 字段」
+    # 的行格式对齐；此前它从「频道」直接开头，视觉上是断层的。
+    line = next(l for l in text.split("\n") if "投稿·求片</a>" in l)
+    assert line.startswith("⚡ "), line
+    assert line.count("⚡") == 1, line      # 只加行首一个，不逐个标签加
 
 
 def test_inline_keyboard_only_resource_button(db):

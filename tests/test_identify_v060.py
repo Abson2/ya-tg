@@ -121,8 +121,8 @@ def test_default_template_emits_tmdb_classification_tags():
     # v0.6.4：新默认模板改为整剧展示，用标签串替代 type=/origin_country=/genres= 调试行
     assert "#保镖恋人" in text and "#电影" in text and "#爱情" in text
     assert "资源：" not in text and ".mkv" not in text  # 不再暴露单集文件名
-    # v2.1.22：默认图文改为 🏷 标签行（标题不再带 🖼️ 后缀）
-    assert "🏷 #保镖恋人" in text
+    # v2.1.23：标签行带「标签:」前缀（与参考图一致），标签本身仍带 # 号
+    assert "🏷 标签: #保镖恋人" in text
     tpl = db.scalar(select(MessageTemplate).where(MessageTemplate.is_default.is_(True)))
     # v2.1.22：入口链接（频道/投稿·求片）由渲染层统一追加，模板里不再有 {{buttons_text}}
     assert tpl and "{{tags}}" in tpl.content and "{{share_url}}" in tpl.content

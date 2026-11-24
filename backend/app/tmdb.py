@@ -360,6 +360,9 @@ def _normalize(item: dict, media_type: str) -> dict:
         "year": date[:4],
         # v0.9.9 #202：完整首播/上映日期，供消息模板 {{release_date}}
         "release_date": date,
+        # v2.1.23：剧集最后一集播出日。`finish_status=ended` 时它决定「新上映」
+        # 标签何时过期（次日 0 点转存量）。电影没有连载概念，恒为空。
+        "last_air_date": (str(item.get("last_air_date") or "") if media_type == "tv" else ""),
         "poster_path": item.get("poster_path") or "",
         "backdrop_path": item.get("backdrop_path") or "",
         "overview": item.get("overview") or "",

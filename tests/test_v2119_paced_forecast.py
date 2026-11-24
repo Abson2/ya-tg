@@ -303,11 +303,15 @@ def test_forecast_lists_hours_and_titles_for_backlog():
 
 
 def test_forecast_times_are_paced_not_all_at_the_top(monkeypatch):
-    """cap=3 时，同一小时的 3 个时间点必须摊开，不能都在 :00。
+    """时间点必须摊开，不能一排都堆在整点。
+
+    v2.1.23 改口径：节奏从「每小时均分」升级为「**每个 2 小时时段均分**」
+    （用户口径：本时段 2 小时、4 部 → 30 分钟 1 部，除不尽四舍五入）。
+    所以间隔 = 时段分钟 ÷ 部数 = 120 ÷ 3 = 40 分钟，站台锚定在时段起点，
+    与 `dispatch` 的 `_period_pace` 同一口径（两处不同源就会预测偏快）。
 
     时间固定在**本小时第 40 分钟**：匀速额度 `_hourly_due(3, 40) == 3`，
-    当前小时的配额是满的，才排得下 3 部。若按真实时刻跑，整点刚过时
-    `_hourly_due` 只放 1 部，这条用例会因为「本小时额度不够」而假红。
+    当前小时的配额是满的，才排得下 3 部。
     """
     from datetime import timezone as _tz
     _real = sc2.utcnow()
@@ -326,10 +330,15 @@ def test_forecast_times_are_paced_not_all_at_the_top(monkeypatch):
     rows = [h for h in out["hours"] if h["total"] >= 3]
     assert rows, "至少应有一个小时排到 3 部"
     times = rows[0]["items"][0]["times"]
-    minutes = [int(t.split(":")[1]) for t in times]
-    assert len(set(minutes)) == len(minutes), "同一小时的时间点不得重复"
-    assert minutes != sorted([0] * len(minutes)), "不得全部堆在整点"
-    assert minutes == [0, 20, 40], f"cap=3 应摊在 0/20/40 分钟，实际 {minutes}"
+    assert times, "排期必须给出时间点"
+    assert len(set(times)) == len(times), f"时间点不得重复：{times}"
+    assert not all(t.endswith(":00") for t in times), f"不得全部堆在整点：{times}"
+    # 相邻两点的间隔应等于「时段分钟 ÷ 部数」= 40 分钟（跨小时按 60 进位）
+    absmin = [int(t.split(":")[0]) * 60 + int(t.split(":")[1]) for t in times]
+    gaps = [b - a for a, b in zip(absmin, absmin[1:])]
+    assert gaps and all(g == 40 for g in gaps), f"间隔应为 40 分钟，实际 {gaps}（{times}）"
+    # 前端据此显示「本时段每 N 分钟 1 部」
+    assert (out.get("pace") or {}).get("interval_minutes") == 40, out.get("pace")
 
 
 def test_forecast_skips_work_already_pushed_with_valid_link():
@@ -378,8 +387,15 @@ def test_forecast_reports_category_limit_blocked_works():
     assert "上限" in out["reason"]
 
 
-def test_forecast_notes_when_hourly_cap_missing():
-    """没配每小时上限时，要提示「会一到位就推」，而不是假装均匀。"""
+def test_forecast_paces_even_without_hourly_cap():
+    """没配每小时上限 ≠ 一到位就全推。
+
+    v2.1.23 起**无论如何**都按「排期时段匀速」放行（用户口径：本时段 2 小时、
+    4 部 → 30 分钟一部）。所以这里断言两件事：
+      ① 旧的那句「未设每小时上限：任务会一到点就推出去」提示必须消失 ——
+         它已经不是事实，留着就是误导；
+      ② 排期照样给出节奏（`pace.interval_minutes` 有值），不假装"随便推"。
+    """
     with SessionLocal() as db:
         _plan(db)
         _category(db, "genre:剧情", "剧情")
@@ -390,7 +406,8 @@ def test_forecast_notes_when_hourly_cap_missing():
         db.commit()
     out = _forecast()
     assert out["ok"] is True
-    assert any("每小时上限" in n for n in out["notes"]), out["notes"]
+    assert not any("每小时上限" in n for n in out["notes"]), out["notes"]
+    assert not any("一到点" in n for n in out["notes"]), out["notes"]
 
 
 def test_forecast_config_echoes_effective_limits():

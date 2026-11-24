@@ -69,21 +69,26 @@ def test_preset_endpoint_returns_single_builtin():
 # ---- ② 版式逐行 ----
 def test_default_template_matches_reference_layout():
     t = DEFAULT_TEMPLATE
-    for token in ("🆔 TMDB: {{tmdb_id}}", "⭐ TMDB评分: {{vote_plain}}/10",
-                  "🖥 画质: {{quality}}", "🎞 版本: {{version}}",
-                  "📦 大小: {{size}}", "🔗 分享: {{share_code}}",
-                  "📡 分集: {{episode_status}}", "📝 简介: {{overview}}",
-                  "🏷 {{tags}}"):
+    # v2.1.23：按用户参考图重新对齐——🎬 标题 / 📺 TMDB / ⭐ 评分 / 💿 画质 /
+    # 🎞 版本 / 💾 大小 / 👤 分享 / 【季集】 / 📝 简介 / 🏷 标签:
+    for token in ("🎬 <b>{{title}}", "📺 TMDB: {{tmdb_id}}",
+                  "⭐ TMDB评分: {{vote_plain}}/10",
+                  "💿 画质: {{quality}}", "🎞 版本: {{version}}",
+                  "💾 大小: {{size}}", "👤 分享: {{share_code}}",
+                  "【{{episode_status}}】", "📝 简介: {{overview}}",
+                  "🏷 标签: {{tags}}"):
         assert token in t, token
     # 参考图里的「豆瓣评分」系统没有数据源，写进去只能永久显示「暂无」→ 不放
     assert "豆瓣" not in t
+    # 用户口径：分集那一行不要再带「共 N 集」这类冗余计数
+    assert "共 " not in t and "集" not in t.replace("【{{episode_status}}】", "")
 
 
 def test_missing_fields_drop_whole_line():
     """缺字段必须整行消失，不能留「分享: 」这种空壳行。"""
     out = utils.render_template(DEFAULT_TEMPLATE,
                                 {"title": "只有标题", "share_url": "https://s/1"})
-    assert out == "<b>只有标题</b>\nhttps://s/1", out
+    assert out == "🎬 <b>只有标题</b>\nhttps://s/1", out
 
 
 # ---- ③ 存量升级 ----
@@ -164,6 +169,38 @@ def test_ensure_single_default_helper(session):
     assert len(flagged) == 1
 
 
+# ---- ④b 读路径也归一（v2.1.23）----
+def test_list_endpoint_never_reports_two_defaults(session):
+    """库里残留两条默认时，列表接口只能报一条。
+
+    用户验收口径是「只能出现一条默认设置」。写路径已经收敛，但旧库 / 手工改库 /
+    并发写仍可能留下多条；只要接口把两条都报成默认，界面上就是两个「默认」标签。
+    这条用例锁死：**读接口自身**必须兜底，并且顺手把库纠正。
+    """
+    session.add(MessageTemplate(name="A", content="x", enabled=True, is_default=True))
+    session.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
+                                enabled=True, is_default=True, builtin=True))
+    session.commit()
+    rows = main.templates(db=session)
+    flagged = [r["name"] for r in rows if r["is_default"]]
+    assert len(flagged) == 1, flagged
+    assert flagged[0] == "默认图文模板"          # 多条时优先内置
+    left = [x.name for x in session.scalars(select(MessageTemplate)).all() if x.is_default]
+    assert left == ["默认图文模板"]               # 库也被纠正，不留下不变量
+
+
+def test_list_endpoint_leaves_single_default_alone(session):
+    """用户把自定义模板设为默认是合法状态，读接口不得抢回内置。"""
+    session.add(MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
+                                enabled=True, is_default=False, builtin=True))
+    session.add(MessageTemplate(name="我的默认", content="x", enabled=True,
+                                is_default=True))
+    session.commit()
+    rows = main.templates(db=session)
+    flagged = [r["name"] for r in rows if r["is_default"]]
+    assert flagged == ["我的默认"]
+
+
 # ---- ⑤ 内置不可删 ----
 def test_builtin_template_cannot_be_deleted(session):
     builtin = MessageTemplate(name="默认图文模板", content=DEFAULT_TEMPLATE,
@@ -212,7 +249,15 @@ def test_restore_endpoint_marks_builtin(session):
 # ---- 前端契约（页面不得出现后端枚举名，且默认只能一条要说清）----
 def test_frontend_template_page_contract():
     assert "仅「默认图文」一条" in APP_VUE
-    assert "默认配置**只能有一条**" in APP_VUE
+    # v2.1.23：文案改成「默认模板『只能有一条』」之后，顺带修掉了原来那句里
+    # 没有渲染的字面 `**`（`默认配置**只能有一条**` 会把星号原样显示给用户）。
+    assert "只能有一条" in APP_VUE
+    assert "默认配置**只能有一条**" not in APP_VUE, "提示文案里不得再出现未渲染的 markdown 星号"
     assert "t.builtin" in APP_VUE          # 列表按内置标记禁用删除
     assert "newTplDraft" in APP_VUE        # 另存为自定义模板的入口
     assert "'share_code'" in APP_VUE       # 新变量进变量面板
+    # v2.1.23 单选语义：编辑器里的「设为默认」必须是**受控**开关（不能是自由 v-model），
+    # 否则两个模板各勾一次就又出现多条默认 —— 这正是用户反复反馈的那条。
+    assert 'v-model="tpl.is_default"' not in APP_VUE
+    assert 'onTplDefaultSwitch' in APP_VUE
+    assert ':model-value="!!tpl.is_default"' in APP_VUE

@@ -85,12 +85,25 @@ def _tag_keys(tags):
 
 
 def test_fresh_entry_is_new_library():
+    """v2.1.23 口径：**当天**入库算「新入库」（每日 0-24 点入库，次日 0 点转存量）。"""
     with SessionLocal() as db:
-        wk, _ = _work(db, title="刚入库", file_id="f-new", entry_days_ago=2)
+        wk, _ = _work(db, title="今日入库", file_id="f-new", entry_days_ago=0)
         db.commit()
         tags = sc2._work_push_tags(db, [wk])
         assert _tag_keys(tags[wk]) == ["new_library"]
         assert tags[wk][0]["label"] == "新入库"
+
+
+def test_entry_two_days_ago_is_not_new_library():
+    """v2.1.23 用户口径：「24 时后转为存量」——隔天入库的不能再叫「新入库」。
+
+    v2.1.22 用的是「7 天窗口」，隔天入库仍标新入库，与用户口径不符。
+    """
+    with SessionLocal() as db:
+        wk, _ = _work(db, title="前天入库", file_id="f-new2", entry_days_ago=2)
+        db.commit()
+        tags = sc2._work_push_tags(db, [wk])
+        assert _tag_keys(tags[wk]) == ["backlog"]
 
 
 def test_old_entry_without_release_is_backlog():
@@ -116,8 +129,9 @@ def test_recent_release_is_new_release():
 def test_new_library_and_recent_release_both_show():
     with SessionLocal() as db:
         rel = (datetime.now(sc2.shanghai_tz()) - timedelta(days=3)).strftime("%Y-%m-%d")
+        # v2.1.23：「新入库」按自然日算，必须是**今天**入库才会同时出现两个标签
         wk, _ = _work(db, title="新片新入库", file_id="f-both", release_date=rel,
-                      entry_days_ago=1)
+                      entry_days_ago=0)
         db.commit()
         tags = sc2._work_push_tags(db, [wk])
         assert _tag_keys(tags[wk]) == ["new_library", "new_release"]
@@ -176,7 +190,7 @@ def test_missing_snapshot_yields_empty_not_guess():
 
 def test_api_tasks_carries_tags():
     with SessionLocal() as db:
-        wk, _ = _work(db, title="任务页标签", file_id="f-task", entry_days_ago=1)
+        wk, _ = _work(db, title="任务页标签", file_id="f-task", entry_days_ago=0)
         lst = SCPushList(list_key="t:1", name="t", status="active", source="plan")
         db.add(lst)
         db.flush()
@@ -184,8 +198,10 @@ def test_api_tasks_carries_tags():
                               dedup_key=f"t:{wk}:1", source_kind="first", status="planned")
         db.add(item)
         db.flush()
+        # 用**在途**状态：终态行会被 `_tags_for_status` 裁掉「存量排期」，
+        # 「新入库」这类仍然有效的标签不受影响，这里锁的是标签能带出来。
         db.add(SCPublishTask(list_item_id=item.id, work_key=wk, kind="first",
-                             status="published", priority=0))
+                             status="planned", priority=0))
         db.commit()
         payload = sc2.api_tasks(db=db)
         assert payload["items"]
@@ -209,7 +225,10 @@ def test_aggregate_views_carry_tags():
         db.commit()
         views = sc2._aggregate_views(db)
         assert views["history"]
-        assert _tag_keys(views["history"][0]["tags"]) == ["backlog"]
+        # v2.1.23（用户口径 1）：**已结束**的记录不显示「存量排期」。
+        # 这条历史记录状态是 published（终态），标签失效后自然变存量排期，
+        # 而存量排期描述的是「还没推的原因」，套在推完的行上没有信息量 → 留空。
+        assert _tag_keys(views["history"][0]["tags"]) == []
 
 
 def test_forecast_works_carry_tags():
@@ -230,7 +249,8 @@ def test_forecast_works_carry_tags():
         db.flush()
         db.add(Channel(bot_id=bot.id, name="频道", chat_id="@ch", kind="channel",
                        enabled=True))
-        wk, res = _work(db, title="排期标签", file_id="f-fc", entry_days_ago=1)
+        # v2.1.23：「新入库」按自然日算，用今天入库
+        wk, res = _work(db, title="排期标签", file_id="f-fc", entry_days_ago=0)
         db.add(SCWorkCategory(work_key=wk, category_key="genre:剧情", media_type="movie",
                               source="tmdb", confidence=1.0))
         db.commit()

@@ -251,6 +251,8 @@ _COLUMNS = {
         "total_episodes": "INTEGER DEFAULT 0",
         # v0.9.9 #202：TMDB 首播/上映完整日期，供 {{release_date}}
         "release_date": "TEXT DEFAULT ''",
+        # v2.1.23：TMDB 剧集最后一集播出日（tv.last_air_date），「新上映」标签的过期判据。
+        "last_air_date": "TEXT DEFAULT ''",
         # v0.6.1：目录名链，供按作品目录识别（修剧集单集认错作品）
         "path_hint": "TEXT DEFAULT ''",
         # v0.6.3：目录 fileId 链 + 剧集目录级分享
@@ -468,20 +470,25 @@ _COLUMNS = {
 # 写进模板只能永久显示「暂无」，属于占位假数据，因此不放这一行。
 # 要显示真实豆瓣评分需先接数据源——这是已知缺口，不是漏做。
 DEFAULT_TEMPLATE = (
-    "<b>{{title}}{{#if year}} ({{year}}){{/if}}</b>\n"
-    "{{#if tmdb_id}}🆔 TMDB: {{tmdb_id}}\n{{/if}}"
+    "🎬 <b>{{title}}{{#if year}} ({{year}}){{/if}}</b>\n"
+    "{{#if tmdb_id}}\n📺 TMDB: {{tmdb_id}}\n{{/if}}"
     "{{#if vote_plain}}⭐ TMDB评分: {{vote_plain}}/10\n{{/if}}"
-    "{{#if quality}}🖥 画质: {{quality}}\n{{/if}}"
+    "{{#if quality}}💿 画质: {{quality}}\n{{/if}}"
     "{{#if version}}🎞 版本: {{version}}\n{{/if}}"
-    "{{#if size}}📦 大小: {{size}}\n{{/if}}"
-    "{{#if share_code}}🔗 分享: {{share_code}}\n{{/if}}"
-    "{{#if episode_status}}📡 分集: {{episode_status}}\n{{/if}}"
+    "{{#if size}}💾 大小: {{size}}\n{{/if}}"
+    "{{#if share_code}}👤 分享: {{share_code}}\n{{/if}}"
+    "{{#if episode_status}}\n【{{episode_status}}】\n{{/if}}"
     "{{#if overview}}\n📝 简介: {{overview}}\n{{/if}}"
-    "{{#if tags}}🏷 {{tags}}\n{{/if}}"
+    "{{#if tags}}\n🏷 标签: {{tags}}\n{{/if}}"
     "{{share_url}}"
 )
-# v2.1.22：当前默认图文的指纹（存量模板升级判定用；改版式时同步改这里）。
-CURRENT_DEFAULT_MARK = "🎞 版本:"
+# v2.1.23：当前默认图文的指纹（存量模板升级判定用；改版式时同步改这里）。
+#
+# 为什么换成「🏷 标签:」：v2.1.22 的指纹是「🎞 版本:」，而 v2.1.22 那版内容里也有
+# 这一行 —— 老指纹对**新旧两版都成立**，升级判定会直接 return False，存量库永远
+# 停在旧版式上（用户看到的「内置模板和我给的参考图有出入」就是这么来的）。
+# 「🏷 标签:」只有 v2.1.23 版式才有（旧版是「🏷 {{tags}}」，无「标签:」前缀）。
+CURRENT_DEFAULT_MARK = "🏷 标签:"
 
 # v0.9.6：内置模板预设（供管理页下拉一键载入，不落库；用户载入后可改可另存）。
 # v2.1.22 收敛：内置**只保留「默认图文」一条**（用户口径：「优化内置模版，仅保留
@@ -553,6 +560,13 @@ def _needs_template_upgrade(content: str) -> bool:
     # v2.1.22：已是当前默认图文版式 → 不动（放在最前，避免旧样式判定误伤新模板）。
     if CURRENT_DEFAULT_MARK in c:
         return False
+    # v2.1.23：v2.1.22 那一版内置图文（🆔 TMDB + 🖥 画质 + 📦 大小 + 🏷 {{tags}}）
+    # 要升级到与用户参考图对齐的新版式（🎬 标题 / 📺 TMDB / 💿 画质 / 💾 大小 /
+    # 👤 分享 / 【季集】/ 🏷 标签:）。四个特征同时命中才动 —— 用户改过的模板凑不齐
+    # 这一组，不会被覆盖。
+    if ("🆔 TMDB: {{tmdb_id}}" in c and "🖥 画质:" in c
+            and "📦 大小:" in c and "🏷 {{tags}}" in c):
+        return True
     # v2.1.22：v0.9.9 的默认图文（内置那一套）三特征同时命中才升级；
     # 用户改过的模板很难同时保留这三个标记，不会被覆盖。
     if "🖼️" in c and "{{buttons_text}}" in c and "🆔 TMDB ID" in c:

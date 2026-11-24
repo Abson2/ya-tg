@@ -117,6 +117,11 @@ class Resource(Base):
     # v0.9.9 #202：TMDB 首播/上映完整日期（如 2026-11-15），供消息模板 {{release_date}}。
     # 与 year（仅年份，文件名解析）分开：有 TMDB 详情时写全日期，否则留空由 year 兜底。
     release_date: Mapped[str] = mapped_column(String(32), default="")
+    # v2.1.23：TMDB 剧集**最后一集播出日**（tv.last_air_date，如 2026-11-18）；电影恒为空。
+    # 用途：「新上映」标签的过期判据——剧集按官方连载状态判定，
+    # `finish_status=ended` 时以「最后一集播出日 + 1 天 0 点」为转存量的时刻。
+    # 与 release_date（首播日）刻意分开：一个作品的首播日与完结日可能差好几年。
+    last_air_date: Mapped[str] = mapped_column(String(32), default="")
     share_id: Mapped[str] = mapped_column(String(64), default="")
     share_url: Mapped[str] = mapped_column(Text, default="")
     share_status: Mapped[str] = mapped_column(String(24), default="not_created")

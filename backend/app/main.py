@@ -1094,7 +1094,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.22", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.23", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1105,7 +1105,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.22", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.23", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3356,26 +3356,35 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
             x.identify_status = "failed"
             x.identify_note = str(exc)[:300]
             stats["failed"] += 1
-    # 完结状态回填：只处理已识别的剧集且缺 finish_status（限量，避免重复请求）
+    # 完结状态 / 最后一集播出日回填：只处理已识别的剧集（限量，避免重复请求）
+    # v2.1.23：把 `last_air_date` 也纳入回填——存量行都没有这一列（本次新增），
+    # 缺了它「新上映」标签就无法按「更新完结次日 0 点」过期，只能退回 30 天窗口。
+    need_status = or_(Resource.finish_status.is_(None), Resource.finish_status == "")
+    need_air = or_(Resource.last_air_date.is_(None), Resource.last_air_date == "")
     stale = list(db.scalars(select(Resource).where(
         Resource.media_type == "tv", Resource.tmdb_id.isnot(None),
         Resource.identify_status == "identified",
-        or_(Resource.finish_status.is_(None), Resource.finish_status == ""),
-        # v0.8.0：手动修正过（含手动清空）的资源不再被 TMDB 自动回填覆盖
-        or_(Resource.finish_locked.is_(None), Resource.finish_locked.is_(False))
+        or_(need_status, need_air),
     ).limit(60)).all())
-    seen_tmdb: dict[int, str] = {}
+    seen_tmdb: dict[int, tuple[str, str]] = {}
     for x in stale:
         tid = int(x.tmdb_id)
         if tid not in seen_tmdb:
             try:
                 d = await tmdb.detail(tid, "tv", db)
-                seen_tmdb[tid] = str(d.get("finish_status") or "")
+                seen_tmdb[tid] = (str(d.get("finish_status") or ""),
+                                  str(d.get("last_air_date") or ""))
             except Exception:
-                seen_tmdb[tid] = ""
-        if seen_tmdb[tid]:
-            x.finish_status = seen_tmdb[tid]
+                seen_tmdb[tid] = ("", "")
+        status_val, air_val = seen_tmdb[tid]
+        # v0.8.0：手动修正过（含手动清空）的完结状态不再被 TMDB 自动回填覆盖；
+        # 但「最后一集播出日」是客观事实，不覆盖用户任何判断，照补。
+        if status_val and not bool(getattr(x, "finish_locked", False)):
+            x.finish_status = status_val
             stats["finish_backfilled"] += 1
+        if air_val and not str(x.last_air_date or ""):
+            x.last_air_date = air_val
+            stats["last_air_backfilled"] = int(stats.get("last_air_backfilled") or 0) + 1
     # v0.9.10.2：作品键集合转成 JSON 安全的部数统计（进度看板按 TMDB 去重显示部数）
     stats["work_stats"] = {
         "identified": _work_breakdown(stats.pop("identified_work_keys")),
@@ -4373,6 +4382,9 @@ def _apply_identification(x: Resource, d: dict, source: str = "manual",
     x.overview = d.get("overview") or ""
     # v0.9.9 #202：TMDB 完整首播/上映日期，供消息模板 {{release_date}}
     x.release_date = d.get("release_date") or ""
+    # v2.1.23：剧集最后一集播出日（电影为空）。「新上映」标签的过期判据靠它，
+    # 不落库就只能退回「上映 30 天窗口」，跟用户口径（更新完结次日 0 点转存量）不符。
+    x.last_air_date = d.get("last_air_date") or ""
     x.poster_path = d.get("poster_path") or ""
     x.genres = json_dumps(d.get("genres") or [])
     x.origin_country = json_dumps(d.get("origin_country") or [])
@@ -5700,9 +5712,45 @@ def template_presets():
 def templates(db: Session = Depends(get_db)):
     # v2.1.22：带上 builtin 标记——前端据此把内置「默认图文」标成不可删除，
     # 用户自定义模板才允许删。此前没有该字段，前端只能"猜"哪条是内置。
+    rows = list(db.scalars(select(MessageTemplate).order_by(MessageTemplate.id)).all())
+    # v2.1.23：**读时也归一**。写路径（新增 / 编辑 / 恢复 / 启动迁移）都已经收敛，
+    # 但历史库里仍可能残留多条 is_default（旧版本写入、手工改库、并发写）。
+    # 只要接口把两条都报成 True，界面上就是两个「默认」标签 —— 用户的验收口径是
+    # 「只能出现一条默认设置」，所以这里按与写路径**同一套规则**兜底挑出唯一 keeper：
+    # 只给它报 True，并把库里多余的顺手纠正（已经合规时不写库）。
+    keeper = _pick_default_keeper(rows)
+    if keeper is not None and sum(1 for x in rows if x.is_default) != 1:
+        for x in rows:
+            x.is_default = (x.id == keeper.id)
+        try:
+            db.commit()
+        except Exception as exc:      # 写不进去也不能让"看模板列表"整个 500
+            db.rollback()
+            logger.warning("[template] 纠正多条默认模板失败（本次仍按唯一默认返回）：%s",
+                           str(exc)[:200])
     return [{"id": x.id, "name": x.name, "content": x.content, "enabled": x.enabled,
-             "is_default": x.is_default, "builtin": bool(x.builtin)}
-            for x in db.scalars(select(MessageTemplate).order_by(MessageTemplate.id)).all()]
+             "is_default": bool(keeper is not None and x.id == keeper.id),
+             "builtin": bool(x.builtin)}
+            for x in rows]
+
+
+def _pick_default_keeper(rows: list[MessageTemplate]) -> MessageTemplate | None:
+    """从模板列表里挑出「唯一默认」该归谁——读路径与写路径共用这一套规则。
+
+    规则（与 v2.1.22 写路径一致，不要各写一份）：
+      恰好一条默认 → 就是它（用户把自定义模板设为默认是合法状态，不抢回内置）；
+      多条默认     → 优先内置那条，其次最早的一条；
+      一条都没有   → 优先内置，其次第一条启用的，最后第一条。
+    """
+    if not rows:
+        return None
+    flagged = [x for x in rows if x.is_default]
+    if len(flagged) == 1:
+        return flagged[0]
+    if flagged:
+        return next((x for x in flagged if x.builtin), flagged[0])
+    return (next((x for x in rows if x.builtin), None)
+            or next((x for x in rows if x.enabled), rows[0]))
 
 
 def _ensure_single_default_template(db: Session) -> int:
@@ -5721,14 +5769,12 @@ def _ensure_single_default_template(db: Session) -> int:
     flagged = [x for x in rows if x.is_default]
     if len(flagged) == 1:
         return 0
-    if flagged:
-        keeper = next((x for x in flagged if x.builtin), flagged[0])
-    else:
-        keeper = (next((x for x in rows if x.builtin), None)
-                  or next((x for x in rows if x.enabled), rows[0]))
+    # v2.1.23：挑 keeper 的规则外移到 `_pick_default_keeper`，与读路径共用一份，
+    # 避免「接口报一条、库里改另一条」这种两套规则打起来的情况。
+    keeper = _pick_default_keeper(rows)
     cleared = 0
     for x in rows:
-        want = (x.id == keeper.id)
+        want = (keeper is not None and x.id == keeper.id)
         if bool(x.is_default) != want:
             if x.is_default and not want:
                 cleared += 1

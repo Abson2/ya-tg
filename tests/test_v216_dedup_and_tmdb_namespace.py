@@ -418,7 +418,9 @@ def test_publisher_dedup_survives_second_dispatch(env, monkeypatch):
     # 本用例验证的是**去重**（第二次进 dispatch 应 skipped），不该被分钟级节流
     # 干扰：整点刚过时额度只放 1 部，dispatch 会先 throttled 退出，
     # 根本走不到去重判定，stats["skipped"] 就恒为 0（假红）。
-    _frozen = sc2.utcnow().replace(minute=59, second=0, microsecond=0)
+    # v2.1.23：冻结到**本排期时段的最后一分钟**，让时段匀速额度放满（口径见 conftest）
+    from conftest import freeze_at_period_end
+    _frozen = freeze_at_period_end(sc2)
     monkeypatch.setattr(sc2, "utcnow", lambda: _frozen)
 
     with S() as db:

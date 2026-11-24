@@ -119,8 +119,10 @@ def test_returning_series_shows_updated_to_and_progress(db):
     text = _render(db)
     # v0.9.0：剧集状态改为季集标签「更新至 S01E12 · 连载中」
     assert "更新至 S01E12 · 连载中" in text, text
-    # v2.1.22：默认图文只保留「📡 分集」一行季集标签（范围/集数由变量面板按需插入）
-    assert "📡 分集:" in text, text
+    # v2.1.23：版式与用户参考图对齐——季集标签整行用【】包住（参考图【S01E04 · 完结】），
+    # 不再带「📡 分集:」这个行头。
+    assert "【更新至 S01E12 · 连载中】" in text, text
+    assert "📡 分集:" not in text, text
 
 
 def test_ended_series_shows_full_episode_count(db):

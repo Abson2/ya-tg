@@ -78,8 +78,12 @@ def _fresh():
 # ---------------------------------------------------------------------------
 
 def _work(db, *, title, file_id, release_date="", entry_days_ago=100,
-          share_url="https://pan.quark.cn/s/abc"):
-    """造一部作品：一条资源 + 一条库快照（快照登记时间 = 首次入库时间）。"""
+          entry_at=None, share_url="https://pan.quark.cn/s/abc"):
+    """造一部作品：一条资源 + 一条库快照（快照登记时间 = 首次入库时间）。
+
+    `entry_at` 直接给绝对时刻（v2.1.23 起「新入库」按上海自然日判定，需要精确
+    控制「同一天内的先后」才能稳定验证排序，不能靠 days 这种粗粒度）。
+    """
     res = Resource(file_id=file_id, name=f"{title}.mkv", ext=".mkv", size=100,
                    utime=1, ctime=0, identify_status="identified",
                    media_type="movie", tmdb_id=abs(hash(file_id)) % 100000,
@@ -93,7 +97,8 @@ def _work(db, *, title, file_id, release_date="", entry_days_ago=100,
         media_type="movie", resource_ids_json=json.dumps([res.id]),
         metadata_json=json.dumps({"title": title}),
         change_type="created",
-        created_at=datetime.now(timezone.utc) - timedelta(days=entry_days_ago),
+        created_at=(entry_at if entry_at is not None
+                    else datetime.now(timezone.utc) - timedelta(days=entry_days_ago)),
     ))
     db.flush()
     return work_key, res
@@ -223,13 +228,19 @@ def test_prefer_release_has_no_new_library_lane():
 
 
 def test_prefer_new_orders_new_library_by_first_entry_time():
-    """新入库优先档：按资源库入库的顺序排（先入库的先推）。"""
+    """新入库优先档：按资源库入库的顺序排（先入库的先推）。
+
+    v2.1.23：「新入库」= **当天**入库，所以三部作品都放在今天，只是入库先后不同；
+    「现在」用 `now_sh` 钉在今天 12:00，避免用例在凌晨跑时算成"昨天入库"而假红。
+    """
     with SessionLocal() as db:
-        _work(db, title="先入库", file_id="f-a", entry_days_ago=5)
-        _work(db, title="中入库", file_id="f-b", entry_days_ago=3)
-        _work(db, title="后入库", file_id="f-c", entry_days_ago=1)
+        now_sh = datetime.now(sc2.shanghai_tz()).replace(
+            hour=12, minute=0, second=0, microsecond=0)
+        _work(db, title="先入库", file_id="f-a", entry_at=now_sh - timedelta(hours=8))
+        _work(db, title="中入库", file_id="f-b", entry_at=now_sh - timedelta(hours=5))
+        _work(db, title="后入库", file_id="f-c", entry_at=now_sh - timedelta(hours=2))
         db.commit()
-        rows = sc2._instant_candidates(db, "prefer_new")
+        rows = sc2._instant_candidates(db, "prefer_new", now_sh=now_sh)
         assert [k for k, _lv, _lane in rows] == ["work:先入库", "work:中入库", "work:后入库"]
         assert all(lane == "new_library" for _k, _lv, lane in rows)
 
@@ -237,11 +248,13 @@ def test_prefer_new_orders_new_library_by_first_entry_time():
 def test_prefer_new_puts_new_release_before_new_library():
     """第 2 档的 a 条：新上映仍然最先（插队），新入库排在它后面。"""
     with SessionLocal() as db:
-        _work(db, title="刚入库", file_id="f-l1", entry_days_ago=1)
+        now_sh = datetime.now(sc2.shanghai_tz()).replace(
+            hour=12, minute=0, second=0, microsecond=0)
+        _work(db, title="刚入库", file_id="f-l1", entry_at=now_sh - timedelta(hours=3))
         _work(db, title="刚上映", file_id="f-r1", release_date=_rel(2),
-              entry_days_ago=1)
+              entry_at=now_sh - timedelta(hours=3))
         db.commit()
-        rows = sc2._instant_candidates(db, "prefer_new")
+        rows = sc2._instant_candidates(db, "prefer_new", now_sh=now_sh)
         assert [k for k, _lv, _lane in rows] == ["work:刚上映", "work:刚入库"]
         assert [lane for _k, _lv, lane in rows] == ["new_release", "new_library"]
 
@@ -337,7 +350,8 @@ def test_plan_engine_prefer_new_gives_priority_800():
     with SessionLocal() as db:
         _plan(db)
         _set_rules(db, enabled="true", policy="prefer_new")
-        wk, _ = _work(db, title="刚入库", file_id="f-p8", entry_days_ago=1)
+        # v2.1.23：「新入库」按上海自然日判定，必须是**今天**入库（0 天前）
+        wk, _ = _work(db, title="刚入库", file_id="f-p8", entry_days_ago=0)
         _bind(db, wk)
         db.commit()
 

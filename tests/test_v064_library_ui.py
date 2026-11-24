@@ -130,8 +130,9 @@ def test_cancel_share_clears_url_and_siblings():
 
 # ---------- 4. 模板整剧展示 ----------
 def test_default_template_is_series_oriented():
-    # v2.1.22：默认图文版式（标题 / TMDB / 评分 / 画质 / 版本 / 大小 / 分享 / 分集 / 简介 / 标签）
-    assert "🏷 {{tags}}" in DEFAULT_TEMPLATE
+    # v2.1.23：默认图文版式（🎬 标题 / 📺 TMDB / ⭐ 评分 / 💿 画质 / 🎞 版本 /
+    # 💾 大小 / 👤 分享 / 【季集】 / 📝 简介 / 🏷 标签）
+    assert "🏷 标签: {{tags}}" in DEFAULT_TEMPLATE
     assert "资源：" not in DEFAULT_TEMPLATE and "{{filename}}" not in DEFAULT_TEMPLATE
     assert "{{quality}}" in DEFAULT_TEMPLATE and "{{episode_status}}" in DEFAULT_TEMPLATE
 

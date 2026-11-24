@@ -19,12 +19,13 @@ class FakeResponse:
 
 
 def test_scan_to_share_to_push_flow(monkeypatch):
-    # v2.1.19：把「现在」固定在本小时第 59 分，让匀速额度放满（cap=3）。
-    # 这条用例验证的是「扫描 → 建分享 → 推送」这条链路本身，不该被分钟级节流
-    # 干扰：整点刚过时 `_hourly_due(3, 分钟数)` 一次只放 1 部，会把「推 2 部」
-    # 的流程测成 1 部（假红）。节流本身由 test_v2119_paced_forecast 专门守。
+    # v2.1.23：把「现在」固定在**本排期时段的最后一分钟**，让时段匀速额度放满。
+    # 这条用例验证的是「扫描 → 建分享 → 推送」这条链路本身，不该被节奏节流干扰：
+    # 时段刚开始时 due 只有 1 部，会把「推 2 部」的流程测成 1 部（假红）。
+    # 节流本身由 test_v2119_paced_forecast / test_v2123_pacing_and_layout 专门守。
     from app import share_center_v2 as _sc2
-    _frozen = _sc2.utcnow().replace(minute=59, second=0, microsecond=0)
+    from conftest import freeze_at_period_end
+    _frozen = freeze_at_period_end(_sc2)
     monkeypatch.setattr(_sc2, "utcnow", lambda: _frozen)
 
     migrate()

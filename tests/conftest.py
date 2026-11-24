@@ -63,6 +63,25 @@ def ensure_full_day_hour_window(db, version_id: int) -> None:
         db.commit()
 
 
+def freeze_at_period_end(sc2):
+    """返回「当前排期时段的最后一分钟」的 UTC 时刻，供 monkeypatch 冻结时钟。
+
+    v2.1.23 起推送节奏从「每小时均分」升级为「每个 `HOUR_SEGMENT_HOURS` 小时
+    时段均分」：间隔 = 时段分钟 ÷ 部数，到此刻应放行 = floor(已过分钟/间隔)+1。
+    整点刚过时 due 只有 1，多任务用例会被节流成 1 条而假红。
+
+    冻结到**时段末尾**，due 就等于本时段全部部数 —— 这些用例验证的是链路本身
+    （扫描→建分享→推送、去重、强制推送），不该被分钟级节奏干扰。
+    节流本身由 `test_v2119_paced_forecast` / `test_v2123_pacing_and_layout` 专门守。
+    """
+    from datetime import timedelta, timezone
+    sh = sc2.utcnow().astimezone(timezone(timedelta(hours=8)))
+    seg = int(getattr(sc2, "HOUR_SEGMENT_HOURS", 2) or 2)
+    last_hour = sh.hour - sh.hour % seg + seg - 1
+    sh = sh.replace(hour=last_hour, minute=59, second=0, microsecond=0)
+    return sh.astimezone(timezone.utc)
+
+
 @pytest.fixture(autouse=True)
 def _clear_module_caches():
     """阶段二：识别缓存/内存态是模块级的，必须每用例清理，避免跨用例串扰假失败。
