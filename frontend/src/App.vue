@@ -706,6 +706,8 @@ function openStartgroup() {
   window.open(inviteLink.value.startgroup_url, '_blank', 'noopener')
 }
 const interactionStatus = ref({}), contributions = ref([]), mediaRequests = ref([])
+// v2.1.32：用户留言板（b 板块第三张卡）
+const feedbacks = ref([])
 const interactionSaving = ref(false), tgtoTesting = ref(false), wantTitle = ref('')
 // v0.9.8 #194：推送效果报表（只展示后端真实可得指标）
 const pushStats = ref({ series: [], totals: {}, unavailable: [], available: [], period: 'day', days: 30 })
@@ -1376,7 +1378,7 @@ async function load() {
     'templates', 'templates/presets', 'audit', 'diagnostics', 'telegram/config',
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
-    'contributions?limit=50', 'media-requests?limit=50', 'logs/overview']
+    'contributions?limit=50', 'media-requests?limit=50', 'logs/overview', 'feedback?limit=50']
   const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
   const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   overview.value = v(0) || overview.value
@@ -1413,6 +1415,7 @@ async function load() {
   interactionStatus.value = v(18) || interactionStatus.value
   contributions.value = v(19) || []
   mediaRequests.value = v(20) || []
+  feedbacks.value = v(22) || feedbacks.value
   const lg = v(21)
   if (lg) {
     logCfg.value = lg.config || logCfg.value
@@ -2101,6 +2104,36 @@ async function deleteContribution(row) {
   const ok = await confirmBox(`确认删除投稿「${row.title}」？只删登记记录，不影响用户与其它数据。`)
   if (!ok) return
   try { await api(`/contributions/${row.id}`, { method: 'DELETE' }); ElMessage.success('已删除'); await load() }
+  catch (e) { ElMessage.error(e.message) }
+}
+// ---------- v2.1.32：用户留言板（b 板块第三张卡） ----------
+// 只有「待回复 / 已回复」两态，页面上绝不出现 pending/replied 原文
+function feedbackStatusLabel(s) { return ({ pending: '待回复', replied: '已回复' })[s] || '待回复' }
+function feedbackStatusTag(s) { return ({ replied: 'success', pending: 'warning' })[s] || 'info' }
+async function replyFeedback(row) {
+  let text = ''
+  try {
+    const r = await ElMessageBox.prompt('回复内容会私聊发回给这位用户，请写清楚结论或后续安排', '回复留言', {
+      confirmButtonText: '发送回复', cancelButtonText: '取消',
+      inputType: 'textarea', inputPlaceholder: '例如：搜索按年份过滤已排入下个版本，感谢建议',
+      inputValidator: v => (String(v || '').trim() ? true : '请填写回复内容')
+    })
+    text = String(r.value || '').trim()
+  } catch (e) { return }
+  if (!text) return
+  try {
+    const d = await api(`/feedback/${row.id}/reply`, { method: 'POST', body: JSON.stringify({ reply_text: text }) })
+    if (d && d.notified === false) {
+      ElMessage.warning({ message: '回复已保存，但没能私聊发出去（用户可能已屏蔽 Bot 或 Token 未配置），可稍后重试', duration: 7000, showClose: true })
+    } else ElMessage.success('已回复并私聊通知用户')
+    await load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+async function deleteFeedback(row) {
+  const brief = String(row.content || '').slice(0, 20)
+  const ok = await confirmBox(`确认删除这条留言「${brief}${(row.content || '').length > 20 ? '…' : ''}」？只删这条留言，不影响该用户其它留言。`)
+  if (!ok) return
+  try { await api(`/feedback/${row.id}`, { method: 'DELETE' }); ElMessage.success('已删除'); await load() }
   catch (e) { ElMessage.error(e.message) }
 }
 async function addWant() {
@@ -3423,7 +3456,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.31 · Asia/Shanghai</span>
+          <span>v2.1.32 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4128,9 +4161,9 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
           <!-- 内置指令速查（交互 Bot 的一部分） -->
           <div class="bot-card">
-            <div class="bot-card-head"><span class="bot-ico">&gt;_</span><h3>内置指令速查</h3><span class="restrict-sub">私聊指令入口 · 只回复指令来源，不主动推送</span><el-tag size="small" type="info" style="margin-left:auto">固定四项 · 不可删除</el-tag></div>
+            <div class="bot-card-head"><span class="bot-ico">&gt;_</span><h3>内置指令速查</h3><span class="restrict-sub">私聊指令入口 · 只回复指令来源，不主动推送</span><el-tag size="small" type="info" style="margin-left:auto">固定五项 · 不可删除</el-tag></div>
             <div class="cmd-add" style="border-top:1px dashed var(--yg-line);margin-top:14px;padding-top:14px">
-              <div class="bot-card-head" style="margin-bottom:10px"><h3 style="font-size:14px">内置指令速查</h3><el-tag size="small" type="info">固定四项 · 不可删除</el-tag></div>
+              <div class="bot-card-head" style="margin-bottom:10px"><h3 style="font-size:14px">内置指令速查</h3><el-tag size="small" type="info">固定五项 · 不可删除</el-tag></div>
             </div>
             <div class="cmd-grid">
               <div class="cmd-item" v-for="c in (interactionCfg.bot_commands || [])" :key="c.command">
@@ -4144,7 +4177,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-input v-model="newCmd.reply" placeholder="回复文本" style="width:260px"/>
               <el-button size="small" type="primary" plain @click="addCustomCommand">添加自定义指令</el-button>
             </div>
-            <p class="hint">求片 / 投稿 / 搜索 / 打赏为内置固定指令，其实现不可改；这里只能追加「收到指令 → 返回固定文本」的自定义功能。</p>
+            <p class="hint">求片 / 投稿 / 搜索 / 打赏 / 建议为内置固定指令，其实现不可改；这里只能追加「收到指令 → 返回固定文本」的自定义功能。用户点「建议/反馈」后需先答一道算术验证码，留言会进下方「用户留言板」，在那里回复即可私聊发回给用户。</p>
 
             <!-- v0.9.6.1：打赏模块归入内置指令速查（/reward 内置指令） -->
             <div class="panel narrow" style="margin-top:14px">
@@ -4191,9 +4224,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
 
           <!-- v0.9.6.1：打赏已移入「内置指令速查」；推送频道/群跳转已移入「消息模板」模块 -->
 
-          <!-- ===== b 板块：用户投稿 / 用户求片 ===== -->
-          <div class="sec-band"><span class="sec-key">b</span><div><h3>用户投稿 · 用户求片</h3><p>私聊 Bot 提交投稿与求片；求片审核通过后自动写入 TgtoDrive 监控规则，删除/拒绝时联动移除</p></div><span class="sec-line"></span></div>
-          <div class="two-col">
+          <!-- ===== b 板块：用户投稿 / 用户求片 / 用户留言板 ===== -->
+          <div class="sec-band"><span class="sec-key">b</span><div><h3>用户投稿 · 用户求片 · 用户留言板</h3><p>私聊 Bot 提交投稿、求片与建议反馈；求片审核通过后自动写入 TgtoDrive 监控规则，删除/拒绝时联动移除</p></div><span class="sec-line"></span></div>
+          <!-- v2.1.32：两张表并列扩成三张（.three-col 已存在，≤1100px 统一降单列） -->
+          <div class="three-col" style="margin-bottom:18px">
             <div class="panel">
               <div class="panel-head"><h3>用户求片（我想看）</h3></div>
               <div class="inline-form"><el-input v-model="wantTitle" placeholder="影视名称" style="width:220px"/><el-button type="primary" @click="addWant">加入监控</el-button></div>
@@ -4246,6 +4280,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   <el-button size="small" type="danger" plain @click="deleteContribution(s.row)">删除</el-button>
                 </template></el-table-column>
               </el-table></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><h3>用户留言板</h3>
+                <el-tag v-if="interactionStatus.feedback_pending" size="small" type="warning" effect="plain" style="margin-left:auto">{{ interactionStatus.feedback_pending }} 条待回复</el-tag>
+                <span v-else class="muted" style="margin-left:auto">暂无待回复</span>
+              </div>
+              <div class="table-scroll"><el-table :data="feedbacks" size="small">
+                <el-table-column label="留言内容" min-width="190"><template #default="s">
+                  <div class="fb-content">{{ s.row.content }}</div>
+                  <div v-if="s.row.reply_text" class="fb-reply">回复：{{ s.row.reply_text }}</div>
+                </template></el-table-column>
+                <el-table-column label="用户" width="96"><template #default="s">{{ s.row.tg_username || s.row.tg_user_id || '—' }}</template></el-table-column>
+                <el-table-column label="状态" width="84"><template #default="s">
+                  <el-tag size="small" :type="feedbackStatusTag(s.row.status)">{{ feedbackStatusLabel(s.row.status) }}</el-tag>
+                </template></el-table-column>
+                <el-table-column label="提交时间" width="124"><template #default="s">{{ fmtTime(s.row.created_at) }}</template></el-table-column>
+                <el-table-column label="操作" width="146"><template #default="s">
+                  <el-button size="small" type="primary" plain @click="replyFeedback(s.row)">{{ s.row.status === 'replied' ? '再回复' : '回复' }}</el-button>
+                  <el-button size="small" type="danger" plain @click="deleteFeedback(s.row)">删除</el-button>
+                </template></el-table-column>
+              </el-table></div>
+              <p class="hint">用户在 Bot 里点「建议/反馈」、答对一道算术验证码后提交；这里回复会直接私聊发回给本人。留言不需要审核，只有「回复」和「删除」两个动作。</p>
             </div>
           </div>
 
@@ -6706,4 +6762,12 @@ html.dark .card-check{background:rgba(20,24,40,.9)}
   .status-tabs{gap:6px;padding:6px}
   .stat-num{font-size:22px}
 }
+
+/* ⑩ v2.1.32：用户留言板（分发与互动中心 b 板块第三张卡）。
+      留言是自由文本、可能很长也可能带换行，所以正文按原文换行并限制高度，
+      回复压一行浅色块，一眼能分出「用户说的」和「我们回的」。 */
+.fb-content{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5;max-height:64px;overflow:hidden}
+.fb-reply{margin-top:5px;padding:4px 7px;border-left:2px solid var(--yg-tone-green-fg);
+  background:var(--yg-tone-green-bg);color:var(--yg-tone-green-fg);border-radius:0 6px 6px 0;
+  font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:56px;overflow:hidden}
 </style>

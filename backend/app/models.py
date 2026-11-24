@@ -649,6 +649,31 @@ class MediaRequest(Base):
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class UserFeedback(Base):
+    """v2.1.32：Telegram 用户「建议/反馈」留言。
+
+    与求片（MediaRequest）/ 投稿（UserContribution）并列的第三种用户输入：
+    求片带作品与白名单、投稿带光鸭链接，留言只是**一段自由文本**，没有作品实体，
+    也不推进任何业务状态机，因此单开一张表而不塞进前两者。
+
+    两态即可，不设「拒绝」：留言不需要审核通过才成立，管理员的动作只有
+    「回复」和「删除」。已回复的留言再改回复文本时覆盖 reply_text 与 replied_at，
+    不追加历史行——同一条留言只保留最新一次回复（用户侧也只关心最新那条）。
+    """
+    __tablename__ = "user_feedback"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tg_user_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    tg_username: Mapped[str] = mapped_column(String(128), default="")
+    content: Mapped[str] = mapped_column(Text, default="")            # 用户原文，不截断
+    status: Mapped[str] = mapped_column(String(24), default="pending")  # pending / replied
+    reply_text: Mapped[str] = mapped_column(Text, default="")
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 用户发来这条留言的那条消息（bot 侧回执/纠错排查用），取不到就留空
+    tg_chat_id: Mapped[str] = mapped_column(String(64), default="")
+    tg_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 # ============================================================================
 # 四模块重构 阶段A：分享中心（原推送队列前移并改造）
 # 设计原则（FOUR_MODULE_REFACTOR_DESIGN.md）：

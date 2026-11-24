@@ -335,7 +335,14 @@ def test_forecast_times_are_paced_not_all_at_the_top(monkeypatch):
     assert not all(t.endswith(":00") for t in times), f"不得全部堆在整点：{times}"
     # 相邻两点的间隔应等于「时段分钟 ÷ 部数」= 40 分钟（跨小时按 60 进位）
     absmin = [int(t.split(":")[0]) * 60 + int(t.split(":")[1]) for t in times]
-    gaps = [b - a for a, b in zip(absmin, absmin[1:])]
+    # v2.1.32：**跨零点要比进位**。本用例把「现在」冻结在当前小时的第 40 分钟，
+    # 于是每天 22:00 之后跑全量时，2 小时时段（22:00-24:00）的三格正好是
+    # 22:40 / 23:20 / 00:00 —— 直接 `b - a` 会把 00:00 算成 0 分钟，
+    # 得到 -1400 这种假负数，看着像「节奏坏了」，其实是断言自己没处理跨日。
+    # 后一个点比前一个小 = 已经翻到第二天，补 1440 分钟再比。
+    gaps = []
+    for _a, _b in zip(absmin, absmin[1:]):
+        gaps.append((_b + 1440 if _b < _a else _b) - _a)
     assert gaps and all(g == 40 for g in gaps), f"间隔应为 40 分钟，实际 {gaps}（{times}）"
     # 前端据此显示「本时段每 N 分钟 1 部」
     assert (out.get("pace") or {}).get("interval_minutes") == 40, out.get("pace")

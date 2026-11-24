@@ -95,9 +95,21 @@ def _clear_module_caches():
         _main._IDENTIFY_CACHE.clear()
     except Exception:
         pass
+    # v2.1.32：建议/反馈的算术验证码会话也是模块级内存态。它比缓存更"粘"——
+    # 上一个用例里已验证通过的 uid 会让下一个用例跳过验证码直接落库而假绿。
+    try:
+        from app import bot_listener as _bl
+        _bl._captcha_sessions.clear()
+    except Exception:
+        pass
     yield
     try:
         from app import main as _main
         _main._IDENTIFY_CACHE.clear()
+    except Exception:
+        pass
+    try:
+        from app import bot_listener as _bl
+        _bl._captcha_sessions.clear()
     except Exception:
         pass

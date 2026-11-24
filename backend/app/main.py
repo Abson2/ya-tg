@@ -34,7 +34,8 @@ from .identify_batch import count_pending, mark_attempted, select_identify_batch
 from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, DiscoveredChat,
                      DistributionEvent, MediaRequest, MessageTemplate, MirrorDir, MirrorFile,
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
-                     ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution)
+                     ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution,
+                     UserFeedback)
 from .publisher import ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, is_masked_secret, mask_secret
@@ -1128,7 +1129,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.31", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.32", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1139,7 +1140,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.31", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.32", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -7883,12 +7884,91 @@ def interaction_status(db: Session = Depends(get_db)):
         "contributions_pending": db.query(UserContribution).filter(
             UserContribution.status == "pending").count(),
         "media_requests": db.query(MediaRequest).count(),
+        # v2.1.32：留言板待回复数（b 板块第三张卡的角标）
+        "feedback_total": db.query(UserFeedback).count(),
+        "feedback_pending": db.query(UserFeedback).filter(
+            UserFeedback.status == "pending").count(),
         "keyword_synced": db.query(MediaRequest).filter(MediaRequest.status == "synced").count(),
         "contribution_enabled": (runtime_config.get(db, "contribution_enabled") or "").lower() == "true",
         "tgto_configured": bool(runtime_config.get(db, "tgto_base_url") and
                                 runtime_config.get(db, "tgto_api_key")),
         "unverified_endpoints": ["投稿分享转存（光鸭接口，8.6 待验证）"],
     }
+
+
+# ============================================================================
+# v2.1.32：用户留言板（Bot「建议/反馈」指令落库 → 后台回复 → 回执给用户）
+#
+# 只有「待回复 / 已回复」两态，没有审核拒绝：留言是用户的一句话，不需要
+# 审批才成立，管理员的动作只有「回复」与「删除」（删的是垃圾留言，与投稿、
+# 求片的删除同一语义——都是管理侧清理登记行，都留审计）。
+#
+# 回复链路严格「先 commit 再 await 外部网络」：落库成功才发 TG，发不出去只
+# 回 notified=false，绝不把已写好的回复回滚掉（求片审核回信的同一条纪律）。
+# ============================================================================
+
+class FeedbackReplyInput(BaseModel):
+    reply_text: str = ""
+
+
+@app.get("/api/feedback", dependencies=ADMIN)
+def feedback_list(status: str = "", limit: int = 100, db: Session = Depends(get_db)):
+    """留言列表：默认按新到旧，可按待回复 / 已回复筛选。"""
+    stmt = select(UserFeedback).order_by(UserFeedback.id.desc()).limit(min(limit, 500))
+    if status in ("pending", "replied"):
+        stmt = stmt.where(UserFeedback.status == status)
+    rows = list(db.scalars(stmt).all())
+    return [{"id": f.id,
+             "content": f.content or "",
+             "tg_user_id": f.tg_user_id or "",
+             "tg_username": f.tg_username or "",
+             "status": f.status or "pending",
+             "reply_text": f.reply_text or "",
+             "replied_at": f.replied_at,
+             "created_at": f.created_at}
+            for f in rows]
+
+
+@app.post("/api/feedback/{fid}/reply", dependencies=ADMIN)
+async def reply_feedback(fid: int, p: FeedbackReplyInput, db: Session = Depends(get_db)):
+    """回复一条留言，并把回复内容私聊发回给留言用户。"""
+    text = (p.reply_text or "").strip()
+    if not text:
+        raise HTTPException(400, "请填写回复内容")
+    if len(text) > 2000:
+        raise HTTPException(400, "回复内容请不要超过 2000 字")
+    f = db.get(UserFeedback, fid)
+    if not f:
+        raise HTTPException(404, "留言不存在")
+    f.reply_text = text
+    f.status = "replied"
+    f.replied_at = utcnow()
+    add_audit(db, "feedback_replied", target_type="feedback", target_id=str(fid),
+              detail=json_dumps({"chars": len(text)}))
+    db.commit()  # 回复先落盘；下面发不出 TG 也不回滚这条回复
+
+    notified = False
+    if f.tg_user_id:
+        quoted = " ".join((f.content or "").split())
+        if len(quoted) > 40:
+            quoted = quoted[:40] + "…"
+        notice = (f"你反馈的「{quoted}」已收到回复：\n{text}" if quoted
+                  else f"你提交的建议/反馈已收到回复：\n{text}")
+        notified = await bot_listener.notify_user(db, f.tg_user_id, notice)
+    return {"ok": True, "notified": notified, "status": f.status,
+            "replied_at": f.replied_at}
+
+
+@app.delete("/api/feedback/{fid}", dependencies=ADMIN)
+def delete_feedback(fid: int, db: Session = Depends(get_db)):
+    """删除一条留言（管理侧清垃圾，与投稿/求片的删除同语义，留审计）。"""
+    f = db.get(UserFeedback, fid)
+    if not f:
+        raise HTTPException(404, "留言不存在")
+    db.delete(f)
+    add_audit(db, "feedback_deleted", target_type="feedback", target_id=str(fid))
+    db.commit()
+    return {"ok": True}
 
 
 def safe_static_file(path: str, root: Path) -> Path | None:

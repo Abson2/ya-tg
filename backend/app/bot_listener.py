@@ -1,7 +1,7 @@
 """v0.9.0：Telegram Bot 交互（接收消息）。
 
 能力：
-  内置指令固定四项：/求片  /投稿  /搜索  /打赏（另 /start /help 帮助）
+  内置指令固定五项：/求片  /投稿  /搜索  /打赏  /建议（另 /start /help 帮助）
   后台自定义指令：管理页配置 command → 说明 + 固定回复文本
   使用限制：可选「必须关注频道 / 必须加入群聊」，结果按秒缓存，未满足时拒绝执行指令
   推送白名单：Bot 只向管理员配置的频道 / 群聊主动推送，绝不私聊刷屏
@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 import time
 
@@ -26,7 +27,7 @@ from sqlalchemy.orm import Session
 from . import runtime_config, tgto, tmdb
 from .contribution_links import extract_guangya_share_url
 from .models import (Bot, Channel, DiscoveredChat, MediaRequest, ProcessedUpdate,
-                     QueueItem, Resource, UserContribution, utcnow)
+                     QueueItem, Resource, UserContribution, UserFeedback, utcnow)
 from .security import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -160,11 +161,16 @@ def _poll_retry_clear(bot_id: int, uid: int) -> None:
 
 
 # v0.9.0：内置指令固定，不允许后台删除；后台只能追加自定义指令。
+# v2.1.32：新增「建议」——用户留言（自由文本），与求片/投稿并列的第三种用户输入。
+# 指令名单个 token 用「建议」，用户实际看到的按钮文字是「建议/反馈」，
+# 故 aliases 里带上按钮原文「建议/反馈」以及「反馈」，三种写法都能命中。
 BUILTIN_COMMANDS = [
     {"command": "求片", "aliases": ["want", "request"], "description": "提交想看的影视，自动加入关键词监控"},
     {"command": "投稿", "aliases": ["contribute"], "description": "投稿资源，登记后由管理员审核"},
     {"command": "搜索", "aliases": ["search"], "description": "搜索资源库中的影视（接关键词）"},
     {"command": "打赏", "aliases": ["donate"], "description": "查看打赏支持方式"},
+    {"command": "建议", "aliases": ["反馈", "建议/反馈", "feedback"],
+     "description": "提交建议或反馈（需先答一道算术验证码），管理员回复后私聊通知你"},
 ]
 HELP = ("Ya-TG 指令说明\n\n"
         "/求片 剧名               — 列出 TMDB 候选，点选提交（推荐）\n"
@@ -173,15 +179,16 @@ HELP = ("Ya-TG 指令说明\n\n"
         "/投稿 标题 分享链接      — 一步提交投稿\n"
         "/搜索 关键词             — 转发已推送、仍在库的资源卡片给你\n"
         "/打赏                    — 直接收赞赏码图片\n"
+        "/建议 内容               — 提交建议或反馈，管理员回复后会通知你\n"
         "/help                    — 查看本说明\n\n"
-        "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏，\n"
+        "也可直接点输入框上方的菜单按钮：求片 / 投稿 / 搜索 / 打赏 / 建议反馈，\n"
         "点后再直接输入文字即可（不必加 /），回复「结束」退出交互。\n"
         "其它指令以管理员在后台配置的为准。")
 
 # v0.9.16 #277：未进入指令/会话态时，对用户随意发送内容的统一纠正提示。
 # 投稿/求片/搜索只走指令或 Reply 菜单进入的会话态，裸链接/裸文字不再自动登记。
 _UNRECOGNIZED_HINT = ("当前内容未识别为指令。请点下方菜单，或发送 "
-                      "/求片 /投稿 /搜索 /打赏 /help；\n"
+                      "/求片 /投稿 /搜索 /打赏 /建议 /help；\n"
                       "如正在交互中，请按提示输入，或回复「结束」退出。")
 
 _SHARE_URL = re.compile(r"https?://[^\s]+", re.I)
@@ -251,6 +258,23 @@ def upsert_contribution(db: Session, *, tg_user_id: str, tg_username: str,
     return existing, False
 
 
+# v2.1.32：建议/反馈留言入库。与投稿/求片不同——留言没有作品实体、也不去重合并，
+# 同一个人连发三条就是三条（管理员要看到原话，合并会丢信息）。
+_FEEDBACK_MAX_LEN = 4000          # 单条留言上限（TG 单条消息上限 4096，取 4000 留余量）
+
+
+def save_feedback(db: Session, *, tg_user_id: str, tg_username: str, content: str,
+                  tg_chat_id: str = "", tg_message_id: int = 0) -> UserFeedback:
+    """登记一条用户留言，返回落库行（调用方负责 commit）。"""
+    row = UserFeedback(
+        tg_user_id=str(tg_user_id), tg_username=str(tg_username or ""),
+        content=str(content or "")[:_FEEDBACK_MAX_LEN], status="pending",
+        tg_chat_id=str(tg_chat_id or ""), tg_message_id=int(tg_message_id or 0))
+    db.add(row)
+    db.flush()  # autoflush=False：写完即取主键必须显式 flush
+    return row
+
+
 # v0.9.17.1 #284：求片按作品去重合并——dedup_key 复用 tgto.keyword_id（与白名单规则
 # id 一一对应），重复求片累加 submit_count 不新增行，后台只显示一条。
 def upsert_media_request(db: Session, *, tg_user_id: str, tg_username: str,
@@ -313,7 +337,7 @@ def _json_list(key: str, db: Session) -> list:
 
 
 def builtin_and_custom(db: Session) -> list[dict]:
-    """给管理页「内置指令速查」用：固定四项 + 后台自定义。"""
+    """给管理页「内置指令速查」用：固定五项 + 后台自定义。"""
     out = [{"command": c["command"], "description": c["description"], "builtin": True}
            for c in BUILTIN_COMMANDS]
     for item in _json_list("bot_commands_json", db):
@@ -981,6 +1005,7 @@ CB_WANT = "m.want"
 CB_CONTRIB = "m.contrib"
 CB_SEARCH = "m.search"
 CB_DONATE = "m.donate"
+CB_FEEDBACK = "m.fb"        # v2.1.32：建议/反馈
 
 # ---------- v0.9.8：求片/投稿 TMDB 候选多轮交互 ----------
 # 会话按 tg_user_id 存内存（进程内，重启即失效，符合「一次性选择」场景）。
@@ -993,6 +1018,7 @@ CB_PICK = "pk"
 FLOW_WANT = "want"
 FLOW_CONTRIB = "contribute"
 FLOW_SEARCH = "search"   # v0.9.12：搜索也走会话态，与求片/投稿一致
+FLOW_FEEDBACK = "feedback"  # v2.1.32：建议/反馈（先过算术验证码，再收留言正文）
 
 # ---------- v0.9.9 #209：点 Reply 键盘进入会话态，后续直接输入文字即可 ----------
 # 与候选会话 _pick_sessions 分开：这里只记录「用户当前处于求片/投稿模式」，
@@ -1035,6 +1061,87 @@ def end_flow_keyboard() -> dict:
     """会话态的 inline 键盘：一个「结束交互」按钮，让用户随时退出文字模式。"""
     return {"inline_keyboard": [
         [{"text": "✅ 结束交互 / 返回主菜单", "callback_data": CB_END}]]}
+
+
+# ---------- v2.1.32：建议/反馈的算术验证码（防刷，纯内存态） ----------
+# 设计取舍（都是刻意的，不要"顺手优化"掉）：
+#  1) **不落库**：验证码是「这一次对话」的临时凭据，服务重启就失效，用户重发一次
+#     指令即可重新拿题，没有任何恢复价值；落库反而要新增表、新增清理 job。
+#  2) **文本算术题，不做图片码**：requirements.txt 里没有 Pillow，为一张验证码引入
+#     图像依赖不划算（CI 也约定只跑纯标准库脚本）。文本题对真人是两秒的事，
+#     对批量脚本够用——它要的是「挡掉无脑刷」，不是图形学级别的对抗。
+#  3) **答案只在内存里**：题面文本里绝不出现答案，也不把答案写进日志。
+#  4) 答错重新出题（不是同一题反复问），连错 3 次直接退出，得重新点指令。
+_captcha_sessions: dict[str, dict] = {}   # {uid: {question, answer, tries, draft, verified, created}}
+_CAPTCHA_TTL = 600                        # 10 分钟没答对即作废
+_CAPTCHA_MAX_TRIES = 3
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _captcha_gc() -> None:
+    now = time.time()
+    for uid in [k for k, v in _captcha_sessions.items()
+                if now - float(v.get("created") or 0) > _CAPTCHA_TTL]:
+        _captcha_sessions.pop(uid, None)
+
+
+def _captcha_get(uid: str) -> dict | None:
+    _captcha_gc()
+    return _captcha_sessions.get(str(uid))
+
+
+def _captcha_clear(uid: str) -> None:
+    _captcha_sessions.pop(str(uid), None)
+
+
+def _captcha_issue(uid: str, *, draft: str = "", tries: int = 0) -> dict:
+    """给用户出一道新的算术题（覆盖旧题），返回会话字典。
+
+    draft：用户在指令里已经带上的正文。先存着，等验证通过直接落库，
+    不让用户把同一段话再打一遍。
+    """
+    a, b = random.randint(2, 19), random.randint(2, 19)
+    if random.random() < 0.5:
+        question, answer = f"{a} + {b}", a + b
+    else:
+        a, b = max(a, b), min(a, b)      # 保证不出现负数答案
+        question, answer = f"{a} - {b}", a - b
+    sess = {"question": question, "answer": int(answer), "tries": int(tries),
+            "draft": str(draft or "")[:_FEEDBACK_MAX_LEN], "verified": False,
+            "created": time.time()}
+    _captcha_sessions[str(uid)] = sess
+    return sess
+
+
+def _captcha_prompt(sess: dict, *, header: str = "") -> str:
+    left = max(0, _CAPTCHA_MAX_TRIES - int(sess.get("tries") or 0))
+    head = (header.strip() + "\n\n") if header else ""
+    return (head + "为防止机器人刷屏，请先算一道算术题：\n\n"
+            f"　　{sess.get('question') or '?'} = ?\n\n"
+            f"把答案（数字）直接发给我即可，还有 {left} 次机会；回复「结束」可退出。")
+
+
+def _captcha_verify(uid: str, raw: str) -> str:
+    """校验答案，返回 verified / wrong / not_number / exhausted / expired。
+
+    只有 wrong 与 exhausted 消耗机会；not_number（发来一句话/一个命令）
+    不算错答，原题重问，避免用户打错一个符号就被扣次数。
+    """
+    sess = _captcha_get(uid)
+    if not sess:
+        return "expired"
+    norm = str(raw or "").strip().translate(_FULLWIDTH_DIGITS).strip(" .。，,、")
+    if not norm.isdigit():
+        return "not_number"
+    if int(norm) == int(sess.get("answer") or 0):
+        sess["verified"] = True
+        return "verified"
+    sess["tries"] = int(sess.get("tries") or 0) + 1
+    if sess["tries"] >= _CAPTCHA_MAX_TRIES:
+        _captcha_clear(uid)
+        return "exhausted"
+    _captcha_issue(uid, draft=sess.get("draft") or "", tries=sess["tries"])
+    return "wrong"
 
 
 def _pick_gc() -> None:
@@ -1119,7 +1226,8 @@ def main_keyboard() -> dict:
          {"text": "👥 交流群组", "callback_data": CB_GROUPS}],
         [{"text": "📤 投稿 / 求片", "callback_data": CB_ACTIONS},
          {"text": "🔍 搜索资源", "callback_data": CB_SEARCH}],
-        [{"text": "💝 打赏支持", "callback_data": CB_DONATE}],
+        [{"text": "💝 打赏支持", "callback_data": CB_DONATE},
+         {"text": "💬 建议反馈", "callback_data": CB_FEEDBACK}],
     ]}
 
 
@@ -1130,8 +1238,12 @@ def main_reply_keyboard() -> dict:
     不是 setMyCommands 注册的底部指令栏，也不是 inline callback 按钮。
     按钮文字用中文指令名（不带斜杠），`_match_builtin()` 已同时接受两种写法。
     只回复 /start 的来源 chat，不主动私推；one_time_keyboard=False 保持常驻。
+
+    v2.1.32：加了第 5 个按钮「建议/反馈」。**3+2 两行**——
+    Telegram 的 Reply 键盘按行渲染，5 个按钮若排成 4+1 会剩一个孤零零的按钮、
+    占满整行宽显得很怪；3+2 两行长度接近，视觉上最稳。
     """
-    return {"keyboard": [["求片", "投稿"], ["搜索", "打赏"]],
+    return {"keyboard": [["求片", "投稿", "搜索"], ["打赏", "建议/反馈"]],
             "resize_keyboard": True, "one_time_keyboard": False,
             "selective": True}
 
@@ -1172,7 +1284,8 @@ def _menu_text(db: Session, data: str) -> tuple[str, dict | None]:
     """根据 callback_data 生成菜单回复文本与键盘。"""
     if data == CB_HOME:
         return ("请选择功能：\n\n求片/投稿/搜索用下方按钮；"
-                "也可直接发送 /求片 剧名、/投稿 标题 链接、/搜索 关键词。", main_keyboard())
+                "也可直接发送 /求片 剧名、/投稿 标题 链接、/搜索 关键词。\n"
+                "要提建议或反馈，点「建议反馈」按钮。", main_keyboard())
     if data == CB_ACTIONS:
         return "求片：提交想看的影视，自动加入关键词监控。\n投稿：登记你的资源分享链接，我们会尽快处理。", actions_keyboard()
     if data == CB_CHANNELS:
@@ -1329,6 +1442,13 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
     # v0.9.12：点「搜索资源」inline 按钮也进入会话态，后续直接输关键词即可
     if data == CB_SEARCH:
         _flow_set(user_id, FLOW_SEARCH)
+    # v2.1.32：点「建议反馈」inline 按钮 → 进会话态并立刻出一道算术验证码。
+    # 与 Reply 键盘的「建议/反馈」走同一条链路（_captcha_issue），两处行为一致。
+    if data == CB_FEEDBACK:
+        _flow_set(user_id, FLOW_FEEDBACK)
+        return await _edit_or_send(db, token, chat_id, message_id,
+                                   _captcha_prompt(_captcha_issue(user_id)),
+                                   end_flow_keyboard())
     # v0.9.12：点「打赏支持」inline 按钮——编辑菜单为说明，再直接发打赏码图片
     if data == CB_DONATE and (runtime_config.get(db, "donation_enabled") or "").lower() == "true":
         img = runtime_config.get(db, "donation_image_url") or ""
@@ -1455,11 +1575,14 @@ def _fmt_title(c: dict) -> str:
 
 
 async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
-                      tg_username: str = "") -> tuple[str, str]:
+                      tg_username: str = "", tg_chat_id: str = "",
+                      tg_message_id: int = 0) -> tuple[str, str]:
     """处理一条用户文本，返回 (动作, 回复文本)。写库但不在此处 commit。
 
     v0.9.9 #209：点「求片 / 投稿」Reply 键盘后进入会话态，后续直接输入文字即可，
     不必每条都加 /命令；发「结束」或点 inline「结束交互」按钮退出。
+
+    v2.1.32：tg_chat_id / tg_message_id 只为留言板留痕（可选，其它指令不用）。
     """
     raw = (text or "").strip()
     if not raw:
@@ -1469,6 +1592,7 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     if low_end(raw):
         _flow_clear(tg_user_id)
         _pick_clear(tg_user_id)
+        _captcha_clear(tg_user_id)   # v2.1.32：验证码会话一并作废
         return "flow_end", "已结束本次交互，随时可点下方「求片 / 投稿」重新开始。"
 
     # v0.9.8：投稿候选已选、正在等光鸭链接 —— 本次消息作为链接落库
@@ -1510,7 +1634,8 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     # v0.9.9 #209：会话态下，用户直接输入的文字（不含命令）当作当前 flow 的输入。
     # 这样点「求片」后发「凡人修仙传」= 求片剧名，点「投稿」后发剧名 = 投稿候选。
     active_flow = _flow_get(tg_user_id)
-    _flow_to_builtin = {FLOW_WANT: "求片", FLOW_CONTRIB: "投稿", FLOW_SEARCH: "搜索"}
+    _flow_to_builtin = {FLOW_WANT: "求片", FLOW_CONTRIB: "投稿", FLOW_SEARCH: "搜索",
+                        FLOW_FEEDBACK: "建议"}
     if active_flow and not builtin and not custom and not low.startswith("/"):
         builtin = _flow_to_builtin.get(active_flow, "求片")
         arg = raw
@@ -1540,6 +1665,55 @@ async def handle_text(db: Session, text: str, *, tg_user_id: str = "",
     # 用户带了内容 → 该轮交互完成，退出文字会话态（后续走正常候选/落库流程）
     if builtin in ("求片", "投稿", "搜索") and active_flow:
         _flow_clear(tg_user_id)
+
+    # v2.1.32：建议/反馈。
+    # 三段式：① 没会话 → 出验证码（指令里带的正文先当草稿存着）
+    #         ② 有会话但没过验证 → 本条文本当答案
+    #         ③ 过了验证 → 本条文本是留言正文，落库
+    # 验证码通过后如果草稿非空，直接用草稿落库——不让用户把同一段话再打一遍。
+    if builtin == "建议":
+        sess = _captcha_get(tg_user_id)
+        if sess is None:
+            _flow_set(tg_user_id, FLOW_FEEDBACK)
+            new = _captcha_issue(tg_user_id, draft=arg)
+            return "feedback_captcha", _captcha_prompt(new)
+        if not sess.get("verified"):
+            state = _captcha_verify(tg_user_id, arg or raw)
+            if state == "not_number":
+                return "feedback_captcha", _captcha_prompt(sess, header="请直接发送数字答案。")
+            if state == "wrong":
+                left = _CAPTCHA_MAX_TRIES - int((_captcha_get(tg_user_id) or {}).get("tries") or 0)
+                return "feedback_captcha_wrong", _captcha_prompt(
+                    _captcha_get(tg_user_id) or sess, header=f"答案不对，还有 {left} 次机会。")
+            if state in ("exhausted", "expired"):
+                _captcha_clear(tg_user_id)
+                _flow_clear(tg_user_id)
+                tip = ("验证未通过，已退出。" if state == "exhausted" else "验证已超时，已退出。")
+                return "feedback_denied", (tip + "如需留言，请重新点下方「建议/反馈」。")
+            # verified
+            sess = _captcha_get(tg_user_id) or sess
+            content = (str(sess.get("draft") or "") or "").strip()
+            if content:
+                row = save_feedback(db, tg_user_id=str(tg_user_id), tg_username=tg_username,
+                                    content=content, tg_chat_id=tg_chat_id,
+                                    tg_message_id=tg_message_id)
+                _captcha_clear(tg_user_id)
+                _flow_clear(tg_user_id)
+                return "feedback", (f"验证通过，反馈已提交（共 {len(row.content)} 字）。"
+                                    "管理员回复后会私聊通知你，感谢支持！")
+            return "feedback_captcha_ok", ("验证通过。请直接发送你的建议或反馈内容"
+                                           "（一段文字即可）。\n随时回复「结束」退出。")
+        # 已验证 → 本条文本就是留言正文
+        content = (arg or raw).strip()
+        if not content:
+            return "feedback_captcha_ok", "请直接发送你的建议或反馈内容（一段文字即可）。"
+        row = save_feedback(db, tg_user_id=str(tg_user_id), tg_username=tg_username,
+                            content=content, tg_chat_id=tg_chat_id,
+                            tg_message_id=tg_message_id)
+        _captcha_clear(tg_user_id)
+        _flow_clear(tg_user_id)
+        return "feedback", (f"反馈已提交（共 {len(row.content)} 字）。"
+                            "管理员回复后会私聊通知你，感谢支持！")
 
     if builtin == "搜索":
         text, ids = await _do_search(db, arg)
@@ -1837,7 +2011,9 @@ async def poll_once(db: Session) -> dict:
                         else:
                             action, reply = await handle_text(
                                 db, text, tg_user_id=user_id,
-                                tg_username=str(user.get("username") or ""))
+                                tg_username=str(user.get("username") or ""),
+                                tg_chat_id=chat_id,
+                                tg_message_id=int(msg.get("message_id") or 0))
                             if action != "ignored":
                                 stats["handled"] += 1
                                 stats["actions"].append(
@@ -1904,6 +2080,9 @@ async def _dispatch_reply(db: Session, token: str, chat_id: str, text: str,
         kb = _candidates_keyboard(sess["flow"], sess["candidates"]) if sess else None
         await _reply(db, token, chat_id, reply, reply_markup=kb)
     elif action == "flow_end":
+        await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
+    elif action in ("feedback", "feedback_denied"):
+        # v2.1.32：留言已收下 / 验证失败退出 —— 都要把 5 个按钮的主菜单还回去
         await _reply(db, token, chat_id, reply, reply_markup=main_reply_keyboard())
     elif action == "unrecognized":
         # v0.9.16 #277：非指令内容纠正提示，附主菜单引导用户走正确入口

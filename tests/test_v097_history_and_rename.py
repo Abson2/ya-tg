@@ -265,7 +265,8 @@ def test_frontend_jump_links_moved_to_template_module():
 def test_private_chat_reply_keyboard_on_start():
     kb = bot_listener.main_reply_keyboard()
     rows = kb["keyboard"]
-    assert [x for row in rows for x in row] == ["求片", "投稿", "搜索", "打赏"]
+    # v2.1.32：第 5 个按钮「建议/反馈」，按行 3+2 排（详见 test_v2132）
+    assert [x for row in rows for x in row] == ["求片", "投稿", "搜索", "打赏", "建议/反馈"]
     assert kb["resize_keyboard"] is True and kb["one_time_keyboard"] is False
     src = (ROOT / "backend/app/bot_listener.py").read_text(encoding="utf-8")
     assert "reply_markup=main_reply_keyboard()" in src
