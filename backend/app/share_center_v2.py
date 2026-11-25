@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import and_, select, update, func, or_, delete
+from sqlalchemy import and_, select, update, func, or_, delete, distinct
 from sqlalchemy.orm import Session
 
 from . import runtime_config, utils
@@ -159,6 +159,19 @@ PERMANENT_ERROR_MARKERS = (
 INVALID_TASK_STATUS = "invalid"        # 无效推送：链接作废 / 建链失败 / 资源已移除
 # 视为「链接已作废」的状态：记录仍在，但那份分享已经不能用了。
 INVALID_LINK_STATES = frozenset({CLEANED_LINK_STATE, INVALID_TASK_STATUS})
+
+# v2.1.47（用户口径）：「已作废不算任务条数」—— 作废的任务**不占任何额度**。
+#
+# 额度（每日总上限 / 单分类每日上限 / 均匀排期的每小时名额）问的是「今天已经推出去
+# 多少」。下面三类任务从未真正投递：用户主动取消（cancelled）、清理归档（cleaned）、
+# 判为无效推送（invalid：链接作废 / 资源已移除 / 建链失败）。让它们继续占额度，
+# 等于让根本没发出去的任务吃掉配额，真实可推量凭空减少。
+#
+# `skipped`（已跳过投递）**故意不在这个集合里**：它有两种来源 ——
+#   ① 同一部已在该渠道发过，这次按去重跳过（确实没发）；
+#   ② 孤儿在途任务归档（进程中断，无法确认到底发没发）。
+# 第 ② 种有真的发出去的可能，宁可让它继续占额度，也不凭猜疑多放一个名额。
+VOID_TASK_STATUSES = frozenset({CLEANED_TASK_STATUS, INVALID_TASK_STATUS, "cancelled"})
 # 计入「推送趋势」失败线的状态（v2.1.19）。
 # 只算真正的失败：failed（重试中的临时失败也算失败尝试）+ invalid（判为无效推送）。
 # 在途（ACTIVE_TASK_STATUS）、cancelled（用户主动取消）、cleaned（已归档）都**不是**
@@ -1441,7 +1454,10 @@ def _respread_forecast_times(hours: list[dict], now_sh: datetime) -> dict[str, A
 
 
 def _category_today_count(db: Session, category_key: str) -> int:
-    """某分类当日已创建任务数（分类排期 daily_limit 用）。上海自然日。"""
+    """某分类当日已创建任务数（分类排期 daily_limit 用）。上海自然日。
+
+    v2.1.47：作废任务（取消 / 清理 / 无效）不计入 —— 它们没真正投递过，不该吃额度。
+    """
     now_sh = datetime.now(shanghai_tz())
     day_start = datetime(now_sh.year, now_sh.month, now_sh.day,
                          tzinfo=shanghai_tz()).astimezone(timezone.utc)
@@ -1450,6 +1466,7 @@ def _category_today_count(db: Session, category_key: str) -> int:
         select(func.count(SCPublishTask.id))
         .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
         .where(SCPushListItem.category_key == category_key,
+               SCPublishTask.status.notin_(VOID_TASK_STATUSES),
                SCPublishTask.created_at >= day_start,
                SCPublishTask.created_at < day_end)
     ) or 0)
@@ -1471,6 +1488,10 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
     想恢复成按周/月控量或休止，需要改代码，不是改配置。
 
     统计口径：当日已建任务数（按 created_at 落库时间），0 = 不限。
+    **单位是「条」**——与页面文案（「单日推送总上限」按条计）一致，所以这里数的是
+    任务行，不是作品部数。
+    v2.1.47（用户口径）：作废任务（取消 / 清理 / 无效）不再计入 —— 它们从未真正
+    投递，却一直在吃当日额度，用户看到的就是「明明没推出去几条，额度却满了」。
     quiet 已在调用方处理。
     返回 (是否拦截, 原因)。
     """
@@ -1487,6 +1508,7 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
                                ).astimezone(timezone.utc)
         end = start + timedelta(days=1)
         used = db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.status.notin_(VOID_TASK_STATUSES),
             SCPublishTask.created_at >= start, SCPublishTask.created_at < end)) or 0
         if int(used) >= cap:
             return True, f"{kind}_quota"
@@ -1519,6 +1541,15 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
 #      行为零变化（没点过按钮就等于没这个功能）；
 #   ③ 额度值一律来自配置（每小时推送上限 → 周期计划小时上限），代码不写死数字；
 #      两个都是 0（＝不限）时如实报「没有可分配的额度」，绝不编一个数出来。
+#
+# v2.1.47（用户口径第 1、3 条）再修三处，都只动「名额怎么算」，不动时段配置：
+#   · **单位对齐**：名额是「部」，此前消费侧数的是任务行（条）。双渠道部署时一部
+#     作品吃两个计数，配额 3 部实际只排 1 部 —— 改成按作品计数（`category_work_counts`
+#     / `cat_works`），`_category_hour_counts` 也改 `count(distinct work_key)`。
+#   · **余量不空转**：名额先夹到该分类「这一小时真能排的部数」，削下来的按剩余
+#     余量回流给还有货的分类（`_fit_quota_to_backlog`），总额仍是发布规则给的上限。
+#   · **作废不占额度**：取消 / 清理 / 无效的推送任务不计入任何额度（`VOID_TASK_STATUSES`）。
+#   方案里另存 `backlog_snapshot`（生成时库存），页面据此提示「排期后又入库了」。
 # ---------------------------------------------------------------------------
 EVEN_PLAN_KEY = "even_plan"
 
@@ -1568,6 +1599,43 @@ def _largest_remainder(weights: dict[str, int], total: int) -> dict[str, int]:
                 diff += 1
             i += 1
     return out
+
+
+def _fit_quota_to_backlog(quotas: dict[str, int],
+                          room: dict[str, int]) -> dict[str, int]:
+    """把每小时名额夹到「这个分类这一小时真能排几部」以内，削下来的回流给有货的分类。
+
+    v2.1.47（真机反馈「有的分类排不上、有的分类排过期」）：
+      最大余额法按存量权重分名额，一个只有 2 部作品的小分类，可能在 cap=6 时也拿到
+      1–2 个名额；若它每小时名额 2 部、全天 15 个可排小时，方案就写着它能排 30 部，
+      实际只有 2 部 —— 剩下的 28 个名额全天**空转**，作品多的分类被自己的配额卡住。
+
+    做法（不发明数字，只是把「用不完的」转给「用得完的」）：
+      · `room[k]` = 该分类这一小时最多能排几部（在库存量 与 单分类每小时上限取小），
+        由调用方算好传进来；
+      · 超额部分削掉，削掉的部数按「剩余余量」为权重用同一套最大余额法回流；
+      · 回流总量 = 被削掉的部数，所以总和只会 ≤ 原总额（发布规则给的上限）——
+        绝不会因为回流多排一部。
+    """
+    base = {k: max(0, int(v)) for k, v in (quotas or {}).items()}
+    if not base:
+        return {}
+    out = {k: min(v, max(0, int(room.get(k, 0)))) for k, v in base.items()}
+    freed = sum(base.values()) - sum(out.values())
+    while freed > 0:
+        spare = {k: max(0, int(room.get(k, 0)) - out[k]) for k in out}
+        spare = {k: v for k, v in spare.items() if v > 0}
+        if not spare:
+            break                       # 所有分类都到顶了 → 剩下的名额只能空着
+        add = _largest_remainder(spare, min(freed, sum(spare.values())))
+        if not add:
+            break
+        for k, n in add.items():
+            take = min(int(n), int(spare[k]))
+            if take > 0:
+                out[k] += take
+                freed -= take
+    return {k: v for k, v in out.items() if v > 0}
 
 
 def _category_backlog(db: Session, live_keys: set[str]) -> dict[str, int]:
@@ -1667,17 +1735,24 @@ def _even_allows(quota: dict[str, int] | None, category_key: str, used: int) -> 
 
 
 def _category_hour_counts(db: Session, hour_start: datetime) -> dict[str, int]:
-    """本小时**已经建好**的分类任务数（上海自然小时，按 created_at 落库时间）。
+    """本小时**已经建好**的分类作品数（上海自然小时，按 created_at 落库时间）。
 
-    与 `_category_today_count` 同源口径，只是窗口缩到一小时。
-    均匀排期要给「本轮还能再建几部」，就得知道这个小时已经建了多少。
+    v2.1.47（用户口径）：单位必须是**部**，不是条。
+    均匀排期的名额是「每个时段排几部作品」，而同一部作品推频道 + 群是两条任务；
+    此前这里数的是任务行数，于是「配额 2 部」遇到两个渠道时只排得出 1 部 ——
+    配的额度和实排部数对不上，等于凭空少排一半。
+    （与 `_pace_interval_minutes` 的分母口径一致：那处也是「部数」而不是「条数」。）
+
+    作废任务（取消 / 清理 / 无效）不计入 —— 用户原话「已作废不算任务条数」。
     """
     start = hour_start.astimezone(timezone.utc)
     end = start + timedelta(hours=1)
     rows = db.execute(
-        select(SCPushListItem.category_key, func.count(SCPublishTask.id))
+        select(SCPushListItem.category_key,
+               func.count(distinct(SCPublishTask.work_key)))
         .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
-        .where(SCPublishTask.created_at >= start, SCPublishTask.created_at < end)
+        .where(SCPublishTask.status.notin_(VOID_TASK_STATUSES),
+               SCPublishTask.created_at >= start, SCPublishTask.created_at < end)
         .group_by(SCPushListItem.category_key)
     ).all()
     return {str(k): int(n or 0) for k, n in rows if k}
@@ -1715,6 +1790,10 @@ def build_even_plan(db: Session) -> dict[str, Any]:
 
     live_keys = _live_work_keys(db)
     backlog = _category_backlog(db, live_keys)
+    if not live_keys or not any(int(v or 0) > 0 for v in backlog.values()):
+        return {"ok": False,
+                "reason": ("资源库里当前没有在库作品，没有可分配的名额——"
+                           "先同步资源库，再来点一键调度。")}
     quiet = _quiet_window(cycle)
     win = None
     try:
@@ -1739,9 +1818,14 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         weights = {c.category_key: max(1, int(backlog.get(c.category_key) or 0))
                    for c in cands}
         quotas = _largest_remainder(weights, cap)
+        # v2.1.47：名额必须夹到「这一小时真能排几部」以内（在库存量与单分类每小时
+        # 上限取小），削下来的按剩余余量回流给还有货的分类。此前只有一个「按权重分」
+        # 的静态名额，小分类拿着用不完的名额空转，大分类被自己的配额卡住。
+        room = {c.category_key: max(0, int(backlog.get(c.category_key) or 0))
+                for c in cands}
         if cycle_hour_max:
-            quotas = {k: min(v, cycle_hour_max) for k, v in quotas.items()}
-        quotas = {k: int(v) for k, v in quotas.items() if int(v) > 0}
+            room = {k: (min(v, cycle_hour_max) if v > 0 else 0) for k, v in room.items()}
+        quotas = _fit_quota_to_backlog(quotas, room)
         if quotas:
             items[str(h)] = quotas
 
@@ -1759,6 +1843,10 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         "categories": len(cats),
         "hours": len(items),
         "slots_total": sum(sum(v.values()) for v in items.values()),
+        # v2.1.47：把「生成这一刻的在库作品数」留成快照。
+        # 页面据此对比当前库存，判断方案是不是已经跟不上入库进度
+        # （用户原话：「我们的排期是排期完成后又入库的」）。
+        "backlog_snapshot": {k: int(v) for k, v in backlog.items() if int(v) > 0},
         "items": items,
     }
     cfg[EVEN_PLAN_KEY] = plan
@@ -1810,7 +1898,15 @@ def clear_even_plan(db: Session) -> dict[str, Any]:
 
 @router.get("/even-plan")
 def api_even_plan(db: Session = Depends(get_db)):
-    """当前均匀排期方案（页面回显用）；未生成 → `active=false` 并说明怎么开。"""
+    """当前均匀排期方案（页面回显用）；未生成 → `active=false` 并说明怎么开。
+
+    v2.1.47 追加「库存漂移」四个数字，回答用户那句「我们的排期是排期完成后又入库的」：
+      · `snapshot_works`：生成方案那一刻的在库作品数（方案里存的快照）；
+      · `current_works`：现在的在库作品数；
+      · `drift`：差额（正数＝排期后又入库了，负数＝库变小了）；
+      · `stale`：差额不为 0 就为真 —— 方案的名额是按旧库存分的，已经跟不上现状。
+    只如实报差额，不猜「差多少部才该重算」，也不自动改方案（改不改由用户点按钮决定）。
+    """
     plan = even_plan_of(db)
     if not plan:
         return {"active": False, "detail": [],
@@ -1827,6 +1923,15 @@ def api_even_plan(db: Session = Depends(get_db)):
                "per_hour": round(v["works"] / v["hours"], 2) if v["hours"] else 0}
               for k, v in per_cat.items()]
     detail.sort(key=lambda x: (-x["works"], x["name"]))
+    # v2.1.47：库存漂移（生成时 vs 现在）。取不到当前库存时如实报 0 差额并标不可比。
+    snap = plan.get("backlog_snapshot") or {}
+    snapshot_works = sum(int(v or 0) for v in snap.values())
+    try:
+        current_works = sum(_category_backlog(db, _live_work_keys(db)).values())
+    except Exception:
+        db.rollback()
+        current_works = -1
+    drift = (current_works - snapshot_works) if current_works >= 0 else 0
     return {
         "active": True,
         "generated_at": plan.get("generated_at") or "",
@@ -1835,6 +1940,10 @@ def api_even_plan(db: Session = Depends(get_db)):
         "categories": int(plan.get("categories") or 0),
         "hours": int(plan.get("hours") or 0),
         "slots_total": int(plan.get("slots_total") or 0),
+        "snapshot_works": int(snapshot_works),
+        "current_works": int(current_works),
+        "drift": int(drift),
+        "stale": bool(current_works >= 0 and drift != 0),
         "detail": detail,
     }
 
@@ -2262,14 +2371,25 @@ def plan_engine(db: Session) -> dict[str, int]:
             minute=0, second=0, microsecond=0)
         even_used = _category_hour_counts(db, hour_start)
 
+    # v2.1.47：**两个计数器，单位不同，别混用**。
+    #   · `category_task_counts` 数「条」——任务行，供 `cycle_hour_max`
+    #     （单分类每小时上限，页面按条配）与日上限比对；
+    #   · `category_work_counts` 数「部」——作品，供均匀排期配额比对。
+    # 同一部作品推频道 + 群是两条任务但只算一部；混用会让「配额 2 部」在双渠道
+    # 部署下只排得出 1 部，实排永远只有配额的一半。
+    category_task_counts: dict[str, int] = {}
+    category_work_counts: dict[str, int] = {}
+
     def _sched_allows(key: str, per_category_count: int) -> bool:
         # v2.1.19：判定内核外移到 `_sched_allows_core`，与「今日排期」预测共用同一份
         # 判据——预测和实跑算出差，就等于骗用户。
         # `today_count` 保持惰性：只有配了日上限时才查库（原闭包同样是短路才算）。
         # v2.1.46：均匀排期配额再拦一道——「本小时库里已建 + 本轮已建」到顶就换下一个
         # 分类，把剩余名额让出去。没有方案时 `_even_allows` 恒为 True，零影响。
+        # v2.1.47：这里比的是**部**（`category_work_counts`），不是条。
         if not _even_allows(even_quota, key,
-                            int(even_used.get(key, 0)) + int(per_category_count)):
+                            int(even_used.get(key, 0))
+                            + int(category_work_counts.get(key, 0))):
             return False
         today = _category_today_count(db, key) if cycle_day_max else 0
         return _sched_allows_core(sched_map.get(key), hour=sh_hour, weekday=iso_weekday,
@@ -2278,7 +2398,6 @@ def plan_engine(db: Session) -> dict[str, int]:
                                   cycle_day_max=cycle_day_max,
                                   today_count=today)
 
-    category_task_counts: dict[str, int] = {}
 
     # v2.1.1：清单不再每轮新建。此前每轮 plan_engine 都用 uuid 建一条新 SCPushList，
     # 真机跑一天即堆积 4000+ 条空清单（列表页被"发布清单"淹没）。
@@ -2441,9 +2560,11 @@ def plan_engine(db: Session) -> dict[str, int]:
             # `_sched_allows` 是每轮每分类只判一次的，判的时候这个分类的计数还是 0，
             # 光靠它挡不住「一个分类在本轮把整点额度吃光」——那正是本版要修的病根。
             # 用「本小时库里已建 + 本轮已建」跟配额比，到顶就收手，把名额让给后面分类。
+            # v2.1.47：两边都换成**部**（`category_work_counts`）。原来用任务条数，
+            # 双渠道部署时一部作品吃两个计数，「配额 3 部」实际只排得出 1–2 部。
             if not _even_allows(even_quota, category.category_key,
                                 int(even_used.get(category.category_key, 0))
-                                + int(category_task_counts.get(category.category_key, 0))):
+                                + int(category_work_counts.get(category.category_key, 0))):
                 break
             work_key = str(lv.work_key or "")
             # 自愈补扫时同一作品可能二次命中；本轮已处理过就不再重复。
@@ -2456,6 +2577,7 @@ def plan_engine(db: Session) -> dict[str, int]:
             # 队列的事实依据是「资源库里当前有这部作品」，而不是历史快照还在不在。
             if work_key not in live_keys:
                 continue
+            built_before_work = built_in_batch
             for channel in channels:
                 target_type = "group" if str(channel.chat_id or "").startswith("-") else "channel"
                 # v2.1.6 真实缺陷修复（泰迪熊2 双推）：dedup **去掉 fingerprint**。
@@ -2513,6 +2635,12 @@ def plan_engine(db: Session) -> dict[str, int]:
                 built_in_batch += 1
                 cursor.last_success_at = utcnow()
                 category_task_counts[category.category_key] = category_task_counts.get(
+                    category.category_key, 0) + 1
+            # v2.1.47：作品级计数（部）——一部作品建完它的全部渠道才算 1 部。
+            # 均匀排期配额比的是这个数；`category_task_counts`（条）继续给
+            # 「单分类每小时上限」用，两者单位不同，不许互相顶替。
+            if built_in_batch > built_before_work:
+                category_work_counts[category.category_key] = category_work_counts.get(
                     category.category_key, 0) + 1
             if hour_max and task_count >= hour_max:
                 break
@@ -3125,7 +3253,10 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         quota = _quota(h)
         hour_items: list[dict[str, Any]] = []
         hour_tasks = 0
+        # v2.1.47：两个计数器，单位不同（`cat_counts`=条，计额度与单分类小时上限；
+        # `cat_works`=部，计均匀排期名额）。与 plan_engine 一一对应，勿混用。
         cat_counts: dict[str, int] = {}
+        cat_works: dict[str, int] = {}
         # v2.1.34：已建任务排在本小时最前（它比插队和轮转都确定），且不计入
         # `hour_tasks` —— 额度在 `submitted_keys_hour` 里已经扣过了，重复扣会把
         # 本小时的预测挤成 0，又变成「有队列、排期表空」。
@@ -3193,8 +3324,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
             key = cat.category_key
             # 本小时「已建任务 + 本小时已预测」到该分类配额就换下一个分类，
             # 剩余名额留给排在后面的分类（这正是「均匀」的实现点）。
+            # v2.1.47：比的是**部**（`cat_works`），与 plan_engine 同口径。
             if not _even_allows(even_q, key,
-                               int(even_base.get(key, 0)) + int(cat_counts.get(key, 0))):
+                               int(even_base.get(key, 0)) + int(cat_works.get(key, 0))):
                 continue
             if not _sched_allows_core(sched_map.get(key), hour=h,
                                       weekday=now_sh.isoweekday(),
@@ -3213,8 +3345,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 # v2.1.46：与 plan_engine 同一处、同一判据——每部作品建之前都按
                 # 「本小时该分类已排 已建」跟配额比一次，到顶就停手。
                 # 只放在分类外层的话，入口计数为 0，一个分类照样能把额度吃满。
+                # v2.1.47：比的是**部**（`cat_works`）。
                 if not _even_allows(even_q, key,
-                                   int(even_base.get(key, 0)) + int(cat_counts.get(key, 0))):
+                                   int(even_base.get(key, 0)) + int(cat_works.get(key, 0))):
                     break
                 wk = str(lv.work_key or "")
                 picks = _picks_for(wk)
@@ -3222,13 +3355,18 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                     # 名额已占的作品也必须越过游标，否则预测会永远卡在同一部上
                     cursors[key] = max(cursors.get(key, 0), int(lv.id))
                     continue
+                built_here = 0
                 for chat_id in picks:
                     if hour_tasks >= quota:
                         break
                     planned_pairs.add((wk, chat_id))
                     hour_tasks += 1
                     built += 1
+                    built_here += 1
                     cat_counts[key] = cat_counts.get(key, 0) + 1
+                if built_here:
+                    # 一部作品算一个名额（它的各渠道任务同属这一部）
+                    cat_works[key] = cat_works.get(key, 0) + 1
                 cursors[key] = max(cursors.get(key, 0), int(lv.id))
                 if wk not in titles:
                     titles.append(wk)

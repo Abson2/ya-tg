@@ -3673,7 +3673,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.46 · Asia/Shanghai</span>
+          <span>v2.1.47 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5371,6 +5371,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <b>均匀排期已生效</b>
                     <span class="hint">每小时 {{ scEvenPlan.base_cap }} 部（额度来自{{ scEvenPlan.cap_source }}）· 覆盖 {{ scEvenPlan.categories }} 个分类、{{ scEvenPlan.hours }} 个时段 · 合计 {{ scEvenPlan.slots_total }} 部</span>
                     <span class="hint sc-even-when">生成于 {{ scEvenPlan.generated_at }}</span>
+                    <!-- v2.1.47：库存漂移。方案名额是按「生成那一刻」的在库作品量分的，
+                         排期之后又入库，名额就跟不上现状了 —— 如实报差额，让用户决定重算。 -->
+                    <span v-if="scEvenPlan.stale" class="hint sc-even-drift">
+                      库存已变化 {{ scEvenPlan.drift > 0 ? '+' : '' }}{{ scEvenPlan.drift }} 部（生成时 {{ scEvenPlan.snapshot_works }} 部 → 现在 {{ scEvenPlan.current_works }} 部），建议重新点一次「一键 AI 调度」
+                    </span>
                     <el-button size="small" text type="primary" @click="scEvenDetailOpen = true">按分类看明细（{{ scEvenPlan.detail.length }}）</el-button>
                     <el-button size="small" text @click="scClearEvenPlan">撤销</el-button>
                   </template>
@@ -6249,6 +6254,8 @@ button{font-family:inherit}
 .sc-even-dot{width:7px;height:7px;border-radius:50%;background:var(--yg-muted);flex:0 0 auto}
 .sc-even-dot.on{background:var(--yg-tone-green-fg)}
 .sc-even-when{font-variant-numeric:tabular-nums}
+/* v2.1.47：库存漂移提示（生成时 vs 现在），只在库存真的变了才出现 */
+.sc-even-drift{color:#cf7f1c !important;font-weight:600;font-variant-numeric:tabular-nums}
 html.dark .sc-even-strip{background:var(--yg-panel);border-color:var(--yg-line)}
 /* v2.1.44：整体镜像进度（A 库 → B 库）—— 看板不能只有 B 库的数 */
 .mirror-overall{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px;margin-bottom:12px}
