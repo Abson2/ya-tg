@@ -476,7 +476,9 @@ def _file_status_label(status: str) -> str:
     状态列，这里统一出中文，页面不出现 pending / copying 这类内部状态词。
     """
     return ({"pending": "待复制", "copying": "复制中", "failed": "复制失败",
-             "unknown": "状态待确认", "synced": "已同步", "superseded": "已归档"}
+             "unknown": "状态待确认", "synced": "已同步", "superseded": "已归档",
+             # v2.1.38：用户确认源文件已删后手动清理归档的行（不删行，可自动恢复）
+             "archived": "已手动清理"}
             .get(str(status or "").strip().lower(), "待处理"))
 
 
@@ -1141,7 +1143,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.37", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.38", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1152,7 +1154,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.37", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.38", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1886,7 +1888,7 @@ class MirrorCleanupInput(BaseModel):
     """v2.1.11：统一「清理无效」端点的入参。
 
     scope   清理范围：file（文件映射）/ dir（目录映射）/ pruned（僵尸目录行）
-            / media（影视映射行）
+            / media（影视映射行）/ archive（用户确认源文件已删的待处理行，归档不删）
     dry_run 只返回预览清单不写库
     rule_id 限定镜像规则（0 = 当前生效规则）
     ids     限定只处理这些行 id（空 = 该 scope 下全部）
@@ -2014,6 +2016,10 @@ def _mirror_guard():
                  f"（已持续约 {held} 秒）{wait_hint}；"
                  "本流程一轮要走完「复制 → 改名 → 翻译 → 识别 → 入库资源库」，"
                  "上一轮彻底结束后才会启动下一轮；"
+                 # v2.1.38（真机反馈）：用户此刻往往只是想清掉「已确认源文件被删」的记录，
+                 # 这类操作根本不需要碰 A/B 库，不该被这把锁挡住 —— 直接告诉他走哪条路。
+                 "若你只想清理已确认源文件被删除的记录，可在「待重试文件」里勾选后点"
+                 "「清理选中」，它不占用镜像任务、不需要等这一轮结束；"
                  f"若长时间（>30 分钟）仍报此错，重启容器即可清除残留锁。")
     try:
         yield
@@ -2362,6 +2368,9 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
                     置为「待重建」（不删行，下轮同步自动重建）
       scope=pruned  彻底移除「已清理待重建」的僵尸目录行（物理删除，可按 ids 限定）
       scope=media   清理无效影视映射：只读核对 B 库，删除整部已无文件的映射行
+      scope=archive 把用户**确认源文件已被删除**的待处理文件行归档（v2.1.38）
+                    —— 不联网、不删行、不动 B 库文件；归档后不再计入「待处理」，
+                    源文件放回 A 库后下轮同步会自动恢复并重新复制
 
     通用参数：
       dry_run=true  只返回预览清单，不写库（强烈建议先预览）
@@ -2372,14 +2381,27 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
     """
     scope = (p.scope or "file").strip().lower()
     # scope=all：文件段 + 目录段一起清（老端点 /mirror/mappings/prune 的原语义）
-    if scope not in ("all", "file", "dir", "pruned", "media"):
-        raise HTTPException(400, "清理范围只能是 all / file / dir / pruned / media")
+    if scope not in ("all", "file", "dir", "pruned", "media", "archive"):
+        raise HTTPException(400, "清理范围只能是 all / file / dir / pruned / media / archive")
     r = _mirror_rule(db)
     if not r:
         raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
     if p.rule_id and int(p.rule_id) != int(r.id):
         raise HTTPException(400, "指定的镜像规则与当前生效规则不一致")
     ids = [int(x) for x in (p.ids or []) if str(x).strip().isdigit()]
+
+    if scope == "archive":
+        # v2.1.38（真机反馈）：用户确认源文件已删 → 手动清理归档。
+        # 纯 DB 操作、不联网、不持锁（不碰 A/B 库），所以不进 _mirror_guard，
+        # 避免正在跑的长任务把用户这个「点一下就好」的动作堵在锁外。
+        out = mirror.archive_retryable_files(db, r, ids, dry_run=bool(p.dry_run))
+        if not p.dry_run and out.get("archived"):
+            add_audit(db, "mirror_files_archived", target_type="mirror",
+                      detail=json_dumps({"archived": out["archived"],
+                                         "ids": out.get("ids", [])[:50]}))
+            db.commit()
+        out["scope"] = scope
+        return out
 
     if scope == "pruned":
         # 纯 DB 操作：物理移除带 [pruned] 标记的僵尸目录行
@@ -2936,6 +2958,17 @@ def mirror_status(db: Session = Depends(get_db)):
                        "error": f.error or "", "status": f.status,
                        "status_label": _file_status_label(f.status)}
                       for f in retryable_files]
+    # v2.1.38（真机反馈）：用户确认源文件已删后可手动清理归档。归档行不再计入
+    # `files_retryable`，所以「N 项待处理」会如实下降；这里另出一份归档明细，
+    # 让用户看得到自己清掉了什么、也知道源文件放回来能自动恢复
+    #（铁律：页面每个数字都必须有一份同谓词明细可点开，不许只给一个数字）。
+    archived_files = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.status == mirror.ARCHIVED_FILE_STATUS
+    ).order_by(MirrorFile.id.desc()).limit(100)).all())
+    archived_rows = [{"id": f.id, "work": titles.get(f.media_id, ""),
+                      "file": f.file_name, "error": f.error or "",
+                      "status": f.status, "status_label": _file_status_label(f.status)}
+                     for f in archived_files]
     # 任务侧有同一个缺口：tasks_failed / tasks_unknown / tasks_skipped / tasks_cancelled
     # 四个计数都没有专属明细，只有一张「最近 30 条全状态混排」的任务表——终态失败 /
     # 跳过 / 取消的任务一旦被新任务挤出 30 条，就只剩数字了。这里给一份只含需处理任务的清单。
@@ -3223,6 +3256,9 @@ def mirror_status(db: Session = Depends(get_db)):
             "files_unknown": db.query(MirrorFile).filter(MirrorFile.status == "unknown").count(),
             "files_retryable": db.query(MirrorFile).filter(
                 MirrorFile.status.in_(list(mirror.RETRYABLE_FILE_STATUS))).count(),
+            # v2.1.38：用户手动清理归档的行（不含在 files_retryable 里，不计入待处理）
+            "files_archived": db.query(MirrorFile).filter(
+                MirrorFile.status == mirror.ARCHIVED_FILE_STATUS).count(),
             # v0.8.6：改名进度与卡点
             "files_renamed": db.query(MirrorFile).filter(
                 MirrorFile.rename_status == "done").count(),
@@ -3331,6 +3367,9 @@ def mirror_status(db: Session = Depends(get_db)):
         # （pending / copying / failed / unknown 全在内），面板据此渲染，
         # 数字与清单从此对得上。上限 100 条，超出时前端标注「仅显示最近 N 条」。
         "retryable_files": retryable_rows,
+        # v2.1.38（真机反馈）：用户确认源文件已删、手动清理归档的行（上限 100 条）。
+        # 它们已不在 counts.files_retryable 里，单列一份明细供核对与了解如何恢复。
+        "archived_files": archived_rows,
         # v2.1.36：与 tasks_failed / tasks_unknown / tasks_skipped / tasks_cancelled
         # 同源的「需处理任务」清单，上限 50 条。
         "task_issues": task_issue_rows,

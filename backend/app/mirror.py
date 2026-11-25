@@ -294,6 +294,12 @@ COPY_BATCH_SIZE = 50
 # v0.8.4：只有 synced 才表示「文件确实到了 B 库」。这些状态必须重试，
 # 绝不能和 synced 一起塞进 existing 判 unchanged（否则永久卡死）。
 RETRYABLE_FILE_STATUS = {"pending", "copying", "failed", "unknown"}
+# v2.1.38（真机反馈）：用户**确认源文件已被删除**后可手动清理归档的终态。
+# 刻意**不放进** RETRYABLE_FILE_STATUS —— 归档后：不再计入「待处理」、不再每轮被
+# 优先排进队列重算、也不再参与自动补复制。行本身保留（项目红线：清理用归档，
+# 不物理删除，历史行与执行记录必须留），源文件放回 A 库后下一轮同步会按同一行
+# 复活重新复制（见 sync_rule 里 archived_rows 的分支）。
+ARCHIVED_FILE_STATUS = "archived"
 # v0.9.6：prune 已清理的目录映射标记。带此标记的 missing 行是「B 库不存在、映射已清、
 # 下轮同步从 A 库重建」的僵尸行，不需用户手工建目录；展示层据此从「待创建目录」排除，
 # 并在用户确认后由 /api/mirror/mappings/clear-pruned 真正删除（不违反自动 prune 不删行的红线）。
@@ -515,7 +521,9 @@ def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool
     n = 0
     for row in db.scalars(select(MirrorFile).where(
             MirrorFile.media_id == media.id,
-            MirrorFile.status != "pending")).all():
+            # v2.1.38：已由用户手动归档的行**不动**。否则整部作品从 A 库消失时
+            # C 类每轮都会把 archived 翻回 failed，用户清理完又冒出来，等于白清。
+            MirrorFile.status.notin_(("pending", ARCHIVED_FILE_STATUS)))).all():
         row.status = status
         if reason:
             row.error = reason
@@ -531,6 +539,58 @@ def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool
         media.status = "failed"
     db.commit()
     return n
+
+
+def archive_retryable_files(db: Session, rule: MirrorRule, ids: list[int],
+                            *, dry_run: bool = False) -> dict:
+    """v2.1.38：把「用户已确认源文件被删除」的待处理文件行**归档**（不删行）。
+
+    背景（真机反馈）：A 库源文件被用户删掉后，补复制客观上不可能成功 —— v2.1.37 已把
+    这类行收敛成「复制失败 + 明确原因」，但用户明明知道片被删了，只希望把这条记录从
+    「问题诊断 → N 项待处理」里清掉、别再每轮重算一遍。此前的清理入口只有
+    「清理无效影视映射」—— 那是**整部作品 + 联网核对 B 库**，颗粒太粗、还要联网。
+
+    口径（与项目红线一致：清理用归档，不物理删除）：
+      - 只处理 status ∈ RETRYABLE_FILE_STATUS 的行；synced / superseded 一律不动
+        （已同步的记录不是「待处理」，绝不能借这个按钮把正常映射清掉）；
+      - 归档后 status=archived，`error` **保留原原因**并追加「已确认…手动清理归档」，
+        用户事后仍能查到当初为什么没复制成功；
+      - 清 target_file_id / target_name / rename_* / task_id（与「重置」同口径）；
+      - **不删行、不删 B 库文件、不动资源 / 分享 / 队列**；
+      - **可恢复**：源文件放回 A 库后，下一轮同步枚举到同一 (fileId, 指纹) 会按**同一行**
+        复活重新复制（不新建行，避免撞 (media_id, source_file_id, fingerprint) 唯一键）；
+      - **不联网**：纯 DB 操作，用户点一下就生效，不受光鸭接口抖动影响。
+
+    返回 {"ok", "selected", "archived", "skipped", "dry_run", "ids"}。
+    """
+    wanted = [int(x) for x in (ids or []) if str(x).strip().lstrip("-").isdigit()]
+    stmt = select(MirrorFile).where(
+        MirrorFile.rule_id == rule.id,
+        MirrorFile.status.in_(sorted(RETRYABLE_FILE_STATUS)))
+    if wanted:
+        stmt = stmt.where(MirrorFile.id.in_(wanted))
+    rows = list(db.scalars(stmt.order_by(MirrorFile.id)).all())
+    out = {"ok": True, "selected": len(wanted), "archived": len(rows),
+           "skipped": max(0, len(wanted) - len(rows)) if wanted else 0,
+           "dry_run": bool(dry_run), "ids": [r.id for r in rows],
+           "note": "已归档的记录只是从「待处理」里移除，没有删除任何文件与历史；"
+                   "源文件放回 A 库后下一轮同步会自动恢复并重新复制"}
+    if dry_run or not rows:
+        return out
+    suffix = ("（已确认 A 库源文件被删除，用户手动清理归档；"
+              "源文件放回 A 库后重新同步会自动恢复）")
+    for row in rows:
+        old = str(row.error or "").strip()
+        row.status = ARCHIVED_FILE_STATUS
+        row.error = ((old + " · " + suffix) if old else suffix)[:500]
+        row.target_file_id = ""
+        row.target_name = ""
+        row.rename_status = ""
+        row.rename_error = ""
+        row.task_id = ""
+        row.updated_at = utcnow()
+    db.commit()
+    return out
 
 
 async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
@@ -1399,6 +1459,11 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             synced_identities = {m.identity for m in all_rows if m.status == "synced"}
             retry_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
                           for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
+            # v2.1.38（真机反馈）：用户手动归档过的行，源文件回到 A 库后按**同一行**复活。
+            # 不复用就必须新建行，而 (media_id, source_file_id, fingerprint) 是唯一键，
+            # 归档行还留在库里 → 新插入直接撞唯一约束。所以复活走这里，不新建。
+            archived_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
+                             for m in all_rows if m.status == ARCHIVED_FILE_STATUS}
             # v0.8.7 补上另一半：DB 标记 synced **也不等于** B 库真的有文件。
             # 用户实测「B 库影视文件夹下为空目录」反复出现，根因是文件被删 /
             # 换了 B 库目录 / 复制任务没落地后，记录仍停在 synced，永远判 unchanged。
@@ -1472,6 +1537,13 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 # 否则它会永远停留在「永不翻译」状态，新集数也永远改不成英文名。
                 has_new_source_file = True
                 row = retry_rows.pop((fid, fp_size), None)
+                if row is None:
+                    # v2.1.38：手动归档过的行，源文件回来了就复活（不新建行）
+                    row = archived_rows.pop((fid, fp_size), None)
+                    if row is not None:
+                        stats["restored"] = int(stats.get("restored", 0) or 0) + 1
+                        stats["file_errors"].append(
+                            f"{title}/{fname}：已归档的记录随源文件回归，自动恢复复制")
                 if row is not None:
                     # 复用旧记录重新复制，不新建行：避免唯一键冲突与历史留痕膨胀
                     identity = row.identity
@@ -1756,6 +1828,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         rule.last_message += f" · A库源文件已删 {stats['source_missing']} 项"
     if int(stats.get("source_changed") or 0) > 0:
         rule.last_message += f" · A库源文件已变 {stats['source_changed']} 项"
+    # v2.1.38：手动归档的记录随源文件回归自动复活，如实回显（用户清完又恢复要看得到）
+    if int(stats.get("restored") or 0) > 0:
+        rule.last_message += f" · 已归档恢复 {stats['restored']} 项"
     # v2.1.36：A 库整部作品消失（源文件被删）——同样如实回显，别让用户只看到
     # 「待处理 N 项」却不知道是「片被删了」。
     _c_del = int((stats.get("prepass") or {}).get("c_deleted_a", 0) or 0)

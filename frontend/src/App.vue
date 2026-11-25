@@ -432,7 +432,7 @@ const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, mirror_mode: 'full', interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], retryable_files: [], task_issues: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {}, schedule: {} })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], retryable_files: [], archived_files: [], task_issues: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {}, schedule: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 // v2.1.11：三处折叠组各用独立 v-model——此前共用同一个 mirrorDiagOpen，
 // 展开一个会收起另一个，用户刚展开「问题诊断」又发现「清单」被关掉了。
@@ -495,6 +495,9 @@ const batchInfo = ref({ status: 'idle', total: 0, done: 0, percent: 0, current_s
 const prunedDirSelected = ref([])
 // v0.9.17.2：失败任务定向批量重试的勾选行（目录 / 文件各自独立）
 const missingDirSelected = ref([]), fileErrSelected = ref([])
+// v2.1.38：待重试文件表格的 ref —— 勾选带 reserve-selection（按行键保留），
+// 行被归档移出数据后必须显式清一次选中，否则内部保留的旧键会让按钮一直显示旧数字。
+const retryTableRef = ref(null)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const showScanPanel = ref(false)
@@ -1730,6 +1733,30 @@ async function retryFailedFiles() {
     }
     fileErrSelected.value = []
     await load()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v2.1.38（真机反馈）：用户确认 A 库源文件已被删除后，手动把这些「永远补不成功」的
+// 待处理记录清理归档——不删行（历史与执行记录必须留），只从待处理清单移除，
+// 源文件放回 A 库后下一轮同步会自动恢复并重新复制。
+async function archiveFiles() {
+  const ids = (fileErrSelected.value || []).slice()
+  if (!ids.length) { ElMessage.info('请先勾选要清理的文件'); return }
+  const ok = await confirmBox(
+    `将把勾选的 ${ids.length} 个待处理文件记录清理归档。\n\n` +
+    '【什么时候用】你已经确认这些片在 A 库被删掉了，补复制不可能成功，只想让它们从「待处理」里消失。\n' +
+    '【会发生什么】这些记录从待处理清单移除，问题诊断的数字随之下降；不再每轮同步重算、不再反复报警。\n' +
+    '【不会发生什么】不删任何文件、不删历史记录、不动 A 库与 B 库、不影响入库 / 分享 / 推送。\n' +
+    '【怎么恢复】把源文件放回 A 库后，下一轮同步会自动认出它并重新复制，不需要手工操作。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/cleanup', { method: 'POST', body: JSON.stringify({ scope: 'archive', ids }) })
+    ElMessage.success(`已清理归档 ${d.archived || 0} 项` +
+      (d.skipped ? ` · 跳过 ${d.skipped} 项（已不是待处理状态）` : ''))
+    fileErrSelected.value = []
+    await load()
+    retryTableRef.value?.clearSelection?.()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
@@ -3498,7 +3525,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.37 · Asia/Shanghai</span>
+          <span>v2.1.38 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3937,8 +3964,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">这些是历史「清理无效映射」或 B 库清空重整留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。勾选后点「重建选中」可立即定向重建，不必等下一轮同步；确认这些行彻底无用时点「清空已清理映射」从清单移除，不影响资源 / 分享 / 队列。</p>
           </div>
           <div v-if="mirrorStatus.retryable_files?.length || mirrorStatus.counts?.files_retryable" class="panel">
-            <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.retryable_files || []" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
+            <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button><el-button size="small" type="warning" plain :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="archiveFiles">清理选中 ({{ fileErrSelected.length }})</el-button></div>
+            <div class="table-scroll"><el-table ref="retryTableRef" :data="mirrorStatus.retryable_files || []" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
               <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
@@ -3946,7 +3973,17 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-table-column prop="task_id" label="任务 ID" min-width="140"/>
               <el-table-column label="原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。</p>
+            <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。<br><b>如果确认源文件已在 A 库被删除</b>（补复制客观上不可能成功），勾选后点「清理选中」把它们归档：立刻从待处理里移除、不再每轮重算也不再反复报警；<b>不删任何文件与历史记录</b>，源文件放回 A 库后下一轮同步会自动恢复并重新复制。</p>
+          </div>
+          <div v-if="mirrorStatus.archived_files?.length || mirrorStatus.counts?.files_archived" class="panel">
+            <div class="panel-head"><h3>已手动清理（源文件已删除）</h3><el-tag type="info" size="small">{{ mirrorStatus.counts?.files_archived || 0 }} 项</el-tag><el-tag v-if="(mirrorStatus.counts?.files_archived || 0) > (mirrorStatus.archived_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.archived_files?.length || 0 }} 条</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.archived_files || []" size="small" row-key="id">
+              <el-table-column prop="work" label="作品" min-width="160"/>
+              <el-table-column prop="file" label="文件名" min-width="200"/>
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
+              <el-table-column label="原原因 / 说明" min-width="320"><template #default="s"><span style="color:#8a6d3b">{{ s.row.error || '—' }}</span></template></el-table-column>
+            </el-table></div>
+            <p class="hint">这些是你确认过「A 库源文件已被删除」后手动清理的记录：已经从「待处理」里移除，不再计入上方数字、不再每轮同步重算，也不会再反复报警。<b>记录本身保留在库里</b>（含当初没复制成功的原原因），随时可以在这里查到。<br><b>怎么恢复</b>：把源文件放回 A 库原目录，下一轮「立即同步」会自动认出它并重新复制，不需要手工操作；届时这条记录会从本清单移回「待重试文件」，复制成功后变为「已同步」。</p>
           </div>
           <div v-if="mirrorStatus.task_issues?.length" class="panel">
             <div class="panel-head"><h3>需处理任务</h3><el-tag type="warning" size="small">{{ taskIssueCount }} 条</el-tag><el-tag v-if="taskIssueCount > (mirrorStatus.task_issues?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.task_issues?.length || 0 }} 条</el-tag></div>
