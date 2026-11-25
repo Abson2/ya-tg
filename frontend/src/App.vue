@@ -3624,7 +3624,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.43 · Asia/Shanghai</span>
+          <span>v2.1.44 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3994,6 +3994,26 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div class="panel mirror-col">
             <div class="panel-head"><h3>同步状态</h3><!-- v2.1.11：状态标签只显示后端算好的中文 state.label，不再直出英文枚举 -->
               <el-tag size="small" :type="mirrorStatus.state?.running ? 'warning' : (mirrorStatus.state?.code === 'failed' ? 'danger' : 'info')">{{ mirrorStatus.state?.label || '尚未同步' }}</el-tag></div>
+            <!-- v2.1.44（用户口径：看板里只有 B 库的、整体镜像进度看不到）：
+                 单独给一条「A 库 → B 库」的总体进度。数字全部来自后端同一份 A 库作品清单，
+                 未镜像数可点开看到是哪几部；清单未建立时显示「待采集」并给黄色提示，
+                 绝不拿 B 库映射条数冒充 A 库规模。 -->
+            <div class="mirror-overall" v-if="mirrorStatus.levels && mirrorStatus.levels.overall">
+              <div class="mo-head">
+                <span class="mo-title">整体镜像进度</span>
+                <span class="mo-pct" :class="{ 'mo-warn': !mirrorStatus.levels.overall.a_known }">
+                  {{ mirrorStatus.levels.overall.a_known ? mirrorStatus.levels.overall.percent + '%' : '待采集' }}</span>
+              </div>
+              <el-progress :percentage="mirrorStatus.levels.overall.a_known ? Math.min(mirrorStatus.levels.overall.percent, 100) : 0"
+                           :stroke-width="10" :show-text="false"
+                           :status="mirrorStatus.levels.overall.a_known ? 'success' : 'warning'" />
+              <div class="mo-nums">
+                <span>已镜像 <b>{{ mirrorStatus.levels.overall.synced }}</b> 部</span>
+                <span>A 库共 <b>{{ mirrorStatus.levels.overall.a_known ? mirrorStatus.levels.overall.a_total : '待采集' }}</b> 部</span>
+                <span class="mo-bad">未镜像 <b>{{ mirrorStatus.levels.overall.unmapped }}</b> 部</span>
+              </div>
+              <p class="mo-src">分母口径：{{ mirrorStatus.levels.overall.source }}</p>
+            </div>
             <!-- v2.1.43（用户口径）：同步状态按「作品级 / 目录级 / 文件级」三栏展示。
                  每栏给完成进度 + 翻译 / 映射 / 失败等状态；**每个数字都能点开看明细**
                  （后端用同一条谓词取数，数字与清单必然对得上，不许只给数字）。 -->
@@ -6143,6 +6163,16 @@ button{font-family:inherit}
 .mini-stat:hover{border-color:var(--yg-primary-2);box-shadow:var(--yg-shadow-lg)}
 .mini-stat small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px;line-height:1.3}
 .mini-stat b{font-size:18px;font-variant-numeric:tabular-nums;font-weight:750}
+/* v2.1.44：整体镜像进度（A 库 → B 库）—— 看板不能只有 B 库的数 */
+.mirror-overall{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px;margin-bottom:12px}
+.mo-head{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.mo-title{font-size:12px;font-weight:700;color:var(--yg-ink)}
+.mo-pct{margin-left:auto;font-size:18px;font-weight:800;color:var(--yg-primary-2);font-variant-numeric:tabular-nums}
+.mo-pct.mo-warn{font-size:12px;font-weight:600;color:#cf7f1c}
+.mo-nums{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:8px;font-size:12px;color:var(--yg-muted)}
+.mo-nums b{color:var(--yg-ink);font-variant-numeric:tabular-nums;font-size:13px}
+.mo-nums .mo-bad b{color:var(--yg-rose)}
+.mo-src{margin:6px 0 0;font-size:11px;color:var(--yg-muted)}
 /* v2.1.43：三层看板（作品级 / 目录级 / 文件级）—— 数字可点开看明细 */
 .stat-group-title .lv-meta{margin-left:auto;font-size:11px;font-weight:500;color:var(--yg-muted);font-variant-numeric:tabular-nums}
 .lv-item{cursor:default}

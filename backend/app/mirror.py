@@ -581,7 +581,8 @@ def detect_increments(db: Session, rule: MirrorRule, works: list,
 
 
 def plan_work_batch(works: list, max_works: int, cursor: str = "",
-                    hard_max: int = 100) -> tuple[list, str, bool]:
+                    hard_max: int = 100,
+                    mapped_keys: set[str] | None = None) -> tuple[list, str, bool]:
     """v0.9.0：把一次镜像要处理的作品按「单轮上限 + 轮转游标」切成一批。
 
     - max_works<=0：不限量，返回全部（仍受 hard_max 防御性上限约束，保持旧行为）。
@@ -591,28 +592,68 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
       sync_rule 对每部作品是原子处理（文件复制 + 批量轮询完成才进入下一部），
       正好满足用户「第一部剧不要间断，整理完再休息」。
     - 到上限即停，剩余作品留给下一次定时同步接着做，不铺满一屏、不瞬时压满网盘。
+
+    v2.1.44（用户口径，两条硬要求）：
+      ① **每轮必须接着上一轮的游标往后走，不能每轮从目录头部重扫**；
+      ② **单轮名额就是配置的 `max_works_per_run`，一部不多**——不另开「不占名额」
+         的旁路批（那会让单轮实际变成 2 倍配置量）。
+
+    传入 `mapped_keys`（已镜像作品的 work_key 集合）时启用新口径——**分两层**：
+      - **第一层：全新作品占名额**。从游标之后按 A 库目录既定顺序排未处理作品，
+        「排到全新作品的占用本轮名额」。未镜像作品被复制后自然变成已镜像，
+        下一轮就不会再排在前面——口径自洽，不需要额外游标，也不会出现
+        「某部卡住就永远卡在队首」的头阻塞。
+      - **第二层：名额没被新作品填满时，按游标顺序用剩余作品补满**（存量仍要推进，
+        否则 C/B 类判定会长期不覆盖它们），总长仍严格等于 max_works。
+      - 游标取**本轮批里最后处理完的那一部**（与 v0.9.0 同义），下一轮从它之后
+        接着走：既不重复扫头部，也不会永远跳过任何一部（目录末尾会自然回绕）。
+      - 注：**已镜像作品的作品内变化（增量）不在本函数范围内**——它们由 sync_rule
+        的 `incr_works` 排在队首优先处理，且**不占本轮名额**（见 sync_rule 注释）。
+      - 传 None（默认）时**完全保持 v0.9.0 旧语义**，其他调用点零影响。
     """
     if not works:
         return [], "", False
     if max_works <= 0:
+        # 不限量（配置为 0）：沿用旧行为，一次给到 hard_max 防御上限
         return works[:hard_max], "", False
     keys = [work_key_of(w) for w, _ in works]
+    n = len(keys)
     start = 0
     if cursor:
         try:
             start = keys.index(cursor) + 1
         except ValueError:
             start = 0  # 游标指向的作品已不在 A 库，从头开始
-        if start >= len(works):
+        if start >= n:
             start = 0  # 上一轮已到末尾，回绕
-    end = start + max_works
-    batch = works[start:end]
-    wrapped = end > len(works)
-    if wrapped and len(batch) < max_works:
-        # 尾部不足，用头部补齐，凑满一整批
-        batch = batch + works[:max_works - len(batch)]
-    new_cursor = work_key_of(batch[-1][0]) if batch else ""
-    return batch, new_cursor, wrapped
+    if mapped_keys is None:
+        # ---- v0.9.0 旧口径：纯按目录顺序切，末尾不足从头部补齐 ----
+        end = start + max_works
+        batch = works[start:end]
+        wrapped = end > n
+        if wrapped and len(batch) < max_works:
+            batch = batch + works[:max_works - len(batch)]
+        new_cursor = work_key_of(batch[-1][0]) if batch else ""
+        return batch, new_cursor, wrapped
+    # ---- v2.1.44：游标之后未镜像优先，取不满用已镜像存量补位，名额不变 ----
+    ring = list(range(start, n)) + list(range(0, start))
+    picked: list[int] = [i for i in ring if keys[i] not in mapped_keys][:max_works]
+    if len(picked) < max_works:
+        _got = set(picked)
+        for i in ring:
+            if i in _got:
+                continue
+            picked.append(i)
+            if len(picked) >= max_works:
+                break
+    if not picked:
+        return [], "", False
+    batch = [works[i] for i in picked]
+    # 游标 = 本轮批里**最后处理完的那一部**（与 v0.9.0 同义），下一轮从它之后接着走。
+    # 用 picked[-1] 而不是「环形位置最大者」：批的实际处理顺序是 picked 的顺序
+    #（未镜像段在前、存量补位段在后），最后落地的就是 picked[-1]，语义与旧口径一致。
+    wrapped = max((i - start) % n for i in picked) >= n - 1
+    return batch, keys[picked[-1]], wrapped
 
 
 # ============================================================================
@@ -1739,7 +1780,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              "walk_force_dirs": 0, "walk_manifest_saved": {},
              # v2.1.41：本轮「已复制作品有新集/变化」的增量优先批次
              "increment_works": 0, "increment_new_files": 0,
-             "increment_changed_files": 0, "queue_size": 0, "stock_left": 0}
+             "increment_changed_files": 0, "queue_size": 0, "stock_left": 0,
+             # v2.1.44：从未镜像过的「新作品」优先批计数与剩余量
+             "new_works": 0, "new_works_left": 0}
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
         raise WebFileError("请先配置 A 源头库目录 ID 与 B 镜像库目录 ID")
     api = GuangYaWebFiles(db)
@@ -1917,6 +1960,28 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     stats["increment_works"] = len(incr_works)
     stats["increment_new_files"] = int(incr_stats.get("new_files") or 0)
     stats["increment_changed_files"] = int(incr_stats.get("changed_files") or 0)
+    # v2.1.44（用户口径，两条硬要求）：**名额就是配置的单轮作品数、一部不多**，
+    # **且每轮必须接着上一轮的游标往后走**（不能每轮从目录头部重扫）。
+    # 病根：老口径把名额切给全量作品（含大量已同步老片），老片指纹命中后
+    # `unchanged` 跳过、一部不复制，452 部未镜像作品被挤在游标后面永远排不上。
+    # 修法：把「已镜像作品键集合」交给 plan_work_batch，让它从游标之后
+    # **未镜像优先**取批——名额仍严格等于 max_works（不另开旁路批），
+    # 游标仍只有一个字段、每轮接着上一轮的位置往后走。
+    try:
+        mapped_keys = {str(k or "") for (k,) in db.execute(
+            select(MirrorMedia.work_key).where(
+                MirrorMedia.rule_id == rule.id)).all()}
+        # 兼容 legacy 无前缀 work_key（同 _works_with_pending_files 口径）
+        mapped_keys |= {"work:" + k for k in list(mapped_keys)
+                        if k and not k.startswith("work:")}
+    except Exception as exc:
+        # 映射清单查不到时**绝不能**把全部作品当新片重复制 —— 降级为 None，
+        # 本轮退回 v0.9.0 纯游标轮转口径，保证故障时不产生重复复制风暴。
+        logger.warning("[mirror] 已镜像作品清单查询失败（本轮退回纯游标轮转）：%s", exc)
+        mapped_keys = None
+    stats["unmapped_total"] = (
+        sum(1 for p in works if work_key_of(p[0]) not in mapped_keys)
+        if mapped_keys is not None else 0)
     # 镜像1.1：单轮开始三方对比预扫描（A树/B树/映射清单查漏补缺）。
     # reprocess_keys（B类整部失效）重排到 works 前部、占本批部数名额；
     # missing_keys（A类单文件缺集）抽成不占 max_works 的优先补丁批次，本轮先补齐
@@ -1948,13 +2013,23 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         logger.warning("[mirror1.1] 预扫描挂钩异常（不阻断同步）：%s", exc)
         priority_works = []
     # v0.9.0：按单轮上限 + 轮转游标切批。max_works<=0 时退化为旧行为（全量，
-    # 仍受 max_media 防御上限约束）；>0 时本批最多 max_works 部，剩余下轮继续。
+    # 仍受 max_media 防御上限约束）；>0 时本批**最多 max_works 部**，剩余下轮继续。
+    # v2.1.44：把 mapped_keys 传下去 —— 从游标之后未镜像优先取批，
+    # 名额不变（仍是配置的单轮作品数），游标仍只有一个、接着上一轮往后走。
     if max_works > 0:
         batch, new_cursor, wrapped = plan_work_batch(
             works, max_works, str(getattr(rule, "works_cursor", "") or ""),
-            hard_max=max_media)
+            hard_max=max_media, mapped_keys=mapped_keys)
     else:
         batch, new_cursor, wrapped = works[:max_media], "", False
+    # 本轮批里有多少部是「从未镜像过」的（回显 & 余量统计用）
+    if mapped_keys is None:
+        stats["new_works"] = 0
+        stats["new_works_left"] = 0
+    else:
+        _n_new = sum(1 for p in batch if work_key_of(p[0]) not in mapped_keys)
+        stats["new_works"] = _n_new
+        stats["new_works_left"] = max(0, int(stats.get("unmapped_total") or 0) - _n_new)
     # v2.1.9：待重试作品优先——有 pending / failed 文件待复制的作品，
     # 本轮**无条件**排进处理队列，不受 max_works_per_run 与轮转游标限制。
     # 此前这类作品要等游标转到它才有机会被处理；一旦某一轮因异常中断
@@ -1987,18 +2062,23 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     stats["batch_size"] = len(batch)
     # v2.1.41：增量批次里没被本批轮转覆盖到的那部分，本轮也会被处理，
     # 算「余多少部下轮继续」时要扣掉，否则数字虚高、用户会觉得永远做不完。
+    # v2.1.44：批已经统一受 max_works 约束（新作品也在这批里），
+    # 余量直接由 len(works) - len(batch) 推出，不再有旁路批要扣。
     _batch_keys_now = {work_key_of(p[0]) for p in batch}
     stats["stock_left"] = max(0, len(works) - len(batch) - sum(
         1 for p in incr_works if work_key_of(p[0]) not in _batch_keys_now))
     stats["works_cursor"] = new_cursor
     stats["wrapped"] = wrapped
     stats["total_works"] = len(works)
-    # 执行顺序就是用户口径的顺序：
-    #   ① 先做「已复制作品有增量/变化」的那批（每轮开始时刚查出来的）
-    #   ② 再做「缺集补丁 / 待重试」这类修补批次（不占部数预算）
-    #   ③ 最后按目录既定顺序推进存量与新作品（受 max_works 轮转限制）
+    # 执行顺序就是用户口径的顺序（**占不占名额**是关键分野）：
+    #   ① 【增量】已镜像作品内部的新增/变化 —— 队首优先，**不占本轮名额**
+    #      （它们是「已处理作品的作品内变化」，不该挤掉新作品的位置）
+    #   ② 【修补】缺集补丁 / 待重试 —— 同属已处理作品的修补，**不占本轮名额**
+    #   ③ 【全新 + 剩余】本批：从上一轮游标之后按目录顺序排未处理作品，**占名额**；
+    #      名额没被新作品填满时按游标用剩余作品补满 —— 严格受配置的单轮名额限制
+    #      （v2.1.44：新作品就在这批里，不另开旁路批）
     # 三段之间用 seen 去重：同一部作品绝不允许在一轮里被处理两次
-    #（A 侧新增集 + B 侧缺集完全可能同时命中同一部剧）。
+    #（A 侧新增集 + B 侧缺集 + 新作品完全可能同时命中同一部剧）。
     run_queue: list = []
     _seen_wk: set[str] = set()
     for _pair in incr_works + priority_works + batch:
@@ -2512,6 +2592,14 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         rule.last_message += (
             f" · 增量优先 {_incr} 部（新增 {int(stats.get('increment_new_files') or 0)} 项"
             f" · 变化 {int(stats.get('increment_changed_files') or 0)} 项）")
+    # v2.1.44：新作品回显——用户此前看到「处理 20 部只复制 2 部」，现在要能直接
+    # 看到「本批里有多少部是从未镜像过的」以及还剩多少未镜像，才能确认全量在推进。
+    # 注意：新作品**在名额之内**（与存量同批），不占额外预算。
+    _nw = int(stats.get("new_works") or 0)
+    if _nw:
+        rule.last_message += (
+            f" · 其中新作品 {_nw} 部（余 "
+            f"{int(stats.get('new_works_left') or 0)} 部未镜像，按目录顺序接着上一轮往后做）")
     # v2.1.42（真机反馈）：有文件自动试满次数已被停手时，必须让用户看到「有几项卡住、
     # 归谁处理」——否则它们只是从数字里消失，用户以为已经自愈。
     try:

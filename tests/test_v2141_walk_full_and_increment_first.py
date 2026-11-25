@@ -288,8 +288,14 @@ def test_truncated_tree_disables_absence_judgement():
 
 
 def test_run_queue_order_is_increment_then_fix_then_stock():
-    """用户口径：① 增量优先 ② 补丁/待重试 ③ 存量按目录顺序。"""
+    """用户口径顺序：① 增量优先 ② 补丁/待重试 ③ 本批（新作品优先、占名额）④ 存量。
+
+    v2.1.44 定稿：全新作品**在名额之内**（不另开旁路批），由 plan_work_batch 的
+    mapped_keys 口径排在批内最前面；因此 run_queue 仍然是增量 + 补丁 + 批三段。
+    """
     assert "_pair in incr_works + priority_works + batch:" in MIRROR_SRC
+    assert "new_works + priority_works" not in MIRROR_SRC, (
+        "v2.1.44 定稿取消了「不占名额」的新作品旁路批")
     assert "detect_increments(db, rule, works, nodes)" in MIRROR_SRC
     # 去重：同一部作品一轮只处理一次
     assert "_seen_wk" in MIRROR_SRC

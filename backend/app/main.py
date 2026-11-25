@@ -1144,7 +1144,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.43", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.44", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1155,7 +1155,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.43", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.44", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1654,6 +1654,19 @@ def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
     # 兼容别名：老调用只传 total_files 时，按「复制任务数」解读
     if not copy_tasks and total_files:
         copy_tasks = int(total_files or 0)
+    # v2.1.44（真机反馈：看板只剩 B 库数、整体镜像进度消失）：
+    # 本函数有 10 个调用点，其中 stage=copy / skipped / failed 等多处**不传 a_works**，
+    # 默认值 0 会把上一份快照里的「A 库作品总数」直接抹掉 —— 作品级分母随之退化成
+    # 映射条数，页面看起来就只剩 B 库的数字。这里改成：本轮没采到就**沿用上一份
+    # 快照**的值，绝不回写 0（A 库规模不会因为某一帧没带就变成 0）。
+    _prev_snap: dict = {}
+    try:
+        if r.last_pipeline_json:
+            _prev_snap = json.loads(r.last_pipeline_json) or {}
+    except Exception:
+        _prev_snap = {}
+    if not a_works:
+        a_works = int(_prev_snap.get("a_works") or 0)
     snap = {"mode": mode, "copied": int(copied or 0), "renamed": int(renamed or 0),
             "identified": int(identified or 0), "queued": int(queued or 0),
             "copy_tasks": int(copy_tasks or 0), "scan_files": int(scan_files or 0),
@@ -3050,6 +3063,77 @@ def _invalid_media_rows(db: Session, rule_id: int | None = None) -> list:
 # （点数字 → /api/mirror/level/detail?level=&scope= 打开清单），所以计数与明细
 # 共用下面这张查询表，绝不允许计数写一条 SQL、明细另写一条。
 # 计数一律用 Query.count()，不用 len(截断后的清单)。
+# ---------- v2.1.44：A 库侧作品清单（整体镜像进度的分母与明细来源） ----------
+# 用户口径：「看板里只有 B 库的、没有 A 库的，整体镜像进度看不到」。
+# 病根是作品级分母此前只认快照里的 a_works，而 a_works 会被 stage=copy 等帧抹成 0，
+# 于是退化成「映射清单条数」（纯 B 侧数）。这里改为**从 A 库目录清单重建作品清单**：
+#   - A 库作品不是固定第 2 层（_discover_works 支持多级分类、也支持「剧名目录下
+#     直接放单集」），判定逻辑只在 mirror._discover_works 里有一份，任何 SQL 近似
+#     都会与同步口径打偏 —— 所以直接复用同一个函数，保证「页面数字 = 明细条数」。
+#   - 带 120 秒进程内缓存：status 接口被前端高频轮询，不能每次都重建整棵目录树。
+_A_WORK_ITEMS_CACHE: dict[int, tuple[float, list[dict]]] = {}
+A_WORK_CACHE_SECONDS = 120.0
+
+
+def _a_work_items(db: Session, rule_id: int = 0) -> list[dict] | None:
+    """从 `mirror_dir_scan` 重建 A 库作品清单（[{id, name}]），失败返回 None。
+
+    返回 None 表示「A 库目录清单还没建立」（首次升级后未同步过）——调用方必须
+    如实降级，**绝不许拿 B 库映射条数冒充 A 库作品数**。
+    """
+    key = int(rule_id or 0)
+    hit = _A_WORK_ITEMS_CACHE.get(key)
+    now = time.time()
+    if hit and (now - hit[0]) < A_WORK_CACHE_SECONDS:
+        return hit[1]
+    try:
+        manifest = mirror.load_dir_manifest(db, key)
+    except Exception as exc:
+        logger.warning("[mirror-levels] 读取 A 库目录清单失败：%s", exc)
+        return None
+    if not manifest:
+        return None
+    nodes: dict[str, dict] = {}
+    for did, c in manifest.items():
+        nodes[did] = {"id": did, "name": c.get("name") or "",
+                      "parent": c.get("parent") or "", "path": c.get("path") or "",
+                      "depth": int(c.get("depth") or 0),
+                      "files": list(c.get("files") or []),
+                      "children": list(c.get("children") or [])}
+    root = ""
+    # 优先用规则里配置的 A 库根目录 id（权威），拿不到再按 depth/parent 推断
+    try:
+        rule = db.get(MirrorRule, key) if key else None
+        root = str(getattr(rule, "source_root_id", "") or "") if rule else ""
+    except Exception:
+        root = ""
+    if root not in nodes:
+        root = ""
+        for did, n in nodes.items():
+            if int(n["depth"]) == 0 and (not n["parent"] or n["parent"] not in nodes):
+                root = did
+                break
+    if not root:
+        return None
+    try:
+        items = [{"id": str(w.get("id") or ""), "name": str(w.get("name") or "")}
+                 for w, _cats in mirror._discover_works(nodes, root)]
+    except Exception as exc:
+        logger.warning("[mirror-levels] 从目录清单重建作品清单失败：%s", exc)
+        return None
+    _A_WORK_ITEMS_CACHE[key] = (now, items)
+    return items
+
+
+def _mirror_mapped_source_ids(db: Session) -> set[str]:
+    """已映射作品对应的 A 库目录 id 集合（用于算「未镜像作品」）。"""
+    try:
+        rows = db.execute(select(MirrorMedia.source_dir_id)).all()
+    except Exception:
+        return set()
+    return {str(x) for (x,) in rows if str(x or "").strip()}
+
+
 def _mirror_level_queries(db: Session) -> dict[str, dict]:
     mark, hint = mirror.PRUNED_DIR_MARK, mirror.PRUNED_DIR_TEXT_HINT
     retryable = sorted(mirror.RETRYABLE_FILE_STATUS)
@@ -3124,15 +3208,23 @@ def _mirror_level_queries(db: Session) -> dict[str, dict]:
     }
 
 
-def _mirror_levels(db: Session, snap: dict) -> dict:
+def _mirror_levels(db: Session, snap: dict, rule_id: int = 0) -> dict:
     """三层看板的展示数据：每层一组「状态 + 数量 + 中文标签」。
 
     `total` 是该层的分母：
-      - 作品级取 A 库上次扫描到的作品总数（快照 `a_works`），缺失时退化为映射清单条数；
-        用户要看的就是「A 库 713 部里镜像了多少」，只给映射条数看不出进度；
+      - 作品级取 **A 库作品清单**（v2.1.44：从 `mirror_dir_scan` 用
+        `mirror._discover_works` 重建），清单未建立时退化为快照 `a_works`，
+        再没有才退化为映射清单条数 —— 三级降级都要在 `total_label` 里如实标明；
       - 目录级取本轮目录清单里的目录数（`mirror_dir_scan`），没有清单时退化为映射条数；
       - 文件级取文件映射总条数。
     每项的 `key` 就是 /api/mirror/level/detail 的 scope 参数。
+
+    v2.1.44（用户口径：「只有 B 库的、整体镜像进度看不到」）：
+      - 作品级新增 `overall` 块：A 库作品数 / 已镜像 / 未镜像 / 完成度。
+        未镜像 = A 库作品清单里 `source_dir_id` 没有映射记录的那些（同一个列表算出来的，
+        点开明细条数必然与数字一致）。
+      - items 前面加「A 库作品」「未镜像作品」两项，让 A 侧数字在页面上是**看得见的数**，
+        而不是只藏在标题栏的括注里。
     """
     q = _mirror_level_queries(db)
 
@@ -3147,7 +3239,22 @@ def _mirror_levels(db: Session, snap: dict) -> dict:
         dir_manifest = int(db.query(MirrorDirScan).count())
     except Exception:
         dir_manifest = 0
-    work_total = a_works or _n("work", "all")
+    # v2.1.44：A 库作品清单（可点开、可算未镜像）；拿不到就如实降级
+    a_items = _a_work_items(db, rule_id)
+    mapped_ids = _mirror_mapped_source_ids(db)
+    if a_items:
+        a_total = len(a_items)
+        a_known = True
+        work_total = a_total
+        total_label = "A 库作品（目录清单）"
+        unmapped_n = sum(1 for w in a_items if w["id"] not in mapped_ids)
+    else:
+        a_total = a_works
+        a_known = bool(a_works)
+        work_total = a_works or _n("work", "all")
+        total_label = "A 库作品（上次扫描）" if a_works else "映射清单作品"
+        # 没有 A 库清单时只能用「A 库总数 − 映射条数」推算，明细点开会在接口里说明原因
+        unmapped_n = max(0, a_works - _n("work", "all")) if a_works else 0
     dir_total = dir_manifest or _n("dir", "all")
     file_total = _n("file", "all")
 
@@ -3156,13 +3263,26 @@ def _mirror_levels(db: Session, snap: dict) -> dict:
             return 0.0
         return round(min(done / total, 1.0) * 100, 1)
 
+    _synced_works = _n("work", "synced")
+    overall = {
+        "a_total": int(work_total),
+        "a_known": bool(a_known),
+        "synced": _synced_works,
+        "unmapped": int(unmapped_n),
+        "percent": _pct(_synced_works, work_total),
+        "source": total_label,
+    }
+
     return {
+        "overall": overall,
         "work": {
             "label": "作品级", "unit": "部", "total": work_total,
-            "total_label": ("A 库作品（上次扫描）" if a_works else "映射清单作品"),
-            "percent": _pct(_n("work", "synced"), work_total),
+            "total_label": total_label,
+            "percent": _pct(_synced_works, work_total),
             "items": [
-                {"key": "synced", "label": "镜像完成", "value": _n("work", "synced"), "tone": "ok"},
+                {"key": "a_total", "label": "A 库作品", "value": int(work_total)},
+                {"key": "unmapped", "label": "未镜像作品", "value": int(unmapped_n), "tone": "bad"},
+                {"key": "synced", "label": "镜像完成", "value": _synced_works, "tone": "ok"},
                 {"key": "syncing", "label": "镜像中", "value": _n("work", "syncing")},
                 {"key": "pending", "label": "待镜像", "value": _n("work", "pending")},
                 {"key": "failed", "label": "镜像失败", "value": _n("work", "failed"), "tone": "bad"},
@@ -3211,7 +3331,7 @@ LEVEL_NAMES = {"work": "作品级", "dir": "目录级", "file": "文件级"}
 
 @app.get("/api/mirror/level/detail", dependencies=ADMIN)
 def mirror_level_detail(level: str, scope: str, limit: int = 200,
-                        db: Session = Depends(get_db)):
+                        db: Session = Depends(get_db), rule_id: int = 0):
     """v2.1.43：三层看板里任一数字的明细（与计数**同一条谓词**）。
 
     页面上的数字必须点得开、看得见是哪几部/哪几个/哪几项 —— 这是本项目一贯的
@@ -3221,10 +3341,31 @@ def mirror_level_detail(level: str, scope: str, limit: int = 200,
     scope = str(scope or "").strip().lower()
     if level not in LEVEL_NAMES:
         raise HTTPException(400, "未知层级")
+    n = max(1, min(int(limit or 200), 500))
+    # v2.1.44：作品级的两个 **A 库侧**数字（A 库作品 / 未镜像作品）不是 SQL 谓词能表达的
+    # ——作品目录判定只在 mirror._discover_works 里有一份。这里用与看板计数**同一个**
+    # `_a_work_items` 结果取明细，保证「页面显示 N 部，点开就是 N 条」。
+    if level == "work" and scope in ("a_total", "unmapped"):
+        rid = int(rule_id or 0)
+        if not rid:
+            rule = _mirror_rule(db)
+            rid = int(getattr(rule, "id", 0) or 0) if rule else 0
+        items = _a_work_items(db, rid)
+        if items is None:
+            raise HTTPException(
+                409, "A 库目录清单尚未建立，先执行一次同步再来查看这份清单")
+        mapped_ids = _mirror_mapped_source_ids(db)
+        rows = items if scope == "a_total" else [
+            w for w in items if w["id"] not in mapped_ids]
+        out = [{"id": w["id"], "title": w["name"],
+                "mirror_name": "", "category_path": "",
+                "status_label": ("已镜像" if w["id"] in mapped_ids else "未镜像"),
+                "english_title": "", "files": 0, "failed_files": 0} for w in rows[:n]]
+        return {"level": level, "level_label": LEVEL_NAMES[level], "scope": scope,
+                "total": len(rows), "shown": len(out), "rows": out}
     q = _mirror_level_queries(db)
     if scope not in q[level]:
         raise HTTPException(400, "未知状态")
-    n = max(1, min(int(limit or 200), 500))
     total = int(q[level][scope].count())
     rows = list(q[level][scope].order_by(None).limit(n).all())
     titles = {m.id: m.title_standard for m in db.scalars(select(MirrorMedia)).all()}
@@ -3596,7 +3737,7 @@ def mirror_status(db: Session = Depends(get_db)):
     # v2.1.43（用户口径）：同步状态改成「作品级 / 目录级 / 文件级」三栏，
     # 「处理流程与进度」只读本轮快照（round）。两者数据源刻意分开：
     # levels 是**库内实况**（累计），round 是**本轮处理量**（不掺历史）。
-    levels = _mirror_levels(db, snap)
+    levels = _mirror_levels(db, snap, int(getattr(r, "id", 0) or 0) if r else 0)
     round_info = dict(snap.get("round") or {}) if has_snap else {}
 
     return {

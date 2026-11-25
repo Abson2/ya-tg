@@ -399,12 +399,15 @@ def test_levels_have_three_groups_with_clickable_items(env):
     db = S()
     rule = _rule(db)
     _media(db, rule, "work:a")
+    main._A_WORK_ITEMS_CACHE.clear()   # v2.1.44：A 库清单有进程内缓存，测试要清
     levels = main._mirror_levels(db, {"a_works": 713})
-    assert set(levels) == {"work", "dir", "file"}
-    for lv in levels.values():
-        assert lv["label"] and lv["unit"] and "total" in lv and "percent" in lv
-        assert lv["items"], f"{lv['label']} 没有任何状态项"
-        for it in lv["items"]:
+    # v2.1.44：多了 overall（整体镜像进度）块，三层仍必须齐全
+    assert set(levels) == {"overall", "work", "dir", "file"}
+    for lv in ("work", "dir", "file"):
+        g = levels[lv]
+        assert g["label"] and g["unit"] and "total" in g and "percent" in g
+        assert g["items"], f"{g['label']} 没有任何状态项"
+        for it in g["items"]:
             assert it["key"] and it["label"], "每个数字都必须带 key（点得开明细）"
             assert isinstance(it["value"], int)
     assert levels["work"]["total"] == 713, "作品级分母要用 A 库扫描到的作品总数"
@@ -426,18 +429,27 @@ def test_levels_counts_match_detail_totals(env):
     db.add(MirrorFile(media_id=a.id, rule_id=rule.id, source_file_id="f2",
                       file_name="b.mkv", status="failed"))
     db.commit()
+    main._A_WORK_ITEMS_CACHE.clear()
     levels = main._mirror_levels(db, {})
+    # v2.1.44：A 库侧两项（a_total / unmapped）的明细需要用目录清单重建作品，
+    # 这套 env 没建清单 → 接口会明确报「清单尚未建立」。它们在 v2.1.44 的用例里
+    # 用 monkeypatch 单独覆盖，这里只校验 SQL 谓词类的项。
+    a_side = {"a_total", "unmapped"}
     for level in ("work", "dir", "file"):
         for it in levels[level]["items"]:
+            if level == "work" and it["key"] in a_side:
+                continue
             d = main.mirror_level_detail(level, it["key"], 200, db)
             assert d["total"] == it["value"], (
                 f"{levels[level]['label']}「{it['label']}」计数 {it['value']} "
                 f"与明细 {d['total']} 不一致（计数与明细不同源）")
-    # 具体口径抽查
-    assert levels["work"]["items"][0]["value"] == 2  # 镜像完成 2 部
-    assert levels["work"]["items"][3]["value"] == 1  # 镜像失败 1 部
-    assert levels["file"]["items"][0]["value"] == 1  # 已复制 1 项
-    assert levels["file"]["items"][4]["value"] == 1  # 复制失败 1 项
+    # 具体口径抽查（按 key 取，不依赖 items 下标顺序）
+    _w = {it["key"]: it["value"] for it in levels["work"]["items"]}
+    _f = {it["key"]: it["value"] for it in levels["file"]["items"]}
+    assert _w["synced"] == 2  # 镜像完成 2 部
+    assert _w["failed"] == 1  # 镜像失败 1 部
+    assert _f["synced"] == 1  # 已复制 1 项
+    assert _f["failed"] == 1  # 复制失败 1 项
     db.close()
 
 
@@ -501,7 +513,8 @@ def test_status_payload_exposes_levels_and_round():
     src = MAIN_SRC
     assert '"levels": levels,' in src
     assert '"round": round_info,' in src
-    assert "levels = _mirror_levels(db, snap)" in src
+    # v2.1.44：作品级分母要靠 A 库目录清单重建，必须把当前规则 id 传下去
+    assert "_mirror_levels(db, snap," in src
     assert 'round_info = dict(snap.get("round") or {}) if has_snap else {}' in src
 
 
@@ -511,7 +524,7 @@ def test_status_payload_exposes_levels_and_round():
 
 def test_frontend_has_three_level_panels():
     vue = APP_VUE
-    assert "v2.1.43" in vue
+    assert "v2.1.44" in vue
     assert "mirrorStatus.levels[lv].label" in vue
     assert "for lv in ['work', 'dir', 'file']" in vue.replace('"', "'").replace(
         "v-for=\"lv in ['work', 'dir', 'file']\"", "for lv in ['work', 'dir', 'file']") or True
@@ -544,11 +557,11 @@ def test_frontend_round_labels_are_business_words():
 
 def test_version_is_143_everywhere():
     from app.main import app as _app  # noqa: F401  确认 main 可导入
-    assert 'version="2.1.43"' in MAIN_SRC
+    assert 'version="2.1.44"' in MAIN_SRC
     pkg = (ROOT / "frontend/package.json").read_text(encoding="utf-8")
-    assert '"version":"2.1.43"' in pkg or '"version": "2.1.43"' in pkg
+    assert '"version":"2.1.44"' in pkg or '"version": "2.1.44"' in pkg
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "2.1.43" in readme
+    assert "2.1.44" in readme
 
 
 # ===========================================================================
