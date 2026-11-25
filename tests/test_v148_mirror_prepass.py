@@ -342,7 +342,9 @@ def test_priority_fix_batch_does_not_consume_max_works():
     """缺集补丁批次先于正常批执行，且不占 max_works / batch_size 名额。"""
     src = (Path(__file__).resolve().parents[1] / "backend" / "app" / "mirror.py").read_text(
         encoding="utf-8")
-    assert "for work, cats in priority_works + batch:" in src
+    # v2.1.41：执行队列从「priority_works + batch」扩展为「增量 + 补丁 + 存量」三段，
+    # 但「补丁批次排在存量之前、且不占 batch_size」这两条口径不变。
+    assert "_pair in incr_works + priority_works + batch:" in src
     assert 'stats["batch_size"] = len(batch)' in src
     assert 'stats["prepass"]["priority_fix_works"]' in src
     assert "works = [p for p in works if work_key_of(p[0]) not in missing_set]" in src

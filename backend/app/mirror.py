@@ -445,6 +445,78 @@ def _works_with_pending_files(db: Session, rule_id: int) -> set[str]:
     return {str(k or "") for (k,) in rows if str(k or "").strip()}
 
 
+def detect_increments(db: Session, rule: MirrorRule, works: list,
+                      nodes: dict) -> tuple[list[str], dict]:
+    """v2.1.41（用户口径）：每轮任务开始时，先查「已复制的作品有没有增量或变化」。
+
+    用户的原话顺序是：① 按顺序把 A 库全量镜像过去；② **每轮开始时优先检查已复制
+    作品是否有增量/变化，有则优先处理，没有才继续复制存量**；③ 完全新进来的作品按
+    目录原有既定顺序排队。
+
+    本函数只负责 ② 的「发现」部分，判定**纯内存 + 一次行查询、零接口调用**：
+      - A 树里出现映射清单里没有的 fileId → 新增（含「已手动清理」后源文件回归）；
+      - 同一 fileId 但 size 段变了          → 内容变化；
+      - 只比 size 段（`_fp_size`），不看 utime —— 否则网盘侧元数据抖动会造成假增量。
+
+    口径边界：
+      - **只算「已经镜像过的作品」**。完全没建过映射的新作品不算增量，它们走存量
+        轮转、按目录既定顺序进入（口径 ③）；
+      - `superseded` 与 `archived` 的行不计入「已知」，所以源文件回归会自然变成新增；
+      - 判定结果交给 `sync_rule` 排到队列最前面，处理完这一轮就不再是增量。
+
+    返回 (work_key 列表, stats)。
+    """
+    out = {"works": 0, "new_files": 0, "changed_files": 0}
+    rows = db.execute(
+        select(MirrorFile.media_id, MirrorFile.source_file_id,
+               MirrorFile.fingerprint, MirrorFile.status)
+        .where(MirrorFile.rule_id == rule.id)).all()
+    known: dict[int, dict[str, str]] = {}
+    for mid, fid, fp, status in rows:
+        sid = str(fid or "")
+        st = str(status or "")
+        if not sid or st in ("superseded", ARCHIVED_FILE_STATUS):
+            continue
+        known.setdefault(int(mid), {})[sid] = _fp_size(str(fp or ""))
+
+    by_key: dict[str, MirrorMedia] = {}
+    for m in db.scalars(select(MirrorMedia).where(
+            MirrorMedia.rule_id == rule.id)).all():
+        k = str(m.work_key or "")
+        if not k:
+            continue
+        by_key[k] = m
+        if not k.startswith("work:"):
+            by_key["work:" + k] = m
+
+    hits: list[str] = []
+    for work, _cats in works:
+        wk = work_key_of(work)
+        media = by_key.get(wk)
+        if media is None:
+            continue                      # 没镜像过 → 新作品，走存量轮转
+        # v2.1.41：映射清单里有、但一行「已知文件」都没有（例如整部都被手动清理
+        # 归档了）→ 不能当成「从没镜像过」跳过，否则源文件回来了也要干等轮转。
+        # 这种情况 A 树里的视频一律算新增。
+        old = known.get(media.id) or {}
+        n_new = n_chg = 0
+        for _node, item in _media_files(work, nodes):
+            fid = str(item.get("fileId") or "")
+            if not fid or not _is_video(_dir_name(item)):
+                continue
+            size = _fp_size(_fingerprint(item))
+            if fid not in old:
+                n_new += 1
+            elif old[fid] != size:
+                n_chg += 1
+        if n_new or n_chg:
+            hits.append(wk)
+            out["works"] += 1
+            out["new_files"] += n_new
+            out["changed_files"] += n_chg
+    return hits, out
+
+
 def plan_work_batch(works: list, max_works: int, cursor: str = "",
                     hard_max: int = 100) -> tuple[list, str, bool]:
     """v0.9.0：把一次镜像要处理的作品按「单轮上限 + 轮转游标」切成一批。
@@ -1120,9 +1192,39 @@ async def _list_dir(api: GuangYaWebFiles, parent_id: str) -> tuple[list[dict], b
     return items, False
 
 
+async def _list_dir_retry(api: GuangYaWebFiles, parent_id: str, *,
+                         retries: int = 3) -> tuple[list[dict], bool]:
+    """v2.1.41：单个目录的列目录，带指数退避重试。
+
+    全量 walk 一次要列上千个目录，任何一次瞬时抖动都不该让整轮白跑；但也绝不能
+    把「重试后仍拿不全」当成正常结果 —— 那种情况仍返回 ok=False，由调用方的
+    `complete` 拦截（红线：禁止用不完整批次做变更）。
+
+    重试策略按项目既有口径：code=127 / 网络抖动用**间隔 + 退避**根治，
+    不靠把并发降到 1。
+    """
+    last_exc: Exception | None = None
+    for i in range(max(1, int(retries))):
+        try:
+            items, ok = await _list_dir(api, parent_id)
+        except Exception as exc:          # 网络 / 限流 / 5xx：退避后重试
+            last_exc = exc
+            await asyncio.sleep(min(8.0, 0.5 * (2 ** i)))
+            continue
+        if ok:
+            return items, True
+        last_exc = None                   # 接口成功但分页不全：也重试
+        await asyncio.sleep(min(8.0, 0.5 * (2 ** i)))
+    if last_exc is not None:
+        raise last_exc
+    return [], False
+
+
 async def _walk_source(api: GuangYaWebFiles, root_id: str,
-                       max_dirs: int = 400,
-                       stats: dict | None = None) -> tuple[dict[str, dict], bool]:
+                       max_dirs: int = 0,
+                       stats: dict | None = None, *,
+                       concurrency: int = 3,
+                       retries: int = 3) -> tuple[dict[str, dict], bool]:
     """只读遍历 A 库目录树，返回 {dirId: 节点} 与批次完整性。
 
     节点含 id / name / parent / path / files(直属文件) / children。
@@ -1130,42 +1232,83 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
 
     v0.9.8 #196：stats 可选，用于回显「本轮列了几个目录、发了几次列目录请求、
     看到多少 A 库文件」——让用户确认慢在列目录（必要开销）而非全量复制。
+
+    v2.1.41（真机反馈，**全量镜像的命门**）：老版本 `max_dirs` 默认 **400**，而且
+    `complete` 只反映「每次列目录请求成功没有」，**跟树有没有走完毫无关系** ——
+    撞到 400 提前退出时只要 400 次请求都成功，`complete` 仍是 True，
+    `sync_rule` 的 `if not complete: raise` 根本不会触发，于是**静默截断**：
+    线上 A 库真实目录数 ≥1436（只读枚举实测：已列 741 个时 frontier 还剩 695 个），
+    每轮只看到约 28%，`last_message` 却写着「A库共 241 部」的假全集。
+
+    现在：
+      - `max_dirs=0`（新默认）表示**不限**，把全树走完；
+      - 与「请求是否成功」分开记：撞上限只置 `walk_truncated`，不再伪报完整；
+      - 按层并发（默认 3）+ 退避重试，全量走完的耗时从串行十几分钟压到分钟级。
     """
     root = str(root_id or "*")
     nodes: dict[str, dict] = {}
-    stack = [(root, "", "", "")]
     complete = True
     a_files = 0
     list_calls = 0
-    while stack and len(nodes) < max_dirs:
-        did, name, path, parent = stack.pop()
-        if did in nodes:
-            continue
-        display = (path + "/" + name).strip("/") if name else path
-        items, ok = await _list_dir(api, did)
-        list_calls += 1
-        complete = complete and ok
-        node = {"id": did, "name": name, "parent": parent, "path": display,
-                "files": [], "children": []}
-        nodes[did] = node
-        # v2.1.12 #296：完全按网盘返回顺序写入（不再按 natural_key 重排）。
-        # 顺序职责收敛到一处 —— 请求侧 orderBy/sortType，见 guangya.LIST_ORDER_BY 注释。
-        dirs_to_push: list[tuple[str, str, str, str]] = []
-        for it in items:
-            fid = str(it.get("fileId") or "")
-            if not fid:
+    truncated = False
+    limit = int(max_dirs or 0)
+    sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
+    frontier: list[tuple[str, str, str, str]] = [(root, "", "", "")]
+
+    async def _fetch(item: tuple[str, str, str, str]):
+        async with sem:
+            return await _list_dir_retry(api, item[0], retries=retries)
+
+    while frontier:
+        # 去重：同一目录只列一次（避免重复计入 a_files / list_calls）
+        seen_now: set[str] = set()
+        level: list[tuple[str, str, str, str]] = []
+        for t in frontier:
+            if t[0] in nodes or t[0] in seen_now:
                 continue
-            if int(it.get("resType", 1) or 1) == 2:
-                node["children"].append(fid)
-                dirs_to_push.append((fid, _dir_name(it), display, did))
-            else:
-                node["files"].append(it)
-                a_files += 1
-        stack.extend(reversed(dirs_to_push))
+            seen_now.add(t[0])
+            level.append(t)
+        if not level:
+            break
+        if limit > 0:
+            room = limit - len(nodes)
+            if room <= 0:
+                truncated = True
+                break
+            if len(level) > room:
+                level = level[:room]
+                truncated = True
+        results = await asyncio.gather(*[_fetch(t) for t in level], return_exceptions=True)
+        nxt: list[tuple[str, str, str, str]] = []
+        for (did, name, path, parent), res in zip(level, results):
+            list_calls += 1
+            if isinstance(res, BaseException):
+                # 重试后仍失败：沿用老语义「整轮中止」，绝不拿残缺树做变更
+                raise res
+            items, ok = res
+            complete = complete and ok
+            display = (path + "/" + name).strip("/") if name else path
+            node = {"id": did, "name": name, "parent": parent, "path": display,
+                    "files": [], "children": []}
+            nodes[did] = node
+            # v2.1.12 #296：完全按网盘返回顺序写入（不再按 natural_key 重排）。
+            for it in items:
+                fid = str(it.get("fileId") or "")
+                if not fid:
+                    continue
+                if int(it.get("resType", 1) or 1) == 2:
+                    node["children"].append(fid)
+                    nxt.append((fid, _dir_name(it), display, did))
+                else:
+                    node["files"].append(it)
+                    a_files += 1
+        frontier = nxt
     if stats is not None:
         stats["walk_dirs"] = len(nodes)
         stats["walk_list_calls"] = list_calls
         stats["walk_a_files"] = a_files
+        # v2.1.41：截断必须可见。为 True 时调用方不得把「作品不在树里」当成「已删除」。
+        stats["walk_truncated"] = truncated
     return nodes, complete
 
 
@@ -1298,7 +1441,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              # v2.1.9：作品级异常被隔离跳过的计数（整轮仍正常跑完并落 last_run）
              "work_errors": 0,
              # v0.9.8 #196：列目录开销诊断（慢在列目录而非全量复制）
-             "walk_dirs": 0, "walk_list_calls": 0, "walk_a_files": 0}
+             "walk_dirs": 0, "walk_list_calls": 0, "walk_a_files": 0,
+             # v2.1.41：A 树是否被单轮目录上限截断（截断 ≠ 全集，禁止据此判删除）
+             "walk_truncated": False,
+             # v2.1.41：本轮「已复制作品有新集/变化」的增量优先批次
+             "increment_works": 0, "increment_new_files": 0,
+             "increment_changed_files": 0, "queue_size": 0, "stock_left": 0}
     if not str(rule.source_root_id or "").strip() or not str(rule.target_root_id or "").strip():
         raise WebFileError("请先配置 A 源头库目录 ID 与 B 镜像库目录 ID")
     api = GuangYaWebFiles(db)
@@ -1310,9 +1458,25 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # v2.1.13：跳过时按文件落 sequence 行，序号从这里连续推进（供「恢复被跳过项」）。
     seq_no = 0
     stats["purged_legacy"] = _purge_legacy_failed(db, rule.id)
-    nodes, complete = await _walk_source(api, rule.source_root_id, stats=stats)
+    # v2.1.41：A 树必须走全量。老代码 `max_dirs` 默认 400 且撞上限不报错 →
+    # 线上 1436+ 个目录每轮只看到约 28%，「A库共 N 部」是个残缺视图，
+    # 用户要的「按顺序把 A 库全量镜像过去」在数据层面永远达不成。
+    try:
+        _walk_max = max(0, int(runtime_config.get(db, "mirror_walk_max_dirs") or 0))
+    except (TypeError, ValueError):
+        _walk_max = 0
+    try:
+        _walk_conc = max(1, int(runtime_config.get(db, "mirror_walk_concurrency") or 3))
+    except (TypeError, ValueError):
+        _walk_conc = 3
+    nodes, complete = await _walk_source(api, rule.source_root_id, max_dirs=_walk_max,
+                                         stats=stats, concurrency=_walk_conc)
     if not complete:
         raise WebFileError("A 库分页不完整，已中止本次镜像（禁止用不完整批次做变更）")
+    # v2.1.41：撞到目录上限被截断时，A 树**不是全集** —— 于是「作品不在树里」
+    # 绝不能当成「作品已被删除」。C 类清清单/删 B 库、以及「A库源文件已删」的
+    # 收敛判定全部要停（与分页不全同一套红线：不把「没扫到」当成「已删除」）。
+    tree_ok = complete and not bool(stats.get("walk_truncated"))
     root = str(rule.source_root_id or "*")
     b_root = str(rule.target_root_id)
     cache: dict[str, dict[str, str]] = {}
@@ -1420,14 +1584,35 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         return fid, None, effective
 
     works = _discover_works(nodes, root)
+    # v2.1.41（用户口径 ②）：**每轮任务开始时先查「已复制的作品有没有增量或变化」**，
+    # 有就排到最前面优先处理，没有才继续推进存量。纯内存 + 一次行查询、零接口调用。
+    # 必须在预扫描之前跑：预扫描会重排 works（B类失效提到前部），而增量批次要按
+    # 目录既定顺序排，用刚发现出来的原始顺序最稳。
+    try:
+        incr_keys, incr_stats = detect_increments(db, rule, works, nodes)
+    except Exception as exc:
+        logger.warning("[mirror] 增量检测失败（不阻断同步）：%s", exc)
+        incr_keys, incr_stats = [], {}
+    incr_set = set(incr_keys)
+    incr_works = [p for p in works if work_key_of(p[0]) in incr_set]
+    # 单轮上限：增量再多也最多先做 max_works 部（0=不限），剩余下轮继续。
+    # 与「缺集补丁 / 待重试」同口径——**不占存量轮转的部数预算**，所以存量每轮
+    # 仍然会推进，不会因为库在活跃更新就永远推不动。
+    if max_works > 0 and len(incr_works) > max_works:
+        incr_works = incr_works[:max_works]
+    stats["increment_works"] = len(incr_works)
+    stats["increment_new_files"] = int(incr_stats.get("new_files") or 0)
+    stats["increment_changed_files"] = int(incr_stats.get("changed_files") or 0)
     # 镜像1.1：单轮开始三方对比预扫描（A树/B树/映射清单查漏补缺）。
     # reprocess_keys（B类整部失效）重排到 works 前部、占本批部数名额；
     # missing_keys（A类单文件缺集）抽成不占 max_works 的优先补丁批次，本轮先补齐
     # 再走正常轮转——真机「B库缺集、映射仍 synced」由此在下一轮自动补回。
     # C类按 mirror_mode 清清单/删B库；预扫描失败只记录不阻断同步。
+    # v2.1.41：判「A 库已无该作品」必须以**完整 A 树**为前提（tree_ok），
+    # 目录被截断时只看得到一部分，绝不能据此清清单或删 B 库文件。
     try:
         reprocess_keys, missing_keys = await reconcile_mappings_prepass(
-            db, rule, nodes, works, api, stats, complete=complete)
+            db, rule, nodes, works, api, stats, complete=tree_ok)
         if reprocess_keys:
             rank = {k: i for i, k in enumerate(reprocess_keys)}
             # works 元素是 (node, cats) 元组，work_key_of 要吃 node（w[0]），
@@ -1474,7 +1659,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         logger.warning("[mirror] 待重试作品统计失败（不阻断同步）：%s", exc)
         pending_work_keys = set()
     if pending_work_keys:
-        seen_keys = {work_key_of(p[0]) for p in priority_works}
+        seen_keys = {work_key_of(p[0]) for p in priority_works} | {
+            work_key_of(p[0]) for p in incr_works}
         # 已进 priority_works 的不重复加入；batch 里的由后续去重逻辑处理
         batch_keys = {work_key_of(p[0]) for p in batch}
         retry_works = [p for p in works
@@ -1485,12 +1671,30 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             priority_works = priority_works + retry_works
             stats["retry_pending_works"] = len(retry_works)
     stats["batch_size"] = len(batch)
+    # v2.1.41：增量批次里没被本批轮转覆盖到的那部分，本轮也会被处理，
+    # 算「余多少部下轮继续」时要扣掉，否则数字虚高、用户会觉得永远做不完。
+    _batch_keys_now = {work_key_of(p[0]) for p in batch}
+    stats["stock_left"] = max(0, len(works) - len(batch) - sum(
+        1 for p in incr_works if work_key_of(p[0]) not in _batch_keys_now))
     stats["works_cursor"] = new_cursor
     stats["wrapped"] = wrapped
     stats["total_works"] = len(works)
-    # 缺集补丁批次先于正常轮转执行；两者已去重（priority 从 works 抽出），
-    # 同一部剧不会在一轮内被处理两次。
-    for work, cats in priority_works + batch:
+    # 执行顺序就是用户口径的顺序：
+    #   ① 先做「已复制作品有增量/变化」的那批（每轮开始时刚查出来的）
+    #   ② 再做「缺集补丁 / 待重试」这类修补批次（不占部数预算）
+    #   ③ 最后按目录既定顺序推进存量与新作品（受 max_works 轮转限制）
+    # 三段之间用 seen 去重：同一部作品绝不允许在一轮里被处理两次
+    #（A 侧新增集 + B 侧缺集完全可能同时命中同一部剧）。
+    run_queue: list = []
+    _seen_wk: set[str] = set()
+    for _pair in incr_works + priority_works + batch:
+        _wk = work_key_of(_pair[0])
+        if _wk in _seen_wk:
+            continue
+        _seen_wk.add(_wk)
+        run_queue.append(_pair)
+    stats["queue_size"] = len(run_queue)
+    for work, cats in run_queue:
         # v2.1.9：作品级异常隔离——单部作品处理失败（光鸭接口抖动、建目录失败、
         # B 库核对异常等）**只跳过这一部**，绝不中断整轮同步。
         # 此前整个循环体没有任何 try/except：任何一步抛异常都会让 sync_rule
@@ -1719,7 +1923,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             # 只在 A 库枚举**完整**时才判定（`complete`，分页取不全时一律不动，
             # 避免把「没扫到」误判成「源文件不存在」——与上面 B 库核对同一套保护）。
             # 标成 failed 不是终点：源文件放回来，下一轮同步会按新文件重新建行并复制。
-            if complete and retry_rows:
+            # v2.1.41：判「源文件已删」同样要求 A 树是全集（tree_ok）——
+            # 目录被截断时「没枚举到」只是没看到，不是不存在。
+            if tree_ok and retry_rows:
                 for (_fid, _fps), row in list(retry_rows.items()):
                     if _fid not in seen_sizes:
                         why = ("A 库未找到源文件（可能已被移动或删除），无法补复制；"
@@ -1956,8 +2162,20 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
     rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
                           f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")
+    # v2.1.41：A 树被单轮上限截断时必须明示——否则用户看到的「A库共 N 部」
+    # 又是残缺视图，跟改之前那个 400 目录的假全集是同一个坑。
+    if stats.get("walk_truncated"):
+        rule.last_message += (" · ⚠ A 库目录数超过单轮上限，本轮只扫了一部分，"
+                             "「已无作品」的清理判定已暂停（不要把没扫到当成已删除）")
+    # v2.1.41：每轮开始时的增量预检结果如实回显——用户要看到「优先处理了什么」。
+    _incr = int(stats.get("increment_works") or 0)
+    if _incr:
+        rule.last_message += (
+            f" · 增量优先 {_incr} 部（新增 {int(stats.get('increment_new_files') or 0)} 项"
+            f" · 变化 {int(stats.get('increment_changed_files') or 0)} 项）")
     if max_works > 0:
-        _left = max(0, stats.get("total_works", 0) - stats["batch_size"])
+        _left = int(stats.get("stock_left", max(0, stats.get("total_works", 0)
+                                                - stats["batch_size"])) or 0)
         rule.last_message += (f" · 本轮限额 {max_works} 部 / 实处理 {stats['batch_size']} 部"
                               f"（A 库共 {stats.get('total_works', 0)} 部，余 {_left} 部下轮继续）")
         _pf = int((stats.get("prepass") or {}).get("priority_fix_works", 0) or 0)
@@ -3340,8 +3558,12 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
             db.commit()
             continue
         # 只 walk 单部作品（非全库），拿到 A 季目录相对链
-        nodes, complete = await _walk_source(api, str(media.source_dir_id), max_dirs=80)
-        if not complete:
+        # v2.1.41：撞上限被截断与「分页不全」同样不可用于判定源文件是否存在，
+        # 一起中止（此前截断是静默的，会把「没扫到」当成「已删除」）。
+        _one_stats: dict = {}
+        nodes, complete = await _walk_source(api, str(media.source_dir_id), max_dirs=80,
+                                             stats=_one_stats)
+        if not complete or _one_stats.get("walk_truncated"):
             for r in group:
                 r.status = "failed"
                 r.error = "[定向重试] A 库该作品目录分页不完整，已中止（禁止用不完整数据重发）"

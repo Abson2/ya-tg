@@ -189,6 +189,15 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # prepass_max_media 预扫描单轮最多核对多少部作品（性能护栏，防接口风暴）。
     "mirror_prepass_enabled": ("mirror_prepass_enabled", "true"),
     "mirror_prepass_max_media": ("mirror_prepass_max_media", "50"),
+    # v2.1.41（真机反馈，全量镜像的命门）：A 树单轮最多列多少个目录。
+    # 老代码把 400 写死在 `_walk_source` 默认值里，撞上限时还照旧报「完整」→
+    # 线上 A 库实测 ≥1436 个目录，每轮只看到约 28%，七成作品永远轮不到
+    # （62T 的库只镜像出 11T）。默认 **0 = 不限**，把全树走完；
+    # 想限制单轮耗时再调成具体数字，被截断时会在同步结果里明确告警且停用清理判定。
+    "mirror_walk_max_dirs": ("mirror_walk_max_dirs", "0"),
+    # 列目录并发度（1 = 串行）。全量走完 1400+ 目录，串行要十几分钟，并发 3 是
+    # 实测 0 失败的量级；遇到 code=127 靠退避重试根治，不靠把并发降到 1。
+    "mirror_walk_concurrency": ("mirror_walk_concurrency", "3"),
     # 镜像模式（用户口径 2026-11-21，默认全镜像）：
     #   full（全镜像，默认）= A 库已删的文件/作品 → 预扫描自动删 B 库对应文件 + 清映射清单，
     #                          保持 A/B 一致；仅 A 树完整时才删（complete 闸门）。

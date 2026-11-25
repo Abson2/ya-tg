@@ -600,11 +600,18 @@ def test_works_loop_has_exception_isolation():
             break
     assert target is not None, "找不到 sync_rule"
 
+    # v2.1.41：作品主循环改成遍历统一去重后的 run_queue（增量 → 修补 → 存量三段拼装）。
+    # 兼容旧形态 `for work, cats in priority_works + batch:` 的写法，两种都认。
     work_loops = []
     for node in ast.walk(target):
-        if isinstance(node, ast.For) and isinstance(node.iter, ast.BinOp):
+        if not isinstance(node, ast.For):
+            continue
+        if isinstance(node.iter, ast.Name) and node.iter.id == "run_queue":
+            work_loops.append(node)
+        elif isinstance(node.iter, ast.BinOp):
             op = node.iter
-            if isinstance(op.op, ast.Add) and getattr(op.left, "id", "") == "priority_works":
+            if isinstance(op.op, ast.Add) and getattr(op.left, "id", "") in (
+                    "priority_works", "incr_works"):
                 work_loops.append(node)
     assert work_loops, "找不到作品主循环"
     loop = work_loops[0]
