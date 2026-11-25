@@ -39,9 +39,11 @@ v0.8.4 接口取证口径（务必区分三类，勿再混为一谈）：
   - 仍未实现：投稿分享转存（TgtoDrive 侧，未抓包）。
 """
 import asyncio
+import json
 import logging
 import re
 import time
+from datetime import timedelta
 
 # v0.9.21：镜像锁进度心跳钩子。默认 no-op；main.py 在 lifespan 注入
 # `_mirror_lock.heartbeat`，让长复制/改名轮询每轮证明「还在进展」。这里不 import
@@ -71,8 +73,9 @@ from .file_naming import (english_file_name, pinyin_title, sanitize_english_titl
                           with_conflict_suffix, work_core_title)
 from .guangya import (GuangYaWebFiles, TRANSIENT_FAULT_MARK, WebFileError,
                       is_auth_expired_guangya, is_transient_guangya_fault)
-from .models import MirrorDir, MirrorFile, MirrorMedia, MirrorRule, MirrorTask, Resource
-from .utils import (NAME_MARK, VIDEO_EXTS, looks_like_name_exists,
+from .models import (MirrorDir, MirrorDirScan, MirrorFile, MirrorMedia, MirrorRule,
+                     MirrorTask, Resource)
+from .utils import (NAME_MARK, VIDEO_EXTS, as_utc, looks_like_name_exists,
                    media_identity, normalize_work_name,
                     parse_media_name, scrub_upstream_internals,
                     standard_media_name, star_media_name, strip_tmdb_tag,
@@ -1280,14 +1283,167 @@ async def _list_dir_retry(api: GuangYaWebFiles, parent_id: str, *,
     return [], False
 
 
+# ---------- v2.1.43：A 库目录清单缓存（轻量扫描的底座） ----------
+# 必列的层级：0=源根、1=分类目录、2=作品目录。更深（季 / 集 / 子目录）在 light 模式下
+# 只在「缓存 utime 变了 / 该作品有未完成文件 / 到深度兜底周期」时才真的去列。
+# 为什么作品层也必须每轮列：新集加在 Season 目录里时，作品目录自身的 utime **不会变**
+#（实测「国产演唱会」目录 utime 2026-09-24 06:23，而子目录内容 18:21 才变）——
+# 只有列一遍作品目录，才能看到季目录自己的 utime 有没有变。
+MANIFEST_ALWAYS_LIST_DEPTH = 2
+
+
+def load_dir_manifest(db: Session, rule_id: int) -> dict[str, dict]:
+    """把上次的 A 库目录清单读进内存（一次查询、零接口调用）。"""
+    out: dict[str, dict] = {}
+    try:
+        rows = db.scalars(select(MirrorDirScan).where(
+            MirrorDirScan.rule_id == rule_id)).all()
+    except Exception as exc:      # 老库未迁移等异常：退化成「没有缓存」，走全量
+        logger.warning("[mirror] 读取目录清单失败（按无缓存处理）：%s", exc)
+        return out
+    for r in rows:
+        try:
+            files = json.loads(r.files_json or "[]")
+        except Exception:
+            files = []
+        try:
+            children = json.loads(r.children_json or "[]")
+        except Exception:
+            children = []
+        out[str(r.dir_id)] = {
+            "utime": int(r.utime or 0), "files": files, "children": children,
+            "name": r.name or "", "path": r.path or "", "parent": r.parent_id or "",
+            "depth": int(r.depth or 0), "n_files": int(r.n_files or 0),
+            "n_dirs": int(r.n_dirs or 0),
+            # v2.1.43：深度兜底判据 —— 深层目录多久没被真列过了
+            "last_listed_at": r.last_listed_at,
+        }
+    return out
+
+
+def save_dir_manifest(db: Session, rule_id: int, nodes: dict[str, dict],
+                      listed: set[str]) -> dict:
+    """把本轮看到的目录树写回清单。
+
+    `listed` = 本轮**真的列过**的目录 id（缓存复用的不算）：只有它们的 files/children
+    是这一轮的新采样，所以只有它们刷新 `last_listed_at`；其余只刷 `last_seen_at`，
+    证明确实还在树上、并把新的 utime 记下来供下一轮比较。
+    """
+    out = {"added": 0, "updated": 0, "listed": len(listed or ())}
+    try:
+        rows = {str(r.dir_id): r for r in db.scalars(select(MirrorDirScan).where(
+            MirrorDirScan.rule_id == rule_id)).all()}
+    except Exception as exc:
+        logger.warning("[mirror] 目录清单不可写（跳过保存）：%s", exc)
+        return out
+    now = utcnow()
+    for did, node in nodes.items():
+        did = str(did)
+        row = rows.get(did)
+        fresh = did in listed
+        if row is None:
+            row = MirrorDirScan(rule_id=rule_id, dir_id=did,
+                                parent_id=str(node.get("parent") or ""),
+                                name=str(node.get("name") or "")[:512],
+                                path=str(node.get("path") or "")[:1024],
+                                depth=int(node.get("depth") or 0),
+                                utime=int(node.get("utime") or 0),
+                                ctime=int(node.get("ctime") or 0),
+                                files_json="[]", children_json="[]",
+                                first_seen_at=now, last_seen_at=now)
+            db.add(row)
+            rows[did] = row
+            out["added"] += 1
+        else:
+            out["updated"] += 1
+            row.parent_id = str(node.get("parent") or "") or row.parent_id
+            row.name = (str(node.get("name") or "")[:512]) or row.name
+            row.path = (str(node.get("path") or "")[:1024]) or row.path
+            row.depth = int(node.get("depth") or 0)
+            row.last_seen_at = now
+        row.utime = int(node.get("utime") or 0)
+        row.ctime = int(node.get("ctime") or 0)
+        if fresh:
+            files = node.get("files") or []
+            children = node.get("children") or []
+            row.files_json = json.dumps(files, ensure_ascii=False)[:200000]
+            row.children_json = json.dumps(children, ensure_ascii=False)[:200000]
+            row.n_files = len(files)
+            row.n_dirs = len(children)
+            row.last_listed_at = now
+    try:
+        db.commit()
+    except Exception as exc:
+        logger.warning("[mirror] 目录清单保存失败（不影响本轮同步）：%s", exc)
+        db.rollback()
+    return out
+
+
+def pending_work_dirs(db: Session, rule_id: int) -> set[str]:
+    """v2.1.43：有未完成文件（待复制/待重试）的作品目录 id。
+
+    轻量扫描下这些作品必须**强制下探**：缓存里的文件清单是上一轮采样，源文件若被
+    替换（同 fileId 不同 size）或者失败需要重取，都必须看实时内容才能判断。整部作品
+    的子树一起强制，避免出现「季目录新列了、集目录还在用旧缓存」的半新半旧状态。
+    """
+    keys = _works_with_pending_files(db, rule_id)
+    if not keys:
+        return set()
+    try:
+        rows = db.scalars(select(MirrorMedia.source_dir_id).where(
+            MirrorMedia.rule_id == rule_id,
+            MirrorMedia.work_key.in_(sorted(keys)))).all()
+    except Exception as exc:
+        logger.warning("[mirror] 读取待处理作品目录失败（本轮不做强制下探）：%s", exc)
+        return set()
+    return {str(x) for x in rows if str(x or "").strip()}
+
+
+def plan_light_scan(db: Session, rule_id: int, manifest: dict[str, dict], *,
+                    deep_minutes: int = 0) -> dict:
+    """v2.1.43：决定这一轮「轻量扫描」还是「全量建清单」。
+
+    三种情况必须全量（light=False），一种都不许省：
+      1. 清单为空 —— 第一次生成镜像同步，还没有可比对的东西；
+      2. 到了深度兜底周期 —— 深层目录（季/集/子目录）超过 `deep_minutes` 没被真列过。
+         为什么需要兜底：轻量扫描只信目录 utime，万一网盘某次没更新 utime，
+         那一支就会一直被缓存挡住，永远看不到新集。周期全量是唯一的自愈通道；
+      3. 调用方显式要求（`sync_rule?full=1`，排查用）。
+    """
+    info = {"light": bool(manifest), "force_dirs": set(), "deep_due": False,
+            "reason": "", "deep_minutes": int(deep_minutes or 0)}
+    if not manifest:
+        info["reason"] = "首次运行，生成 A/B 目录清单"
+        return info
+    info["force_dirs"] = pending_work_dirs(db, rule_id)
+    if deep_minutes and deep_minutes > 0:
+        cutoff = utcnow() - timedelta(minutes=int(deep_minutes))
+        for c in manifest.values():
+            if int(c.get("depth") or 0) <= MANIFEST_ALWAYS_LIST_DEPTH:
+                continue
+            listed = as_utc(c.get("last_listed_at"))
+            if listed is None or listed < cutoff:
+                info["deep_due"] = True
+                info["light"] = False
+                info["reason"] = f"深层目录已 {int(deep_minutes)} 分钟未全量核对，本轮改为全量"
+                break
+    if info["light"] and not info["reason"]:
+        info["reason"] = "轻量扫描：分类与作品层照列，更深目录只下探有变化的"
+    return info
+
+
 async def _walk_source(api: GuangYaWebFiles, root_id: str,
                        max_dirs: int = 0,
                        stats: dict | None = None, *,
                        concurrency: int = 3,
-                       retries: int = 3) -> tuple[dict[str, dict], bool]:
+                       retries: int = 3,
+                       manifest: dict | None = None,
+                       light: bool = False,
+                       force_dirs: set[str] | None = None,
+                       listed_out: set[str] | None = None) -> tuple[dict[str, dict], bool]:
     """只读遍历 A 库目录树，返回 {dirId: 节点} 与批次完整性。
 
-    节点含 id / name / parent / path / files(直属文件) / children。
+    节点含 id / name / parent / path / utime / files(直属文件) / children。
     不写任何数据库表，不触碰 Resource —— 扫描 A 库绝不能污染 B 库资源库。
 
     v0.9.8 #196：stats 可选，用于回显「本轮列了几个目录、发了几次列目录请求、
@@ -1304,25 +1460,69 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
       - `max_dirs=0`（新默认）表示**不限**，把全树走完；
       - 与「请求是否成功」分开记：撞上限只置 `walk_truncated`，不再伪报完整；
       - 按层并发（默认 3）+ 退避重试，全量走完的耗时从串行十几分钟压到分钟级。
+
+    v2.1.43（用户口径：轻量扫描，别每轮整盘全扫）：
+      - `light=True` 时，**只到 `MANIFEST_ALWAYS_LIST_DEPTH`（分类 + 作品）必列**，
+        更深的目录（季/集/子目录）一律先看缓存：
+          · 缓存里 utime 与本轮父目录给出的 utime 一致 → 不下探，直接用缓存内容；
+          · utime 变了 / 没有缓存 / 在 `force_dirs`（该作品有未完成文件）→ 照常列；
+        `light=False`（深度兜底轮）行为与 v2.1.41 完全一致（整棵列一遍）。
+      - 判据依据（2026-11-25 线上只读实测）：网盘目录条目本身带 utime/ctime，
+        且「日韩演唱会」目录的 utime 与子项最大 utime 完全一致 → 目录 utime 随
+        **直接子项**增删改更新。所以「作品目录 utime 未变」不能证明季目录里没新集，
+        这也是为什么作品层必须每轮都列（那一层就是用来发现季目录 utime 变化的）。
+      - 缓存复用的目录会记进 `stats["walk_cached_dirs"]`，`last_message` 会回显，
+        用户能一眼看出「这轮到底真列了多少、复用多少」。
+      - `listed_out`（可选出参）：本轮**真的发过列目录请求**的目录 id 集合。缓存复用的
+        不进去 —— 调用方只应拿它去刷新清单的采样时间，不能被缓存冒充成新采样。
     """
     root = str(root_id or "*")
     nodes: dict[str, dict] = {}
+    manifest = manifest or {}
+    # 复制一份：命中「有未完成文件」的目录会把强制下探**向下传染**给子目录
+    force = set(force_dirs or ())
     complete = True
     a_files = 0
     list_calls = 0
     truncated = False
+    cached_dirs = 0
     limit = int(max_dirs or 0)
     sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
-    frontier: list[tuple[str, str, str, str]] = [(root, "", "", "")]
+    # (dirId, name, path, parent, level, utime, ctime)
+    frontier: list[tuple] = [(root, "", "", "", 0, 0, 0)]
 
-    async def _fetch(item: tuple[str, str, str, str]):
+    async def _fetch(item: tuple):
         async with sem:
             return await _list_dir_retry(api, item[0], retries=retries)
+
+    def _materialize_cached(did: str, level: int) -> int:
+        """把缓存里的这棵子树补进 nodes（不发任何请求）。返回补进来的目录数。"""
+        n = 0
+        stack = [(did, level)]
+        while stack:
+            cur, lv = stack.pop()
+            if cur in nodes:
+                continue
+            c = manifest.get(cur)
+            if c is None:
+                continue
+            node = {"id": cur, "name": c.get("name") or "",
+                    "parent": c.get("parent") or "", "path": c.get("path") or "",
+                    "utime": int(c.get("utime") or 0),
+                    "depth": int(lv),
+                    "files": list(c.get("files") or []),
+                    "children": list(c.get("children") or []), "cached": True}
+            nodes[cur] = node
+            n += 1
+            for _c in node["children"]:
+                if _c not in nodes:
+                    stack.append((_c, lv + 1))
+        return n
 
     while frontier:
         # 去重：同一目录只列一次（避免重复计入 a_files / list_calls）
         seen_now: set[str] = set()
-        level: list[tuple[str, str, str, str]] = []
+        level: list[tuple] = []
         for t in frontier:
             if t[0] in nodes or t[0] in seen_now:
                 continue
@@ -1330,6 +1530,25 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
             level.append(t)
         if not level:
             break
+        # v2.1.43：light 模式下，深层目录先看缓存 —— 未变就不下探
+        if light:
+            still: list[tuple] = []
+            for t in level:
+                did, _nm, _pth, _par, lv, ut, _ct = t
+                if lv <= MANIFEST_ALWAYS_LIST_DEPTH or did in force:
+                    still.append(t)
+                    continue
+                c = manifest.get(did)
+                same = (c is not None and int(c.get("utime") or 0) == int(ut or 0)
+                        and c.get("files") is not None)
+                if same:
+                    cached_dirs += _materialize_cached(did, lv)
+                else:
+                    still.append(t)
+            level = still
+            if not level:
+                frontier = []
+                break
         if limit > 0:
             room = limit - len(nodes)
             if room <= 0:
@@ -1339,8 +1558,8 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                 level = level[:room]
                 truncated = True
         results = await asyncio.gather(*[_fetch(t) for t in level], return_exceptions=True)
-        nxt: list[tuple[str, str, str, str]] = []
-        for (did, name, path, parent), res in zip(level, results):
+        nxt: list[tuple] = []
+        for (did, name, path, parent, lv, ut, ct), res in zip(level, results):
             list_calls += 1
             if isinstance(res, BaseException):
                 # 重试后仍失败：沿用老语义「整轮中止」，绝不拿残缺树做变更
@@ -1349,8 +1568,12 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
             complete = complete and ok
             display = (path + "/" + name).strip("/") if name else path
             node = {"id": did, "name": name, "parent": parent, "path": display,
-                    "files": [], "children": []}
+                    "utime": int(ut or 0), "ctime": int(ct or 0),
+                    "depth": int(lv),
+                    "files": [], "children": [], "cached": False}
             nodes[did] = node
+            if listed_out is not None:
+                listed_out.add(did)
             # v2.1.12 #296：完全按网盘返回顺序写入（不再按 natural_key 重排）。
             for it in items:
                 fid = str(it.get("fileId") or "")
@@ -1358,7 +1581,11 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                     continue
                 if int(it.get("resType", 1) or 1) == 2:
                     node["children"].append(fid)
-                    nxt.append((fid, _dir_name(it), display, did))
+                    # v2.1.43：强制下探向下传染 —— 有未完成文件的作品，越深也照列
+                    if did in force:
+                        force.add(fid)
+                    nxt.append((fid, _dir_name(it), display, did, lv + 1,
+                                int(it.get("utime") or 0), int(it.get("ctime") or 0)))
                 else:
                     node["files"].append(it)
                     a_files += 1
@@ -1369,6 +1596,9 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         stats["walk_a_files"] = a_files
         # v2.1.41：截断必须可见。为 True 时调用方不得把「作品不在树里」当成「已删除」。
         stats["walk_truncated"] = truncated
+        # v2.1.43：这轮有多少目录是「用缓存、没真列」的（轻量扫描的核心指标）
+        stats["walk_cached_dirs"] = cached_dirs
+        stats["walk_light"] = bool(light)
     return nodes, complete
 
 
@@ -1504,6 +1734,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              "walk_dirs": 0, "walk_list_calls": 0, "walk_a_files": 0,
              # v2.1.41：A 树是否被单轮目录上限截断（截断 ≠ 全集，禁止据此判删除）
              "walk_truncated": False,
+             # v2.1.43：本轮扫描模式（light 轻量 / full 全量）与缓存复用目录数
+             "walk_scan_mode": "full", "walk_scan_reason": "", "walk_cached_dirs": 0,
+             "walk_force_dirs": 0, "walk_manifest_saved": {},
              # v2.1.41：本轮「已复制作品有新集/变化」的增量优先批次
              "increment_works": 0, "increment_new_files": 0,
              "increment_changed_files": 0, "queue_size": 0, "stock_left": 0}
@@ -1533,10 +1766,27 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         _walk_conc = max(1, int(runtime_config.get(db, "mirror_walk_concurrency") or 3))
     except (TypeError, ValueError):
         _walk_conc = 3
-    nodes, complete = await _walk_source(api, rule.source_root_id, max_dirs=_walk_max,
-                                         stats=stats, concurrency=_walk_conc)
+    # v2.1.43（用户口径：轻量扫描，别每轮整盘全扫触发风控）：
+    # 第一次生成 A/B 目录清单并缓存，后续每轮只列「分类 + 作品」两层，更深的
+    # 季/集目录按 utime 变化、或该作品有未完成文件时才下探。兜底靠深度周期全量。
+    try:
+        _deep_min = max(0, int(runtime_config.get(
+            db, "mirror_manifest_depth_fallback_minutes") or 0))
+    except (TypeError, ValueError):
+        _deep_min = 1440
+    _manifest = load_dir_manifest(db, rule.id)
+    _plan = plan_light_scan(db, rule.id, _manifest, deep_minutes=_deep_min)
+    _listed: set[str] = set()
+    nodes, complete = await _walk_source(
+        api, rule.source_root_id, max_dirs=_walk_max, stats=stats,
+        concurrency=_walk_conc, manifest=_manifest, light=_plan["light"],
+        force_dirs=_plan["force_dirs"], listed_out=_listed)
     if not complete:
         raise WebFileError("A 库分页不完整，已中止本次镜像（禁止用不完整批次做变更）")
+    stats["walk_manifest_saved"] = save_dir_manifest(db, rule.id, nodes, _listed)
+    stats["walk_scan_mode"] = "light" if _plan["light"] else "full"
+    stats["walk_scan_reason"] = _plan["reason"]
+    stats["walk_force_dirs"] = len(_plan["force_dirs"])
     # v2.1.41：撞到目录上限被截断时，A 树**不是全集** —— 于是「作品不在树里」
     # 绝不能当成「作品已被删除」。C 类清清单/删 B 库、以及「A库源文件已删」的
     # 收敛判定全部要停（与分页不全同一套红线：不把「没扫到」当成「已删除」）。
@@ -2238,6 +2488,19 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
     rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
                           f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")
+    # v2.1.43（用户口径）：把「这轮到底真查了多少、多少沿用上次清单」写清楚。
+    # 用户提出轻量扫描就是为了少打网盘接口，所以这行必须能被核对。
+    _cached = int(stats.get("walk_cached_dirs") or 0)
+    if stats.get("walk_scan_mode") == "light":
+        rule.last_message += (f" · 本轮轻量扫描：实查 {stats['walk_list_calls']} 个目录，"
+                              f"另 {_cached} 个沿用上次清单")
+        _forced = int(stats.get("walk_force_dirs") or 0)
+        if _forced:
+            rule.last_message += f"（{_forced} 部有未完成文件的作品已强制重查）"
+    elif _manifest:
+        rule.last_message += f" · 本轮全量核对：{stats['walk_scan_reason'] or '按周期全量核对'}"
+        if _cached:
+            rule.last_message += f"，其中 {_cached} 个沿用清单"
     # v2.1.41：A 树被单轮上限截断时必须明示——否则用户看到的「A库共 N 部」
     # 又是残缺视图，跟改之前那个 400 目录的假全集是同一个坑。
     if stats.get("walk_truncated"):

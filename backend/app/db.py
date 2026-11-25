@@ -277,6 +277,10 @@ _COLUMNS = {
         "clean_state": "TEXT DEFAULT ''",
         "cleaned_at": "DATETIME",
         "clean_reason": "TEXT DEFAULT ''",
+        # v2.1.43：首次入库时间（资源库「按入库时间排序」的锚点）。
+        # 与 scanned_at 刻意分开——scanned_at 在内容变化（size 变）时会被刷新，
+        # 拿它排序会让老作品补一集就跳到最新。此列只在新建行时写一次。
+        "first_seen_at": "DATETIME",
     },
     "push_queue": {
         "next_retry_at": "DATETIME",
@@ -781,6 +785,28 @@ def _repair_rename_state_consistency(db) -> int:
     return changed
 
 
+def _backfill_first_seen(db) -> int:
+    """v2.1.43：给老库回填「首次入库时间」= 当时的 scanned_at。
+
+    为什么用 scanned_at 兜底：v2.1.43 之前根本没有这一列，`scanned_at` 是当年
+    唯一的「什么时候入库」的近似值（新建行时写入）。它确实会被内容变化刷新，
+    历史值已经找不回来了——所以这次回填只是**排序的起点**，不是精确史料；
+    从本版起新建的行才是准的。只跑一次（AppConfig 标记），之后不再覆盖。
+    """
+    from .models import AppConfig, utcnow
+    marker_key = "resource_first_seen_backfill_v2143"
+    if db.get(AppConfig, marker_key):
+        return 0
+    res = db.execute(text(
+        "UPDATE resources SET first_seen_at = scanned_at "
+        "WHERE first_seen_at IS NULL AND scanned_at IS NOT NULL"))
+    changed = int(res.rowcount or 0)
+    db.add(AppConfig(key=marker_key, value_enc=str(changed), updated_at=utcnow()))
+    db.commit()
+    logger.info("[db] 首次入库时间回填 %s 行（upgrade from < v2.1.43）", changed)
+    return changed
+
+
 def migrate() -> None:
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
@@ -806,6 +832,8 @@ def migrate() -> None:
         _recover_rate_limited_identify(db)
         # v2.1.10：修掉改名状态矛盾（done 带错误文案 / 160 假失败留在 failed）。
         _repair_rename_state_consistency(db)
+        # v2.1.43：老库回填首次入库时间（资源库按入库时间排序的锚点）。
+        _backfill_first_seen(db)
 
         tpl = db.query(MessageTemplate).filter(MessageTemplate.name == "默认图文模板").first()
         # v0.9.6：去重——历史上「一键恢复默认模板」在并发 / 空表时可能写入多条同名

@@ -420,6 +420,28 @@ const batchDuration = ref(0)
 const groupByCategory = ref(true)
 const collapsedGroups = ref([])
 const UNGROUPED_NAME = '未分类'
+// v2.1.43（用户需求）：资源库「按入库时间」排序。
+//   default    —— 后端原顺序（识别优先，保持既有观感，不改默认行为）
+//   added_desc —— 入库时间倒序（新入库的排最前）
+//   added_asc  —— 入库时间顺序（最早入库的排最前）
+// 排序键是作品级 first_seen_at（组内最早那一集的首次入库时间，后端给 ISO 串）。
+// 空值（老数据异常）一律排最后，不参与「比大小」，避免冒出一个 1970 的假时间。
+const libSort = ref('default')
+const LIB_SORT_OPTIONS = [
+  { value: 'default', label: '默认排序' },
+  { value: 'added_desc', label: '入库时间：新 → 旧' },
+  { value: 'added_asc', label: '入库时间：旧 → 新' },
+]
+function appliedLibSort(list) {
+  if (libSort.value === 'default') return list
+  const withTs = [], noTs = []
+  for (const g of list) (g.first_seen_at ? withTs : noTs).push(g)
+  withTs.sort((a, b) => {
+    const d = String(a.first_seen_at).localeCompare(String(b.first_seen_at))
+    return libSort.value === 'added_asc' ? d : -d
+  })
+  return withTs.concat(noTs)
+}
 // v0.7.0：TG 分发扩展配置 + 赞赏码
 const tgExtra = ref({ push_mode: 'channel', custom_bot_token: '', custom_chat_id: '', fubao_bot: '', link_style: 'button', detail_level: 'compact' })
 const tgExtraSaving = ref(false), rewardCfg = ref({ code: '' }), rewardSaving = ref(false)
@@ -487,6 +509,53 @@ const useLocalPager = (rowsRef, defaultSize = 5) => {
   watch(pageCount, n => { if (page.value > n) page.value = n })
   return { page, pageSize, sizeOptions, total, pageCount, paged }
 }
+
+// v2.1.43（用户口径）：同步状态分「作品级 / 目录级 / 文件级」三栏展示，
+// 每个数字都可以点开看明细（后端 /mirror/level/detail，与计数同一条谓词）。
+const levelDetail = ref({ open: false, loading: false, level: '', level_label: '',
+  scope: '', scope_label: '', total: 0, shown: 0, rows: [] })
+const levelDetailRows = computed(() => levelDetail.value.rows || [])
+const levelPager = useLocalPager(levelDetailRows, 10)
+async function openLevelDetail(level, item) {
+  if (!item || !item.value) return
+  levelDetail.value = { open: true, loading: true, level, level_label: '',
+    scope: item.key, scope_label: item.label, total: 0, shown: 0, rows: [] }
+  try {
+    const d = await api(`/mirror/level/detail?level=${encodeURIComponent(level)}&scope=${encodeURIComponent(item.key)}&limit=200`)
+    levelDetail.value = { open: true, loading: false, level,
+      level_label: d.level_label || '', scope: item.key, scope_label: item.label,
+      total: d.total ?? 0, shown: d.shown ?? 0, rows: d.rows || [] }
+  } catch (e) {
+    levelDetail.value.loading = false
+    ElMessage.error('明细读取失败：' + (e?.message || e))
+  }
+}
+// 「处理流程与进度」只展示本轮：作品级 / 文件级两组数量（来自后端本轮快照）
+const roundWorkItems = computed(() => {
+  const w = (mirrorStatus.value.round || {}).work || {}
+  return [
+    { k: 'scanned', label: '本轮扫描作品', v: w.scanned || 0 },
+    { k: 'queued', label: '排队处理', v: w.queued || 0 },
+    { k: 'processed', label: '已处理', v: w.processed || 0, tone: 'ok' },
+    { k: 'increment', label: '增量优先', v: w.increment || 0 },
+    { k: 'translated', label: '翻译作品', v: w.translated || 0 },
+    { k: 'mapped_dirs', label: '映射目录', v: w.mapped_dirs || 0 },
+    { k: 'failed', label: '异常跳过', v: w.failed || 0, tone: (w.failed ? 'bad' : '') },
+  ]
+})
+const roundFileItems = computed(() => {
+  const f = (mirrorStatus.value.round || {}).file || {}
+  return [
+    { k: 'submitted', label: '提交复制', v: f.submitted || 0 },
+    { k: 'done', label: '复制成功', v: f.done || 0, tone: 'ok' },
+    { k: 'failed', label: '复制失败', v: f.failed || 0, tone: (f.failed ? 'bad' : '') },
+    { k: 'unknown', label: '待确认', v: f.unknown || 0 },
+    { k: 'skipped', label: '跳过', v: f.skipped || 0 },
+    { k: 'renamed', label: '改名成功', v: f.renamed || 0 },
+    { k: 'rename_failed', label: '改名失败', v: f.rename_failed || 0, tone: (f.rename_failed ? 'bad' : '') },
+  ]
+})
+const hasRound = computed(() => !!(mirrorStatus.value.round || {}).at)
 const dirPager = useLocalPager(computed(() => mirrorStatus.value.dirs || []))
 const mediaPager = useLocalPager(computed(() => mirrorStatus.value.media || []))
 // v2.1.13：严格顺序模式与开关已移除（顺序固定按网盘文件名升序，批次控制常态生效）
@@ -1265,7 +1334,8 @@ const filteredResources = computed(() => resources.value.filter(r => {
   return hitKey && hitStatus && hitType && hitIdentify
 }))
 
-const filteredSeries = computed(() => seriesGroups.value.filter(g => {
+// v2.1.43（用户需求）：筛选后统一过一遍「按入库时间」排序（default 时原样返回）。
+const filteredSeries = computed(() => appliedLibSort(seriesGroups.value.filter(g => {
   const hitKey = !keyword.value || String(g.title || '').toLowerCase().includes(keyword.value.toLowerCase())
   const hitStatus = !statusFilter.value || g.share_status === statusFilter.value
   // v0.7.0：一级状态栏——媒体类型 tab 支持 全部/剧集/电影/完结/追更
@@ -1282,7 +1352,7 @@ const filteredSeries = computed(() => seriesGroups.value.filter(g => {
   const hitIdentifySel = !identifyFilter.value || g.identify_status === identifyFilter.value
   const hitFinish = !finishFilter.value || g.finish_status === finishFilter.value
   return hitKey && hitStatus && hitType && hitIdentifyTab && hitTypeSel && hitIdentifySel && hitFinish
-}))
+})))
 // v0.7.0：全选/全不选（作用于当前筛选结果）
 const allSelected = computed(() => filteredSeries.value.length > 0 && filteredSeries.value.every(g => selectedSeries.value.includes(g.key)))
 function toggleSelectAll() {
@@ -3554,7 +3624,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.42 · Asia/Shanghai</span>
+          <span>v2.1.43 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3827,6 +3897,27 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div class="pipe-detail">{{ node.detail }}</div>
               </div>
             </div>
+            <!-- v2.1.43（用户口径）：这一段**只展示本轮**的任务量，分作品级 / 文件级两组。
+                 历史累计全部移到下面「同步状态」的三层看板，两处口径不混。 -->
+            <div class="round-grid" v-if="hasRound">
+              <div class="round-card">
+                <div class="round-card-head"><span class="round-dot"></span>本轮作品级</div>
+                <div class="round-items">
+                  <span v-for="it in roundWorkItems" :key="it.k" class="round-item" :class="it.tone ? 'is-' + it.tone : ''">
+                    <small>{{ it.label }}</small><b>{{ it.v }}</b>
+                  </span>
+                </div>
+              </div>
+              <div class="round-card">
+                <div class="round-card-head"><span class="round-dot g-teal"></span>本轮文件级</div>
+                <div class="round-items">
+                  <span v-for="it in roundFileItems" :key="it.k" class="round-item" :class="it.tone ? 'is-' + it.tone : ''">
+                    <small>{{ it.label }}</small><b>{{ it.v }}</b>
+                  </span>
+                </div>
+              </div>
+            </div>
+            <p class="hint" v-else style="margin-top:12px">本轮还没有任务记录。点「立即同步」后，这里只显示<b>本轮</b>处理的作品数与文件数；历史累计请看下面「同步状态」的作品级 / 目录级 / 文件级三栏。</p>
             <p class="hint" style="margin-top:12px">任务运行中每 2 秒自动刷新，实时显示复制 / 改名 / 入库 / 分享 / 入队各阶段数量。「入库识别 / 生成分享 / 推送入队」按 TMDB 作品去重显示<b>剧集部数 / 电影部数</b>（非集数）；进度条只有分享队列清空、全部推送完成后才到 100%。若本轮入队为 0，节点会显示拦截原因（无海报 / 路由未匹配 / 未配置目标等）。</p>
           </div>
           <!-- v0.9.9 #200：A/B 库设置与同步状态并列，减少纵向滚动 -->
@@ -3903,40 +3994,29 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div class="panel mirror-col">
             <div class="panel-head"><h3>同步状态</h3><!-- v2.1.11：状态标签只显示后端算好的中文 state.label，不再直出英文枚举 -->
               <el-tag size="small" :type="mirrorStatus.state?.running ? 'warning' : (mirrorStatus.state?.code === 'failed' ? 'danger' : 'info')">{{ mirrorStatus.state?.label || '尚未同步' }}</el-tag></div>
-            <div class="stat-group">
-              <div class="stat-group-title"><span class="grp-ico">⇄</span>文件传输</div>
-              <div class="mini-stat-grid">
-                <div class="mini-stat"><small>影视映射</small><b>{{ mirrorStatus.counts?.media || 0 }}</b></div>
-                <div class="mini-stat"><small>文件映射</small><b>{{ mirrorStatus.counts?.files || 0 }}</b></div>
-                <div class="mini-stat"><small>已同步</small><b>{{ mirrorStatus.counts?.synced || 0 }}</b></div>
-                <div class="mini-stat"><small>复制失败</small><b :style="mirrorStatus.counts?.files_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_failed || 0 }}</b></div>
-                <div class="mini-stat"><small>待重试文件</small><b>{{ mirrorStatus.counts?.files_retryable || 0 }}</b></div>
-                <div class="mini-stat"><small>被替代</small><b>{{ mirrorStatus.counts?.superseded || 0 }}</b></div>
+            <!-- v2.1.43（用户口径）：同步状态按「作品级 / 目录级 / 文件级」三栏展示。
+                 每栏给完成进度 + 翻译 / 映射 / 失败等状态；**每个数字都能点开看明细**
+                 （后端用同一条谓词取数，数字与清单必然对得上，不许只给数字）。 -->
+            <template v-for="lv in ['work', 'dir', 'file']" :key="lv">
+              <div class="stat-group" v-if="mirrorStatus.levels && mirrorStatus.levels[lv]">
+                <div class="stat-group-title">
+                  <span class="grp-ico" :class="lv === 'work' ? '' : (lv === 'dir' ? 'g-amber' : 'g-teal')">{{ lv === 'work' ? '作' : (lv === 'dir' ? '▤' : '▦') }}</span>{{ mirrorStatus.levels[lv].label }}
+                  <span class="lv-meta">{{ mirrorStatus.levels[lv].percent }}% · 共 {{ mirrorStatus.levels[lv].total }} {{ mirrorStatus.levels[lv].unit }}（{{ mirrorStatus.levels[lv].total_label }}）</span>
+                </div>
+                <div class="mini-stat-grid">
+                  <div v-for="it in mirrorStatus.levels[lv].items" :key="it.key" class="mini-stat lv-item"
+                       :class="[(it.tone ? 'is-' + it.tone : ''), (it.value ? 'lv-clickable' : '')]"
+                       :title="it.value ? '点击查看明细' : '暂无记录'" @click="openLevelDetail(lv, it)">
+                    <small>{{ it.label }}</small><b>{{ it.value }}</b>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div class="stat-group">
-              <div class="stat-group-title"><span class="grp-ico g-teal">文</span>英文改名</div>
-              <div class="mini-stat-grid">
-                <div class="mini-stat"><small>已改英文名</small><b>{{ mirrorStatus.counts?.files_renamed || 0 }}</b></div>
-                <div class="mini-stat"><small>改名失败</small><b :style="mirrorStatus.counts?.files_rename_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.files_rename_failed || 0 }}</b></div>
-                <div class="mini-stat"><small>待翻译作品</small><b :style="mirrorStatus.counts?.works_without_english ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.works_without_english || 0 }}</b></div>
-                <!-- v2.1.4：被标记忽略的作品单独统计并透明展示，避免「清空后红字仍在」的错觉 -->
-                <div class="mini-stat"><small>忽略翻译</small><b :style="mirrorStatus.counts?.works_english_ignored ? 'color:#cf7f1c' : ''">{{ mirrorStatus.counts?.works_english_ignored || 0 }}</b></div>
-              </div>
-            </div>
-            <div class="stat-group">
-              <div class="stat-group-title"><span class="grp-ico g-amber">▤</span>目录</div>
-              <div class="mini-stat-grid">
-                <div class="mini-stat"><small>已映射</small><b>{{ mirrorStatus.counts?.dirs_mapped || 0 }}</b></div>
-                <div class="mini-stat"><small>自动创建</small><b>{{ mirrorStatus.counts?.dirs_created || 0 }}</b></div>
-                <div class="mini-stat"><small>待创建</small><b>{{ mirrorStatus.counts?.dirs_missing || 0 }}</b></div>
-              </div>
-            </div>
+            </template>
             <div class="stat-group">
               <div class="stat-group-title"><span class="grp-ico g-violet">◷</span>任务 / 风控</div>
               <div class="mini-stat-grid">
                 <div class="mini-stat"><small>待确认任务</small><b>{{ mirrorStatus.counts?.tasks_unknown || 0 }}</b></div>
-                <div class="mini-stat"><small>失败任务</small><b>{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div>
+                <div class="mini-stat"><small>失败任务</small><b :style="mirrorStatus.counts?.tasks_failed ? 'color:#d63f59' : ''">{{ mirrorStatus.counts?.tasks_failed || 0 }}</b></div>
                 <div class="mini-stat"><small>文件操作下限</small><b>{{ mirrorStatus.min_idle_seconds || 0.5 }}s</b></div>
               </div>
             </div>
@@ -4116,6 +4196,48 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           </div>
             </el-collapse-item>
           </el-collapse>
+          <!-- v2.1.43：三层看板数字的明细弹窗。后端用与计数**同一条谓词**取数，
+               所以这里列出来的行数一定等于点进来的那个数字（超过 200 条时标注）。 -->
+          <el-dialog v-model="levelDetail.open" :title="`${levelDetail.level_label} · ${levelDetail.scope_label}（共 ${levelDetail.total} 条）`" width="920px" append-to-body>
+            <div v-if="levelDetail.loading" class="hint">正在读取明细…</div>
+            <template v-else>
+              <div v-if="!levelDetail.rows.length" class="hint">这一类当前没有记录。</div>
+              <template v-else>
+                <el-table :data="levelPager.paged.value" size="small" max-height="460">
+                  <template v-if="levelDetail.level === 'work'">
+                    <el-table-column prop="title" label="作品" min-width="200"/>
+                    <el-table-column prop="category_path" label="A 库分类" min-width="140"/>
+                    <el-table-column label="状态" width="110"><template #default="s">{{ s.row.status_label || '—' }}</template></el-table-column>
+                    <el-table-column prop="files" label="文件" width="80"/>
+                    <el-table-column label="失败文件" width="100"><template #default="s"><span :style="s.row.failed_files ? 'color:#d63f59' : ''">{{ s.row.failed_files || 0 }}</span></template></el-table-column>
+                    <el-table-column prop="english_title" label="英文名" min-width="160"/>
+                  </template>
+                  <template v-else-if="levelDetail.level === 'dir'">
+                    <el-table-column prop="name" label="目录名" min-width="220"/>
+                    <el-table-column prop="category_path" label="分类路径" min-width="160"/>
+                    <el-table-column label="状态" width="110"><template #default="s">{{ s.row.status_label || '—' }}</template></el-table-column>
+                    <el-table-column label="B 库目录" width="160"><template #default="s">{{ s.row.target_dir_id || '未建立' }}</template></el-table-column>
+                    <el-table-column prop="error" label="说明" min-width="200"/>
+                  </template>
+                  <template v-else>
+                    <el-table-column prop="work" label="作品" min-width="180"/>
+                    <el-table-column prop="file" label="文件" min-width="220"/>
+                    <el-table-column label="状态" width="100"><template #default="s">{{ s.row.status_label || '—' }}</template></el-table-column>
+                    <el-table-column label="自动重试" width="100"><template #default="s">{{ s.row.attempts ? s.row.attempts + ' 次' : '—' }}</template></el-table-column>
+                    <el-table-column prop="error" label="说明" min-width="220"/>
+                  </template>
+                </el-table>
+                <div class="pager-row">
+                  <el-pagination background small layout="total, sizes, prev, pager, next, jumper"
+                    :total="levelPager.total.value"
+                    v-model:current-page="levelPager.page.value"
+                    v-model:page-size="levelPager.pageSize.value"
+                    :page-sizes="levelPager.sizeOptions" />
+                </div>
+                <p class="hint" v-if="levelDetail.total > levelDetail.shown">共 {{ levelDetail.total }} 条，这里只取了前 {{ levelDetail.shown }} 条。</p>
+              </template>
+            </template>
+          </el-dialog>
         </section>
 
         <section v-else-if="tab === '分发与互动中心'" class="fade">
@@ -4532,6 +4654,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div class="grid-toolbar">
             <label class="select-all"><input type="checkbox" :checked="allSelected" @change="toggleSelectAll"/> 全选本页（{{ filteredSeries.length }}）</label>
             <div class="grid-toolbar-right">
+              <!-- v2.1.43（用户需求）：作品排序——按入库时间的顺序 / 倒序。
+                   「入库时间」= 作品组内最早那一集的首次入库时间（后端 first_seen_at），
+                   不是「最近一次内容变化」，补集不会把老作品顶到最前。 -->
+              <label class="select-all">排序
+                <el-select v-model="libSort" size="small" style="width:150px;margin-left:6px">
+                  <el-option v-for="o in LIB_SORT_OPTIONS" :key="o.value" :label="o.label" :value="o.value"/>
+                </el-select>
+              </label>
               <label class="select-all"><input type="checkbox" :checked="groupByCategory" @change="groupByCategory = !groupByCategory"/> 按 TMDB 分类分组</label>
               <template v-if="groupByCategory && seriesGroupsByCategory.length">
                 <el-button size="small" text @click="toggleAllGroups(!allGroupsCollapsed)">{{ allGroupsCollapsed ? '展开所有' : '折叠所有' }}</el-button>
@@ -6013,6 +6143,27 @@ button{font-family:inherit}
 .mini-stat:hover{border-color:var(--yg-primary-2);box-shadow:var(--yg-shadow-lg)}
 .mini-stat small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px;line-height:1.3}
 .mini-stat b{font-size:18px;font-variant-numeric:tabular-nums;font-weight:750}
+/* v2.1.43：三层看板（作品级 / 目录级 / 文件级）—— 数字可点开看明细 */
+.stat-group-title .lv-meta{margin-left:auto;font-size:11px;font-weight:500;color:var(--yg-muted);font-variant-numeric:tabular-nums}
+.lv-item{cursor:default}
+.lv-item.lv-clickable{cursor:pointer}
+.lv-item.lv-clickable:hover{border-color:var(--yg-primary-2)}
+.lv-item.is-ok b{color:var(--yg-tone-green-fg)}
+.lv-item.is-bad b{color:var(--yg-rose)}
+.lv-item.is-warn b{color:#cf7f1c}
+/* v2.1.43：处理流程与进度里的「本轮」两组 */
+.round-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}
+.round-card{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px}
+.round-card-head{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--yg-ink);margin-bottom:10px}
+.round-dot{width:7px;height:7px;border-radius:50%;background:var(--yg-primary-2)}
+.round-dot.g-teal{background:#19b3a6}
+.round-items{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px}
+.round-item{background:var(--yg-bg);border:1px solid var(--yg-line);border-radius:8px;padding:8px 10px}
+.round-item small{display:block;color:var(--yg-muted);font-size:11px;line-height:1.3;margin-bottom:4px}
+.round-item b{font-size:16px;font-variant-numeric:tabular-nums;font-weight:750}
+.round-item.is-ok b{color:var(--yg-tone-green-fg)}
+.round-item.is-bad b{color:var(--yg-rose)}
+@media (max-width:900px){.round-grid{grid-template-columns:1fr}}
 /* 生效配置 / 接口清单：结构化 chip 行，替代长串小字 */
 .info-chips{display:flex;flex-wrap:wrap;gap:8px 10px;margin:2px 0 0}
 .info-chip{display:inline-flex;align-items:center;gap:6px;background:var(--yg-bg);border:1px solid var(--yg-line);border-radius:9px;padding:6px 11px;font-size:12px;color:var(--yg-muted)}

@@ -144,6 +144,15 @@ class Resource(Base):
     source_category: Mapped[str] = mapped_column(String(512), default="")
     revision: Mapped[int] = mapped_column(Integer, default=0)  # utime/size 变化次数
     scanned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # v2.1.43（用户需求：资源库按入库时间排序）：**首次入库时间**锚点。
+    #
+    # 为什么不直接用 scanned_at：scanned_at 在文件内容变化（size 变）时会被刷新
+    # （见 scanner.py 的 old_fp != new_fp 分支），它其实是「最近一次变化时间」。
+    # 拿它排序会出现「老剧补了一集就跳到最新」——用户要的「入库时间」不是这个。
+    # 本列只在**新建行时写一次**，此后永不修改；作品级取组内最早的那一集/文件。
+    # 老库由 db.migrate 一次性用 scanned_at 回填（那时它是当时唯一的近似值）。
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True)
     # v2.1.11：归档标记——B 库被用户手动清空后，资源库行**不物理删除**，
     # 只标记为已归档（clean_state='cleaned'）并记时间。历史行与执行记录必须保留，
     # 这是清理类操作的既定红线（此前 _reconcile_library 是物理 delete，直接违反）。
@@ -457,6 +466,42 @@ class MirrorDir(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("rule_id", "source_dir_id", name="uq_mirror_dir_rule_source"),)
+
+
+class MirrorDirScan(Base):
+    """v2.1.43：A 库目录清单快照（轻量扫描的缓存底座）。
+
+    为什么要这张表：A 库真实目录数 ≥1436，此前每轮都要把整棵树列一遍，
+    既慢又容易触发网盘风控（code=127）。网盘的目录条目自带 `utime`/`ctime`，
+    实测「日韩演唱会」的目录 utime 与子项最大 utime 完全一致 → 目录 utime 会随
+    直接子项增删改更新。因此可以把目录树与直属文件清单缓存下来：
+    每轮只列「分类 + 作品」两层（必列），更深的季/集目录只在 utime 变化、
+    该作品有未完成文件、或到了深度兜底周期时才下探；未下探的分支直接用缓存。
+
+    `files_json` 存该目录**直属**文件（fileId/fileName/fileSize/utime），
+    `children_json` 存子目录 id（顺序即网盘返回序）。两者都是「上次实列时的样子」，
+    所以只有 `last_listed_at` 最新且 `utime` 与缓存一致时才可信。
+    """
+    __tablename__ = "mirror_dir_scan"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("mirror_rules.id"), index=True)
+    dir_id: Mapped[str] = mapped_column(String(64), index=True)
+    parent_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    name: Mapped[str] = mapped_column(String(512), default="")
+    path: Mapped[str] = mapped_column(String(1024), default="")
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    # 网盘侧时间戳（目录自身），轻量扫描的核心判据
+    utime: Mapped[int] = mapped_column(BigInteger, default=0)
+    ctime: Mapped[int] = mapped_column(BigInteger, default=0)
+    files_json: Mapped[str] = mapped_column(Text, default="[]")
+    children_json: Mapped[str] = mapped_column(Text, default="[]")
+    n_files: Mapped[int] = mapped_column(Integer, default=0)
+    n_dirs: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 上次「真的列了这个目录」的时间（= 缓存内容的采样时刻）
+    last_listed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("rule_id", "dir_id", name="uq_mirror_dir_scan"),)
 
 
 class MirrorMedia(Base):

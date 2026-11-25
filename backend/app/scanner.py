@@ -104,7 +104,10 @@ def _upsert_resource(db: Session, item: dict, parent: str,
     created = row is None
     change = None
     if created:
-        row = Resource(file_id=fid, scanned_at=utcnow(), **values)
+        # v2.1.43：首次入库时间只在这里写一次，之后任何重扫/内容变化都不再动它
+        # （资源库「按入库时间排序」的锚点，与会被刷新的 scanned_at 分开）。
+        _now = utcnow()
+        row = Resource(file_id=fid, scanned_at=_now, first_seen_at=_now, **values)
         db.add(row)
     else:
         # v2.1.25 真缺陷修复（刚入库被当追更·治触发源）：**指纹不含 utime**。

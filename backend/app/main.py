@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -32,7 +32,8 @@ from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaW
                       WebFileError, create_share_parsed)
 from .identify_batch import count_pending, mark_attempted, select_identify_batch
 from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, DiscoveredChat,
-                     DistributionEvent, MediaRequest, MessageTemplate, MirrorDir, MirrorFile,
+                     DistributionEvent, MediaRequest, MessageTemplate, MirrorDir,
+                     MirrorDirScan, MirrorFile,
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
                      ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution,
                      UserFeedback)
@@ -1143,7 +1144,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.42", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.43", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1154,7 +1155,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.42", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.43", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1608,7 +1609,9 @@ def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
                              enqueue_diag: dict | None = None,
                              works: dict | None = None,
                              running: bool = False, stage: str = "",
-                             total_files: int = 0) -> None:
+                             total_files: int = 0,
+                             round_stats: dict | None = None,
+                             a_works: int = 0) -> None:
     """v0.9.10：把本轮任务各节点处理量写入 MirrorRule.last_pipeline_json。
 
     「处理流程与进度」只读这个快照显示当前任务量，不再拿全库累计计数冒充进度。
@@ -1633,6 +1636,18 @@ def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
     v2.1.11：补部数口径 works_total / works_done——用户口径里「部」才是主单位
       （单轮上限 max_works_per_run 按部、分享/推送按 TMDB 作品去重按部），
       此前部数只存在于 last_message 文本里，前端拿不到，进度无法按部表达。
+
+    v2.1.43（真机反馈：`works_done=28 > works_total=20`）：两个字段此前**不同源** ——
+      `works_total` 取 `stats["batch_size"]`（存量轮转那一批），而 `works_done` 取
+      `stats["media"]`（**整个队列**处理掉的作品数，含增量批次与待重试补齐）。
+      增量一多，分子就超过分母。现在调用方统一传 `stats["queue_size"]`
+      （三段队列去重后的实际排队数）作分母，两者同源。
+
+    v2.1.43 追加两项（用户口径）：
+      - `round_stats`：本轮**作品级 / 文件级**数量快照，「处理流程与进度」只读它，
+        不再拿全库累计冒充本轮；结构见调用方。
+      - `a_works`：A 库扫描到的作品总数。「同步状态 → 作品级」要拿它当分母算
+        整体镜像进度，否则只有映射清单里的作品数，看不出「A 库 713 部镜像了多少」。
     """
     if not r:
         return
@@ -1643,9 +1658,23 @@ def _write_pipeline_snapshot(db: Session, r: MirrorRule | None, *,
             "identified": int(identified or 0), "queued": int(queued or 0),
             "copy_tasks": int(copy_tasks or 0), "scan_files": int(scan_files or 0),
             "works_total": int(works_total or 0), "works_done": int(works_done or 0),
+            "a_works": int(a_works or 0),
             "at": utcnow().isoformat(),
             "enqueue_diag": dict(enqueue_diag or {}),
             "works": dict(works or {}), "running": bool(running), "stage": str(stage or "")}
+    if round_stats:
+        # 只收白名单字段，避免把 sync_rule 的整份 stats（含错误文本/目录树）塞进快照
+        rw = dict(round_stats.get("work") or {})
+        rf = dict(round_stats.get("file") or {})
+        snap["round"] = {
+            "work": {k: int(rw.get(k) or 0) for k in
+                     ("scanned", "queued", "processed", "failed", "increment",
+                      "translated", "mapped_dirs")},
+            "file": {k: int(rf.get(k) or 0) for k in
+                     ("submitted", "done", "failed", "unknown", "skipped",
+                      "renamed", "rename_failed")},
+            "at": utcnow().isoformat(),
+        }
     try:
         r.last_pipeline_json = json_dumps(snap)
         db.flush()
@@ -1805,12 +1834,18 @@ async def _scheduled_mirror() -> None:
                                   "（这些作品本轮不入队推送，其余作品照常入库）")
                             db.commit()
                     # 改名完成 → 写「入库识别中」中间帧（与手动路径同语义）
+                    # v2.1.43：分母/分子同源（queue_size / media），并带上本轮
+                    #          作品级+文件级快照与 A 库作品总数。
+                    _round = _round_stats_from_sync({**stats, "rename": rename_stats})
+                    _a_works = int(stats.get("total_works") or 0)
+                    _queued = int(stats.get("queue_size") or 0)
                     _write_pipeline_snapshot(
                         db, r, mode="定时同步", stage="identify", running=True,
                         copied=int(stats.get("done", 0) or 0),
                         renamed=int(rename_stats.get("renamed", 0) or 0),
                         copy_tasks=int(stats.get("done", 0) or 0),
-                        works_total=int(stats.get("batch_size", 0) or 0))
+                        works_total=_queued, a_works=_a_works,
+                        round_stats=_round)
                     db.commit()
                     gate_block_round = rename_failed and RENAME_GATE_BLOCK_WHOLE_ROUND
                     if bool(getattr(r, "auto_identify", True)) and not gate_block_round:
@@ -1824,10 +1859,11 @@ async def _scheduled_mirror() -> None:
                             queued=int(p.get("queued", 0) or 0),
                             copy_tasks=int(stats.get("done", 0) or 0),
                             scan_files=int(p.get("files", 0) or 0),
-                            works_total=int(stats.get("batch_size", 0) or 0),
+                            works_total=_queued,
                             works_done=int(stats.get("media", 0) or 0),
                             enqueue_diag=dict(p.get("enqueue_diag") or {}),
-                            works=dict(ident.get("work_stats") or {}))
+                            works=dict(ident.get("work_stats") or {}),
+                            round_stats=_round, a_works=_a_works)
                         db.commit()
                         # 追加而非覆盖：v0.8.4 的文件级复制错误就写在 last_message
                         tail = (f" | [自动入库] 扫 {p['files']} 文件 · 识别 "
@@ -1844,8 +1880,9 @@ async def _scheduled_mirror() -> None:
                             copied=int(stats.get("done", 0) or 0),
                             renamed=int(rename_stats.get("renamed", 0) or 0),
                             copy_tasks=int(stats.get("done", 0) or 0),
-                            works_total=int(stats.get("batch_size", 0) or 0),
-                            works_done=int(stats.get("media", 0) or 0))
+                            works_total=_queued,
+                            works_done=int(stats.get("media", 0) or 0),
+                            round_stats=_round, a_works=_a_works)
                         db.commit()
                 else:
                     # v2.1.39：规则被停用 / A、B 库目录 ID 被清空 → 本轮定时镜像什么都没做。
@@ -2056,6 +2093,39 @@ def _mirror_guard():
         _mirror_lock.release()
 
 
+def _round_stats_from_sync(stats: dict) -> dict:
+    """v2.1.43（用户口径）：把一轮同步的统计折算成「本轮 作品级 / 文件级」快照。
+
+    「处理流程与进度」只展示**本轮**的数量，不掺全库累计。字段口径：
+      作品级 —— scanned 本轮 A 库扫描到的作品数 / queued 本轮实际排队数 /
+                processed 真实处理掉的作品数 / failed 异常跳过的作品数 /
+                increment 增量优先作品数 / translated 本轮翻译作品数 /
+                mapped_dirs 本轮映射成功的目录数
+      文件级 —— submitted 提交的复制任务数 / done 复制成功 / failed 失败 /
+                unknown 未确认 / skipped 跳过 / renamed 改英文名成功 /
+                rename_failed 改名失败
+    全部来自 `sync_rule` 的返回值，不额外查库、不猜。
+    """
+    st = stats or {}
+    rn = st.get("rename") or {}
+    return {
+        "work": {"scanned": int(st.get("total_works") or 0),
+                 "queued": int(st.get("queue_size") or 0),
+                 "processed": int(st.get("media") or 0),
+                 "failed": int(st.get("work_errors") or 0),
+                 "increment": int(st.get("increment_works") or 0),
+                 "translated": int(rn.get("works") or 0),
+                 "mapped_dirs": int(st.get("dirs_mapped") or 0)},
+        "file": {"submitted": int(st.get("tasks") or 0),
+                 "done": int(st.get("done") or 0),
+                 "failed": int(st.get("failed") or 0),
+                 "unknown": int(st.get("unknown") or 0),
+                 "skipped": int(st.get("skipped") or 0),
+                 "renamed": int(rn.get("renamed") or 0),
+                 "rename_failed": int(rn.get("failed") or 0)},
+    }
+
+
 async def _safe_rename(db: Session, r: MirrorRule, **kwargs) -> dict:
     """v0.8.6：改名是可选优化，整体失败绝不能拖垮已完成的复制与后续入库 / 推送。
 
@@ -2104,10 +2174,16 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
         # v2.1.11：copy_tasks 用复制任务数（分子分母同口径），不再复用 total_files。
+        # v2.1.43：works_total 改取 queue_size（本轮三段队列去重后的实际排队数），
+        #          与 works_done(=stats["media"]) 同源，杜绝「28/20」这种分子超分母。
+        _round = _round_stats_from_sync(stats)
+        _a_works = int(stats.get("total_works") or 0)
+        _queued = int(stats.get("queue_size") or 0)
         _write_pipeline_snapshot(db, r, mode="镜像同步", stage="rename", running=True,
                                  copied=int(stats.get("done", 0) or 0),
                                  copy_tasks=int(stats.get("done", 0) or 0),
-                                 works_total=int(stats.get("batch_size", 0) or 0))
+                                 works_total=_queued, a_works=_a_works,
+                                 round_stats=_round)
         db.commit()
         _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（复制完成→改名）
         # v0.8.6：改名赶在「扫描入库」之前，只动 B 库单集/单电影文件名；
@@ -2147,11 +2223,13 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
                                 "（这些作品本轮不入队推送，其余作品照常入库）")
         if do_pipeline and not gate_block_round:
             # 改名完成 → 写「入库识别中」阶段帧
+            _round = _round_stats_from_sync(stats)
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="identify", running=True,
                                      copied=int(stats.get("done", 0) or 0),
                                      renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
                                      copy_tasks=int(stats.get("done", 0) or 0),
-                                     works_total=int(stats.get("batch_size", 0) or 0))
+                                     works_total=_queued, a_works=_a_works,
+                                     round_stats=_round)
             db.commit()
             _mirror_lock.heartbeat()  # v0.9.21：阶段推进打点（改名完成→入库识别）
             # v0.8.9：找不到官方英文名的作品在改名环节已直接直译兜底，绝不在这里
@@ -2171,18 +2249,22 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
                 queued=int(pipe.get("queued", 0) or 0),
                 copy_tasks=int(stats.get("done", 0) or 0),
                 scan_files=int(pipe.get("files", 0) or 0),
-                works_total=int(stats.get("batch_size", 0) or 0),
+                works_total=_queued,
                 works_done=int(stats.get("media", 0) or 0),
                 enqueue_diag=dict(pipe.get("enqueue_diag") or {}),
-                works=dict(ident.get("work_stats") or {}))
+                works=dict(ident.get("work_stats") or {}),
+                round_stats=_round_stats_from_sync(stats),
+                a_works=_a_works)
         else:
             # 仅同步 / 定时关入库：也要把 running 归位，避免进度条永远显示「运行中」
             _write_pipeline_snapshot(db, r, mode="镜像同步", stage="done", running=False,
                                      copied=int(stats.get("done", 0) or 0),
                                      renamed=int((stats.get("rename") or {}).get("renamed", 0) or 0),
                                      copy_tasks=int(stats.get("done", 0) or 0),
-                                     works_total=int(stats.get("batch_size", 0) or 0),
-                                     works_done=int(stats.get("media", 0) or 0))
+                                     works_total=_queued,
+                                     works_done=int(stats.get("media", 0) or 0),
+                                     round_stats=_round_stats_from_sync(stats),
+                                     a_works=_a_works)
         add_audit(db, "mirror_run", target_type="mirror",
                   detail=json_dumps({"media": stats.get("media"), "new": stats.get("new"),
                                      "done": stats.get("done"), "unknown": stats.get("unknown"),
@@ -2962,6 +3044,225 @@ def _invalid_media_rows(db: Session, rule_id: int | None = None) -> list:
     return out
 
 
+# ---------- v2.1.43：同步状态三层看板（作品级 / 目录级 / 文件级） ----------
+# 用户口径：同步状态要按「作品级 / 目录级 / 文件级」三栏展示，每栏给出完成进度、
+# 翻译、映射、失败等状态。硬红线：**每个数字都必须能用同一条谓词取出明细**
+# （点数字 → /api/mirror/level/detail?level=&scope= 打开清单），所以计数与明细
+# 共用下面这张查询表，绝不允许计数写一条 SQL、明细另写一条。
+# 计数一律用 Query.count()，不用 len(截断后的清单)。
+def _mirror_level_queries(db: Session) -> dict[str, dict]:
+    mark, hint = mirror.PRUNED_DIR_MARK, mirror.PRUNED_DIR_TEXT_HINT
+    retryable = sorted(mirror.RETRYABLE_FILE_STATUS)
+    no_en = or_(MirrorMedia.english_title.is_(None), MirrorMedia.english_title == "")
+    failed_media = select(MirrorFile.media_id).where(MirrorFile.status == "failed")
+    retry_media = select(MirrorFile.media_id).where(
+        MirrorFile.status.in_(retryable))
+    return {
+        # ---- 作品级：映射清单里的每一部影视 ——
+        "work": {
+            "all": db.query(MirrorMedia),
+            "synced": db.query(MirrorMedia).filter(MirrorMedia.status == "synced"),
+            "syncing": db.query(MirrorMedia).filter(MirrorMedia.status == "syncing"),
+            "pending": db.query(MirrorMedia).filter(MirrorMedia.status == "pending"),
+            "failed": db.query(MirrorMedia).filter(MirrorMedia.status == "failed"),
+            "blocked": db.query(MirrorMedia).filter(MirrorMedia.status == "blocked"),
+            "translated": db.query(MirrorMedia).filter(
+                func.coalesce(MirrorMedia.english_title, "") != ""),
+            # 口径与「待翻译作品」清单、counts.works_without_english 完全一致：
+            # 排除被用户标记忽略（english_source='ignored'）的作品。
+            "untranslated": db.query(MirrorMedia).filter(no_en).filter(
+                or_(MirrorMedia.english_source.is_(None),
+                    MirrorMedia.english_source != "ignored")),
+            "english_ignored": db.query(MirrorMedia).filter(no_en).filter(
+                MirrorMedia.english_source == "ignored"),
+            "dir_mapped": db.query(MirrorMedia).filter(
+                func.coalesce(MirrorMedia.target_dir_id, "") != ""),
+            "has_failed_files": db.query(MirrorMedia).filter(
+                MirrorMedia.id.in_(failed_media)),
+            "has_pending_files": db.query(MirrorMedia).filter(
+                MirrorMedia.id.in_(retry_media)),
+        },
+        # ---- 目录级：A→B 目录映射登记 ——
+        "dir": {
+            "all": db.query(MirrorDir),
+            "mapped": db.query(MirrorDir).filter(MirrorDir.status != "missing"),
+            "created": db.query(MirrorDir).filter(MirrorDir.status == "created"),
+            "fallback": db.query(MirrorDir).filter(
+                MirrorDir.status == "created_fallback"),
+            "missing": db.query(MirrorDir).filter(MirrorDir.status == "missing"),
+            # 与 mirror.is_pruned_dir_error 同语义（两种文案都认），只用于计数与明细
+            "pruned": db.query(MirrorDir).filter(MirrorDir.status == "missing").filter(
+                or_(MirrorDir.error.like(mark + "%"),
+                    MirrorDir.error.like("%" + hint + "%"))),
+            "need_create": db.query(MirrorDir).filter(MirrorDir.status == "missing").filter(
+                ~or_(MirrorDir.error.like(mark + "%"),
+                     MirrorDir.error.like("%" + hint + "%"))),
+        },
+        # ---- 文件级：单集 / 单电影的文件映射 ——
+        "file": {
+            "all": db.query(MirrorFile),
+            "synced": db.query(MirrorFile).filter(MirrorFile.status == "synced"),
+            "copying": db.query(MirrorFile).filter(MirrorFile.status == "copying"),
+            "pending": db.query(MirrorFile).filter(MirrorFile.status == "pending"),
+            "unknown": db.query(MirrorFile).filter(MirrorFile.status == "unknown"),
+            "failed": db.query(MirrorFile).filter(MirrorFile.status == "failed"),
+            "retryable": db.query(MirrorFile).filter(MirrorFile.status.in_(retryable)),
+            "auto_stopped": db.query(MirrorFile).filter(
+                MirrorFile.status == "failed",
+                func.coalesce(MirrorFile.attempts, 0) >= mirror.max_file_attempts(db)),
+            "archived": db.query(MirrorFile).filter(
+                MirrorFile.status == mirror.ARCHIVED_FILE_STATUS),
+            "superseded": db.query(MirrorFile).filter(MirrorFile.status == "superseded"),
+            "renamed": db.query(MirrorFile).filter(MirrorFile.rename_status == "done"),
+            "rename_failed": db.query(MirrorFile).filter(
+                MirrorFile.rename_status == "failed"),
+            "rename_todo": db.query(MirrorFile).filter(
+                or_(MirrorFile.rename_status.is_(None), MirrorFile.rename_status == "",
+                    MirrorFile.rename_status == "pending_visible"),
+                MirrorFile.status == "synced"),
+        },
+    }
+
+
+def _mirror_levels(db: Session, snap: dict) -> dict:
+    """三层看板的展示数据：每层一组「状态 + 数量 + 中文标签」。
+
+    `total` 是该层的分母：
+      - 作品级取 A 库上次扫描到的作品总数（快照 `a_works`），缺失时退化为映射清单条数；
+        用户要看的就是「A 库 713 部里镜像了多少」，只给映射条数看不出进度；
+      - 目录级取本轮目录清单里的目录数（`mirror_dir_scan`），没有清单时退化为映射条数；
+      - 文件级取文件映射总条数。
+    每项的 `key` 就是 /api/mirror/level/detail 的 scope 参数。
+    """
+    q = _mirror_level_queries(db)
+
+    def _n(level: str, scope: str) -> int:
+        try:
+            return int(q[level][scope].count())
+        except Exception:
+            return 0
+
+    a_works = int((snap or {}).get("a_works") or 0)
+    try:
+        dir_manifest = int(db.query(MirrorDirScan).count())
+    except Exception:
+        dir_manifest = 0
+    work_total = a_works or _n("work", "all")
+    dir_total = dir_manifest or _n("dir", "all")
+    file_total = _n("file", "all")
+
+    def _pct(done: int, total: int) -> float:
+        if not total:
+            return 0.0
+        return round(min(done / total, 1.0) * 100, 1)
+
+    return {
+        "work": {
+            "label": "作品级", "unit": "部", "total": work_total,
+            "total_label": ("A 库作品（上次扫描）" if a_works else "映射清单作品"),
+            "percent": _pct(_n("work", "synced"), work_total),
+            "items": [
+                {"key": "synced", "label": "镜像完成", "value": _n("work", "synced"), "tone": "ok"},
+                {"key": "syncing", "label": "镜像中", "value": _n("work", "syncing")},
+                {"key": "pending", "label": "待镜像", "value": _n("work", "pending")},
+                {"key": "failed", "label": "镜像失败", "value": _n("work", "failed"), "tone": "bad"},
+                {"key": "dir_mapped", "label": "目录已映射", "value": _n("work", "dir_mapped")},
+                {"key": "translated", "label": "英文名已翻译", "value": _n("work", "translated")},
+                {"key": "untranslated", "label": "待翻译", "value": _n("work", "untranslated"), "tone": "bad"},
+                {"key": "english_ignored", "label": "已忽略翻译", "value": _n("work", "english_ignored"), "tone": "warn"},
+                {"key": "has_failed_files", "label": "含失败文件的作品", "value": _n("work", "has_failed_files"), "tone": "bad"},
+            ],
+        },
+        "dir": {
+            "label": "目录级", "unit": "个", "total": dir_total,
+            "total_label": ("A 库目录（已建清单）" if dir_manifest else "目录映射登记"),
+            "percent": _pct(_n("dir", "mapped"), dir_total),
+            "items": [
+                {"key": "mapped", "label": "已映射", "value": _n("dir", "mapped"), "tone": "ok"},
+                {"key": "created", "label": "自动创建", "value": _n("dir", "created")},
+                {"key": "fallback", "label": "降级命名创建", "value": _n("dir", "fallback"), "tone": "warn"},
+                {"key": "need_create", "label": "待创建", "value": _n("dir", "need_create"), "tone": "bad"},
+                {"key": "pruned", "label": "已清理待重建", "value": _n("dir", "pruned"), "tone": "warn"},
+            ],
+        },
+        "file": {
+            "label": "文件级", "unit": "项", "total": file_total,
+            "total_label": "文件映射总数",
+            "percent": _pct(_n("file", "synced"), file_total),
+            "items": [
+                {"key": "synced", "label": "已复制", "value": _n("file", "synced"), "tone": "ok"},
+                {"key": "copying", "label": "复制中", "value": _n("file", "copying")},
+                {"key": "pending", "label": "待复制", "value": _n("file", "pending")},
+                {"key": "unknown", "label": "待确认", "value": _n("file", "unknown")},
+                {"key": "failed", "label": "复制失败", "value": _n("file", "failed"), "tone": "bad"},
+                {"key": "auto_stopped", "label": "已停止自动重试", "value": _n("file", "auto_stopped"), "tone": "warn"},
+                {"key": "renamed", "label": "已改英文名", "value": _n("file", "renamed")},
+                {"key": "rename_failed", "label": "改名失败", "value": _n("file", "rename_failed"), "tone": "bad"},
+                {"key": "rename_todo", "label": "待改名", "value": _n("file", "rename_todo")},
+                {"key": "archived", "label": "已归档", "value": _n("file", "archived")},
+                {"key": "superseded", "label": "被替代", "value": _n("file", "superseded")},
+            ],
+        },
+    }
+
+
+LEVEL_NAMES = {"work": "作品级", "dir": "目录级", "file": "文件级"}
+
+
+@app.get("/api/mirror/level/detail", dependencies=ADMIN)
+def mirror_level_detail(level: str, scope: str, limit: int = 200,
+                        db: Session = Depends(get_db)):
+    """v2.1.43：三层看板里任一数字的明细（与计数**同一条谓词**）。
+
+    页面上的数字必须点得开、看得见是哪几部/哪几个/哪几项 —— 这是本项目一贯的
+    铁律（计数与明细不许不同源）。这里直接复用 `_mirror_level_queries`。
+    """
+    level = str(level or "").strip().lower()
+    scope = str(scope or "").strip().lower()
+    if level not in LEVEL_NAMES:
+        raise HTTPException(400, "未知层级")
+    q = _mirror_level_queries(db)
+    if scope not in q[level]:
+        raise HTTPException(400, "未知状态")
+    n = max(1, min(int(limit or 200), 500))
+    total = int(q[level][scope].count())
+    rows = list(q[level][scope].order_by(None).limit(n).all())
+    titles = {m.id: m.title_standard for m in db.scalars(select(MirrorMedia)).all()}
+    out: list[dict] = []
+    if level == "work":
+        failed_counts: dict[int, int] = {}
+        for mid, cnt in db.execute(
+                select(MirrorFile.media_id, func.count(MirrorFile.id))
+                .where(MirrorFile.status == "failed")
+                .group_by(MirrorFile.media_id)).all():
+            failed_counts[int(mid)] = int(cnt)
+        for m in rows:
+            out.append({"id": m.id, "title": m.title_standard,
+                        "mirror_name": m.title_mirror or "",
+                        "category_path": getattr(m, "category_path", "") or "",
+                        "status_label": _media_status_label(m.status),
+                        "english_title": getattr(m, "english_title", "") or "",
+                        "files": db.query(MirrorFile).filter(
+                            MirrorFile.media_id == m.id).count(),
+                        "failed_files": failed_counts.get(int(m.id), 0)})
+    elif level == "dir":
+        for d in rows:
+            out.append({"id": d.id, "name": d.name_standard, "kind": d.kind,
+                        "category_path": d.category_path or "",
+                        "status_label": _dir_status_label(d.status),
+                        "target_dir_id": d.target_dir_id or "",
+                        "error": getattr(d, "error", "") or ""})
+    else:
+        for f in rows:
+            out.append({"id": f.id, "work": titles.get(f.media_id, ""),
+                        "file": f.file_name, "target": f.target_name or "",
+                        "status_label": _file_status_label(f.status),
+                        "attempts": int(getattr(f, "attempts", 0) or 0),
+                        "error": (f.error or "")[:300]})
+    return {"level": level, "level_label": LEVEL_NAMES[level], "scope": scope,
+            "total": total, "shown": len(out), "rows": out}
+
+
 @app.get("/api/mirror/status", dependencies=ADMIN)
 def mirror_status(db: Session = Depends(get_db)):
     r = _mirror_rule(db)
@@ -3292,6 +3593,12 @@ def mirror_status(db: Session = Depends(get_db)):
         "result": ("" if _is_running else _state_label),
     }
 
+    # v2.1.43（用户口径）：同步状态改成「作品级 / 目录级 / 文件级」三栏，
+    # 「处理流程与进度」只读本轮快照（round）。两者数据源刻意分开：
+    # levels 是**库内实况**（累计），round 是**本轮处理量**（不掺历史）。
+    levels = _mirror_levels(db, snap)
+    round_info = dict(snap.get("round") or {}) if has_snap else {}
+
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -3451,6 +3758,12 @@ def mirror_status(db: Session = Depends(get_db)):
                      "enabled": bool(r.enabled) if r else False},
         # v0.9.8 #195：全流程节点 + 同步进度，首页/镜像页据此展示流程条与进度
         "pipeline": pipeline,
+        # v2.1.43（用户口径）：同步状态三层看板（作品级 / 目录级 / 文件级）。
+        # 每项都带 key，前端点数字 → /api/mirror/level/detail 打开同谓词明细。
+        "levels": levels,
+        # v2.1.43：「处理流程与进度」只展示**本轮**的作品级 / 文件级数量。
+        # 快照里没有（老库 / 只改名的轮次）时为空，前端显示「本轮无记录」。
+        "round": round_info,
         # v2.1.11：进度唯一口径 —— 分子分母与右侧文字同源（部数口径）。
         #   此前 percent 走五节点综合，而右侧文字取全库累计 synced/total，
         #   进度条 100% 时文字可能显示「3/89」。现在 percent / done / total /
@@ -4137,6 +4450,8 @@ def resources(q: str = "", limit: int = 100, media_type: str = "",
             "origin_country", "vote_average", "season", "episode", "identify_status",
             "identify_source", "identify_note", "share_url", "share_status",
             "share_duration", "revision", "utime",
+            # v2.1.43（用户需求）：首次入库时间，供资源级「按入库时间排序」。
+            "scanned_at", "first_seen_at",
             # v2.1.11：A 库映射（正确作品名 / 原文件名 / 影视号 / 类型）。
             # 前端手动修正窗口用这几个字段预填，避免拿 B 库英文名去搜。
             "source_title", "source_name", "source_tmdb_id", "source_media_type"]
@@ -4155,6 +4470,28 @@ def _series_group_key(x: Resource) -> str:
     utils.work_group_key，且只用扫描阶段就有的字段，未识别单集不会被漏掉或裂成两张卡。
     """
     return work_group_key(x)
+
+
+def _first_seen_of(x):
+    """v2.1.43：单条资源的**首次入库时间**（资源库「按入库时间排序」的锚点）。
+
+    优先 `first_seen_at`（本版起新建行才写、之后永不改）；老库该列为空时回退
+    `scanned_at`（当时唯一近似值）。两者都为空返回 None，排到最后。
+
+    归一成 **UTC 时间戳（float 秒）** 返回：库里读回的是 naive datetime、新建时
+    写的是 aware datetime，两者直接比较会抛「can't compare offset-naive and
+    offset-aware」——先折算成时间戳，比较与排序都不会踩这个坑。
+    """
+    v = (getattr(x, "first_seen_at", None)
+         or getattr(x, "scanned_at", None))
+    if v is None:
+        return None
+    try:
+        if getattr(v, "tzinfo", None) is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return float(v.timestamp())
+    except Exception:
+        return None
 
 
 def _year_of(title: str) -> str:
@@ -4260,6 +4597,10 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "seasons": set(), "episodes": [],
                 "ids": [], "representative_id": x.id,
                 "unidentified_count": 0,
+                # v2.1.43（用户需求）：作品**入库时间** = 组内最早那一集的首次入库时间。
+                # 用内部键 `_first` 暂存 datetime，输出前转 ISO 字符串（JSON 用），
+                # 不直接放在返回体里。前端拿它做「按入库时间正序 / 倒序」排序。
+                "_first": _first_seen_of(x),
                 # v2.1.6：作品级 TMDB 分类集合（资源库按分类分组展示用）。
                 # primary_genre = genres 列表第一个（与分享中心同口径）；
                 # genre_names 只含官方 genre 字典里的中文名（不编造分类）。
@@ -4268,7 +4609,11 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             }
         g["count"] += 1
         g["ids"].append(x.id)
-        # v2.1.11：组内成员可能识别状态不齐（A 库映射只在部分行回填成功），
+        # v2.1.43：作品的入库时间取**组内最早**（第一条被扫进来的那一集/文件）。
+        # 组内成员可能升级前入库、也可能本版才入库，逐个比一次即可。
+        _fx = _first_seen_of(x)
+        if _fx is not None and (g.get("_first") is None or _fx < g["_first"]):
+            g["_first"] = _fx        # v2.1.11：组内成员可能识别状态不齐（A 库映射只在部分行回填成功），
         # 标题/影视号/类型取「组内已有的最好信息」，不因首个成员缺映射就定死。
         if not g.get("source_title") and str(getattr(x, "source_title", "") or "").strip():
             g["source_title"] = str(x.source_title or "").strip()
@@ -4331,6 +4676,14 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     for g in groups.values():
         seasons = sorted(g.pop("seasons"))
         eps = sorted(set(g.pop("episodes")))
+        # v2.1.43（用户需求）：作品的入库时间，供前端「按入库时间正序 / 倒序」。
+        # 空值一律给空串，前端排到最后，绝不填一个假时间冒充。
+        _fts = g.pop("_first", None)
+        try:
+            g["first_seen_at"] = (datetime.fromtimestamp(_fts, timezone.utc).isoformat()
+                                  if _fts is not None else "")
+        except Exception:
+            g["first_seen_at"] = ""
         label = ""
         if seasons:
             label = f"第{seasons[0]}季" if len(seasons) == 1 else f"第{seasons[0]}-{seasons[-1]}季"
