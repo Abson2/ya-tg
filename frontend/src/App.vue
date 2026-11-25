@@ -156,9 +156,11 @@ const scSchedSelection = ref([]), scSchedTableRef = ref(null)
 // v2.1.2：分类偏好排名（真实派生：字典优先级 + 已成功推送数），决定高峰独占时段分配
 const scPreference = ref({ items: [], segments: [], peak_segments: [], day_segments: [], night_segments: [], full_day_window: [0, 24], segment_hours: 2, source: '' })
 const scBasicRules = ref({ quick_publish_enabled: 'true', update_detect_minutes: '10', quick_publish_hourly_limit: '3', conflict_policy: 'prefer_release' })
-const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24, week_rest_enabled: false })
+// v2.1.45：不再持有 week_rest_enabled / month_rest_enabled —— 周/月档位连同休止
+// 窗口一起下线，前端连字段都不带，避免 POST 时又把死键写回配置。
+const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24 })
 const scRuleTab = ref('基础规则') // 基础规则 / 分类时间排期
-const scCycleTab = ref('小时')     // 小时 / 日度 / 周度 / 月度
+const scCycleTab = ref('小时')     // 小时 / 日度（周度、月度已于 v2.1.45 下线）
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
 const scTaskSearch = ref(''), scTaskTypeFilter = ref('全部'), scSelectedDetail = ref(null)
 const scTaskStatusFilter = ref(''), scLinkFilter = ref(''), scSelectedTasks = ref([])
@@ -3624,7 +3626,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.44 · Asia/Shanghai</span>
+          <span>v2.1.45 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5269,14 +5271,18 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </p>
               </div>
 
-              <!-- 周期计划管理：小时/日/周/月度配额 + 静默保护（真实持久化并生效）
+              <!-- 周期计划管理：小时 / 日度配额 + 静默保护（真实持久化并生效）
                    v2.1.6：仅在「基础规则」子 tab 下常驻，分类时间排期 tab 不再重复露出
-                   （此前无 v-show，两个 tab 都显示，排期区会冒出一张重复卡片）。 -->
+                   （此前无 v-show，两个 tab 都显示，排期区会冒出一张重复卡片）。
+                   v2.1.45：周度、月度两个子页整体撤掉 —— 周/月限额 v2.1.42 已下线，
+                   当时这两页只剩「到点暂停普通排期」的休止开关，而后端对应的休止
+                   判定也一并删了（见 `_cycle_quota_gate`）。留着开关＝留一条看不见的
+                   规则：库里旧值一开就能让普通排期整天不排，用户在页面上找不到原因。 -->
               <div class="sc-card" v-show="scRuleTab==='基础规则'">
-                <div class="sc-card-head"><span class="sc-ico">▦</span><div><h3>周期计划管理</h3><p>小时/日/周/月度配额与静默保护；保存后由调度引擎夹逼执行</p></div>
+                <div class="sc-card-head"><span class="sc-ico">▦</span><div><h3>周期计划管理</h3><p>小时 / 日度配额与静默保护；保存后由调度引擎夹逼执行</p></div>
                   <el-button size="small" type="primary" plain @click="scSaveCyclePlan">调整周期计划</el-button></div>
                 <div class="sc-subtabbar sc-subtab-sm">
-                  <button v-for="t in ['小时','日度','周度','月度']" :key="t" :class="['sc-subtab',{on: scCycleTab===t}]" @click="scCycleTab=t">{{ t }}</button>
+                  <button v-for="t in ['小时','日度']" :key="t" :class="['sc-subtab',{on: scCycleTab===t}]" @click="scCycleTab=t">{{ t }}</button>
                 </div>
                 <div class="sc-cycle-grid">
                   <template v-if="scCycleTab==='小时'">
@@ -5287,19 +5293,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <label class="hint">静默止(时)<br><el-input-number v-model="scCyclePlan.quiet_end" :min="1" :max="24" size="small"/></label>
                     <p class="hint sc-source-note">静默保护默认关闭；开启后 {{ scCyclePlan.quiet_start }}:00–{{ scCyclePlan.quiet_end }}:00 不推送，命中时段 plan_engine 直接空转。凌晨时段（00:00–08:00）依赖该保护关闭才能产出。</p>
                   </template>
-                  <template v-else-if="scCycleTab==='日度'">
+                  <template v-else>
                     <label class="hint">单日推送总上限<br><el-input-number v-model="scCyclePlan.day_max" :min="0" size="small"/></label>
                     <label class="hint">单分类每日上限<br><el-input-number v-model="scCyclePlan.category_day_max" :min="0" size="small" title="0=不限"/></label>
                     <label class="hint">主推送窗口起<br><el-input-number v-model="scCyclePlan.window_start" :min="0" :max="23" size="small"/></label>
                     <label class="hint">主推送窗口止<br><el-input-number v-model="scCyclePlan.window_end" :min="1" :max="24" size="small"/></label>
-                  </template>
-                  <template v-else-if="scCycleTab==='周度'">
-                    <label class="hint">周度休闲窗口<br><el-switch v-model="scCyclePlan.week_rest_enabled"/></label>
-                    <p class="hint sc-source-note">周推送总配额已下线（v2.1.42）：推送量只按<b>日上限</b>控，一周推多少由每天的日上限自然累计，不再有第二道周闸门。这里只剩「到点暂停普通排期」的休止窗口。</p>
-                  </template>
-                  <template v-else>
-                    <label class="hint">月度休刊<br><el-switch v-model="scCyclePlan.month_rest_enabled"/></label>
-                    <p class="hint sc-source-note">月推送总量配额已下线（v2.1.42）：同上，只按日上限控量。这里只剩「月末最后一天暂停普通排期」的休刊开关。</p>
+                    <p class="hint sc-source-note">推送量只按<b>日上限</b>控：一周推多少由每天的日上限自然累计，没有周闸门也没有月闸门（周/月限额与休止窗口已于 v2.1.42–v2.1.45 全线下线）。</p>
                   </template>
                 </div>
               </div>

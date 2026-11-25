@@ -1456,49 +1456,35 @@ def _category_today_count(db: Session, category_key: str) -> int:
 
 
 def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
-    """周期计划**日**配额与休止窗口门禁（v2.1.0 真实消费，此前只落库）。
+    """周期计划**日**配额门禁（v2.1.0 真实消费，此前只落库）。
 
     v2.1.42（用户口径）：**周 / 月限额已下线，只保留日度限额**。
     原来 `week_max` / `month_max` 与日上限并排拦截，但周/月额度长期远未触顶、
     只会让「到底被哪一层拦了」变得难解释；用户明确要求砍掉这两层，只按天控量。
-    库里保存的旧 `week_max` / `month_max` 值**原样保留**（历史配置不删、不清零），
-    只是不再参与任何判定 —— 想恢复成按周/月控量需要改代码，不是改配置。
+
+    v2.1.45（用户口径）：**周 / 月休止窗口也一并下线**，不留死代码。
+    页面上的「周度」「月度」两个子页已整体撤掉，若后端还保留
+    `week_rest_enabled` / `month_rest_enabled` 的判定，库里一条页面上再也看不见的
+    旧开关就能让普通排期整天 / 整月不排——用户原话是「避免后续被规则卡住，而不知情」。
+    所以这两个分支连同 `weekly_rest` / `monthly_rest` 两种原因码直接删除；
+    历史遗留的这几个键在下次保存周期计划时清掉（见 `api_save_cycle_plan`）。
+    想恢复成按周/月控量或休止，需要改代码，不是改配置。
 
     统计口径：当日已建任务数（按 created_at 落库时间），0 = 不限。
-    休止窗口命中时直接拦截（周末/月末指定小时后停普通排期），quiet 已在调用方处理。
+    quiet 已在调用方处理。
     返回 (是否拦截, 原因)。
     """
     now_sh = datetime.now(shanghai_tz())
-    # 周度休止：如「周六 20:00 后暂停普通排期」
-    if cycle.get("week_rest_enabled"):
-        rest_day = int(cycle.get("week_rest_day") or 6)  # 0=周一 ... 6=周日
-        rest_hour = int(cycle.get("week_rest_hour") or 20)
-        if now_sh.weekday() == rest_day and now_sh.hour >= rest_hour:
-            return True, "weekly_rest"
-    # 月度休止
-    if cycle.get("month_rest_enabled"):
-        month_end = (now_sh + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-        if now_sh.date() == month_end.date():
-            return True, "monthly_rest"
-
-    def period_start(dt: datetime, kind: str) -> datetime:
-        if kind == "day":
-            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        if kind == "week":
-            return (dt - timedelta(days=dt.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0)
-        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-    # v2.1.42：只剩日度一层。周 / 月不再参与判定（故意留在这里的是「只按天控量」
-    # 这一条口径，不是漏配——前端也已撤掉那两个输入框）。
+    # 只剩「日」一层。周 / 月窗口与休止判断已随功能下线删除（v2.1.45）。
     checks = (("day_max", "day"),)
     for key, kind in checks:
         cap = int(cycle.get(key) or 0)
         if cap <= 0:
             continue
-        start = period_start(now_sh, kind).astimezone(timezone.utc)
-        # v2.1.42：只剩「日」这一层，窗口固定一天。周 / 月分支已随功能下线删除，
-        # 不留死代码（否则以后有人看到分支会以为还能按周/月控量）。
+        # 统计窗口固定为上海自然日的一天（周窗口的 7 天 / 月窗口早已删掉，
+        # 否则哪怕 checks 只剩日度，也留着一个能按周/月统计的死分支）。
+        start = now_sh.replace(hour=0, minute=0, second=0, microsecond=0
+                               ).astimezone(timezone.utc)
         end = start + timedelta(days=1)
         used = db.scalar(select(func.count(SCPublishTask.id)).where(
             SCPublishTask.created_at >= start, SCPublishTask.created_at < end)) or 0
@@ -2530,17 +2516,15 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     quiet_start = int(cycle.get("quiet_start") or 0)
     quiet_end = int(cycle.get("quiet_end") or 0)
 
-    # v2.1.35（用户口径）：时、日、周、月与分类的推送上限**一律由发布规则给**，
-    # 代码里不写死任何一个数字。这里把 `plan_engine` 开头那道日/周/月额度门禁
-    # （`_cycle_quota_gate`，读的是发布规则的 `cycle_plan.day_max/week_max/month_max`
-    # 与休止窗口）也接到预测侧来 —— 此前只有实跑消费它，于是额度吃满时出现
+    # v2.1.35（用户口径）：时、日与分类的推送上限**一律由发布规则给**，
+    # 代码里不写死任何一个数字。这里把 `plan_engine` 开头那道额度门禁
+    # （`_cycle_quota_gate`，读的是发布规则的 `cycle_plan.day_max`）
+    # 也接到预测侧来 —— 此前只有实跑消费它，于是额度吃满时出现
     # 「实跑 0 部、排期表照旧预测一堆」的同屏矛盾（v2.1.19 红线：预测与实跑同口径）。
-    # v2.1.42（用户口径）：周 / 月限额已下线，这里只剩日度与休止窗口。
+    # v2.1.42：周 / 月限额下线；v2.1.45：周 / 月休止窗口也下线，只剩日度一层。
     quota_blocked, quota_code = _cycle_quota_gate(db, cycle)
     quota_reason = {
         "day_quota": "今日推送部数已达发布规则上限",
-        "weekly_rest": "已到本周休止时段，普通排期暂停",
-        "monthly_rest": "已到本月休止日，普通排期暂停",
     }.get(quota_code, "已达发布规则上限")
     if quota_blocked:
         out["notes"].append(
@@ -6913,23 +6897,37 @@ def api_save_basic_rules(body: Payload, db: Session = Depends(get_db)):
 CYCLE_PLAN_DEFAULTS = {
     "hour_max": 60, "category_hour_max": 8, "quiet_start": 0, "quiet_end": 7,
     "quiet_enabled": False, "day_max": 180, "window_start": 0, "window_end": 24,
-    # v2.1.42（用户口径）：周 / 月限额下线，只保留日度限额。休止窗口是另一件事
-    # （到点停普通排期），保留。
-    "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
-    "month_rest_enabled": False,
     # v2.1.6：单分类每日上限——分类排期表移除「日上限」列后，
     # 分类级日限流统一由周期计划约束（此前无处可配，分类级日限流是死配置）。
     "category_day_max": 0,
 }
 
+# 已经彻底下线的周期计划键（v2.1.45 下线周/月休止窗口）。这些键**不再有默认值、
+# 不再参与任何判定**；保留这份清单只为两件事：
+#   ① 接口回显时把它们过滤掉，别让页面上看不见的旧值看起来还管用；
+#   ② 保存周期计划时把它们从 config_json 里清掉，避免以后有人恢复部分代码时
+#      被一条谁也不知道存在的旧开关卡住（用户口径：别被规则卡住而不自知）。
+# 注意：周/月**限额**键（`week_max`/`month_max`）不在此列 —— v2.1.42 起它们就
+# 已不接受写入、也没有任何判定分支，`test_v2135` 的契约是「代码里连字面量都别出现」，
+# 这里不去碰它（它们是纯数字、不会拦任何东西，不属于「看不见的开关」）。
+RETIRED_CYCLE_KEYS = (
+    "week_rest_enabled", "week_rest_day", "week_rest_hour",
+    "month_rest_enabled",
+)
+
+
 @router.get("/cycle-plan")
 def api_cycle_plan(db: Session = Depends(get_db)):
-    """周期计划（小时/日/周/月配额 + 静默保护），持久化于活动版本 config_json.cycle_plan。"""
+    """周期计划（小时 / 日度配额 + 静默保护），持久化于活动版本 config_json.cycle_plan。
+
+    v2.1.45：周度、月度两档已整体下线，回显里不再出现任何周/月键（历史值也不回显）。
+    """
     version = _active_version(db)
     if not version:
         return {**CYCLE_PLAN_DEFAULTS, "version_id": 0}
     cfg = _jload(version.config_json, {})
-    saved = cfg.get("cycle_plan") or {}
+    saved = {k: v for k, v in (cfg.get("cycle_plan") or {}).items()
+             if k not in RETIRED_CYCLE_KEYS}
     return {**CYCLE_PLAN_DEFAULTS, **saved, "version_id": version.id}
 
 
@@ -6941,11 +6939,14 @@ def api_save_cycle_plan(body: Payload, db: Session = Depends(get_db)):
     cfg = _jload(version.config_json, {})
     saved = {k: body.payload.get(k, v) for k, v in CYCLE_PLAN_DEFAULTS.items() if k in body.payload}
     cycle = {**CYCLE_PLAN_DEFAULTS, **(cfg.get("cycle_plan") or {}), **saved}
+    # v2.1.45：周 / 月相关键（限额 + 休止窗口）已彻底下线，写回时一并清掉。
+    # 它们的值已经不影响任何判定，留着只会让「为什么今天不排期」变成悬案。
+    for _retired in RETIRED_CYCLE_KEYS:
+        cycle.pop(_retired, None)
     # 数值夹逼，防非法输入破坏调度
-    # v2.1.42：周 / 月限额已下线，不再接受这两个键的写入（旧值原样留在 config_json 里）。
     for k in ("hour_max", "category_hour_max", "category_day_max", "day_max"):
         cycle[k] = max(0, int(cycle.get(k) or 0))
-    for k in ("quiet_start", "window_start", "week_rest_hour"):
+    for k in ("quiet_start", "window_start"):
         cycle[k] = max(0, min(23, int(cycle.get(k) or 0)))
     for k in ("quiet_end", "window_end"):
         cycle[k] = max(1, min(24, int(cycle.get(k) or 24)))

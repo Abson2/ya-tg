@@ -218,9 +218,11 @@ def test_cycle_plan_defaults_no_week_month_quota():
     assert "week_max" not in CYCLE_PLAN_DEFAULTS, "周限额默认值应已下线"
     assert "month_max" not in CYCLE_PLAN_DEFAULTS, "月限额默认值应已下线"
     assert "day_max" in CYCLE_PLAN_DEFAULTS, "日度限额必须保留"
-    # 休止窗口是另一件事，保留
-    assert "week_rest_enabled" in CYCLE_PLAN_DEFAULTS
-    assert "month_rest_enabled" in CYCLE_PLAN_DEFAULTS
+    # v2.1.45（用户口径）：周/月休止窗口也整体下线 —— 契约从「保留」翻转为「必须没有」，
+    # 因为页面上那两个子页已经撤掉，留着后端开关＝留一条看不见的拦截规则。
+    assert "week_rest_enabled" not in CYCLE_PLAN_DEFAULTS
+    assert "month_rest_enabled" not in CYCLE_PLAN_DEFAULTS
+    assert "week_rest_hour" not in CYCLE_PLAN_DEFAULTS
 
 
 def test_quota_gate_only_day_layer():
@@ -232,9 +234,11 @@ def test_quota_gate_only_day_layer():
     assert '("week_max"' not in body and '("month_max"' not in body
     assert 'cycle.get("week_max")' not in body
     assert 'cycle.get("month_max")' not in body
-    # 周 / 月的休止窗口仍在（不是限额）
-    assert 'return True, "weekly_rest"' in body
-    assert 'return True, "monthly_rest"' in body
+    # v2.1.45：周 / 月的**休止窗口**判定也删干净了（不只是限额）。
+    assert 'return True, "weekly_rest"' not in body
+    assert 'return True, "monthly_rest"' not in body
+    assert 'cycle.get("week_rest_enabled")' not in body
+    assert 'cycle.get("month_rest_enabled")' not in body
     # 统计窗口只剩「一天」——周窗口的 timedelta(days=7) 必须彻底消失，
     # 否则哪怕 checks 只剩日度，也留着一个能按周统计的死代码。
     assert "end = start + timedelta(days=1)" in body
@@ -248,16 +252,24 @@ def test_save_cycle_plan_does_not_clamp_week_month():
     body = SC2_SRC[start:end]
     assert '"day_max")' in body
     assert "week_max" not in body and "month_max" not in body
+    # v2.1.45：连周/月休止窗口的数值夹逼也一起撤掉
+    assert "week_rest_hour" not in body
 
 
 def test_forecast_reason_map_has_no_week_month():
     assert '"week_quota": "本周推送部数已达发布规则上限"' not in SC2_SRC
     assert '"month_quota": "本月推送部数已达发布规则上限"' not in SC2_SRC
     assert '"day_quota": "今日推送部数已达发布规则上限"' in SC2_SRC
+    # v2.1.45：休止窗口的原因码也一起删了，别留一条用户看不懂的拦截理由
+    assert '"weekly_rest":' not in SC2_SRC
+    assert '"monthly_rest":' not in SC2_SRC
 
 
 def test_frontend_has_no_week_month_quota_inputs():
     assert "scCyclePlan.week_max" not in APP_VUE, "周限额输入框应已撤掉"
     assert "scCyclePlan.month_max" not in APP_VUE, "月限额输入框应已撤掉"
     assert "scCyclePlan.day_max" in APP_VUE, "日度限额输入框必须保留"
-    assert "周推送总配额已下线" in APP_VUE and "月推送总量配额已下线" in APP_VUE
+    # v2.1.45：周度 / 月度两个子页整体撤掉，页面里不该再出现这两个档位名
+    assert "'小时','日度','周度','月度'" not in APP_VUE, "周期计划子页应只剩小时/日度"
+    assert "scCyclePlan.week_rest_enabled" not in APP_VUE
+    assert "scCyclePlan.month_rest_enabled" not in APP_VUE
