@@ -191,7 +191,9 @@ def test_inline_keyboard_only_resource_button(db):
         asyncio.run(publisher._send_telegram(db, q, r, c, b))
     kb = captured["payload"]["reply_markup"]["inline_keyboard"]
     # inline 键盘只剩一行「获取资源」，三个跳转不再占按钮位
-    assert len(kb) == 1
+    # v2.1.50：推送卡片多了第二行「👍 想看」（点击统计）。第一行仍是资源按钮，
+    # 且**只有**这两行——不许多塞别的按钮。
+    assert len(kb) == 2 and kb[0][0]["text"] == "📥 获取资源"
     assert kb[0][0]["text"] == "📥 获取资源"
     # 三个跳转以正文标签形式出现，不在 reply_markup 里
     assert all("频道" not in btn["text"] and "群聊" not in btn["text"]
@@ -216,4 +218,6 @@ def test_jump_tag_links_skip_empty_link(db):
     assert '<a href="https://t.me/official">频道</a>' in caption
     assert ">群聊</a>" not in caption and ">投稿·求片</a>" not in caption
     kb = captured["payload"]["reply_markup"]["inline_keyboard"]
-    assert len(kb) == 1 and kb[0][0]["text"] == "📥 获取资源"
+    # v2.1.50：推送卡片多了第二行「👍 想看」（点击统计）。第一行仍是资源按钮，
+    # 且**只有**这两行——不许多塞别的按钮。
+    assert len(kb) == 2 and kb[0][0]["text"] == "📥 获取资源" and kb[0][0]["text"] == "📥 获取资源"

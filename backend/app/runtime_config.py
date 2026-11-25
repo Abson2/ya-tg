@@ -220,16 +220,17 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 但以 mirror_mode 为准；full 即等价于"允许删 B 库"。
     "mirror_mode": ("mirror_mode", "full"),
     # ------------------------------------------------------------------------
-    # v2.1.7 #241：Telegram 阅读量采集（MTProto user account）
-    # Bot API 拿不到消息浏览量，只有 MTProto 的 Message.views 才有 → 必须用户账号接入。
-    # 凭证走本表（Fernet 加密落库 + 管理页配置），明文**绝不**回前端。
+    # v2.1.7 #241：Telegram 阅读量采集（MTProto 接入）
+    # Bot API 拿不到消息浏览量，只有 MTProto 的 Message.views 才有。
+    # v2.1.50 改口径：**用推送 Bot 自己的令牌登录**，不再要手机号 + 验证码
+    # （Bot 走 MTProto 的 get_messages(ids) 一样能读到 views，且人工零操作）。
     # api_id 是 my.telegram.org 申请的数字；api_hash 是 32 位十六进制。
-    # 登录验证码是**一次性**的，只在登录流程内存活，不落库。
     # ------------------------------------------------------------------------
     "tg_stats_enabled": ("tg_stats_enabled", "false"),
     "tg_api_id": ("tg_api_id", ""),
     "tg_api_hash": ("tg_api_hash", ""),
-    "tg_phone": ("tg_phone", ""),
+    # 用哪个 Bot 采集（bots.id）。留空 = 自动跟推送用同一个 Bot。
+    "tg_stats_bot_id": ("tg_stats_bot_id", ""),
     # 会话文件目录（会话文件等同账号凭据，只落本地，绝不通过接口返回）
     "tg_session_dir": ("tg_session_dir", "./data/tg_session"),
     # 采集回溯窗口（小时）与单轮上限（防接口风暴护栏）
@@ -238,8 +239,6 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # 定时采集间隔（小时）。阅读量是累计值，趋势必须靠周期采集才能形成，
     # 只靠手动点按钮永远只有一个数据点。0 = 关闭定时采集（仅手动触发）。
     "tg_stats_collect_interval_hours": ("tg_stats_collect_interval_hours", "0"),
-    # MTProto 接入点（默认官方；支持自建 DC）
-    "tg_api_base": ("tg_api_base", ""),
 }
 
 

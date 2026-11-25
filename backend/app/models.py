@@ -1183,6 +1183,33 @@ class TelegramMessageStat(Base):
     )
 
 
+class TelegramPushClick(Base):
+    """v2.1.50：推送卡片上「想看」按钮被点了一次（**按人去重**）。
+
+    为什么单独一张表、单独一个指标
+    ------------------------------
+    阅读量是 Telegram 给的**累计值**（一条帖子被看过几次），点击是我们自己数的
+    **行为**（有多少个不同的人主动表达了兴趣）。两者单位不同（次 / 人）、
+    来源不同（平台给 / 自己数）、也不保证同向（刷屏也会涨阅读）。
+    所以报表必须**单列**，不得相加、不得互相替代。
+
+    去重口径：`(queue_id, user_id)` 唯一——同一个人点十次只有一行。
+    `queue_id` 不设外键：队列项被清理后点击记录仍要保留（历史统计不能丢）。
+    """
+    __tablename__ = "telegram_push_clicks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    queue_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    # 点击所在的目标（频道/群）与点击者。
+    chat_id: Mapped[str] = mapped_column(String(128), index=True, default="")
+    user_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    # 作品键（落库时就算好，避免报表再去 join 已被清理的队列项）。
+    work_key: Mapped[str] = mapped_column(String(256), index=True, default="")
+    clicked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    __table_args__ = (
+        UniqueConstraint("queue_id", "user_id", name="uq_tg_click_queue_user"),
+    )
+
+
 class TelegramStatRun(Base):
     """一轮阅读量采集的执行记录（可诊断：采集了多少、成功多少、失败原因）。"""
     __tablename__ = "telegram_stat_runs"

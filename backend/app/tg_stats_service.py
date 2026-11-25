@@ -26,6 +26,7 @@ from .models import (
     QueueItem,
     Resource,
     TelegramMessageStat,
+    TelegramPushClick,
     TelegramStatRun,
     utcnow,
 )
@@ -159,7 +160,9 @@ async def collect_once(db: Session) -> dict[str, Any]:
             return result
 
         client = tg_stats._get_client(db)
-        await tg_stats._ensure_authorized(client)
+        # v2.1.50：传 db 进去 —— 会话没建立时用 Bot 令牌当场自动签一次，
+        # 不再要求用户先去页面点「获取验证码 / 完成登录」。
+        await tg_stats._ensure_authorized(client, db)
 
         collected = 0
         skipped = 0
@@ -327,6 +330,35 @@ def _delta_map(rows: list[TelegramMessageStat]) -> dict[tuple[int, str], dict[st
     return out
 
 
+def _click_rollup(db: Session, since: datetime, until: datetime) -> dict[str, Any]:
+    """期间内「想看」按钮的**人数**（去重），按作品 / 目标分列。
+
+    v2.1.50：点击与阅读量**不同源**——阅读量是 Telegram 给的累计次数，
+    点击是我们自己数的人。所以这里只出「人数」，绝不去和 views 相加、
+    也不拿它冒充阅读量（刷屏会让阅读量上涨，但不会让点击人数上涨）。
+    """
+    rows = list(db.scalars(select(TelegramPushClick).where(
+        TelegramPushClick.clicked_at >= since,
+        TelegramPushClick.clicked_at <= until)).all())
+    users: set[str] = set()
+    per_work: dict[str, set[str]] = {}
+    per_chat: dict[str, set[str]] = {}
+    for r in rows:
+        uid = str(r.user_id or "")
+        if not uid:
+            continue
+        users.add(uid)
+        if r.work_key:
+            per_work.setdefault(r.work_key, set()).add(uid)
+        if r.chat_id:
+            per_chat.setdefault(r.chat_id, set()).add(uid)
+    return {
+        "clickers": len(users),
+        "works": {k: len(v) for k, v in per_work.items()},
+        "targets": {k: len(v) for k, v in per_chat.items()},
+    }
+
+
 def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
     """阅读量趋势报表。
 
@@ -382,6 +414,8 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
         kind = row.target_kind or "channel"
         key = (row.chat_id or "", kind)
         item = per_target.setdefault(key, {
+            # chat_id 只在**后端**用于关联点击统计，接口层不会输出它。
+            "chat_id": row.chat_id or "",
             "name": row.target_name or "",
             "kind": kind,
             "messages": 0,
@@ -420,6 +454,13 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
             item["views_delta"] += delta["views"]
     works = sorted(per_work.values(), key=lambda x: -int(x["views_delta"]))[:20]
 
+    # v2.1.50：点击人数（与阅读量分开的一列，不参与上面的任何求和）。
+    clicks = _click_rollup(db, since, until)
+    for item in works:
+        item["clickers"] = int(clicks["works"].get(item["work_key"], 0))
+    for item in targets:
+        item["clickers_total"] = int(clicks["targets"].get(item["chat_id"] or "", 0))
+
     return {
         "days": days,
         "since": since.isoformat(),
@@ -432,6 +473,8 @@ def trend_report(db: Session, days: int = 7) -> dict[str, Any]:
             "views_delta": sum(int(b["views"]) for b in buckets.values()),
             "forwards_delta": sum(int(b["forwards"]) for b in buckets.values()),
             "reactions_delta": sum(int(b["reactions"]) for b in buckets.values()),
+            # 点击人数：与上面三项不同源，单列。
+            "clickers": int(clicks["clickers"]),
         },
         # 口径说明：前端据此提示「群聊不提供浏览量」。
         "capability": {

@@ -27,7 +27,8 @@ from sqlalchemy.orm import Session
 from . import runtime_config, tgto, tmdb
 from .contribution_links import extract_guangya_share_url
 from .models import (Bot, Channel, DiscoveredChat, MediaRequest, ProcessedUpdate,
-                     QueueItem, Resource, UserContribution, UserFeedback, utcnow)
+                     QueueItem, Resource, TelegramPushClick, UserContribution,
+                     UserFeedback, utcnow)
 from .security import decrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -1408,6 +1409,68 @@ async def _handle_pick(db: Session, token: str, data: str, *, uid: str, chat_id:
                                back_keyboard())
 
 
+def _click_work_key(db: Session, queue_id: int) -> str:
+    """把队列项翻译成作品键（落库时就算好，报表不再依赖队列项还在不在）。"""
+    q = db.get(QueueItem, int(queue_id or 0))
+    if q is None:
+        return ""
+    res = db.get(Resource, q.resource_id) if q.resource_id else None
+    if res is None:
+        return ""
+    try:
+        from .utils import work_group_key
+        key = work_group_key(res)
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return str(getattr(res, "media_title", "") or "")
+
+
+async def _handle_push_click(db: Session, token: str, cb: dict, data: str) -> str:
+    """推送卡片上「👍 想看」被点了一下：按人去重记账，**不改消息**。
+
+    v2.1.50：这是独立的「点击」指标，与阅读量**不同源**——
+    阅读量是 Telegram 给的累计值（次），点击是我们自己数的人（人）。
+    两者不得相加、不得互相替代，报表里必须分开显示。
+
+    去重：`(queue_id, user_id)` 唯一。同一个人反复点只有一行，
+    并发两次点击时第二次会撞唯一键 → rollback 吞掉，不报错、不重复计数。
+    """
+    cb_id = str(cb.get("id") or "")
+    try:
+        queue_id = int(str(data).split(".", 1)[1])
+    except (IndexError, ValueError):
+        queue_id = 0
+    user = cb.get("from") or {}
+    user_id = str(user.get("id") or "")
+    chat_id = str(((cb.get("message") or {}).get("chat") or {}).get("id") or "")
+    recorded = False
+    if queue_id > 0 and user_id:
+        exists = db.scalar(select(TelegramPushClick).where(
+            TelegramPushClick.queue_id == queue_id,
+            TelegramPushClick.user_id == user_id))
+        if exists is None:
+            db.add(TelegramPushClick(queue_id=queue_id, chat_id=chat_id,
+                                     user_id=user_id,
+                                     work_key=_click_work_key(db, queue_id)))
+            try:
+                db.commit()
+                recorded = True
+            except Exception:
+                # 并发重复点击撞唯一键：当作「已记过」，绝不让它冒泡打断轮询。
+                # A-09：静默吞异常必须留日志，否则以后排查「点击少了」毫无线索。
+                logger.warning("[bot] 记录点击失败（多半是并发重复点击撞唯一键）queue=%s",
+                               queue_id)
+                db.rollback()
+    if cb_id:
+        await _api(db, token, "answerCallbackQuery", {
+            "callback_query_id": cb_id,
+            "text": "已记下，感谢反馈" if recorded else "这条已经记过了",
+        })
+    return "click"
+
+
 async def _handle_callback(db: Session, token: str, cb: dict) -> str:
     """处理一个 callback_query：先 answer 消掉按钮 loading，再编辑原消息。"""
     cb_id = str(cb.get("id") or "")
@@ -1417,6 +1480,11 @@ async def _handle_callback(db: Session, token: str, cb: dict) -> str:
     message_id = msg.get("message_id")
     user = cb.get("from") or {}
     user_id = str(user.get("id") or chat_id)
+    # v2.1.50：推送卡片的「想看」按钮 —— 只记账 + 回一句提示，**不编辑消息**。
+    # 必须放在下面那次统一 answerCallbackQuery 之前：一个回调只能 answer 一次，
+    # 先 answer 过的那个不带文字，用户就看不到任何反馈。
+    if data.startswith("pc."):
+        return await _handle_push_click(db, token, cb, data)
     if cb_id:
         await _api(db, token, "answerCallbackQuery", {"callback_query_id": cb_id})
     ok, reason = await check_restriction(db, token, user_id)

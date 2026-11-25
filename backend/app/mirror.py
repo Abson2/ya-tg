@@ -354,6 +354,53 @@ def mark_file_failed(row, msg: str, limit: int) -> int:
     row.error = text[:500]
     row.updated_at = utcnow()
     return n
+
+
+# ---------------- v2.1.50：作品级状态只有一套判据 ----------------
+# 真机现象（2026-11-25 20:46 实测）：定向重试把某部作品 284 行全部改成 synced、
+# target_name 也全有值，作品在页面上仍显示「失败」。
+# 根因不是某一行算错，而是「作品状态由谁定」有三套实现、口径各不同：
+#   ① 扫描轮（sync_rule 尾部）：看本作品所有文件行 —— 唯一正确的那套；
+#   ② 任务轮询（poll_pending_tasks）：按「最后轮询到的那个任务」直接定生死，
+#      同一部作品只要有第二个任务，状态就可能被翻转；
+#   ③ 定向重试（retry_failed_files）：**根本不重算**，只更新 last_synced_at。
+# 所以「重试成功了但界面还是失败」不是显示层的问题，是状态压根没被重算过。
+# 收敛办法：判据只留 media_status_from，写入只留 reconcile_media_status，
+# 三个调用点全部改走它 —— 以后新增任何改文件状态的路径也只需要调这一个。
+MEDIA_TERMINAL_FILE_STATUS = ("synced", "superseded")
+
+
+def media_status_from(rows) -> str:
+    """一部作品的 status：只要还有文件行留着活要干就是 failed，否则 synced。
+
+    唯一判据。`superseded`（被新内容取代）与 `synced` 一样算「这行没有活要干」；
+    其余一切状态都算没干完 —— 包括 `archived`：归档行若被放回 A 库要复活复制，
+    在复活完成前作品仍然不该显示「已同步」。
+    """
+    for r in rows:
+        if str(getattr(r, "status", "") or "") not in MEDIA_TERMINAL_FILE_STATUS:
+            return "failed"
+    return "synced"
+
+
+def reconcile_media_status(db: Session, media_id: int, *,
+                           touch_synced_at: bool = False) -> str:
+    """按 `media_status_from` 重算一部作品的状态并落库，返回新状态。
+
+    作品不存在返回空串（调用方据此跳过）。内部是一次 select，会触发 autoflush，
+    所以调用前刚在内存里改过的文件行状态一定会被算进去（不需要显式 flush）。
+    """
+    media = db.get(MirrorMedia, media_id)
+    if not media:
+        return ""
+    rows = list(db.scalars(
+        select(MirrorFile).where(MirrorFile.media_id == media_id)).all())
+    media.status = media_status_from(rows)
+    if touch_synced_at:
+        media.last_synced_at = utcnow()
+    return media.status
+
+
 # v0.9.6：prune 已清理的目录映射标记。带此标记的 missing 行是「B 库不存在、映射已清、
 # 下轮同步从 A 库重建」的僵尸行，不需用户手工建目录；展示层据此从「待创建目录」排除，
 # 并在用户确认后由 /api/mirror/mappings/clear-pruned 真正删除（不违反自动 prune 不删行的红线）。
@@ -2487,9 +2534,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             if not copy_jobs:
                 # v0.8.4：还有未成功的文件记录时绝不标 synced，
                 # 否则界面显示「已同步」而 B 库其实是空目录。
-                pending_left = any(r.status != "synced" and r.status != "superseded"
-                                   for r in all_rows)
-                media.status = "failed" if pending_left else "synced"
+                # v2.1.50：判据收敛到 media_status_from，不再在这里另写一份 any(...)。
+                media.status = media_status_from(all_rows)
                 media.last_synced_at = utcnow()
                 stats["media"] += 1
                 db.commit()
@@ -2610,10 +2656,15 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                            f"（最后状态 {task.raw_status or '未知'}），已保留任务供继续轮询")
                     stats["errors"].append(msg)
                     stats["file_errors"].append(msg[:240])
-            any_failed = any(r.status == "failed" for r, _, _ in copy_jobs)
-            media.status = ("failed" if any_failed else
-                            "synced" if tasks and all(t.status == "done" for t, _ in tasks)
-                            else "syncing")
+            # v2.1.50：终态只由 media_status_from 决定；「还有任务在跑」是唯一的中间态。
+            # 旧写法只看本轮 copy_jobs 里有没有 failed，本作品其它历史失败行被无视，
+            # 于是会出现「面板已同步、实际还有失败行」。
+            if "failed" in {str(r.status or "") for r in all_rows}:
+                media.status = "failed"
+            elif tasks and not all(t.status == "done" for t, _ in tasks):
+                media.status = "syncing"
+            else:
+                media.status = media_status_from(all_rows)
             media.last_synced_at = utcnow()
             db.commit()
             stats["media"] += 1
@@ -3980,19 +4031,17 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
             for row in rows:
                 row.status, row.error = "synced", ""
             if task.media_id:
-                media = db.get(MirrorMedia, task.media_id)
-                if media:
-                    media.status = "synced"
-                    media.last_synced_at = utcnow()
+                # v2.1.50：不再「这个任务成功 → 整部作品算成功」。同一部作品可能还有
+                # 别的失败行（一次定向重试会并发多个任务），按唯一判据重算才不会
+                # 把还剩的失败掩盖成已同步。
+                reconcile_media_status(db, task.media_id, touch_synced_at=True)
         elif task.status == "failed":
             # v0.8.4：明确失败的任务把文件标 failed，下一轮同步会重新发起复制
             failed += 1
             for row in rows:
                 mark_file_failed(row, task.error, _lim)
             if task.media_id:
-                media = db.get(MirrorMedia, task.media_id)
-                if media:
-                    media.status = "failed"
+                reconcile_media_status(db, task.media_id)
     db.commit()
     return {"tasks": len(tasks), "done": done, "failed": failed,
             "still_unknown": len(tasks) - done - failed}
@@ -4088,6 +4137,39 @@ async def retry_failed_dirs(db: Session, rule: MirrorRule, dir_ids: list[int], *
     return out
 
 
+async def _backfill_ids_for_media(api, db: Session, media: MirrorMedia,
+                                  rows: list) -> int:
+    """列一次该作品的 B 库目录，把缺 `target_file_id` 的行按文件名+大小回填。
+
+    v2.1.50：光鸭 `copy_file` 只回 taskId、不回副本 fileId —— 这个缺口正常同步靠
+    `backfill_target_file_ids` 补，定向重试以前根本没有对应步骤，于是刚复制成功的行
+    拿着空 `target_file_id` 停在原地（改名能靠 B 库目录反查自救，但映射行一直是空的）。
+    判据与 `backfill_target_file_ids` 完全同一个 `_lookup_b_file`，只是范围限定在
+    **这一部作品**：重试结束立刻补齐，不必等下一轮全库回填。
+    """
+    need = [r for r in rows
+            if not str(getattr(r, "target_file_id", "") or "").strip()
+            and str(getattr(r, "status", "") or "")
+            in ("synced", "copying", "failed", "unknown", "pending")]
+    if not need:
+        return 0
+    candidates, _verified = await _b_file_candidates(api, media)
+    if not candidates:
+        return 0
+    n = 0
+    for r in need:
+        hit = _lookup_b_file(candidates, r)
+        if not hit:
+            continue
+        r.target_file_id = hit
+        # 与 v0.8.4 同一口径：B 库实际存在就纠正为 synced，别让下一轮再发一次。
+        if str(getattr(r, "status", "") or "") != "synced":
+            r.status, r.error = "synced", ""
+        r.updated_at = utcnow()
+        n += 1
+    return n
+
+
 async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int], *,
                              idle: float = MIN_FILE_IDLE_SECONDS,
                              max_polls: int = 8, poll_interval: float = 2.0) -> dict:
@@ -4127,6 +4209,8 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
                 r.error = "[定向重试] 作品 A/B 目录映射缺失，无法定位复制目标"
                 out["failed"] += 1
                 out["details"].append(f"{r.file_name}：{r.error}")
+            # v2.1.50：中止路径同样要收口作品状态，否则这条作品会一直停在旧状态。
+            reconcile_media_status(db, media_id)
             db.commit()
             continue
         # 只 walk 单部作品（非全库），拿到 A 季目录相对链
@@ -4141,6 +4225,8 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
                 r.error = "[定向重试] A 库该作品目录分页不完整，已中止（禁止用不完整数据重发）"
                 out["failed"] += 1
                 out["details"].append(f"{r.file_name}：{r.error}")
+            # v2.1.50：中止路径同样要收口作品状态。
+            reconcile_media_status(db, media_id)
             db.commit()
             continue
         root_node = nodes.get(str(media.source_dir_id))
@@ -4259,8 +4345,16 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
                         out["failed"] += 1
                     out["details"].append(f"{rr.file_name}：{rr.status}" +
                                           (f"（{rr.error}）" if rr.error else ""))
-            media_row = db.get(MirrorMedia, media_id)
-            if media_row:
-                media_row.last_synced_at = utcnow()
             db.commit()
+        # v2.1.50（根治「重试成功仍显示失败」）：复制接口只回 taskId，定向重试到这儿
+        # 就结束了 —— 文件行拿不到 target_file_id，作品级状态也没人重算。补上与正常
+        # 同步同一套收尾：① 列一次 B 库回填 fileId；② 按唯一判据重算作品状态。
+        # 放在 if 外面：全部走「B 库已存在 → 回填」这条路径时同样要收尾。
+        filled = await _backfill_ids_for_media(api, db, media, group)
+        if filled:
+            out["backfilled"] = int(out.get("backfilled", 0)) + filled
+            out["details"].append(
+                f"作品《{media.title_standard}》补回 {filled} 个 B 库文件 ID")
+        reconcile_media_status(db, media_id, touch_synced_at=True)
+        db.commit()
     return out

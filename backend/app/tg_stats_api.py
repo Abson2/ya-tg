@@ -67,10 +67,14 @@ def api_stats_status(db: Session = Depends(get_db)):
     st = tg_stats.status(db)
     return {
         "ready": bool(st.get("dependency_ready") and st.get("configured")
-                      and st.get("logged_in")),
+                      and st.get("bot_ready")),
         "dependency_ready": bool(st.get("dependency_ready")),
         "configured": bool(st.get("configured")),
         "logged_in": bool(st.get("logged_in")),
+        # v2.1.50：bot 直连后「能不能用」只看有没有可用的 Bot 令牌，
+        # 不看本地会话文件（首次采集会自己签一次）。
+        "bot_ready": bool(st.get("bot_ready")),
+        "bot_name": str(st.get("bot_name") or ""),
         "enabled": bool(st.get("enabled")),
         "lookback_hours": int(st.get("lookback_hours") or 72),
         "max_per_run": int(st.get("max_per_run") or 200),
@@ -121,8 +125,9 @@ def api_stats_config(body: Payload, db: Session = Depends(get_db)):
         updates[tg_stats.CFG_API_ID] = str(data["api_id"] or "").strip()
     if "api_hash" in data:
         updates[tg_stats.CFG_API_HASH] = str(data["api_hash"] or "").strip()
-    if "phone" in data:
-        updates[tg_stats.CFG_PHONE] = str(data["phone"] or "").strip()
+    if "bot_id" in data:
+        # 留空 = 自动跟推送用同一个 Bot（推荐）；填了就固定用它。
+        updates[tg_stats.CFG_BOT_ID] = str(data["bot_id"] or "").strip()
     if updates:
         runtime_config.set_many(db, updates)
         db.commit()
@@ -131,6 +136,8 @@ def api_stats_config(body: Payload, db: Session = Depends(get_db)):
         "ok": True,
         "configured": bool(st.get("configured")),
         "logged_in": bool(st.get("logged_in")),
+        "bot_ready": bool(st.get("bot_ready")),
+        "bot_name": str(st.get("bot_name") or ""),
         "enabled": bool(st.get("enabled")),
         "lookback_hours": int(st.get("lookback_hours") or 72),
         "max_per_run": int(st.get("max_per_run") or 200),
@@ -138,24 +145,16 @@ def api_stats_config(body: Payload, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/stats/login/code")
-async def api_stats_login_code(body: Payload, db: Session = Depends(get_db)):
-    """第一步：获取登录验证码。验证码由 Telegram 直接发给用户，不落库。"""
-    try:
-        result = await tg_stats.request_login_code(db)
-        return {"ok": True, "sent": bool(result.get("sent")),
-                "reason": result.get("reason", "")}
-    except tg_stats.MTProtoUnavailable as exc:
-        return {"ok": False, "error": str(exc)[:300]}
+@router.post("/stats/login/bot")
+async def api_stats_login_bot(db: Session = Depends(get_db)):
+    """v2.1.50：用推送 Bot 的令牌连接 MTProto（人工零操作）。
 
-
-@router.post("/stats/login/verify")
-async def api_stats_login_verify(body: Payload, db: Session = Depends(get_db)):
-    """第二步：提交验证码完成登录。验证码一次性，不落库。"""
-    code = str((body.payload or {}).get("code") or "")
+    取代原来的「获取验证码 → 填验证码」两步。已经有有效会话时直接返回已连接。
+    """
     try:
-        await tg_stats.complete_login(db, code)
-        return {"ok": True, "logged_in": True}
+        result = await tg_stats.ensure_bot_login(db)
+        return {"ok": True, "already": bool(result.get("already")),
+                "bot_name": str(result.get("bot") or "")}
     except tg_stats.MTProtoUnavailable as exc:
         return {"ok": False, "error": str(exc)[:300]}
 
@@ -204,6 +203,8 @@ def api_stats_trend(days: int = 7, db: Session = Depends(get_db)):
         "shares_gain": int(w["forwards_delta"]),
         "reactions_gain": int(w["reactions_delta"]),
         "posts": int(w["messages"]),
+        # v2.1.50：「想在群里看」的**人数**（按人去重）。与阅读量不同源，单列。
+        "clickers": int(w.get("clickers") or 0),
     } for w in report.get("works", [])]
     targets = [{
         "name": t["name"] or "未命名目标",
@@ -216,6 +217,7 @@ def api_stats_trend(days: int = 7, db: Session = Depends(get_db)):
         # 群聊没有浏览量 → 前端据此显示「不适用」而非 0。
         # 字段名用中性词（reads_shown），**不暴露**后端的 views_available。
         "reads_shown": bool(t["views_available"]),
+        "clickers": int(t.get("clickers_total") or 0),
     } for t in report.get("targets", [])]
     buckets = [{
         "day": b["day"],
@@ -236,6 +238,9 @@ def api_stats_trend(days: int = 7, db: Session = Depends(get_db)):
             "reads_gain": int(totals.get("views_delta") or 0),
             "shares_gain": int(totals.get("forwards_delta") or 0),
             "reactions_gain": int(totals.get("reactions_delta") or 0),
+            # 点击人数：与阅读量**不同源**（平台给的次数 vs 我们自己数的人），
+            # 前端必须单独一格显示，不得与 reads_gain 相加。
+            "clickers": int(totals.get("clickers") or 0),
         },
         "capability": report.get("capability", {}),
     }

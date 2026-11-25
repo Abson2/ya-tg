@@ -1,10 +1,23 @@
-"""v2.1.7 #241：Telegram 阅读量采集（MTProto user account）。
+"""v2.1.7 #241：Telegram 阅读量采集（MTProto 接入）。
 
-为什么需要 MTProto 而不是 Bot API
---------------------------------
+v2.1.50 改口径：**用推送 Bot 自己的令牌登录，不再要手机号 + 验证码**
+---------------------------------------------------------------
+v2.1.7 最初用的是「用户账号 + 手机号 + 一次性验证码」。真机上这条路极其难走：
+换号要重新人工收码、验证码超时就失败、还要在服务器上维护一个真人账号的会话。
+
+关键事实（用户实测 + 本轮核对）：**Bot 走 MTProto 一样能读到 `Message.views`**。
+`getHistory`（拉历史消息）对 Bot 会被服务端拒（`BotMethodInvalidError`），
+但我们本来就只需要「按 message_id 精确取一条」——`get_messages(ids=...)` 对 Bot 是放行的。
+所以整条链路可以只用 Bot 令牌，与推送用的是同一个 Bot：
+- 会话文件 `tg_bot_<bot_id>.session`，令牌取 `bots.token`（Fernet 密文，用时解密）；
+- **首次采集自动登录**（`_ensure_authorized` 里发现未授权就 `sign_in(bot_token=...)`），
+  人工零操作；管理页那个按钮退化成「检测一下通不通」。
+
+为什么不能用 Bot API
+-------------------
 Bot API **不暴露消息浏览量**——`getChat` / `getFile` 等方法拿不到「这条帖子被看过几次」。
-只有 MTProto 的 `messages.GetHistory` 返回的 `Message` 对象里才有 `views` 字段。
-因此要统计频道帖的阅读量，必须用**用户账号**（user account）以 MTProto 协议接入。
+只有 MTProto 的 `messages.GetHistory` / `messages.GetMessages` 返回的 `Message`
+对象里才有 `views` 字段。Bot 令牌可以通过 MTProto 协议登录，所以两者不冲突。
 
 口径边界（务必记住，报表不得越界）
 --------------------------------
@@ -14,29 +27,20 @@ Bot API **不暴露消息浏览量**——`getChat` / `getFile` 等方法拿不�
 2. **阅读量是累计值**：Telegram 只给当前总数，不给增量。趋势必须由
    相邻两次快照求差得到——所以本模块只负责把「当前总数」如实写入快照表，
    差值计算放在报表层。
-3. **用户账号权限边界**：普通用户账号只能读到它**自己有权查看**的频道。
-   私有频道若该账号不是订阅者就读不到——采集会拿到「消息不存在」，
-   此时如实标记为不可采集，**不编造 0**。
+3. **Bot 只能读到它自己看得见的目标**：Bot 必须是该频道/群的管理员或成员，
+   否则拿到「消息不存在」，此时如实标记为不可采集，**不编造 0**。
 
 依赖
 ----
 `telethon`（纯 Python MTProto 客户端）。未安装时本模块的所有对外能力
 一律返回「未启用」而不是抛异常——**绝不让阅读量功能拖垮主链**。
-镜像构建时通过 `backend/requirements.txt` 安装。
-
-登录与会话
-----------
-首次登录需要 `api_id` + `api_hash` + 手机号 + 验证码（验证码是**一次性**的，
-由用户在管理页输入，**不落库**）。登录成功后 Telethon 会在本地写一个
-`.session` 文件，之后无需重复认证。
 
 凭证管理
 --------
-`api_id` / `api_hash` / 手机号 走 runtime_config（Fernet 加密落库 + 管理页配置），
-与会话文件路径分离：
-- 凭证：数据库 `app_config`（加密），可通过管理页随时改；
-- 会话：本地 `.session` 文件（目录由 `tg_session_dir` 配置，默认 `./data/tg_session`）。
-  **会话文件等同于账号凭据**，绝不通过接口返回给前端，只报告「是否已登录」。
+`api_id` / `api_hash` 走 runtime_config（Fernet 加密落库 + 管理页配置）；
+Bot 令牌复用「Bot 管理」里那一条（同一份密文，不另存）。
+会话：本地 `.session` 文件（目录由 `tg_session_dir` 配置，默认 `./data/tg_session`）。
+**会话文件等同于账号凭据**，绝不通过接口返回给前端，只报告「是否已连接」。
 """
 from __future__ import annotations
 
@@ -47,9 +51,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import runtime_config
+from .models import Bot, Channel
+from .security import decrypt_secret
 
 # ---------------------------------------------------------------------------
 # 配置键（走 runtime_config → app_config 加密落库 / .env 兜底）
@@ -59,8 +66,9 @@ from . import runtime_config
 CFG_API_ID = "tg_api_id"
 # MTProto 应用的 api_hash（my.telegram.org 申请的 32 位十六进制）。
 CFG_API_HASH = "tg_api_hash"
-# 登录用的手机号（含国际区号，如 +86...）。
-CFG_PHONE = "tg_phone"
+# v2.1.50：用哪个 Bot 的令牌登录（bots.id 的字符串形式）。
+# 留空则自动挑「有启用推送目标且启用」的第一个 Bot —— 即推送在用的那个。
+CFG_BOT_ID = "tg_stats_bot_id"
 # 会话文件所在目录。
 CFG_SESSION_DIR = "tg_session_dir"
 # 采集总开关。
@@ -72,13 +80,6 @@ CFG_MAX_PER_RUN = "tg_stats_max_per_run"
 # 定时采集间隔（小时）。阅读量是累计值，趋势必须靠**周期采集**才能形成，
 # 只靠手动点按钮永远只有一条数据点。0 表示关闭定时采集（仅手动）。
 CFG_COLLECT_INTERVAL_HOURS = "tg_stats_collect_interval_hours"
-# MTProto 接入点（默认官方；支持自建 DC / 反代）。
-CFG_API_BASE = "tg_api_base"
-
-# 用户码登录（首次 / 换号）时临时保存的登录态。
-# 只在**内存**里活到验证码校验完成，不落库——验证码是一次性的。
-_PENDING_LOGIN: dict[str, Any] = {}
-_PENDING_LOCK = threading.Lock()
 
 # 已建立的客户端会话缓存：key = 会话标识，value = Telethon Client。
 _CLIENTS: dict[str, Any] = {}
@@ -155,10 +156,47 @@ def _ensure_session_dir(db: Session) -> Path:
     return path
 
 
+def _stats_bot(db: Session) -> Bot | None:
+    """采集用哪个 Bot：运行时指定优先，否则挑「有启用推送目标」的第一个。
+
+    为什么要挑「有启用推送目标」的：采集能读到的只能是 Bot 自己看得见的频道/群。
+    推送在用的那个 Bot 一定在目标里，所以默认跟推送对齐，不需要用户再选一次。
+    """
+    raw = str(runtime_config.get(db, CFG_BOT_ID) or "").strip()
+    if raw.isdigit():
+        bot = db.get(Bot, int(raw))
+        if bot is not None and bool(bot.enabled):
+            return bot
+    ids = [int(x) for x in db.scalars(
+        select(Channel.bot_id).where(Channel.enabled.is_(True)).distinct()).all() if x]
+    if ids:
+        bot = db.scalars(select(Bot).where(Bot.id.in_(ids), Bot.enabled.is_(True))
+                         .order_by(Bot.id)).first()
+        if bot is not None:
+            return bot
+    return db.scalars(select(Bot).where(Bot.enabled.is_(True))
+                      .order_by(Bot.id)).first()
+
+
+def _bot_token(db: Session) -> str:
+    """取采集用 Bot 的明文令牌（解密失败按空处理，不抛——不能拖垮主链）。"""
+    bot = _stats_bot(db)
+    if bot is None:
+        return ""
+    try:
+        return str(decrypt_secret(bot.token) or "").strip()
+    except Exception:
+        return ""
+
+
 def _session_path(db: Session) -> Path:
-    """会话文件路径。文件名由手机号派生（同号复用同一会话）。"""
-    phone = runtime_config.get(db, CFG_PHONE) or ""
-    safe = "".join(ch for ch in phone if ch.isdigit()) or "default"
+    """会话文件路径。文件名由**推送 Bot** 派生（同一个 Bot 复用同一会话）。
+
+    v2.1.50：此前按手机号派生（`tg_<手机号>.session`）。bot 直连后没有手机号了，
+    改成 `tg_bot_<bot_id>.session`——换 Bot 等于换会话，不会串号。
+    """
+    bot = _stats_bot(db)
+    safe = f"bot_{int(bot.id)}" if bot is not None else "bot_default"
     return _session_dir(db) / f"tg_{safe}.session"
 
 
@@ -195,10 +233,16 @@ def session_exists(db: Session) -> bool:
 
 def status(db: Session) -> dict[str, Any]:
     """采集能力的当前状态（供管理页展示）。**不返回任何明文凭证**。"""
+    bot = _stats_bot(db)
     out: dict[str, Any] = {
         "dependency_ready": telethon_available(),
         "configured": is_configured(db),
+        # v2.1.50：`logged_in` 的含义变了 —— 不再有「人工登录」这一步，
+        # 它只表示「本地已有会话文件」（= 之前自动签过）。没有也不影响使用：
+        # 下一轮采集会自动签一次，所以前端不把它当门槛。
         "logged_in": session_exists(db),
+        "bot_ready": bool(bot is not None and _bot_token(db)),
+        "bot_name": str(getattr(bot, "name", "") or ""),
         "enabled": (runtime_config.get(db, CFG_ENABLED) or "false").lower() == "true",
         "lookback_hours": _int_cfg(db, CFG_LOOKBACK_HOURS, 72),
         "max_per_run": _int_cfg(db, CFG_MAX_PER_RUN, 200),
@@ -208,8 +252,10 @@ def status(db: Session) -> dict[str, Any]:
         out["reason"] = "未安装 telethon 依赖"
     elif not out["configured"]:
         out["reason"] = "未配置 api_id / api_hash"
+    elif not out["bot_ready"]:
+        out["reason"] = "还没有可用的 Bot（先到「Bot 管理」添加并启用一个）"
     elif not out["logged_in"]:
-        out["reason"] = "尚未完成登录"
+        out["reason"] = "首次采集时会自动用该 Bot 连接，无需手动登录"
     return out
 
 
@@ -221,87 +267,45 @@ def _int_cfg(db: Session, key: str, default: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 登录
+# 连接（bot 直连，无需人工登录）
 # ---------------------------------------------------------------------------
 
-async def request_login_code(db: Session) -> dict[str, Any]:
-    """第一步：向手机号请求登录验证码。
+async def ensure_bot_login(db: Session) -> dict[str, Any]:
+    """用推送 Bot 的令牌建立 MTProto 会话（人工零操作）。
 
-    返回中性信息给前端（不含验证码本身）——验证码由 Telegram 直接发给用户，
-    用户再填回页面。验证码**不落库**。
+    v2.1.50：这是「登录」的全部内容了——不再有手机号、验证码两步。
+    已经有有效会话时直接返回 `already=True`，不重复签入。
     """
     TelegramClient = _require_telethon()
     api_id, api_hash = _api_credentials(db)
-    phone = (runtime_config.get(db, CFG_PHONE) or "").strip()
-    if not phone:
-        raise MTProtoUnavailable("未配置登录手机号")
-    # 登录要落 session 文件 → 这里才确保目录存在。
+    bot = _stats_bot(db)
+    if bot is None:
+        raise MTProtoUnavailable("还没有可用的 Bot，请先在「Bot 管理」里添加并启用一个")
+    token = _bot_token(db)
+    if not token:
+        raise MTProtoUnavailable(f"Bot「{bot.name}」的令牌为空或无法解密，请重新填写")
     _ensure_session_dir(db)
-    client = TelegramClient(
-        str(_session_path(db)), api_id, api_hash,
-        api_base=_api_base(db),
-    )
+    client = TelegramClient(str(_session_path(db)), api_id, api_hash)
     try:
         await client.connect()
         if await client.is_user_authorized():
-            return {"ok": True, "sent": False, "reason": "already_authorized"}
-        sent = await client.send_code_request(phone)
+            return {"ok": True, "already": True, "bot": bot.name}
+        await client.sign_in(bot_token=token)
+        return {"ok": True, "already": False, "bot": bot.name}
     except MTProtoUnavailable:
         raise
     except Exception as exc:
-        raise MTProtoUnavailable(f"发送验证码失败：{str(exc)[:300]}") from exc
+        raise MTProtoUnavailable(f"用 Bot「{bot.name}」连接失败：{str(exc)[:300]}") from exc
     finally:
-        # connect 成功但流程未完成时断开——避免连接泄漏。
-        if not _pending_exists():
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-    with _PENDING_LOCK:
-        _PENDING_LOGIN["phone"] = phone
-        _PENDING_LOGIN["phone_code_hash"] = getattr(sent, "phone_code_hash", "")
-        _PENDING_LOGIN["client"] = client
-    return {"ok": True, "sent": True}
-
-
-def _pending_exists() -> bool:
-    with _PENDING_LOCK:
-        return bool(_PENDING_LOGIN.get("client"))
-
-
-async def complete_login(db: Session, code: str) -> dict[str, Any]:
-    """第二步：提交验证码完成登录。
-
-    验证码是**一次性**的，仅用于这一步，**绝不落库**。
-    """
-    TelegramClient = _require_telethon()
-    api_id, api_hash = _api_credentials(db)
-    code = (code or "").strip()
-    if not code:
-        raise MTProtoUnavailable("验证码为空")
-    with _PENDING_LOCK:
-        client = _PENDING_LOGIN.get("client")
-        phone = _PENDING_LOGIN.get("phone", "")
-        phone_code_hash = _PENDING_LOGIN.get("phone_code_hash", "")
-    if client is None:
-        raise MTProtoUnavailable("没有进行中的登录流程，请先获取验证码")
-    try:
-        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-    except Exception as exc:
-        raise MTProtoUnavailable(f"验证码校验失败：{str(exc)[:300]}") from exc
-    finally:
-        with _PENDING_LOCK:
-            _PENDING_LOGIN.clear()
-    # 登录成功后关闭这个临时连接；后续采集用带 session 的客户端。
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
-    return {"ok": True}
+        # 只做「签一次」这一件事；后续采集由 _get_client 统一建连（跨事件循环自己重建）。
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 def logout(db: Session) -> dict[str, Any]:
-    """退出登录：删除本地会话文件（下次采集需重新登录）。"""
+    """断开并删除本地会话文件（下次采集会自动重新签一次，无需人工登录）。"""
     try:
         path = _session_path(db)
         removed = False
@@ -313,11 +317,6 @@ def logout(db: Session) -> dict[str, Any]:
         return {"ok": True, "removed": removed}
     except Exception as exc:
         raise MTProtoUnavailable(f"退出登录失败：{str(exc)[:300]}") from exc
-
-
-def _api_base(db: Session) -> str | None:
-    raw = (runtime_config.get(db, CFG_API_BASE) or "").strip()
-    return raw or None
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +353,32 @@ def _get_client(db: Session):
                 return client
         # 建客户端要落 session 文件 → 这里才确保目录存在。
         _ensure_session_dir(db)
-        client = TelegramClient(key, api_id, api_hash, api_base=_api_base(db))
+        # v2.1.50：**不再传 api_base**。telethon 1.44 的 TelegramClient 没有这个
+        # 参数（历史上传了就是 TypeError，整条采集链一进来就炸）。
+        # 需要自建 DC / 反代时走 telethon 自己的 connection 参数，不在这里拼。
+        client = TelegramClient(key, api_id, api_hash)
         _CLIENTS[key] = client
         return client
 
 
-async def _ensure_authorized(client) -> None:
+async def _ensure_authorized(client, db: Session | None = None) -> None:
+    """确保客户端已连上且已授权；未授权就**当场用 Bot 令牌签一次**。
+
+    v2.1.50：这是「登录太费劲」的真正解法——人工不需要再点任何东西。
+    只要 api_id/api_hash 与 Bot 令牌在，首次采集会自己完成签入，
+    会话落在 `tg_bot_<id>.session`，之后直接复用。
+    """
     await client.connect()
-    if not await client.is_user_authorized():
-        raise MTProtoUnavailable("账号未登录或登录已失效，请重新登录")
+    if await client.is_user_authorized():
+        return
+    token = _bot_token(db) if db is not None else ""
+    if not token:
+        raise MTProtoUnavailable("采集会话尚未建立，且没有可用的 Bot 令牌"
+                                 "（请到「Bot 管理」确认 Bot 已启用、令牌已填写）")
+    try:
+        await client.sign_in(bot_token=token)
+    except Exception as exc:
+        raise MTProtoUnavailable(f"用 Bot 令牌自动登录失败：{str(exc)[:200]}") from exc
 
 
 async def close_client(db: Session) -> None:

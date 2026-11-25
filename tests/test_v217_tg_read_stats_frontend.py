@@ -141,12 +141,17 @@ def test_period_new_labels(app):
 # ---------------------------------------------------------------------------
 
 def test_config_area_has_credentials_and_switch(app):
-    """配置区含三项凭证 + 启用开关 + 回溯窗口 + 单轮上限。"""
+    """配置区含 MTProto 应用凭据 + 启用开关 + 回溯窗口 + 单轮上限。
+
+    v2.1.50：手机号一项已删除 —— 采集改用推送 Bot 的令牌，不再需要手机号。
+    """
     block = _stats_block(app)
     for token in ("scStatsConfig.api_id", "scStatsConfig.api_hash",
-                  "scStatsConfig.phone", "scStatsConfig.enabled",
+                  "scStatsConfig.enabled",
                   "scStatsConfig.lookback_hours", "scStatsConfig.max_per_run"):
         assert token in block, f"配置项缺失：{token}"
+    assert "scStatsConfig.phone" not in block, \
+        "手机号输入框应已下线（采集身份改为推送 Bot）"
 
 
 def test_credential_input_is_password_type(app):
@@ -169,11 +174,13 @@ def test_credentials_cleared_after_save(app):
 
 
 def test_login_flow_present(app):
-    """登录两步流程都在（取验证码 → 提交验证码）。"""
-    assert "scStatsSendLoginCode" in app
-    assert "scStatsSubmitLoginCode" in app
-    assert "/sc/stats/login/code" in app
-    assert "/sc/stats/login/verify" in app
+    """v2.1.50：登录退化成一个动作（用推送 Bot 连接），手机号+验证码两步已删除。"""
+    assert "scStatsConnectBot" in app
+    assert "/sc/stats/login/bot" in app
+    for gone in ("scStatsSendLoginCode", "scStatsSubmitLoginCode",
+                 "/sc/stats/login/code", "/sc/stats/login/verify",
+                 "登录手机号"):
+        assert gone not in app, f"手机号登录残留：{gone}"
 
 
 def test_collect_button_calls_endpoint(app):
@@ -232,8 +239,8 @@ def test_script_state_refs_declared(app):
 
 def test_script_helpers_defined(app):
     """辅助函数都有定义。"""
-    for fn in ("loadScStats", "saveScStatsConfig", "scStatsSendLoginCode",
-               "scStatsSubmitLoginCode", "scStatsCollect", "scStatsRunLabel"):
+    for fn in ("loadScStats", "saveScStatsConfig", "scStatsConnectBot",
+               "scStatsCollect", "scStatsRunLabel"):
         assert f"function {fn}" in app, f"函数未定义：{fn}"
 
 

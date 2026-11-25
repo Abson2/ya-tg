@@ -140,9 +140,9 @@ const scStatsRuns = ref([])
 const scStatsDays = ref(7)
 const scStatsLoading = ref(false)
 const scStatsCollecting = ref(false)
-const scStatsConfig = ref({ api_id: '', api_hash: '', phone: '', enabled: false, lookback_hours: 72, max_per_run: 200, interval_hours: 0 })
-const scStatsLoginCode = ref('')
-const scStatsLoginCodeSent = ref(false)
+// v2.1.50：不再有手机号 / 验证码 —— 采集直接用推送 Bot 的令牌连 MTProto，
+// 首次采集会自动签一次，这个表单只留 MTProto 应用凭据。
+const scStatsConfig = ref({ api_id: '', api_hash: '', enabled: false, lookback_hours: 72, max_per_run: 200, interval_hours: 0 })
 const scStatsSaving = ref(false)
 // 小时分类排期：每行一条 sc_hour_windows 记录，分类下拉来自真实 SCCategory
 const scHourRows = ref([])
@@ -2834,7 +2834,6 @@ async function saveScStatsConfig() {
     // 凭证只在**用户实际填写时**才提交；留空表示不修改。
     if (scStatsConfig.value.api_id) body.api_id = scStatsConfig.value.api_id
     if (scStatsConfig.value.api_hash) body.api_hash = scStatsConfig.value.api_hash
-    if (scStatsConfig.value.phone) body.phone = scStatsConfig.value.phone
     const d = await api('/sc/stats/config', { method: 'POST', body: JSON.stringify({ payload: body }) })
     // 保存后清空凭证输入框——明文不留存在页面状态里。
     scStatsConfig.value.api_id = ''
@@ -2845,34 +2844,19 @@ async function saveScStatsConfig() {
   } catch (e) { ElMessage.error(e.message) }
   finally { scStatsSaving.value = false }
 }
-async function scStatsSendLoginCode() {
+// v2.1.50：登录只剩一个动作 —— 让后台用推送 Bot 的令牌连一次。
+// 正常情况连这一步都不用点：第一轮采集会自己签。这里只是「当场验一下通不通」。
+async function scStatsConnectBot() {
   scStatsSaving.value = true
   try {
-    const d = await api('/sc/stats/login/code', { method: 'POST', body: JSON.stringify({ payload: {} }) })
-    if (d.ok && d.sent) {
-      scStatsLoginCodeSent.value = true
-      ElMessage.success('验证码已发送到该手机号，请填写后提交')
-    } else if (d.ok) {
-      ElMessage.info('该账号已登录，无需重复验证')
-    } else {
-      ElMessage.error(d.error || '获取验证码失败')
-    }
-  } catch (e) { ElMessage.error(e.message) }
-  finally { scStatsSaving.value = false }
-}
-async function scStatsSubmitLoginCode() {
-  const code = String(scStatsLoginCode.value || '').trim()
-  if (!code) { ElMessage.warning('请填写验证码'); return }
-  scStatsSaving.value = true
-  try {
-    const d = await api('/sc/stats/login/verify', { method: 'POST', body: JSON.stringify({ payload: { code } }) })
+    const d = await api('/sc/stats/login/bot', { method: 'POST', body: JSON.stringify({ payload: {} }) })
     if (d.ok) {
-      scStatsLoginCode.value = ''
-      scStatsLoginCodeSent.value = false
-      ElMessage.success('登录成功')
+      ElMessage.success(d.already
+        ? `已连接（${d.bot_name || '推送 Bot'}），采集可以直接跑`
+        : `已用 ${d.bot_name || '推送 Bot'} 连接成功`)
       await loadScStats()
     } else {
-      ElMessage.error(d.error || '验证码校验失败')
+      ElMessage.error(d.error || '连接失败')
     }
   } catch (e) { ElMessage.error(e.message) }
   finally { scStatsSaving.value = false }
@@ -3673,7 +3657,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.49 · Asia/Shanghai</span>
+          <span>v2.1.50 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5617,9 +5601,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <small>与编号配套使用，加密存储，不会回显。</small>
                     </div>
                     <div class="field">
-                      <label>登录手机号</label>
-                      <el-input v-model="scStatsConfig.phone" placeholder="含国际区号，如 +86"/>
-                      <small>仅用于首次登录验证，验证码由 Telegram 直接发送给你。</small>
+                      <label>采集身份</label>
+                      <div class="sc-stats-bot">
+                        <b>{{ scStatsStatus.bot_name || '推送 Bot' }}</b>
+                        <small>采集与推送用同一个 Bot，不需要手机号、不需要验证码。首次采集会自动连接。</small>
+                      </div>
                     </div>
                     <div class="field inline"><label>启用采集</label><el-switch v-model="scStatsConfig.enabled"/></div>
                     <div class="field">
@@ -5640,9 +5626,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                   </div>
                   <div class="sc-form-row" style="margin-top:12px">
                     <el-button size="small" type="primary" :loading="scStatsSaving" @click="saveScStatsConfig">保存配置</el-button>
-                    <el-button size="small" plain :loading="scStatsSaving" :disabled="!scStatsConfig.phone && !scStatsConfig.api_id" @click="scStatsSendLoginCode">获取登录验证码</el-button>
-                    <el-input v-if="scStatsLoginCodeSent" v-model="scStatsLoginCode" size="small" placeholder="填写收到的验证码" style="width:170px"/>
-                    <el-button v-if="scStatsLoginCodeSent" size="small" type="primary" plain :loading="scStatsSaving" @click="scStatsSubmitLoginCode">完成登录</el-button>
+                    <el-button size="small" plain :loading="scStatsSaving" :disabled="!scStatsStatus.configured" @click="scStatsConnectBot">测试连接</el-button>
+                    <span class="hint">不点也行：第一轮采集会自动用该 Bot 连上</span>
                   </div>
                 </div>
               </div>
@@ -5652,6 +5637,8 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div><small>期间新增阅读</small><b>{{ scStatsTrend.totals?.reads_gain || 0 }}</b></div>
                 <div><small>期间新增转发</small><b>{{ scStatsTrend.totals?.shares_gain || 0 }}</b></div>
                 <div><small>期间新增回应</small><b>{{ scStatsTrend.totals?.reactions_gain || 0 }}</b></div>
+                <!-- v2.1.50：点击人数是**自己数的行为**，与上面三个「平台给的次数」不同源，单列一格 -->
+                <div><small>期间点「想看」人数</small><b title="按人去重；与阅读量不同源，不能相加">{{ scStatsTrend.totals?.clickers || 0 }}</b></div>
                 <div><small>统计消息数</small><b class="muted">{{ scStatsTrend.totals?.posts || 0 }}</b></div>
               </div>
 
@@ -5678,6 +5665,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     </template></el-table-column>
                     <el-table-column label="转发" width="80"><template #default="s">{{ s.row.shares_total || 0 }}</template></el-table-column>
                     <el-table-column label="回应" width="80"><template #default="s">{{ s.row.reactions_total || 0 }}</template></el-table-column>
+                    <el-table-column label="想看人数" width="94"><template #default="s">{{ s.row.clickers || 0 }}</template></el-table-column>
                   </el-table>
                   <div v-if="!(scStatsTrend.targets || []).length" class="empty">暂无目标数据</div>
                 </div>
@@ -5688,6 +5676,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-table-column label="新增阅读" width="100"><template #default="s">{{ s.row.reads_gain || 0 }}</template></el-table-column>
                     <el-table-column label="转发" width="80"><template #default="s">{{ s.row.shares_gain || 0 }}</template></el-table-column>
                     <el-table-column label="回应" width="80"><template #default="s">{{ s.row.reactions_gain || 0 }}</template></el-table-column>
+                    <el-table-column label="想看人数" width="94"><template #default="s">{{ s.row.clickers || 0 }}</template></el-table-column>
                   </el-table>
                   <div v-if="!(scStatsTrend.works || []).length" class="empty">暂无作品数据</div>
                 </div>

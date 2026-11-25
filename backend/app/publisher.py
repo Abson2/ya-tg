@@ -98,7 +98,8 @@ def _template(db: Session) -> MessageTemplate | None:
 
 
 def share_link_presentation(db: Session, res: Resource,
-                            caption: str) -> tuple[str, dict | None]:
+                            caption: str,
+                            queue_id: int = 0) -> tuple[str, dict | None]:
     """分享链接怎么呈现：`📥 获取资源` 按钮 / 纯文本（v2.1.27）。
 
     为什么单独抽出来：**频道 / 群推送**与**Bot 搜索卡片**必须是同一套口径。
@@ -113,13 +114,21 @@ def share_link_presentation(db: Session, res: Resource,
                   （否则按钮 + 裸链接重复出现）；
       · plain  —— 正文原样保留链接，不收键盘（聊天客户端会自动把它识别成可点链接）。
     没有分享链接时两条路都原样返回，不凭空造按钮。
+
+    v2.1.50：多了一个**去向统计**按钮。只给「真正推出去的卡片」加
+    （传了 `queue_id` 才加），Bot 搜索卡片不传 → 不加，因为搜索不是推送，
+    计入点击会污染口径。回调数据用 `pc.<queue_id>`，由 Bot 收到后按人去重记账。
     """
     style = (runtime_config.get(db, "tg_link_style") or "button").strip()
     url = str(getattr(res, "share_url", "") or "").strip()
     if style != "button" or not url:
         return caption, None
     cleaned = re.sub(r"\n?https?://\S+\s*$", "", caption).rstrip()
-    return cleaned, {"inline_keyboard": [[{"text": "📥 获取资源", "url": url}]]}
+    rows = [[{"text": "📥 获取资源", "url": url}]]
+    if int(queue_id or 0) > 0:
+        # 文字不带任何后端名词；点完只回一句短提示，不编辑消息（卡片必须保持原样）。
+        rows.append([{"text": "👍 想看", "callback_data": f"pc.{int(queue_id)}"}])
+    return cleaned, {"inline_keyboard": rows}
 
 
 def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str]:
@@ -405,7 +414,8 @@ async def _send_telegram(db: Session, q: QueueItem, res: Resource, channel: Chan
     # v2.1.27：这段「按钮 + 剥掉正文末尾纯文本链接」的判定抽到
     # `share_link_presentation`，Bot 搜索卡片走同一个函数 —— 否则同一部作品在群里
     # 是按钮、在私聊搜索结果是裸链接。
-    caption, markup = share_link_presentation(db, res, caption)
+    # v2.1.50：传 queue_id → 额外挂一个「👍 想看」按钮，点击按人去重记账。
+    caption, markup = share_link_presentation(db, res, caption, queue_id=q.id)
     payload["caption" if poster else "text"] = caption
     if markup:
         payload["reply_markup"] = markup

@@ -352,7 +352,8 @@ def test_collect_once_writes_snapshots(env, monkeypatch):
         def _fake_get_client(_db):
             return fake
 
-        async def _fake_authorized(_client):
+        async def _fake_authorized(_client, _db=None):
+            # v2.1.50：_ensure_authorized 多了一个 db 参数（用于 Bot 令牌自动签入）
             return None
 
         # telethon 未装到测试环境 → 必须假扮「依赖就绪」才能走完整采集路径。
@@ -561,9 +562,11 @@ def test_stats_for_ai_gives_facts_only(env):
 def test_credential_keys_registered_in_runtime_config():
     """凭证键必须在 runtime_config 白名单里，否则 set_many 会静默丢弃。"""
     from app import runtime_config
-    for key in ("tg_api_id", "tg_api_hash", "tg_phone",
+    for key in ("tg_api_id", "tg_api_hash", "tg_stats_bot_id",
                 "tg_stats_enabled", "tg_session_dir"):
         assert key in runtime_config.DEFAULTS, f"凭证键未注册：{key}"
+    # v2.1.50：手机号登录已下线，键与入口一并删除（留半套只会让人以为还能用）。
+    assert "tg_phone" not in runtime_config.DEFAULTS
 
 
 def test_credentials_encrypted_at_rest(env):
