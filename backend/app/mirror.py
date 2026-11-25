@@ -499,18 +499,28 @@ def _build_a_facts(nodes: dict, works: list) -> tuple[set[str], dict[str, str], 
     return a_file_ids, a_source_fps, a_work_keys
 
 
-def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool = True) -> int:
+def _clear_media_mappings(db: Session, media: MirrorMedia, *, mark_retired: bool = True,
+                          status: str = "pending", reason: str = "") -> int:
     """清一部作品的无效映射清单（C 类默认动作）：重置 MirrorFile 字段，不物理删行。
 
     复用 prune_stale_mappings 的"重置 pending"语义（mirror.py:2216-2224），
     让这些行不参与后续核对；mark_retired 时把 MirrorMedia.status 标 failed 留痕。
     返回清理的文件行数。不删 B 库文件、不删 DB 行（物理删走手动端点）。
+
+    v2.1.36（真机反馈）：C 类（A 库已无该作品，源文件被删）默认仍重置为 `pending`，
+    可 A 库已经没有源文件了，补复制永远不可能成功 —— 这些行会一直挂在「待复制」，
+    问题诊断的「N 项待处理」就永远清不掉。所以加了 `status` / `reason` 两个参数：
+    C 类传 `failed` + 明确原因，让用户看得到「为什么、该怎么办」。
     """
     n = 0
     for row in db.scalars(select(MirrorFile).where(
             MirrorFile.media_id == media.id,
             MirrorFile.status != "pending")).all():
-        row.status = "pending"
+        row.status = status
+        if reason:
+            row.error = reason
+        elif status != "pending":
+            row.error = ""
         row.target_file_id = ""
         row.target_name = ""
         row.rename_status = ""
@@ -601,7 +611,16 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                 b_ids: list[str] = [str(r.target_file_id) for r in rows
                                     if r.target_file_id and str(r.target_file_id).strip()]
                 # 先清清单（不跨 await），再删 B 库（网络 await 前已 commit）
-                prepass["c_mapping_cleared"] += _clear_media_mappings(db, media)
+                #
+                # v2.1.36（真机反馈）：A 库已无该作品时，源文件**客观上不存在**，
+                # 补复制永远不可能成功。此前这里统一重置为 pending，这些行就一直挂在
+                # 「待复制」→ 问题诊断的「N 项待处理」永远清不掉、也没有任何入口能处理。
+                # 改成 failed + 明确原因：用户看得到「为什么、该怎么办」，也可用
+                # 「清理无效影视映射」一次性收掉；源文件放回 A 库后下一轮会重新建行复制。
+                prepass["c_mapping_cleared"] += _clear_media_mappings(
+                    db, media, status="failed",
+                    reason="A 库已无该作品（源文件已被删除），B 库对应文件已按全镜像清理；"
+                           "把源文件放回 A 库后重新同步即可恢复")
                 if b_ids:
                     try:
                         await api.delete_files(b_ids)
@@ -1433,6 +1452,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             # v2.1.4：本轮是否在 A 库发现了「指纹未命中的新文件」。
             # 用于在作品级解除 english_source='ignored' 标记（见下方解除逻辑）。
             has_new_source_file = False
+            # v2.1.36（真机反馈）：记录本轮 A 库该作品枚举到的 fileId → 指纹集合。
+            # 用于在循环结束后判定「补复制行为什么一直等不到源文件」：
+            # fileId 压根不在 → 源文件被删/移走；fileId 在但指纹变了 → 内容已变化。
+            seen_sizes: dict[str, set[str]] = {}
             for container, item in _media_files(work, nodes):
                 fid = str(item.get("fileId") or "")
                 fname = _dir_name(item)
@@ -1440,6 +1463,7 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     continue
                 fp = _fingerprint(item)
                 fp_size = _fp_size(fp)
+                seen_sizes.setdefault(fid, set()).add(fp_size)
                 if (fid, fp_size) in synced_rows:
                     stats["unchanged"] += 1
                     continue
@@ -1501,6 +1525,36 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                 else:
                     stats["retries"] += 1
                 copy_jobs.append((row, fid, target_parent))
+
+            # v2.1.36（真机反馈）：A 库源文件被删 → 补复制**客观上不可能成功**，
+            # 但自动路径此前会把它永远挂在 pending。
+            #
+            # 机制：`retry_rows` 的键是 (A 库 fileId, 指纹)，只有在 A 库**再次枚举到**
+            # 这个文件时才会被 pop 出来重新入队（上面那句 `retry_rows.pop`）。源文件
+            # 被删/移走后它永远匹配不上，循环结束就没人管它了——既不报错、也不再发
+            # 复制任务，于是问题诊断里就是「永远 N 项待处理」，而且点重试也没用。
+            #
+            # 对照：手动「定向重试」路径（`retry_failed_files`）早就有这个兜底，找不到
+            # 源文件就明确标 failed 并写原因。这里把同一条兜底补到自动路径。
+            #
+            # 只在 A 库枚举**完整**时才判定（`complete`，分页取不全时一律不动，
+            # 避免把「没扫到」误判成「源文件不存在」——与上面 B 库核对同一套保护）。
+            # 标成 failed 不是终点：源文件放回来，下一轮同步会按新文件重新建行并复制。
+            if complete and retry_rows:
+                for (_fid, _fps), row in list(retry_rows.items()):
+                    if _fid not in seen_sizes:
+                        why = ("A 库未找到源文件（可能已被移动或删除），无法补复制；"
+                               "源文件放回 A 库后重新同步即可恢复")
+                        stats["source_missing"] = int(stats.get("source_missing", 0) or 0) + 1
+                    else:
+                        why = ("A 库该文件内容已变化，旧记录不再补复制（已按新文件重新排队）")
+                        stats["source_changed"] = int(stats.get("source_changed", 0) or 0) + 1
+                    row.status, row.error = "failed", why
+                    row.target_file_id = ""
+                    row.updated_at = utcnow()
+                    stats["file_errors"].append(f"{title}/{row.file_name}：{why}")
+                    del retry_rows[(_fid, _fps)]
+                db.commit()
 
             # v2.1.4：本轮 A 库有新文件 → 解除该作品的 ignored 标记，恢复英文名解析。
             #
@@ -1695,6 +1749,18 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # 而不是只看到一个笼统的「部分失败」。
     if int(stats.get("work_errors") or 0) > 0:
         rule.last_message += f" · 异常跳过 {stats['work_errors']} 部"
+    # v2.1.36（真机反馈）：补复制等不到源文件的行会被收敛成失败并写清原因，
+    # 这里如实回显——此前它们静默挂在 pending，「待处理 N 项」永远清不掉，
+    # 用户既看不到原因也不知道该做什么。
+    if int(stats.get("source_missing") or 0) > 0:
+        rule.last_message += f" · A库源文件已删 {stats['source_missing']} 项"
+    if int(stats.get("source_changed") or 0) > 0:
+        rule.last_message += f" · A库源文件已变 {stats['source_changed']} 项"
+    # v2.1.36：A 库整部作品消失（源文件被删）——同样如实回显，别让用户只看到
+    # 「待处理 N 项」却不知道是「片被删了」。
+    _c_del = int((stats.get("prepass") or {}).get("c_deleted_a", 0) or 0)
+    if _c_del:
+        rule.last_message += f" · A库已无作品 {_c_del} 部"
     # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
     rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
                           f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")

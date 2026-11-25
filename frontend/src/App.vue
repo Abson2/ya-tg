@@ -3498,7 +3498,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.36 · Asia/Shanghai</span>
+          <span>v2.1.37 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3915,7 +3915,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div v-if="mirrorStatus.missing_dirs?.length" class="panel">
             <div class="panel-head"><h3>待创建目录</h3><el-tag type="warning" size="small">{{ mirrorStatus.missing_dirs.length }} 个</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !missingDirSelected.length" @click="retryFailedDirs">批量重建选中 ({{ missingDirSelected.length }})</el-button></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.missing_dirs" size="small" row-key="id" @selection-change="v => missingDirSelected = v.map(x => x.id)">
-              <el-table-column type="selection" width="42" align="center"/>
+              <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="name" label="B 库应建目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="parent_id" label="父目录 ID" min-width="180"/>
@@ -3928,7 +3928,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               <el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !prunedDirSelected.length" @click="rebuildPrunedDirs">重建选中 ({{ prunedDirSelected.length }})</el-button>
               <el-button size="small" type="danger" plain :loading="mirrorBusy" :disabled="mirrorBusy" @click="clearPrunedMappings">清空已清理映射</el-button></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.pruned_dirs || []" size="small" row-key="id" @selection-change="v => prunedDirSelected = v.map(x => x.id)">
-              <el-table-column type="selection" width="42" align="center"/>
+              <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="name" label="目录名" min-width="200"/>
               <el-table-column prop="kind" label="类别" width="100"/>
               <el-table-column prop="category_path" label="所属分类" min-width="160"/>
@@ -3939,7 +3939,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div v-if="mirrorStatus.retryable_files?.length || mirrorStatus.counts?.files_retryable" class="panel">
             <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
             <div class="table-scroll"><el-table :data="mirrorStatus.retryable_files || []" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
-              <el-table-column type="selection" width="42" align="center"/>
+              <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
               <el-table-column label="状态" width="110"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
