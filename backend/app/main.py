@@ -731,13 +731,11 @@ async def _job_rename_pending():
             r = db.scalar(select(MirrorRule).where(MirrorRule.enabled.is_(True)).limit(1))
             if not r or not bool(getattr(r, "rename_files", True)):
                 return
+            # v2.1.51：待改名判据唯一化（此前这里 4 种、看板 3 种、stats 又是另一种）
             pending = db.scalar(select(func.count()).select_from(MirrorFile).where(
                 MirrorFile.rule_id == r.id,
                 MirrorFile.status == "synced",
-                or_(MirrorFile.rename_status.is_(None),
-                    MirrorFile.rename_status == "",
-                    MirrorFile.rename_status == "pending_visible",
-                    MirrorFile.rename_status == "failed"))) or 0
+                mirror.rename_pending_filter())) or 0
             if not pending:
                 return
             # v1.4.4 按部收敛：不再传 max_files=10 截断单集（那会让被选中的整部剧
@@ -1144,7 +1142,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.50", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.51", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1155,7 +1153,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.50", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.51", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2185,6 +2183,17 @@ async def _do_mirror_run(post_identify: bool | None, db: Session,
         # v2.1.13：严格顺序引擎已移除，只有一套复制路径；strict 仅作为兼容入参透传（被忽略）
         stats = await mirror.sync_rule(db, r, strict=strict)
         stats["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
+        # v2.1.51：把「文件行全干完、作品状态却还挂在 failed」的作品批量纠正回来。
+        # **不依赖作品是否在本轮 works 清单里** —— 真机遗留的「完美世界」正是因历史
+        # 清单损坏一直不进清单，才没有任何路径去重算它，看板上那一条就永远挂着。
+        # 纯 DB 一条 SQL + 逐个重算，不联网、不发明计数。
+        try:
+            _healed = mirror.reconcile_stale_media_status(db, r.id)
+        except Exception as exc:
+            logger.warning("[mirror] 作品状态自愈巡检失败（不影响同步）：%s", exc)
+            _healed = []
+        if _healed:
+            stats["status_healed"] = len(_healed)
         # 复制完成：先落一帧「复制 N / 改名待办」快照（网络 await 前不持写事务）
         # v2.1.11：copy_tasks 用复制任务数（分子分母同口径），不再复用 total_files。
         # v2.1.43：works_total 改取 queue_size（本轮三段队列去重后的实际排队数），
@@ -2466,6 +2475,15 @@ async def _do_mirror_poll_tasks(db: Session) -> dict:
             out["target_file_ids_backfilled"] = await mirror.backfill_target_file_ids(db, r)
             if bool(getattr(r, "rename_files", True)):
                 out["rename"] = await _safe_rename(db, r)
+        # v2.1.51：轮询路径也跑一次作品状态自愈（这条路径不经过 sync_rule，
+        # 历史遗留的「行全同步、作品仍 failed」不会因为轮询而消失）
+        try:
+            _healed = mirror.reconcile_stale_media_status(db, r.id)
+        except Exception as exc:
+            logger.warning("[mirror] 作品状态自愈巡检失败（不影响轮询）：%s", exc)
+            _healed = []
+        if _healed:
+            out["status_healed"] = len(_healed)
         return out
     except Exception as exc:
         raise HTTPException(502, str(exc))
@@ -3201,8 +3219,7 @@ def _mirror_level_queries(db: Session) -> dict[str, dict]:
             "rename_failed": db.query(MirrorFile).filter(
                 MirrorFile.rename_status == "failed"),
             "rename_todo": db.query(MirrorFile).filter(
-                or_(MirrorFile.rename_status.is_(None), MirrorFile.rename_status == "",
-                    MirrorFile.rename_status == "pending_visible"),
+                mirror.rename_pending_filter(),
                 MirrorFile.status == "synced"),
         },
     }
@@ -3512,9 +3529,9 @@ def mirror_status(db: Session = Depends(get_db)):
         pending_items.append({"kind": "文件待复制", "work": titles.get(f.media_id, ""),
                               "target": f.file_name, "status": f.status,
                               "detail": (f.error or "")[:300]})
+    # v2.1.51：与看板计数同一个判据（此前这里少算 failed，看板少算 failed，选批却算）。
     rename_todo = list(db.scalars(select(MirrorFile).where(
-        or_(MirrorFile.rename_status.is_(None), MirrorFile.rename_status == "",
-            MirrorFile.rename_status == "pending_visible"),
+        mirror.rename_pending_filter(),
         MirrorFile.status == "synced"
     ).order_by(MirrorFile.id).limit(200)).all())
     for f in rename_todo:

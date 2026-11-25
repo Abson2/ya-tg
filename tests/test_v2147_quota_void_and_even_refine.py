@@ -242,8 +242,12 @@ def test_engine_and_forecast_share_work_unit():
     assert "category_task_counts" not in gate, "实跑的作品级门禁还在按条数比"
 
 
-def test_forecast_quota_is_in_works():
-    """预测侧同样按部：配额 2 部 + 两个渠道 → 该小时 2 部作品、4 条任务。"""
+def test_forecast_quota_is_in_works(forecast_at_noon):
+    """预测侧同样按部：配额 2 部 + 两个渠道 → 该小时 2 部作品、4 条任务。
+
+    v2.1.51：时钟冻结到正午 —— 23 点后跑全量时已经没有任何「未来整点」，
+    下面按未来整点取行的断言会假红（本机 23:02 撞上）。
+    """
     with SessionLocal() as db:
         _seed(db, cycle={"hour_max": 6})
         _set_hourly(db, 6)
@@ -379,8 +383,8 @@ def test_frontend_shows_drift_hint():
 
 def test_version_is_current_everywhere():
     """版本锁（v2.1.47 建立，此后每版随发版一起推进）。"""
-    assert 'version="2.1.50"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert "v2.1.50 · Asia/Shanghai" in APP_VUE
+    assert 'version="2.1.51"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
+    assert "v2.1.51 · Asia/Shanghai" in APP_VUE
     assert json.loads((ROOT / "frontend/package.json").read_text(
-        encoding="utf-8"))["version"] == "2.1.50"
-    assert "当前版本：v2.1.50" in (ROOT / "README.md").read_text(encoding="utf-8")
+        encoding="utf-8"))["version"] == "2.1.51"
+    assert "当前版本：v2.1.51" in (ROOT / "README.md").read_text(encoding="utf-8")

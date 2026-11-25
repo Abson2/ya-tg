@@ -63,7 +63,7 @@ def _beat() -> None:
         except Exception:
             pass  # 心跳是辅助诊断，绝不阻断同步
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -383,6 +383,32 @@ def media_status_from(rows) -> str:
     return "synced"
 
 
+# v2.1.51：「待改名」的唯一判据。此前这条口径有 **5 份** 实现，互不相同：
+#   看板文件级 `rename_todo`   = (None | "" | pending_visible) + status=synced
+#   明细「文件待改名」          = 同上（3 种）
+#   后台复查 job 的 pending 计数 = 上面 3 种 + failed（4 种）
+#   `rename_mirror_files` 选批  = 上面 3 种 + failed（4 种）
+#   `stats["remaining"]`        = `rename_status != "done"` —— 把 skipped_ascii /
+#                                 skipped_legacy 也算成「待改」，于是「剩余 N」永远不归零
+# 真机现象（2026-11-25 22:45）：看板「待改名 2」，用户核对后确认那两个文件其实早已改名。
+RENAME_PENDING_STATUSES = ("", "pending_visible", "failed")
+
+
+def rename_is_pending(row) -> bool:
+    """这一行是否还等着改英文名（对象版判据，与 SQL 版同源）。"""
+    return str(getattr(row, "rename_status", "") or "") in RENAME_PENDING_STATUSES
+
+
+def rename_pending_filter():
+    """待改名的唯一判据（SQL 版）。`None` 与空串等价，所以两段都要写。
+
+    `skipped_ascii`（本来就没有中文名要换）与 `skipped_legacy`（历史行默认不回刷）
+    是**终态**，绝不能算进「待改名」—— 它们永远不会有下一轮，算进去就永远归零不了。
+    """
+    return or_(MirrorFile.rename_status.is_(None),
+               MirrorFile.rename_status.in_(list(RENAME_PENDING_STATUSES)))
+
+
 def reconcile_media_status(db: Session, media_id: int, *,
                            touch_synced_at: bool = False) -> str:
     """按 `media_status_from` 重算一部作品的状态并落库，返回新状态。
@@ -399,6 +425,45 @@ def reconcile_media_status(db: Session, media_id: int, *,
     if touch_synced_at:
         media.last_synced_at = utcnow()
     return media.status
+
+
+def reconcile_stale_media_status(db: Session, rule_id: int = 0) -> list[tuple[int, str]]:
+    """v2.1.51：把「文件行全干完了、作品状态却还挂在非终态」的作品批量纠正回来。
+
+    为什么必须有这一层：v2.1.50 把判据收成唯一实现，但**重算只在作品被扫到、
+    被轮询或被重试时发生**。真机遗留的「完美世界」正是这样 —— 284 行全部 synced，
+    作品 status 停在 failed，而它因为历史清单损坏一直不在本轮 works 清单里，
+    于是没有任何路径去重算它，状态就那么挂着（22:05 看板「作品级·镜像失败 1」）。
+
+    这里不依赖「作品进没进 works 清单」，直接用一条 SQL 找：
+      status 不是 synced、**有**文件行、且**不存在**任何非终态文件行。
+    纯 DB 操作、不联网，每轮同步收尾跑一次，一个计数都不发明 —— 判据仍然只有
+    `media_status_from` 一份（这里只负责挑候选，写回走 `reconcile_media_status`）。
+
+    `rule_id` 传 0 表示所有规则。返回 [(media_id, 新状态), ...]（只含真变过的）。
+    """
+    has_files = exists().where(MirrorFile.media_id == MirrorMedia.id)
+    has_open = exists().where(and_(
+        MirrorFile.media_id == MirrorMedia.id,
+        or_(MirrorFile.status.is_(None),
+            MirrorFile.status.notin_(MEDIA_TERMINAL_FILE_STATUS))))
+    stmt = (select(MirrorMedia.id)
+            .where(MirrorMedia.status != "synced")
+            .where(has_files)
+            .where(~has_open))
+    if int(rule_id or 0) > 0:
+        stmt = stmt.where(MirrorMedia.rule_id == int(rule_id))
+    ids = [int(x) for (x,) in db.execute(stmt).all()]
+    if not ids:
+        return []
+    changed: list[tuple[int, str]] = []
+    for mid in ids:
+        st = reconcile_media_status(db, mid)
+        if st:                      # 候选本来就都不是 synced，返回非空即「变了」
+            changed.append((mid, st))
+    if changed:
+        db.commit()
+    return changed
 
 
 # v0.9.6：prune 已清理的目录映射标记。带此标记的 missing 行是「B 库不存在、映射已清、
@@ -564,6 +629,51 @@ def _works_with_pending_files(db: Session, rule_id: int) -> set[str]:
                    func.coalesce(MirrorFile.attempts, 0) < limit))
     ).all()
     return {str(k or "") for (k,) in rows if str(k or "").strip()}
+
+
+def retry_works_limit(db: Session, rule: "MirrorRule") -> int:
+    """v2.1.51：一轮最多排几部「待重试作品」。0 = 不限。
+
+    默认**等于单轮名额** `rule.max_works_per_run`（不发明额度，与 v2.1.44 的
+    「名额就是配置值」同口径），可用运行时配置 `mirror_retry_works_max` 单独覆盖。
+
+    为什么要设上限：待重试作品是**追加**进队列、不占名额的（v2.1.9 为修「89 条
+    文件永远卡 pending」而设计）。失败作品一多，单轮实际处理部数就没有上限了 ——
+    每部作品至少 N 个文件 × `MIN_FILE_IDLE_SECONDS` 的节流，单轮可能长到跨过下一个
+    调度周期；一旦被外部超时打断，整轮白跑、`last_run` 不更新，反而把 v2.1.9
+    要修的病放大。设上限是拿「重试排得慢一点」换「单轮时长可预期」。
+    """
+    raw = str(runtime_config.get(db, "mirror_retry_works_max") or "").strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        return max(0, int(getattr(rule, "max_works_per_run", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def retry_works_order(db: Session, rule_id: int,
+                      limit: int = 0) -> tuple[list[str], int]:
+    """v2.1.51：有重试价值的作品键，**最久没被处理过的排前面**。返回 (选中, 总数)。
+
+    与 `_works_with_pending_files` 完全同谓词（含 v2.1.42 的 attempts 上限），只多了
+    排序和截断。排序是为了**轮转**：按 `last_synced_at`（没处理过的排最前）升序取前
+    `limit` 部，被处理过的作品下一轮自然落到后面。**不能只按目录顺序取前 N 部** ——
+    那样排在后面的失败作品永远轮不到，是比原问题更坏的回归。
+    """
+    limit = int(limit or 0)
+    stamp = func.coalesce(MirrorMedia.last_synced_at, MirrorMedia.created_at)
+    stmt = (select(MirrorMedia.work_key)
+            .join(MirrorFile, MirrorFile.media_id == MirrorMedia.id)
+            .where(MirrorMedia.rule_id == rule_id,
+                   MirrorFile.status.in_(sorted(RETRYABLE_FILE_STATUS)),
+                   or_(MirrorFile.status != "failed",
+                       func.coalesce(MirrorFile.attempts, 0) < max_file_attempts(db)))
+            .group_by(MirrorMedia.work_key)
+            .order_by(func.min(stamp).asc(), MirrorMedia.work_key.asc()))
+    keys = [str(k) for (k,) in db.execute(stmt).all() if str(k or "").strip()]
+    total = len(keys)
+    return (keys[:limit] if limit > 0 else keys), total
 
 
 def detect_increments(db: Session, rule: MirrorRule, works: list,
@@ -2204,23 +2314,34 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     #（同一轮里同一部作品绝不能被处理两次）。若写在切批之前，
     # `batch` 尚未赋值 → UnboundLocalError → 整轮直接崩，
     # 反而制造出本轮要修的「整轮停摆」症状。
+    #
+    # v2.1.51：**这一段现在有上限**。待重试作品是追加进队列、不占名额的，失败作品
+    # 一多单轮实际处理部数就没有上限（详见 retry_works_limit 注释）；改成按
+    # 「最久没被处理过」取前 N 部，被处理过的下一轮自然落到后面 —— 轮转，不饿死尾部。
     try:
-        pending_work_keys = _works_with_pending_files(db, rule.id)
+        _retry_order, _retry_total = retry_works_order(
+            db, rule.id, retry_works_limit(db, rule))
     except Exception as exc:
         logger.warning("[mirror] 待重试作品统计失败（不阻断同步）：%s", exc)
-        pending_work_keys = set()
+        _retry_order, _retry_total = [], 0
+    pending_work_keys = set(_retry_order)
     if pending_work_keys:
+        _retry_rank = {k: i for i, k in enumerate(_retry_order)}
         seen_keys = {work_key_of(p[0]) for p in priority_works} | {
             work_key_of(p[0]) for p in incr_works}
         # 已进 priority_works 的不重复加入；batch 里的由后续去重逻辑处理
         batch_keys = {work_key_of(p[0]) for p in batch}
-        retry_works = [p for p in works
-                       if work_key_of(p[0]) in pending_work_keys
-                       and work_key_of(p[0]) not in seen_keys
-                       and work_key_of(p[0]) not in batch_keys]
+        retry_works = sorted(
+            [p for p in works
+             if work_key_of(p[0]) in pending_work_keys
+             and work_key_of(p[0]) not in seen_keys
+             and work_key_of(p[0]) not in batch_keys],
+            key=lambda p: _retry_rank.get(work_key_of(p[0]), len(_retry_order)))
         if retry_works:
             priority_works = priority_works + retry_works
             stats["retry_pending_works"] = len(retry_works)
+        # 「因上限本轮没排上、下轮继续」的数量（只有真的超了才 > 0，如实报，不填 0 冒充）
+        stats["retry_capped_out"] = max(0, int(_retry_total) - len(_retry_order))
     stats["batch_size"] = len(batch)
     # v2.1.41：增量批次里没被本批轮转覆盖到的那部分，本轮也会被处理，
     # 算「余多少部下轮继续」时要扣掉，否则数字虚高、用户会觉得永远做不完。
@@ -3383,8 +3504,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         media_q = media_q.where(MirrorMedia.id.in_(
             select(MirrorFile.media_id).where(
                 MirrorFile.status == "synced",
-                or_(MirrorFile.rename_status.is_(None),
-                    MirrorFile.rename_status.in_(["", "pending_visible", "failed"])))))
+                rename_pending_filter())))
     medias = list(db.scalars(media_q).all())
     # v1.4.4 按部收敛：每轮最多 max_works 部，改完的部不再 pending，下一轮自动
     # 选下一批（天然轮转，无需游标，也不与复制阶段共用的 works_cursor 冲突）。
@@ -3442,8 +3562,7 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
             rows = [r for r in rows
                     if str(getattr(r, "rename_status", "") or "") != "skipped_legacy"]
         if only_pending:
-            rows = [r for r in rows
-                    if str(getattr(r, "rename_status", "") or "") in ("", "pending_visible", "failed")]
+            rows = [r for r in rows if rename_is_pending(r)]
         if not rows:
             stats["no_rows"] += 1
             continue
@@ -3823,11 +3942,12 @@ async def rename_mirror_files(db: Session, rule: MirrorRule, *,
         # v0.8.9：一次性统计全局剩余（含本轮完全没触及的后续作品），只给一条
         # 明确提示。旧写法逐部累加还会在空 rows 时误用上一轮的 idx。
         stats["truncated_reason"] = stop_reason
+        # v2.1.51：与看板/明细/选批同一个判据。旧口径 `!= "done"` 会把
+        # skipped_ascii / skipped_legacy 也算成待改，「剩余 N」永远不归零。
         remaining = db.scalar(select(func.count()).select_from(MirrorFile).where(
             MirrorFile.rule_id == rule.id,
             MirrorFile.status == "synced",
-            or_(MirrorFile.rename_status.is_(None),
-                MirrorFile.rename_status != "done"))) or 0
+            rename_pending_filter())) or 0
         stats["remaining"] = int(remaining)
         stats["notices"].append(
             f"本轮改名到上限（{stop_reason}），剩余 {stats['remaining']} 个文件"
@@ -4038,10 +4158,26 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
         elif task.status == "failed":
             # v0.8.4：明确失败的任务把文件标 failed，下一轮同步会重新发起复制
             failed += 1
+            # v2.1.51：**先核对 B 库再判失败**。光鸭 task_status != 2 有三种原因：
+            # 真失败 / 轮询次数用完 / 超时；后两种文件可能已经落到 B 库了。
+            # 旧写法一律 mark_file_failed，代价是①页面先显示失败、要等下一轮
+            # `backfill_target_file_ids` 才救回来；②白耗一次 attempts，把「已停止
+            # 自动重试」的文案提前写上去。判据与定向重试同一个
+            # `_backfill_ids_for_media`（同 `_lookup_b_file`），范围限本任务的行。
+            media = db.get(MirrorMedia, task.media_id) if task.media_id else None
+            landed = 0
+            if media is not None:
+                try:
+                    landed = await _backfill_ids_for_media(api, db, media, rows)
+                except Exception as exc:
+                    # A-09：静默吞异常必须留日志
+                    logger.warning("[mirror] 失败任务核对 B 库未完成（不影响轮询）：%s", exc)
             for row in rows:
+                if str(getattr(row, "status", "") or "") == "synced":
+                    continue        # 已在 B 库找到，不再判失败、也不再消耗 attempts
                 mark_file_failed(row, task.error, _lim)
-            if task.media_id:
-                reconcile_media_status(db, task.media_id)
+            if media is not None:
+                reconcile_media_status(db, media.id, touch_synced_at=bool(landed))
     db.commit()
     return {"tasks": len(tasks), "done": done, "failed": failed,
             "still_unknown": len(tasks) - done - failed}

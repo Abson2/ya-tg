@@ -416,8 +416,12 @@ def test_forecast_and_engine_use_same_even_gate():
     assert "even_plan = even_plan_of(db, version)" in SC2_SRC
 
 
-def test_forecast_reflects_even_plan():
-    """预测侧也吃同一份方案：方案给了两类名额，预测里两类都该出现。"""
+def test_forecast_reflects_even_plan(forecast_at_noon):
+    """预测侧也吃同一份方案：方案给了两类名额，预测里两类都该出现。
+
+    v2.1.51：时钟冻结到正午 —— 深夜跑全量时「今天剩余时段」只剩当前那一小时，
+    方案里的第二类根本没有时段可落，断言会假红。
+    """
     with SessionLocal() as db:
         _seed(db, cycle={"hour_max": 3})
         _set_hourly(db, 3)

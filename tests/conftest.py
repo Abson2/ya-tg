@@ -40,6 +40,28 @@ os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 import pytest
 
 
+@pytest.fixture
+def forecast_at_noon(monkeypatch):
+    """v2.1.51：把「排期预测看到的现在」冻结到今天上海正午。
+
+    为什么需要：`forecast_schedule` 的 `hours` 是「今天**剩余**时段」。
+    深夜（≥23:00）跑全量时剩下只有当前那一个小时，于是
+      · 按「未来整点」取行的断言（test_forecast_quota_is_in_works）取不到 → 假红；
+      · 断言「两类分类都出现」的用例（test_forecast_reflects_even_plan）只剩 1 类 → 假红。
+    本机 2026-11-25 23:02 发版全量撞上这两条，22:47 同一套代码全绿 —— 纯时间性。
+
+    做法：数据仍用真实 `utcnow()` 造（都落在「今天」），只把预测侧读的时钟钉到正午。
+    生产代码不依赖此 fixture。
+    """
+    from app import share_center_v2 as sc2
+    real = sc2.utcnow()
+    noon_sh = real.astimezone(sc2.shanghai_tz()).replace(
+        hour=12, minute=0, second=0, microsecond=0)
+    fixed = noon_sh.astimezone(timezone.utc)
+    monkeypatch.setattr(sc2, "utcnow", lambda: fixed)
+    return fixed
+
+
 def ensure_full_day_hour_window(db, version_id: int) -> None:
     """把当前小时纳入可调度窗口，使 plan_engine 相关测试不依赖真实墙钟小时。
 

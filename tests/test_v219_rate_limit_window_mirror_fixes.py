@@ -691,11 +691,15 @@ def test_works_with_pending_files_collects_retryable_works(env):
 
 
 def test_retry_pending_works_counted_in_stats():
-    """待重试作品优先必须计入 stats 并追加到优先队列。"""
+    """待重试作品优先必须计入 stats 并追加到优先队列。
+
+    v2.1.51：sync_rule 改调 `retry_works_order`（同谓词 + 最久未处理优先 + 上限），
+    归集口径本身仍由 `_works_with_pending_files` 提供（轻量扫描的强制下探还在用它）。
+    """
     import inspect
     from app import mirror
     src = inspect.getsource(mirror.sync_rule)
-    assert "_works_with_pending_files" in src, "sync_rule 必须调待重试归集"
+    assert "retry_works_order" in src, "sync_rule 必须调待重试归集（v2.1.51 起带上限）"
     assert "retry_pending_works" in src, "必须有 retry_pending_works 计数"
     assert "priority_works = priority_works + retry_works" in src, \
         "待重试作品必须追加到优先队列"
