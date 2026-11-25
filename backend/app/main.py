@@ -1143,7 +1143,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.39", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.40", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1154,7 +1154,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.39", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.40", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2400,6 +2400,9 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
       scope=archive 把用户**确认源文件已被删除**的待处理文件行归档（v2.1.38）
                     —— 不联网、不删行、不动 B 库文件；归档后不再计入「待处理」，
                     源文件放回 A 库后下轮同步会自动恢复并重新复制
+      scope=purge_archive
+                    把「已手动清理」里的归档记录**彻底删除**（v2.1.40）—— 只删
+                    status=archived 的行，不碰 synced / 待处理，不删任何物理文件
 
     通用参数：
       dry_run=true  只返回预览清单，不写库（强烈建议先预览）
@@ -2410,8 +2413,9 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
     """
     scope = (p.scope or "file").strip().lower()
     # scope=all：文件段 + 目录段一起清（老端点 /mirror/mappings/prune 的原语义）
-    if scope not in ("all", "file", "dir", "pruned", "media", "archive"):
-        raise HTTPException(400, "清理范围只能是 all / file / dir / pruned / media / archive")
+    if scope not in ("all", "file", "dir", "pruned", "media", "archive", "purge_archive"):
+        raise HTTPException(
+            400, "清理范围只能是 all / file / dir / pruned / media / archive / purge_archive")
     r = _mirror_rule(db)
     if not r:
         raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
@@ -2427,6 +2431,19 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
         if not p.dry_run and out.get("archived"):
             add_audit(db, "mirror_files_archived", target_type="mirror",
                       detail=json_dumps({"archived": out["archived"],
+                                         "ids": out.get("ids", [])[:50]}))
+            db.commit()
+        out["scope"] = scope
+        return out
+
+    if scope == "purge_archive":
+        # v2.1.40（真机反馈）：归档只是「从待处理里摘出去」，行还在 —— 用户明确
+        # 表示「这两条记录我不想再看到」。这里给一个最终清理入口，同样纯 DB、
+        # 不联网、不持锁；函数内部只允许删 status=archived 的行。
+        out = mirror.purge_archived_files(db, r, ids, dry_run=bool(p.dry_run))
+        if not p.dry_run and out.get("purged"):
+            add_audit(db, "mirror_files_purged", target_type="mirror",
+                      detail=json_dumps({"purged": out["purged"],
                                          "ids": out.get("ids", [])[:50]}))
             db.commit()
         out["scope"] = scope

@@ -256,7 +256,11 @@ def test_c_class_does_not_unarchive_rows(db):
     with patch("app.mirror.GuangYaWebFiles", FakeAPI):
         second = _sync(db)
 
-    assert second["prepass"]["c_deleted_a"] == 1, second["prepass"]
+    # v2.1.40：计数口径拆分 —— c_candidates=本轮识别到几部「A 库已无」（无状态），
+    # c_deleted_a=本轮实际处置几部（幂等）。这部作品的行全是已归档（已处理干净），
+    # 本轮不重复计数、不重复写库，所以前者仍为 1、后者为 0。
+    assert second["prepass"]["c_candidates"] == 1, second["prepass"]
+    assert second["prepass"]["c_deleted_a"] == 0, second["prepass"]
     db.refresh(row)
     assert row.status == mirror.ARCHIVED_FILE_STATUS, (
         f"C 类预扫描把已归档的行翻回了 {row.status!r} —— 用户清完下一轮又冒出来，等于白清")

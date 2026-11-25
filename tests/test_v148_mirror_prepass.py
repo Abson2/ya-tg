@@ -165,7 +165,11 @@ def test_c_class_half_mirror_keeps_b_and_mapping(env):
         db, rule, nodes, _works("现存剧"), api, stats, complete=True))
     pp = stats["prepass"]
     assert pp["mirror_mode"] == "half"
-    assert pp["c_deleted_a"] == 1
+    # v2.1.40：计数口径拆分 —— `c_candidates`=本轮识别到几部「A 库已无」（无状态、
+    # 每轮都算），`c_deleted_a`=本轮**实际处置**几部（幂等，处理完就归零）。
+    # 半镜像不动任何数据，所以只有前者是 1。
+    assert pp["c_candidates"] == 1
+    assert pp["c_deleted_a"] == 0
     assert pp["c_kept_in_half_mode"] == 1
     assert pp["c_mapping_cleared"] == 0
     assert pp["c_b_files_removed"] == 0

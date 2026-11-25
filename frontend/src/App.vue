@@ -498,6 +498,10 @@ const missingDirSelected = ref([]), fileErrSelected = ref([])
 // v2.1.38：待重试文件表格的 ref —— 勾选带 reserve-selection（按行键保留），
 // 行被归档移出数据后必须显式清一次选中，否则内部保留的旧键会让按钮一直显示旧数字。
 const retryTableRef = ref(null)
+// v2.1.40：「已手动清理」面板的勾选与表格 ref —— 归档记录此前只能看、不能删，
+// 归档了就永远留在这个清单里。用户确认这些记录彻底没用之后可以在这里删掉。
+const archivedSelected = ref([])
+const archivedTableRef = ref(null)
 // v0.8.1：扫描设置不再单独成页，折叠进「资源库」
 // v0.8.3：定时配置里不再出现任何根目录 ID 输入框，统一引用镜像同步里的 B 库 ID
 const showScanPanel = ref(false)
@@ -1757,6 +1761,31 @@ async function archiveFiles() {
     fileErrSelected.value = []
     await load()
     retryTableRef.value?.clearSelection?.()
+  } catch (e) { ElMessage.error(e.message) }
+  finally { mirrorBusy.value = false }
+}
+// v2.1.40（真机反馈）：归档只是「从待处理里摘出去」，行还留在库里，所以「已手动清理」
+// 清单只会越来越长、此前没有任何入口能删掉。这里给最终清理：只删这些归档记录本身，
+// 不碰已同步记录、不碰待处理项、不删任何文件与 A/B 库。
+async function purgeArchivedFiles() {
+  const ids = (archivedSelected.value || []).slice()
+  if (!ids.length) { ElMessage.info('请先勾选要删除的记录'); return }
+  const ok = await confirmBox(
+    `将永久删除勾选的 ${ids.length} 条已手动清理记录。\n\n` +
+    '【什么时候用】这些片你确认已经从 A 库删掉了，也不想再在「已手动清理」里看到它们。\n' +
+    '【会发生什么】这些记录从库里彻底删除，本清单随之变短。\n' +
+    '【不会发生什么】不删任何片、不动 A 库与 B 库、不影响已同步的映射、不影响入库 / 分享 / 推送。\n' +
+    '【注意】删除后没有「恢复」可点。以后把源文件放回 A 库，下一轮同步仍会当成新文件重新复制，' +
+    '只是当初「为什么没复制成功」那条原因记录不再保留。')
+  if (!ok) return
+  mirrorBusy.value = true
+  try {
+    const d = await api('/mirror/cleanup', { method: 'POST', body: JSON.stringify({ scope: 'purge_archive', ids }) })
+    ElMessage.success(`已删除 ${d.purged || 0} 条记录` +
+      (d.skipped ? ` · 跳过 ${d.skipped} 条（已不是已清理状态）` : ''))
+    archivedSelected.value = []
+    await load()
+    archivedTableRef.value?.clearSelection?.()
   } catch (e) { ElMessage.error(e.message) }
   finally { mirrorBusy.value = false }
 }
@@ -3525,7 +3554,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.39 · Asia/Shanghai</span>
+          <span>v2.1.40 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3976,14 +4005,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。<br><b>如果确认源文件已在 A 库被删除</b>（补复制客观上不可能成功），勾选后点「清理选中」把它们归档：立刻从待处理里移除、不再每轮重算也不再反复报警；<b>不删任何文件与历史记录</b>，源文件放回 A 库后下一轮同步会自动恢复并重新复制。</p>
           </div>
           <div v-if="mirrorStatus.archived_files?.length || mirrorStatus.counts?.files_archived" class="panel">
-            <div class="panel-head"><h3>已手动清理（源文件已删除）</h3><el-tag type="info" size="small">{{ mirrorStatus.counts?.files_archived || 0 }} 项</el-tag><el-tag v-if="(mirrorStatus.counts?.files_archived || 0) > (mirrorStatus.archived_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.archived_files?.length || 0 }} 条</el-tag></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.archived_files || []" size="small" row-key="id">
+            <div class="panel-head"><h3>已手动清理（源文件已删除）</h3><el-tag type="info" size="small">{{ mirrorStatus.counts?.files_archived || 0 }} 项</el-tag><el-tag v-if="(mirrorStatus.counts?.files_archived || 0) > (mirrorStatus.archived_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.archived_files?.length || 0 }} 条</el-tag><el-button size="small" type="danger" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !archivedSelected.length" @click="purgeArchivedFiles">删除选中记录 ({{ archivedSelected.length }})</el-button></div>
+            <div class="table-scroll"><el-table ref="archivedTableRef" :data="mirrorStatus.archived_files || []" size="small" row-key="id" @selection-change="v => archivedSelected = v.map(x => x.id)">
+              <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
               <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
               <el-table-column label="原原因 / 说明" min-width="320"><template #default="s"><span style="color:#8a6d3b">{{ s.row.error || '—' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这些是你确认过「A 库源文件已被删除」后手动清理的记录：已经从「待处理」里移除，不再计入上方数字、不再每轮同步重算，也不会再反复报警。<b>记录本身保留在库里</b>（含当初没复制成功的原原因），随时可以在这里查到。<br><b>怎么恢复</b>：把源文件放回 A 库原目录，下一轮「立即同步」会自动认出它并重新复制，不需要手工操作；届时这条记录会从本清单移回「待重试文件」，复制成功后变为「已同步」。</p>
+            <p class="hint">这些是你确认过「A 库源文件已被删除」后手动清理的记录：已经从「待处理」里移除，不再计入上方数字、不再每轮同步重算，也不会再反复报警。<b>记录本身保留在库里</b>（含当初没复制成功的原原因），随时可以在这里查到。<br><b>怎么恢复</b>：把源文件放回 A 库原目录，下一轮「立即同步」会自动认出它并重新复制，不需要手工操作；届时这条记录会从本清单移回「待重试文件」，复制成功后变为「已同步」。<br><b>不想再看到这些记录</b>：勾选后点「删除选中记录」即可把它们从库里彻底删除——只删这些记录本身，<b>不删任何片、不动 A 库与 B 库、不影响已同步的映射</b>。删除后没有「恢复」可点；以后把源文件放回 A 库，同步仍会当成新文件重新复制，只是当初那条原因记录不再保留。</p>
           </div>
           <div v-if="mirrorStatus.task_issues?.length" class="panel">
             <div class="panel-head"><h3>需处理任务</h3><el-tag type="warning" size="small">{{ taskIssueCount }} 条</el-tag><el-tag v-if="taskIssueCount > (mirrorStatus.task_issues?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.task_issues?.length || 0 }} 条</el-tag></div>

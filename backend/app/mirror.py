@@ -593,6 +593,43 @@ def archive_retryable_files(db: Session, rule: MirrorRule, ids: list[int],
     return out
 
 
+def purge_archived_files(db: Session, rule: MirrorRule, ids: list[int],
+                         *, dry_run: bool = False) -> dict:
+    """v2.1.40（真机反馈）：把「已手动清理」的归档记录**彻底删除**。
+
+    与 `archive_retryable_files` 的分工：
+      - 归档（v2.1.38）= 从「待处理」里摘出去，行保留、源文件放回来自动复活；
+      - 彻底删除（本函数）= 用户明确表示「这两条记录我不想再看到」时的最终清理。
+
+    约束收到最小面（这是唯一一处会物理删 MirrorFile 行的入口）：
+      - **只允许删 status == archived 的行**；synced / pending / copying / failed /
+        superseded 一律跳过 —— 绝不借这个入口误删正常映射或待处理项；
+      - 指定 ids 时逐条校验：不存在的、非 archived 的都计入 skipped，不报错；
+      - 不删任何物理文件、不动 A/B 库、不动资源 / 分享 / 队列 / 执行记录；
+      - 行删掉后源文件若放回 A 库，下一轮同步按**新行**重建复制。
+        （归档复活机制只在行还存在时生效；行没了就是全新行，不会撞唯一键。）
+
+    返回 {"ok", "selected", "purged", "skipped", "dry_run", "ids"}。
+    """
+    wanted = [int(x) for x in (ids or []) if str(x).strip().lstrip("-").isdigit()]
+    stmt = select(MirrorFile).where(
+        MirrorFile.rule_id == rule.id,
+        MirrorFile.status == ARCHIVED_FILE_STATUS)
+    if wanted:
+        stmt = stmt.where(MirrorFile.id.in_(wanted))
+    rows = list(db.scalars(stmt.order_by(MirrorFile.id)).all())
+    out = {"ok": True, "selected": len(wanted), "purged": len(rows),
+           "skipped": max(0, len(wanted) - len(rows)) if wanted else 0,
+           "dry_run": bool(dry_run), "ids": [r.id for r in rows],
+           "note": "只删除了这些已手动清理的记录本身，没有动任何文件与 A/B 库"}
+    if dry_run or not rows:
+        return out
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return out
+
+
 async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                                       works: list, api: GuangYaWebFiles, stats: dict,
                                       *, complete: bool) -> tuple[list[str], list[str]]:
@@ -617,6 +654,8 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
     prepass = {"enabled": True, "complete": complete, "mirror_mode": "full",
                "c_deleted_a": 0, "c_b_files_removed": 0, "c_mapping_cleared": 0,
                "c_kept_in_half_mode": 0, "c_delete_failed": 0,
+               # v2.1.40：C 类命中量 / 异常护栏 / 单轮额度 / B 库反查超额
+               "c_candidates": 0, "c_anomaly": 0, "c_deferred": 0, "b_over_budget": 0,
                "b_invalid_reprocess": 0, "a_single_file_fix": 0,
                "a_missing_episodes": 0, "d_unchanged": 0,
                "skipped": 0}
@@ -635,10 +674,54 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
             max_media = 50
 
         a_file_ids, a_source_fps, a_work_keys = _build_a_facts(nodes, works)
-        medias = list(db.scalars(select(MirrorMedia).where(
-            MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id)).all()[:max_media])
+        # v2.1.40（真机反馈）：C 类必须覆盖**全库**，不能被 `[:max_media]` 截断。
+        #
+        # 病根：`mirror_prepass_max_media` 的本意是抑制 B 库反查（api_b_candidates_safe）
+        # 的接口风暴 —— 见 runtime_config.py「性能护栏，防接口风暴」注释。而 C 类
+        # （A 库已无该作品）判定只用 A 树事实集（a_file_ids / a_work_keys，纯内存 set），
+        # 一次接口都不打。此前两者被同一个 `[:max_media]` 切片一起截断，后果是
+        # **只有最老入库的 50 部作品有「整部消失」保护，且永不轮转**：线上 260 部 →
+        # 覆盖率 19%，被保护的那 50 部恰好是最不可能被删的老片。
+        # 真机证据（2026-11-25）：「缅北电诈覆灭纪实」media id=220，A 库目录
+        # 1955014968956665857 仍在但已空（list 成功、0 项），作品已不被 _discover_works
+        # 识别 → 属 C 类；却因 id 220 在 LIMIT 50 之外从未被扫到，2 条记录挂了整周。
+        all_medias = list(db.scalars(select(MirrorMedia).where(
+            MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id)).all())
+        # B/A 类要反查 B 库，仍按 max_media 限量（性能护栏语义不变）
+        probe_ids = ({m.id for m in all_medias[:max_media]} if max_media > 0
+                     else {m.id for m in all_medias})
+        # C 类命中量先算一遍（一次聚合查询、零接口调用），用于「批量异常」护栏：
+        # 一轮之内命中两三成库 ≈ A 树枚举出错，而不是用户真删了这么多片。此时宁可
+        # 漏清一轮也不能动刀 —— full 镜像下 C 类会**真删 B 库文件**。
+        src_by_media: dict[int, set[str]] = {}
+        for _mid, _sid in db.execute(
+                select(MirrorFile.media_id, MirrorFile.source_file_id)
+                .where(MirrorFile.rule_id == rule.id)).all():
+            _s = str(_sid or "").strip()
+            if _s:
+                src_by_media.setdefault(int(_mid), set()).add(_s)
+        c_candidates = 0
+        if complete:
+            for _m in all_medias:
+                _sids = src_by_media.get(_m.id) or set()
+                if not _sids:
+                    continue
+                _wk = str(_m.work_key or "")
+                if _wk and not _wk.startswith("work:"):
+                    _wk = "work:" + _wk
+                if not (_sids & a_file_ids) and _wk not in a_work_keys:
+                    c_candidates += 1
+        _c_guard = max(10, int(len(all_medias) * 0.2)) if all_medias else 10
+        # 一次命中两三成库 ≈ A 树枚举出错，而不是用户真删了这么多片。
+        # 不用「A 库一部作品都没枚举到」单独做条件：那会把「小库被删空」这种
+        # 真实且合法的场景也挡掉（此时命中数本来就小，比例护栏不会误伤）。
+        c_anomaly = bool(c_candidates) and c_candidates > _c_guard
+        prepass["c_candidates"] = c_candidates
+        prepass["c_anomaly"] = c_candidates if c_anomaly else 0
+        # 单轮最多对这么多部「已无作品」动 B 库文件（清映射不受限，删文件受此节流）
+        c_delete_budget = max_media if max_media > 0 else len(all_medias)
 
-        for media in medias:
+        for media in all_medias:
             wk = str(media.work_key or "")
             # 镜像1.1：兼容 legacy 无前缀 work_key。C 类判定与 B 类重排都依赖与
             # work_key_of() 同口径的 "work:" 前缀，否则会把 A 还在的作品误判为已删。
@@ -658,7 +741,19 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
             # 只有 A 树完整（complete=True）才进入本分支，绝不误删；删 B 库走已抓包
             # api.delete_files（异步任务），失败只记录不中断；网络 await 前不持写事务。
             if complete and not in_a and wk not in a_work_keys:
-                prepass["c_deleted_a"] += 1
+                # v2.1.40：命中量异常（或 A 树一部作品都没枚举到）→ 本轮一律不动数据。
+                # full 镜像下这里会真删 B 库文件，一次可疑的枚举不能拿来当删除依据。
+                if c_anomaly:
+                    continue
+                # v2.1.40：幂等。上一轮已经处理干净的行（都在终态且 B 库句柄已清）不再
+                # 重复计数、重复写库 —— 否则覆盖全库后「A库已无作品 N 部」会每轮虚报，
+                # 而且每部作品一次 commit，白耗一轮。
+                _live = [r for r in rows
+                         if str(r.status or "") not in ("failed", "superseded",
+                                                        ARCHIVED_FILE_STATUS)
+                         or str(r.target_file_id or "").strip()]
+                if not _live:
+                    continue
                 mode = str(runtime_config.get(db, "mirror_mode") or "full").lower().strip()
                 prepass["mirror_mode"] = "half" if mode in (
                     "half", "semi", "partial", "0", "false", "off") else "full"
@@ -666,6 +761,13 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                 if not full_mirror:
                     prepass["c_kept_in_half_mode"] += 1
                     continue  # 半镜像：清单与 B 文件都保留
+                # v2.1.40：单轮额度用尽就整部留到下一轮（不半途清空 B 库句柄，
+                # 否则 target_file_id 被清就再也拿不到 b_ids，B 库文件永久残留）。
+                if c_delete_budget <= 0:
+                    prepass["c_deferred"] += 1
+                    continue
+                c_delete_budget -= 1
+                prepass["c_deleted_a"] += 1
                 # 必须在清清单前捕获 b_ids：_clear_media_mappings 会清空 ORM 行的
                 # target_file_id，rows 与其共享 identity map，事后取不到。
                 b_ids: list[str] = [str(r.target_file_id) for r in rows
@@ -693,6 +795,11 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
             # 作品 A 库还在 → B 类整部缺失 / A 类单文件缺集或变化 / D 无变化
             if not complete:
                 prepass["skipped"] += 1
+                continue
+            # v2.1.40：B/A 类要逐部反查 B 库（接口开销），仍按 max_media 限量。
+            # 超出预算的作品本轮只享受上面那段零接口开销的 C 类判定，其余留给下一轮。
+            if media.id not in probe_ids:
+                prepass["b_over_budget"] += 1
                 continue
             # v2.1.31：只比 size 段 —— utime 单变不算内容变化（见 `_fp_size` 注释）
             changed_fp = sum(1 for r in rows if r.source_file_id in a_source_fps
@@ -1836,6 +1943,16 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     _c_del = int((stats.get("prepass") or {}).get("c_deleted_a", 0) or 0)
     if _c_del:
         rule.last_message += f" · A库已无作品 {_c_del} 部"
+    # v2.1.40：C 类覆盖全库后必须把「有多少、暂缓几部、是否疑似枚举异常」讲清楚，
+    # 否则用户只看到清理数字变小，不知道背后还有一批在排队或被护栏挡住。
+    _c_cand = int((stats.get("prepass") or {}).get("c_candidates", 0) or 0)
+    _c_defer = int((stats.get("prepass") or {}).get("c_deferred", 0) or 0)
+    if _c_defer:
+        rule.last_message += (f" · 另有 {_c_defer} 部已无作品待清理"
+                              "（本轮清理额度已满，下轮继续）")
+    if int((stats.get("prepass") or {}).get("c_anomaly", 0) or 0):
+        rule.last_message += (f" · 疑似 A 库枚举异常：有 {_c_cand} 部作品查不到任何源文件，"
+                              "本轮已暂缓清理，请核实 A 库后再同步")
     # v0.9.8 #196：明确「慢在列目录、复制是增量的」——用户担心全量跑任务时据此判断
     rule.last_message += (f" · 列目录 {stats['walk_dirs']} 个/{stats['walk_list_calls']} 次请求"
                           f" · A库文件 {stats['walk_a_files']} · 未变跳过 {stats['unchanged']}")
