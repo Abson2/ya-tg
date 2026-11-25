@@ -432,7 +432,7 @@ const matchTried = ref([]), matchTranslated = ref([])
 // v0.8.0：扫描间隔按钮、A/B 镜像、扫描批次、用户互动
 const scanInterval = ref(30), scanCustom = ref(false), scanPresets = ref([10, 15, 30, 60, 120, 360, 720, 1440])
 const mirrorCfg = ref({ name: '默认镜像', source_root_id: '', target_root_id: '', interval_minutes: 60, enabled: false, star_naming: true, auto_identify: true, file_idle_seconds: 1.0, min_idle_seconds: 0.5, auto_create_dirs: true, rename_files: true, max_works_per_run: 0, mirror_mode: 'full', interval_presets: [], unverified_endpoints: [], note: '' })
-const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {}, schedule: {} })
+const mirrorStatus = ref({ counts: {}, media: [], dirs: [], missing_dirs: [], tasks: [], retryable_files: [], task_issues: [], rule: {}, config: {}, unverified_endpoints: [], rename_errors: [], untranslated_works: [], lock: {}, pipeline: [], progress: {}, schedule: {} })
 // v0.8.9：诊断表格与长说明默认收起，镜像同步页不再把所有信息堆在一屏
 // v2.1.11：三处折叠组各用独立 v-model——此前共用同一个 mirrorDiagOpen，
 // 展开一个会收起另一个，用户刚展开「问题诊断」又发现「清单」被关掉了。
@@ -442,18 +442,30 @@ const mirrorStatusOpen = ref([])
 const diagCount = computed(() => {
   const s = mirrorStatus.value
   const c = s.counts || {}
-  // v2.1.11：补齐所有失败/待处理态——此前只算 4 项，
-  // 页面「同步状态」里显示「失败任务 3」但折叠头写「无待处理项」，
-  // 用户根本不知道该不该点进去。
-  return (s.missing_dirs?.length || 0) + (s.file_errors?.length || 0) +
-    (s.untranslated_works?.length || 0) + (s.rename_errors?.length || 0) +
-    (c.files_failed || 0) + (c.files_copying || 0) + (c.files_unknown || 0) +
-    (c.files_retryable || 0) + (c.files_rename_failed || 0) +
+  // v2.1.36（真机反馈）：提示「2 项待处理」，点开却只有已完成的复制任务。
+  //
+  // 两条病根，这里一起改掉：
+  // ① **重复计数**：`files_retryable` 本身就是 failed / copying / unknown / pending
+  //    的并集（后端 RETRYABLE_FILE_STATUS），此前又把 files_failed / files_copying /
+  //    files_unknown 逐项加了一遍 —— 同一个文件被算两次以上，数字天然虚高。
+  // ② **拿清单长度当计数**：清单都有 limit（失败 50 条、待翻译 50 条…），条数一多
+  //    就小于真实值，于是又变成「数字说有 N 项、点开只有几条」。
+  //
+  // 现在只做一件事：**每个加数都是后端全表 count，且面板里都有对应明细**。
+  return (c.unmapped_dirs || 0) + (c.files_retryable || 0) +
+    (c.works_without_english || 0) + (c.files_rename_failed || 0) +
     (c.tasks_failed || 0) + (c.tasks_unknown || 0) +
     (c.tasks_skipped || 0) + (c.tasks_cancelled || 0) +
     // v2.1.11：用后端给的中文口径别名，不再在后端字段名上直接取值
     // （页面不得体现后端代码名词）。
-    (c.invalid_mappings || 0) + (c.unmapped_dirs || 0)
+    (c.invalid_mappings || 0)
+})
+// v2.1.36：任务侧四个计数（失败 / 待确认 / 跳过 / 取消）合并成一个面板标题数字，
+// 与「需处理任务」清单同源；清单本身限 50 条，超出时标注「仅显示最近 N 条」。
+const taskIssueCount = computed(() => {
+  const c = mirrorStatus.value.counts || {}
+  return (c.tasks_failed || 0) + (c.tasks_unknown || 0) +
+    (c.tasks_skipped || 0) + (c.tasks_cancelled || 0)
 })
 const scanBatches = ref([]), mirrorBusy = ref(false), mirrorSaving = ref(false)
 // v2.1.14：目录映射 / 影视映射清单加分页。此前两张表把全部行一次性渲染，
@@ -1702,9 +1714,9 @@ async function retryFailedDirs() {
 // v0.9.17.2：勾选失败文件定向重发复制（只 walk 所属作品，不扫全库）
 async function retryFailedFiles() {
   const ids = (fileErrSelected.value || []).slice()
-  if (!ids.length) { ElMessage.info('请先勾选要重试的失败文件'); return }
+  if (!ids.length) { ElMessage.info('请先勾选要重试的文件'); return }
   const ok = await confirmBox(
-    `将对勾选的 ${ids.length} 个失败文件定向重发复制。\n\n` +
+    `将对勾选的 ${ids.length} 个待重试文件定向重发复制。\n\n` +
     '只扫描这些文件所属作品的 A 库目录（不扫整个源头库）；' +
     'B 库已存在的会直接回填、不重复复制。复制成功后自动走入库→识别→推送入队。')
   if (!ok) return
@@ -3486,7 +3498,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.35 · Asia/Shanghai</span>
+          <span>v2.1.36 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3924,16 +3936,28 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             </el-table></div>
             <p class="hint">这些是历史「清理无效映射」或 B 库清空重整留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。勾选后点「重建选中」可立即定向重建，不必等下一轮同步；确认这些行彻底无用时点「清空已清理映射」从清单移除，不影响资源 / 分享 / 队列。</p>
           </div>
-          <div v-if="mirrorStatus.file_errors?.length" class="panel">
-            <div class="panel-head"><h3>文件复制失败 / 待重试</h3><el-tag type="danger" size="small">{{ mirrorStatus.file_errors.length }} 个</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
-            <div class="table-scroll"><el-table :data="mirrorStatus.file_errors" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
+          <div v-if="mirrorStatus.retryable_files?.length || mirrorStatus.counts?.files_retryable" class="panel">
+            <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.retryable_files || []" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
               <el-table-column type="selection" width="42" align="center"/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
+              <el-table-column label="状态" width="110"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
               <el-table-column prop="task_id" label="任务 ID" min-width="140"/>
-              <el-table-column label="失败原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
+              <el-table-column label="原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这里显示 copy_file / get_task_status 的真实报错，已从数据库持久化，刷新页面仍在。v0.8.4 起失败任务会标 status=3 或 detail.code≠0 为明确失败（旧版误记为「待确认」）；<b>v0.9.17.2：勾选后点「批量重试选中」只对这些文件定向重发复制——只扫描其所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队</b>；也可等下一轮「立即同步」全量重试。若全部报同一错误，请按「待验证接口」提示补抓一次网页端「复制到」的 HAR。</p>
+            <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。</p>
+          </div>
+          <div v-if="mirrorStatus.task_issues?.length" class="panel">
+            <div class="panel-head"><h3>需处理任务</h3><el-tag type="warning" size="small">{{ taskIssueCount }} 条</el-tag><el-tag v-if="taskIssueCount > (mirrorStatus.task_issues?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.task_issues?.length || 0 }} 条</el-tag></div>
+            <div class="table-scroll"><el-table :data="mirrorStatus.task_issues || []" size="small">
+              <el-table-column prop="work" label="作品" min-width="160"/>
+              <el-table-column prop="task_id" label="任务 ID" min-width="150"/>
+              <el-table-column label="状态" width="120"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
+              <el-table-column prop="polls" label="轮询次数" width="100"/>
+              <el-table-column label="报错 / 说明" min-width="300"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '—' }}</span></template></el-table-column>
+            </el-table></div>
+            <p class="hint">失败 / 状态待确认 / 跳过本序列 / 已取消的复制任务都列在这里。此前这四类只体现在「问题诊断」的数字里，而「复制任务」表只显示最近 30 条全状态混排——终态任务一旦被新任务挤出去，就只剩一个数字，用户无从判断该不该重处理。跳过与取消是「跳过当前 / 取消当前批次」产生的，需要重新投递时点上方批次行的「恢复被跳过项」；失败与待确认的，可直接在「待重试文件」里勾选对应文件重发复制，或点「立即同步」重跑一轮。</p>
           </div>
           <div v-if="mirrorStatus.tasks?.length" class="panel">
             <div class="panel-head"><h3>复制任务</h3><el-tag size="small" type="info">{{ mirrorStatus.tasks.length }} 条（最近 30 条）</el-tag></div>

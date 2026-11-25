@@ -468,6 +468,18 @@ def _dir_status_label(status: str) -> str:
             .get(str(status or "").strip().lower(), "待创建"))
 
 
+def _file_status_label(status: str) -> str:
+    """单个文件（MirrorFile）状态的中文标签。
+
+    v2.1.36（真机反馈）：「文件复制失败 / 待重试」面板原先只列 `status == "failed"`，
+    待复制（pending）的文件一条都不在里面；面板扩成「所有可重试文件」之后必须给
+    状态列，这里统一出中文，页面不出现 pending / copying 这类内部状态词。
+    """
+    return ({"pending": "待复制", "copying": "复制中", "failed": "复制失败",
+             "unknown": "状态待确认", "synced": "已同步", "superseded": "已归档"}
+            .get(str(status or "").strip().lower(), "待处理"))
+
+
 def _task_status_label(status: str, task_status: str = "") -> str:
     """复制任务状态中文标签。
 
@@ -1129,7 +1141,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.35", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.36", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1140,7 +1152,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.35", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.36", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2906,6 +2918,37 @@ def mirror_status(db: Session = Depends(get_db)):
                     "file": f.file_name, "task_id": f.task_id or "",
                     "error": f.error or "", "status": f.status}
                    for f in failed_files]
+    # v2.1.36（真机反馈）：问题诊断提示「2 项待处理」，点开只有已完成的复制任务，
+    # 既看不到是哪两个、也没有重处理入口。
+    #
+    # 根因是**计数口径与展示口径不同源**：计数里的 files_retryable 是
+    # `mirror.RETRYABLE_FILE_STATUS`（pending / copying / failed / unknown）的并集，
+    # 而上面这份清单只查 `status == "failed"`。于是「待复制」的文件被计进数字、
+    # 却没有任何明细区可以点开——真机那 2 项正是 B 库核对后自动打回 pending 的补复制行。
+    #
+    # 这里另出一份**与计数同源**的明细（同一集合、同一条 SQL 谓词），面板直接用它渲染；
+    # `file_errors` 保持原样不动，避免影响既有调用方。
+    retryable_files = list(db.scalars(select(MirrorFile).where(
+        MirrorFile.status.in_(sorted(mirror.RETRYABLE_FILE_STATUS))
+    ).order_by(MirrorFile.id.desc()).limit(100)).all())
+    retryable_rows = [{"id": f.id, "work": titles.get(f.media_id, ""),
+                       "file": f.file_name, "task_id": f.task_id or "",
+                       "error": f.error or "", "status": f.status,
+                       "status_label": _file_status_label(f.status)}
+                      for f in retryable_files]
+    # 任务侧有同一个缺口：tasks_failed / tasks_unknown / tasks_skipped / tasks_cancelled
+    # 四个计数都没有专属明细，只有一张「最近 30 条全状态混排」的任务表——终态失败 /
+    # 跳过 / 取消的任务一旦被新任务挤出 30 条，就只剩数字了。这里给一份只含需处理任务的清单。
+    task_issues = list(db.scalars(select(MirrorTask).where(or_(
+        MirrorTask.status.in_(("failed", "unknown")),
+        MirrorTask.task_status.in_(("failed", "skipped", "cancelled")),
+    )).order_by(MirrorTask.id.desc()).limit(50)).all())
+    task_issue_rows = [{"id": t.id, "task_id": t.task_id,
+                        "work": titles.get(t.media_id, ""),
+                        "status": t.status, "task_status": t.task_status,
+                        "status_label": _task_status_label(t.status, t.task_status),
+                        "error": t.error or "", "polls": t.polls}
+                       for t in task_issues]
     # v0.8.6：改名失败与「英文名待处理」都必须持久化可查，刷新页面仍在
     rename_failed = list(db.scalars(select(MirrorFile).where(
         MirrorFile.rename_status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
@@ -3284,6 +3327,13 @@ def mirror_status(db: Session = Depends(get_db)):
                    "work": titles.get(t.media_id, "")} for t in tasks],
         # v0.8.4：文件复制失败清单（持久化，刷新页面仍在）
         "file_errors": file_errors,
+        # v2.1.36（真机反馈）：与 counts.files_retryable **同源**的明细
+        # （pending / copying / failed / unknown 全在内），面板据此渲染，
+        # 数字与清单从此对得上。上限 100 条，超出时前端标注「仅显示最近 N 条」。
+        "retryable_files": retryable_rows,
+        # v2.1.36：与 tasks_failed / tasks_unknown / tasks_skipped / tasks_cancelled
+        # 同源的「需处理任务」清单，上限 50 条。
+        "task_issues": task_issue_rows,
         # v0.8.6：改名失败与英文名待处理清单
         "rename_errors": rename_errors,
         "untranslated_works": untranslated_works,
