@@ -1493,6 +1493,364 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
     return False, ""
 
 
+# ---------------------------------------------------------------------------
+# v2.1.46 一键 AI 调度 · 均匀排期
+#
+# 真机问题（用户原话）：「我们的作品排期可能不够均匀（比如每个分类下的作品数量
+# 不一致，有的分类作品很多、有的很少，有些分类可能不全，而且我们的排期是排期
+# 完成后又入库的）」。
+#
+# 根因不是时段配置，而是**同一小时内的名额分配**：`plan_engine` 按
+# `SCCategory.priority desc` 遍历分类，每个分类只要在窗口内就一路建任务直到
+# `hour_max` 用完。于是优先级最高的那个分类把整点额度吃光，排在后面的分类
+# 每小时都拿 0 部——排期表上看就是「少数几个分类占满整天、其余分类整天没有」。
+#
+# 本版加一层**名额分配**（不是改时段）：
+#   · 输入只有三样：每类在库待排作品数、每类自己的时段窗口、发布规则给的每小时上限；
+#   · 用最大余额法把每小时额度按「待排存量权重」分给当小时有窗口的分类，
+#     每类至少 1 部（额度够时），谁也不至于被前排吃光；
+#   · 结果存进 `config_json.even_plan`，由 `plan_engine` 与 `forecast_schedule`
+#     **同一份**数据消费（v2.1.19 红线：预测与实跑必须同口径）。
+#
+# 三条硬边界（用户口径：只调整每个时段排的数量，不能影响原有时段和时段 AI 建议）：
+#   ① **不动** `SCCategorySchedule` 的任何字段（window_start/end、week_windows、
+#      pref_rank、suggest_*）——时段是谁配的还是谁配的；
+#   ② `even_plan` 为空时，`plan_engine` / `forecast_schedule` 全部短路走老路，
+#      行为零变化（没点过按钮就等于没这个功能）；
+#   ③ 额度值一律来自配置（每小时推送上限 → 周期计划小时上限），代码不写死数字；
+#      两个都是 0（＝不限）时如实报「没有可分配的额度」，绝不编一个数出来。
+# ---------------------------------------------------------------------------
+EVEN_PLAN_KEY = "even_plan"
+
+
+def _in_quiet_hour(hour: int, quiet: tuple[int, int] | None) -> bool:
+    if not quiet:
+        return False
+    qs, qe = int(quiet[0]), int(quiet[1])
+    return (qs <= hour < qe) if qe > qs else (hour >= qs or hour < qe)
+
+
+def _largest_remainder(weights: dict[str, int], total: int) -> dict[str, int]:
+    """最大余额法：把 `total` 个名额按 `weights` 权重分成整数，总和恰为 min(total, ...)。
+
+    - `total <= 0` 或没有候选 → 空；
+    - `total < 候选数` → 按权重从大到小各给 1，其余 0（宁可空着几个分类，
+      也不让任何一类超额——总额度是发布规则给的硬上限）；
+    - 否则先取整数部分、把 0 抬到 1（每类至少 1 部，这是「均匀」的最低保证），
+      余额按小数部分从大到小补，超了就从「高出理论值最多」的那类往下削。
+
+    纯整数运算，不引入浮点误差；结果可复现（同输入同输出）。
+    """
+    if total <= 0 or not weights:
+        return {}
+    keys = list(weights)
+    if total <= len(keys):
+        order = sorted(keys, key=lambda k: (-weights[k], k))
+        return {k: (1 if i < total else 0) for i, k in enumerate(order)}
+    s = sum(weights.values()) or 1
+    exact = {k: total * weights[k] / s for k in keys}
+    out = {k: max(1, int(exact[k])) for k in keys}
+    diff = total - sum(out.values())
+    if diff > 0:
+        order = sorted(keys, key=lambda k: (-(exact[k] - int(exact[k])), -weights[k], k))
+        i = 0
+        while diff > 0:
+            out[order[i % len(order)]] += 1
+            diff -= 1
+            i += 1
+    elif diff < 0:
+        order = sorted(keys, key=lambda k: (exact[k] - out[k], -weights[k], k))
+        i = 0
+        while diff < 0 and i < 10000:
+            k = order[i % len(order)]
+            if out[k] > 1:
+                out[k] -= 1
+                diff += 1
+            i += 1
+    return out
+
+
+def _category_backlog(db: Session, live_keys: set[str]) -> dict[str, int]:
+    """每个分类**当前在库待排**的作品数（均匀排期的权重来源）。
+
+    与 `plan_engine` / `forecast_schedule` 同一份在库口径：只认最新快照 +
+    `live_keys`。没有这批数字就没法按存量分配名额，所以宁可返回空也不编。
+    """
+    if not live_keys:
+        return {}
+    latest_ids = select(func.max(SCLibraryVersion.id)).group_by(SCLibraryVersion.work_key)
+    rows = db.execute(
+        select(SCWorkCategory.category_key, func.count(SCLibraryVersion.id))
+        .join(SCLibraryVersion, SCLibraryVersion.work_key == SCWorkCategory.work_key)
+        .where(SCLibraryVersion.id.in_(latest_ids))
+        .where(SCLibraryVersion.work_key.in_(live_keys))
+        .group_by(SCWorkCategory.category_key)
+    ).all()
+    return {str(k): int(n or 0) for k, n in rows if k}
+
+
+def _schedule_open_hours(row: "SCCategorySchedule | None",
+                         quiet: tuple[int, int] | None,
+                         win: tuple[int, int] | None) -> list[int]:
+    """某分类「一天里能排期」的小时列表（只读它自己的时段，不改任何东西）。
+
+    顺序是：分类自己的时段窗口 → 发布规则的主推送窗口 → 去掉静默保护小时。
+    一切仍以 `SCCategorySchedule` 为准；本函数只做「读出来」，绝不回写。
+    """
+    if row is None:
+        hours = list(range(24))
+    else:
+        ws = int(row.window_start or 0)
+        we = int(row.window_end or 24)
+        hours = list(range(24)) if we <= ws else list(range(ws, min(24, we)))
+    if win:
+        hours = [h for h in hours if int(win[0]) <= h < int(win[1])]
+    if quiet:
+        hours = [h for h in hours if not _in_quiet_hour(h, quiet)]
+    return hours
+
+
+def _even_cap_from_config(db: Session, cycle: dict[str, Any]) -> tuple[int, str]:
+    """每小时可分配额度：先看「每小时推送上限」，没有再看周期计划的「小时」上限。
+
+    两个都是 0＝不限 → 返回 (0, "")，调用方据此如实报错，**绝不编一个数**。
+    """
+    cap = 0
+    try:
+        on = str(runtime_config.get(db, "sc_quick_publish_enabled") or "true").lower() in (
+            "1", "true", "yes", "on")
+        if on:
+            cap = max(0, int(runtime_config.get(db, "sc_quick_publish_hourly_limit") or 0))
+    except (TypeError, ValueError):
+        cap = 0
+    if cap:
+        return cap, "每小时推送上限"
+    cap = max(0, int(cycle.get("hour_max") or 0))
+    if cap:
+        return cap, "周期计划的每小时上限"
+    return 0, ""
+
+
+def even_plan_of(db: Session, version: "SCSharePlanVersion | None" = None) -> dict[str, Any]:
+    """取当前生效的均匀排期方案；没生成过 / 已被清空 → 空 dict（＝不生效）。"""
+    v = version or _active_version(db)
+    if v is None:
+        return {}
+    cfg = _jload(v.config_json, {})
+    plan = cfg.get(EVEN_PLAN_KEY) if isinstance(cfg, dict) else None
+    if not isinstance(plan, dict):
+        return {}
+    items = plan.get("items")
+    return plan if isinstance(items, dict) and items else {}
+
+
+def even_hour_quota(plan: dict[str, Any], hour: int) -> dict[str, int] | None:
+    """某小时的「分类 → 部数」配额；方案里没有这个小时 → 空 dict（该小时不出货）。"""
+    items = (plan or {}).get("items")
+    if not isinstance(items, dict) or not items:
+        return None
+    row = items.get(str(int(hour)))
+    if not isinstance(row, dict):
+        return {}
+    return {str(k): int(v) for k, v in row.items()}
+
+
+def _even_allows(quota: dict[str, int] | None, category_key: str, used: int) -> bool:
+    """均匀排期门禁：该分类在本小时还能不能再出。
+
+    `quota is None` ＝ 没有方案，全部放行（老路径零变化）。
+    """
+    if quota is None:
+        return True
+    cap = int((quota or {}).get(category_key) or 0)
+    return cap > 0 and int(used) < cap
+
+
+def _category_hour_counts(db: Session, hour_start: datetime) -> dict[str, int]:
+    """本小时**已经建好**的分类任务数（上海自然小时，按 created_at 落库时间）。
+
+    与 `_category_today_count` 同源口径，只是窗口缩到一小时。
+    均匀排期要给「本轮还能再建几部」，就得知道这个小时已经建了多少。
+    """
+    start = hour_start.astimezone(timezone.utc)
+    end = start + timedelta(hours=1)
+    rows = db.execute(
+        select(SCPushListItem.category_key, func.count(SCPublishTask.id))
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.created_at >= start, SCPublishTask.created_at < end)
+        .group_by(SCPushListItem.category_key)
+    ).all()
+    return {str(k): int(n or 0) for k, n in rows if k}
+
+
+def build_even_plan(db: Session) -> dict[str, Any]:
+    """算一份均匀排期方案并落库到活动版本的 `config_json.even_plan`。
+
+    口径（不发明数字）：
+      · 每小时额度 = 「每小时推送上限」（没配则周期计划的小时上限），两个都 0 → 报错不生成；
+      · 分配权重 = 每个分类**在库待排作品数**，作品多的多给、作品少的少给；
+      · 每类至少 1 部（额度够时），额度不够就按权重从大到小给，其余本小时为 0；
+      · 还受「单分类每小时上限」与「单分类每日上限」的常识性约束（前者直接夹逼）；
+      · 时段一律读分类现有配置，静默保护与主推送窗口之外的小时不参与分配。
+
+    返回结构既给前端回显（分类名已转中文），也写进配置供调度消费。
+    """
+    version = _active_version(db)
+    if version is None:
+        return {"ok": False, "reason": "当前没有活动中的计划版本，先建一个发布规则再点一键调度。"}
+    cfg = _jload(version.config_json, {})
+    cycle = {**CYCLE_PLAN_DEFAULTS, **(cfg.get("cycle_plan") or {})}
+    cap, cap_source = _even_cap_from_config(db, cycle)
+    if cap <= 0:
+        return {"ok": False,
+                "reason": ("当前没有可分配的每小时额度（「每小时推送上限」与周期计划的"
+                           "「小时」上限都是 0＝不限），先设一个上限再点一键调度。")}
+    category_limit = max(1, int(cfg.get("category_limit") or 20))
+    cats = list(db.scalars(
+        select(SCCategory).where(SCCategory.enabled.is_(True))
+        .order_by(SCCategory.priority.desc(), SCCategory.id)
+    ).all())[:category_limit]
+    if not cats:
+        return {"ok": False, "reason": "没有启用中的分类，排期无从谈起。"}
+
+    live_keys = _live_work_keys(db)
+    backlog = _category_backlog(db, live_keys)
+    quiet = _quiet_window(cycle)
+    win = None
+    try:
+        ws = int(cycle.get("window_start") or 0)
+        we = int(cycle.get("window_end") or 24)
+        if 0 <= ws < we <= 24:
+            win = (ws, we)
+    except (TypeError, ValueError):
+        win = None
+    cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
+    sched_map = {s.category_key: s for s in db.scalars(
+        select(SCCategorySchedule).where(
+            SCCategorySchedule.plan_version_id == version.id)).all()}
+    open_hours = {c.category_key: _schedule_open_hours(
+        sched_map.get(c.category_key), quiet, win) for c in cats}
+
+    items: dict[str, dict[str, int]] = {}
+    for h in range(24):
+        cands = [c for c in cats if h in open_hours.get(c.category_key, [])]
+        if not cands:
+            continue
+        weights = {c.category_key: max(1, int(backlog.get(c.category_key) or 0))
+                   for c in cands}
+        quotas = _largest_remainder(weights, cap)
+        if cycle_hour_max:
+            quotas = {k: min(v, cycle_hour_max) for k, v in quotas.items()}
+        quotas = {k: int(v) for k, v in quotas.items() if int(v) > 0}
+        if quotas:
+            items[str(h)] = quotas
+
+    if not items:
+        return {"ok": False,
+                "reason": ("按当前分类时段与静默保护，全天没有任何可排期的小时——"
+                           "先检查分类时间排期与主推送窗口。")}
+
+    now_sh = datetime.now(shanghai_tz())
+    plan = {
+        "generated_at": now_sh.strftime("%Y-%m-%d %H:%M"),
+        "base_cap": int(cap),
+        "cap_source": cap_source,
+        "category_limit": category_limit,
+        "categories": len(cats),
+        "hours": len(items),
+        "slots_total": sum(sum(v.values()) for v in items.values()),
+        "items": items,
+    }
+    cfg[EVEN_PLAN_KEY] = plan
+    version.config_json = _jdump(cfg)
+    db.commit()
+
+    # ---- 回显：全部转成业务语言（分类名 / 小时 / 部数），不外露后端键形态 ----
+    per_cat: dict[str, dict[str, Any]] = {}
+    for h in sorted(items, key=lambda x: int(x)):
+        for key, n in items[h].items():
+            row = per_cat.setdefault(key, {"name": _category_display_name(key),
+                                           "hours": 0, "works": 0})
+            row["hours"] += 1
+            row["works"] += int(n)
+    detail = []
+    for key, row in per_cat.items():
+        detail.append({
+            "name": row["name"],
+            "backlog": int(backlog.get(key) or 0),
+            "hours": int(row["hours"]),
+            "per_hour": round(row["works"] / row["hours"], 2) if row["hours"] else 0,
+            "works": int(row["works"]),
+        })
+    detail.sort(key=lambda x: (-x["works"], x["name"]))
+    return {
+        "ok": True,
+        "generated_at": plan["generated_at"],
+        "base_cap": int(cap),
+        "cap_source": cap_source,
+        "categories": len(cats),
+        "hours": len(items),
+        "slots_total": plan["slots_total"],
+        "detail": detail,
+    }
+
+
+def clear_even_plan(db: Session) -> dict[str, Any]:
+    """清空均匀排期方案 → 调度立刻回到「按分类优先级顺序吃满额度」的原行为。"""
+    version = _active_version(db)
+    if version is None:
+        return {"ok": False, "reason": "当前没有活动中的计划版本。"}
+    cfg = _jload(version.config_json, {})
+    if EVEN_PLAN_KEY in cfg:
+        cfg.pop(EVEN_PLAN_KEY, None)
+        version.config_json = _jdump(cfg)
+        db.commit()
+    return {"ok": True}
+
+
+@router.get("/even-plan")
+def api_even_plan(db: Session = Depends(get_db)):
+    """当前均匀排期方案（页面回显用）；未生成 → `active=false` 并说明怎么开。"""
+    plan = even_plan_of(db)
+    if not plan:
+        return {"active": False, "detail": [],
+                "hint": "还没生成均匀排期。点「一键 AI 调度」按当前分类作品量重新分配每小时的排期数量。"}
+    items = plan.get("items") or {}
+    per_cat: dict[str, dict[str, Any]] = {}
+    for h in items:
+        for key, n in (items[h] or {}).items():
+            row = per_cat.setdefault(key, {"hours": 0, "works": 0})
+            row["hours"] += 1
+            row["works"] += int(n)
+    detail = [{"name": _category_display_name(k), "hours": v["hours"],
+               "works": v["works"],
+               "per_hour": round(v["works"] / v["hours"], 2) if v["hours"] else 0}
+              for k, v in per_cat.items()]
+    detail.sort(key=lambda x: (-x["works"], x["name"]))
+    return {
+        "active": True,
+        "generated_at": plan.get("generated_at") or "",
+        "base_cap": int(plan.get("base_cap") or 0),
+        "cap_source": plan.get("cap_source") or "",
+        "categories": int(plan.get("categories") or 0),
+        "hours": int(plan.get("hours") or 0),
+        "slots_total": int(plan.get("slots_total") or 0),
+        "detail": detail,
+    }
+
+
+@router.post("/even-plan/apply")
+def api_apply_even_plan(db: Session = Depends(get_db)):
+    """一键 AI 调度：按当前分类作品量重新分配每小时的排期数量。"""
+    return build_even_plan(db)
+
+
+@router.post("/even-plan/clear")
+def api_clear_even_plan(db: Session = Depends(get_db)):
+    """撤销均匀排期，回到原有排期分配方式。"""
+    return clear_even_plan(db)
+
+
 def _prune_empty_push_lists(db: Session) -> int:
     """清理无清单项的空清单（历史遗留垃圾），保留仍有数据的清单。
 
@@ -1895,10 +2253,24 @@ def plan_engine(db: Session) -> dict[str, int]:
     # 但**不再参与调度判定**——否则用户在前台看不到、却在后台限流，无法排查。
     cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
     cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
+    # v2.1.46：均匀排期配额（没生成过 → None，下面所有判定原样走老路）。
+    # 只影响「本小时这个分类还能再出几部」，不改任何时段配置。
+    even_quota = even_hour_quota(even_plan_of(db, version), sh_hour)
+    even_used: dict[str, int] = {}
+    if even_quota is not None:
+        hour_start = datetime.now(shanghai_tz()).replace(
+            minute=0, second=0, microsecond=0)
+        even_used = _category_hour_counts(db, hour_start)
+
     def _sched_allows(key: str, per_category_count: int) -> bool:
         # v2.1.19：判定内核外移到 `_sched_allows_core`，与「今日排期」预测共用同一份
         # 判据——预测和实跑算出差，就等于骗用户。
         # `today_count` 保持惰性：只有配了日上限时才查库（原闭包同样是短路才算）。
+        # v2.1.46：均匀排期配额再拦一道——「本小时库里已建 + 本轮已建」到顶就换下一个
+        # 分类，把剩余名额让出去。没有方案时 `_even_allows` 恒为 True，零影响。
+        if not _even_allows(even_quota, key,
+                            int(even_used.get(key, 0)) + int(per_category_count)):
+            return False
         today = _category_today_count(db, key) if cycle_day_max else 0
         return _sched_allows_core(sched_map.get(key), hour=sh_hour, weekday=iso_weekday,
                                   per_category_count=per_category_count,
@@ -2064,6 +2436,14 @@ def plan_engine(db: Session) -> dict[str, int]:
             # hour_max=1 时实际仍能建出 N 部，周期计划的小时上限形同虚设
             # （插队通道加入后两档叠加，超出更明显）。
             if hour_max and task_count >= hour_max:
+                break
+            # v2.1.46：均匀排期配额必须也在**作品级**拦一刀。
+            # `_sched_allows` 是每轮每分类只判一次的，判的时候这个分类的计数还是 0，
+            # 光靠它挡不住「一个分类在本轮把整点额度吃光」——那正是本版要修的病根。
+            # 用「本小时库里已建 + 本轮已建」跟配额比，到顶就收手，把名额让给后面分类。
+            if not _even_allows(even_quota, category.category_key,
+                                int(even_used.get(category.category_key, 0))
+                                + int(category_task_counts.get(category.category_key, 0))):
                 break
             work_key = str(lv.work_key or "")
             # 自愈补扫时同一作品可能二次命中；本轮已处理过就不再重复。
@@ -2576,6 +2956,20 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     # 一个只给真实任务，于是同一屏里对不上。
     built_by_hour, built_keys = _queue_works_by_hour(db, now_sh)
 
+    # v2.1.46：均匀排期方案（没生成过 → 空 dict，下面 `even_hour_quota` 返回 None，
+    # 全部走老路径）。这里同时把「已建任务」按分类×小时统计出来，作为配额的已用部位，
+    # 与 plan_engine 的 `_category_hour_counts` 同源，保证预测与实跑算同一笔账。
+    even_plan = even_plan_of(db, version)
+    built_key_counts: dict[int, dict[str, int]] = {}
+    if even_plan:
+        for _h in (built_by_hour or {}):
+            try:
+                built_key_counts[int(_h)] = _category_hour_counts(
+                    db, now_sh.replace(hour=int(_h), minute=0, second=0, microsecond=0))
+            except Exception:
+                db.rollback()
+                built_key_counts[int(_h)] = {}
+
     def _quota(h: int) -> int:
         """该小时还剩多少推送额度（匀速口径，单位=部）。"""
         if not hourly_cap:
@@ -2789,10 +3183,19 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                     "works_total": len(ikeys),
                     "more": max(0, len(instant_rows) - len(taken)),
                 })
+        # v2.1.46：均匀排期配额（与 plan_engine 同一份方案、同一个判据）。
+        # `even_q is None` ＝ 没有方案 → 下面 `_even_allows` 恒 True，行为零变化。
+        even_q = even_hour_quota(even_plan, h)
+        even_base = built_key_counts.get(h, {})
         for cat in cats:
             if hour_tasks >= quota:
                 break
             key = cat.category_key
+            # 本小时「已建任务 + 本小时已预测」到该分类配额就换下一个分类，
+            # 剩余名额留给排在后面的分类（这正是「均匀」的实现点）。
+            if not _even_allows(even_q, key,
+                               int(even_base.get(key, 0)) + int(cat_counts.get(key, 0))):
+                continue
             if not _sched_allows_core(sched_map.get(key), hour=h,
                                       weekday=now_sh.isoweekday(),
                                       per_category_count=cat_counts.get(key, 0),
@@ -2806,6 +3209,12 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                 if hour_tasks >= quota:
                     break
                 if hour_max and hour_tasks >= hour_max:
+                    break
+                # v2.1.46：与 plan_engine 同一处、同一判据——每部作品建之前都按
+                # 「本小时该分类已排 已建」跟配额比一次，到顶就停手。
+                # 只放在分类外层的话，入口计数为 0，一个分类照样能把额度吃满。
+                if not _even_allows(even_q, key,
+                                   int(even_base.get(key, 0)) + int(cat_counts.get(key, 0))):
                     break
                 wk = str(lv.work_key or "")
                 picks = _picks_for(wk)

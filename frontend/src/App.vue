@@ -161,6 +161,11 @@ const scBasicRules = ref({ quick_publish_enabled: 'true', update_detect_minutes:
 const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24 })
 const scRuleTab = ref('基础规则') // 基础规则 / 分类时间排期
 const scCycleTab = ref('小时')     // 小时 / 日度（周度、月度已于 v2.1.45 下线）
+// v2.1.46 一键 AI 调度 · 均匀排期：只分配「每个时段排多少部」，
+// 不动分类时段配置，也不动时段 AI 建议。
+const scEvenPlan = ref({ active: false, detail: [], hint: '' })
+const scEvenBusy = ref(false)
+const scEvenDetailOpen = ref(false)
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
 const scTaskSearch = ref(''), scTaskTypeFilter = ref('全部'), scSelectedDetail = ref(null)
 const scTaskStatusFilter = ref(''), scLinkFilter = ref(''), scSelectedTasks = ref([])
@@ -2586,7 +2591,9 @@ async function loadSc() {
     // v2.1.1：分享管理改用独立真实端点（口径与统计卡一致，不再混用 overview.views）
     '/sc/share-records?limit=200',
     // v2.1.1：分类偏好排名（真实派生），用于默认时间表的时段分配
-    '/sc/preference']
+    '/sc/preference',
+    // v2.1.46：均匀排期方案（一键 AI 调度的结果回显）
+    '/sc/even-plan']
   const settled = await Promise.allSettled(paths.map(p => api(p)))
   const val = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
   const ov = val(0); if (ov) scOverview.value = ov
@@ -2613,6 +2620,7 @@ async function loadSc() {
   const cycle = val(12); if (cycle) scCyclePlan.value = { ...scCyclePlan.value, ...cycle }
   const sr = val(13); if (sr) scShareRecords.value = sr.items || []
   const pf = val(14); if (pf) scPreference.value = { ...scPreference.value, ...pf }
+  const ev = val(15); if (ev) scEvenPlan.value = ev
   // v2.1.19：排期预测单独异步拉取，**不 await**——它要扫作品快照与名额索引，
   // 塞进上面的 allSettled 会让整个仪表盘等它出结果。失败也不影响其它卡片。
   loadScForecast()
@@ -3376,6 +3384,45 @@ async function scSaveCyclePlan() {
     ElMessage.success('周期计划已保存（静默时段立即对调度生效）'); await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
+// ---- v2.1.46 一键 AI 调度 · 均匀排期 ----
+// 只做一件事：按各分类当前在库作品量，把每小时的排期名额分匀。
+// 不写 SCCategorySchedule、不改时段与时段 AI 建议（后端也只读它们）。
+async function loadScEvenPlan() {
+  try {
+    const d = await api('/sc/even-plan')
+    if (d) scEvenPlan.value = d
+  } catch (e) { /* 静默：卡片保持「未启用」即可，不打断整个面板 */ }
+}
+async function scApplyEvenPlan() {
+  try {
+    await ElMessageBox.confirm(
+      '按各分类当前的待排作品量，重新分配每个时段的排期数量。不会改动你配的分类时段，也不会动时段 AI 建议。确定执行？',
+      '一键 AI 调度', { type: 'info' })
+  } catch { return }
+  scEvenBusy.value = true
+  try {
+    const d = await api('/sc/even-plan/apply', { method: 'POST', body: JSON.stringify({ payload: {} }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '生成失败'); return }
+    ElMessage.success(`均匀排期已生效：每小时 ${d.base_cap} 部，覆盖 ${d.categories} 个分类、${d.hours} 个时段，合计 ${d.slots_total} 部`)
+    await loadScEvenPlan()
+    // 排期预测与调度同源，配额一变就要重算，否则同屏两处又对不上
+    loadScForecast()
+  } catch (e) { ElMessage.error(String(e?.message || e)) } finally { scEvenBusy.value = false }
+}
+async function scClearEvenPlan() {
+  try {
+    await ElMessageBox.confirm(
+      '撤销后回到原有分配方式：按分类优先级顺序，谁在前谁先吃满每小时额度。确定撤销？',
+      '撤销均匀排期', { type: 'warning' })
+  } catch { return }
+  try {
+    const d = await api('/sc/even-plan/clear', { method: 'POST', body: JSON.stringify({ payload: {} }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '撤销失败'); return }
+    ElMessage.success('已撤销均匀排期')
+    await loadScEvenPlan()
+    loadScForecast()
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
 function scSchedName(key) {
   return scGenreCatalog.value.find(c => c.category_key === key)?.name || key
 }
@@ -3626,7 +3673,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.45 · Asia/Shanghai</span>
+          <span>v2.1.46 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5313,7 +5360,38 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段；默认按观影习惯分配 2 小时一段（热门分类排白天、冷门分类排夜间，自动避开静默时段），共 {{ scSchedRows.length }} 类</p></div>
                   <el-button size="small" plain :loading="scSchedSaving" @click="scApplySchedDefaults">一键恢复默认</el-button>
                   <el-button size="small" plain :loading="scAdoptingAllAi" @click="scAdoptAllAi">批量采纳 AI 建议</el-button>
+                  <!-- v2.1.46：一键 AI 调度 —— 只重新分配每个时段「排多少部」，
+                       不动上面这些时段配置，也不动「推荐时间段」里的 AI 建议。 -->
+                  <el-button size="small" type="success" plain :loading="scEvenBusy" @click="scApplyEvenPlan">一键 AI 调度</el-button>
                   <el-button size="small" type="primary" :loading="scSchedSaving" @click="scSaveAllSchedRows">保存</el-button></div>
+                <!-- v2.1.46 均匀排期状态条：生效时数字与「按分类看明细」同源（同一份方案） -->
+                <div class="sc-even-strip">
+                  <template v-if="scEvenPlan.active">
+                    <span class="sc-even-dot on"></span>
+                    <b>均匀排期已生效</b>
+                    <span class="hint">每小时 {{ scEvenPlan.base_cap }} 部（额度来自{{ scEvenPlan.cap_source }}）· 覆盖 {{ scEvenPlan.categories }} 个分类、{{ scEvenPlan.hours }} 个时段 · 合计 {{ scEvenPlan.slots_total }} 部</span>
+                    <span class="hint sc-even-when">生成于 {{ scEvenPlan.generated_at }}</span>
+                    <el-button size="small" text type="primary" @click="scEvenDetailOpen = true">按分类看明细（{{ scEvenPlan.detail.length }}）</el-button>
+                    <el-button size="small" text @click="scClearEvenPlan">撤销</el-button>
+                  </template>
+                  <template v-else>
+                    <span class="sc-even-dot"></span>
+                    <b>均匀排期未启用</b>
+                    <span class="hint">{{ scEvenPlan.hint || '按各分类的待排作品量把每小时的名额分匀，避免少数分类占满整天、其余分类整天轮不到。' }}</span>
+                  </template>
+                </div>
+                <!-- 明细弹窗：一行一个分类，数字与状态条出自同一份方案，点得开、对得上 -->
+                <el-dialog v-model="scEvenDetailOpen" title="均匀排期 · 按分类明细" width="680px" append-to-body>
+                  <p class="hint" v-if="scEvenPlan.generated_at">生成于 {{ scEvenPlan.generated_at }}；额度每小时 {{ scEvenPlan.base_cap }} 部，来自{{ scEvenPlan.cap_source }}。</p>
+                  <el-table :data="scEvenPlan.detail" size="small" max-height="420" stripe>
+                    <el-table-column label="分类" min-width="120"><template #default="s"><b>{{ s.row.name }}</b></template></el-table-column>
+                    <el-table-column label="待排作品" width="100" align="right"><template #default="s">{{ s.row.backlog != null ? s.row.backlog : '—' }}</template></el-table-column>
+                    <el-table-column label="覆盖时段" width="100" align="right"><template #default="s">{{ s.row.hours }}</template></el-table-column>
+                    <el-table-column label="每小时" width="90" align="right"><template #default="s">{{ s.row.per_hour }}</template></el-table-column>
+                    <el-table-column label="合计部数" width="100" align="right"><template #default="s"><b>{{ s.row.works }}</b></template></el-table-column>
+                  </el-table>
+                  <p class="hint">这份方案只决定「每个时段排多少部」，分类时段与时段 AI 建议原样不动；改过分类时段后建议再点一次「一键 AI 调度」重算。</p>
+                </el-dialog>
                 <div class="sc-table-scroll sc-sched-scroll">
                 <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420"
                           ref="scSchedTableRef" @selection-change="scSchedSelection = $event">
@@ -6162,6 +6240,16 @@ button{font-family:inherit}
 .mini-stat:hover{border-color:var(--yg-primary-2);box-shadow:var(--yg-shadow-lg)}
 .mini-stat small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:6px;line-height:1.3}
 .mini-stat b{font-size:18px;font-variant-numeric:tabular-nums;font-weight:750}
+/* v2.1.46：一键 AI 调度 · 均匀排期状态条（只展示「每个时段排多少部」的分配结果） */
+.sc-even-strip{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:0 0 10px;
+  padding:8px 12px;border:1px dashed var(--yg-line);border-radius:var(--yg-radius-sm);
+  background:var(--yg-surface);font-size:12px;color:var(--yg-ink)}
+.sc-even-strip b{font-weight:700}
+.sc-even-strip .hint{margin:0;color:var(--yg-muted)}
+.sc-even-dot{width:7px;height:7px;border-radius:50%;background:var(--yg-muted);flex:0 0 auto}
+.sc-even-dot.on{background:var(--yg-tone-green-fg)}
+.sc-even-when{font-variant-numeric:tabular-nums}
+html.dark .sc-even-strip{background:var(--yg-panel);border-color:var(--yg-line)}
 /* v2.1.44：整体镜像进度（A 库 → B 库）—— 看板不能只有 B 库的数 */
 .mirror-overall{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px;margin-bottom:12px}
 .mo-head{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
