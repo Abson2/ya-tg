@@ -1143,7 +1143,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.38", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.39", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1154,7 +1154,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.38", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.39", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -1847,12 +1847,41 @@ async def _scheduled_mirror() -> None:
                             works_total=int(stats.get("batch_size", 0) or 0),
                             works_done=int(stats.get("media", 0) or 0))
                         db.commit()
+                else:
+                    # v2.1.39：规则被停用 / A、B 库目录 ID 被清空 → 本轮定时镜像什么都没做。
+                    # 上一次若因异常残留了「进行中」快照，页面就会一直显示「复制中」。
+                    # 注意 r 可能是 None：上面按 enabled=True 查，停用规则查不到，
+                    # 这种情形更要归位（否则只能靠重启或等重新启用）。
+                    # **只在旧快照确实是 running 时才归位**：否则会把上一轮成功快照的
+                    # 计数一起清零，看板倒退回 0，比显示「进行中」更误导。
+                    rr = r if r is not None else db.scalar(select(MirrorRule).limit(1))
+                    _prev_running = False
+                    if rr is not None:
+                        try:
+                            _prev_running = bool(
+                                (json.loads(str(getattr(rr, "last_pipeline_json", "") or "{}")
+                                            or "{}") or {}).get("running"))
+                        except Exception:
+                            _prev_running = False
+                    if _prev_running:
+                        _write_pipeline_snapshot(db, rr, mode="定时同步", stage="skipped",
+                                                 running=False)
+                        db.commit()
             except Exception as exc:
                 db.rollback()
                 try:
                     r = db.scalar(select(MirrorRule).limit(1))
                     if r:
                         r.last_status, r.last_message = "failed", str(exc)[:1000]
+                        # v2.1.39（真机反馈）：**异常路径必须写终态帧**。
+                        # 此前这里只写 last_status / last_message，快照就一直停在
+                        # 上面那份 `stage="copy", running=True` 的中间帧 —— 页面上
+                        # 「处理流程」永远显示「复制中」，看着像还在跑，实际早就结束了，
+                        # 而且和 last_status 自相矛盾（用户现场看到 success + 进行中）。
+                        # 手动路径（见 `_do_mirror_run` 的两个 except）一直有这一帧，
+                        # 定时路径漏了，属疏漏；口径与手动路径保持一致。
+                        _write_pipeline_snapshot(db, r, mode="定时同步", stage="failed",
+                                                 running=False)
                         db.commit()
                 except Exception:
                     pass
