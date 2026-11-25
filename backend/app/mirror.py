@@ -415,7 +415,18 @@ def natural_key(name: str) -> tuple:
 
 
 def _has_video(node: dict) -> bool:
-    return any(_is_video(_dir_name(f)) for f in node.get("files") or [])
+    files = node.get("files") or []
+    if any(_is_video(_dir_name(f)) for f in files):
+        return True
+    # v2.1.48：清单**看不全**时不能判「没有视频」。
+    # 老代码只看 `files`：清单被按字符硬截成非法 JSON 后读回空列表，`_has_video`
+    # 判 False → `_subtree_video` 判该目录没有视频 → 作品被 `_discover_works` 跳过，
+    # 整部作品从 A 库消失（真机：完美世界(2021) 184 集）。
+    # 现在只要「有文件但这个目录的清单不可信」就按「有视频」处理：宁可多算一部，
+    # 也不能把作品判没 —— 真正的空目录（n_files=0）仍然判空，分类目录照常下探。
+    if node.get("files_broken") or int(node.get("n_files") or 0) > len(files):
+        return int(node.get("n_files") or 0) > 0
+    return False
 
 
 def _subtree_video(did: str, nodes: dict, cache: dict) -> bool:
@@ -1332,9 +1343,69 @@ async def _list_dir_retry(api: GuangYaWebFiles, parent_id: str, *,
 # 只有列一遍作品目录，才能看到季目录自己的 utime 有没有变。
 MANIFEST_ALWAYS_LIST_DEPTH = 2
 
+# ---------------------------------------------------------------------------
+# v2.1.48（真机事故）：清单落库**绝不能按字符硬截**
+#
+# 取证：「完美世界(2021)」184 个文件、`json.dumps(...)` 恰好 200000 字符，老代码把
+# 这个字符串切到 20 万字符 —— 直接切在 JSON 中间，落库的是一段**非法 JSON**。
+# 下一轮 `load_dir_manifest` 解析失败 → `files=[]`（当成「这个目录没有文件」）→
+# `_subtree_video` 判「没有视频」→ 作品目录被 `_discover_works` 直接跳过 ——
+# 于是 184 个文件对应的作品**从 A 库发现结果里消失**，184 行复制永远失败、
+# 也不会自愈（缓存 utime 没变，轻量扫描一直复用这份坏清单）。
+#
+# 修法两条一起上：
+#   ① 落库改为「预算内**完整装下整条**」：JSON 永远合法，装了多少条另存 `n_files`
+#      真实条数（`n_files > len(files)` 即「清单被截」，不新增列也能判断）；
+#   ② 解析失败不再当成空目录：标 `files_broken`，并把内存里的 utime 归 0 →
+#      本轮强制重列该目录，重列后写回合法 JSON，自愈。
+#
+# 预算单位是**字节**（老代码是字符，中文按 3 字节算，同样的字符数会更小），所以默认
+# 给到 1 MB：184 集这种目录要能一条不落地装下（丢一条 = 少镜像一集）。
+MANIFEST_MAX_FILE_BYTES = 1024 * 1024
+MANIFEST_MAX_CHILDREN_BYTES = 256 * 1024
+
+
+def _dump_items_capped(items: list, max_bytes: int) -> tuple[str, int]:
+    """把条目列表序列化成**合法** JSON，体积不超过 `max_bytes`，返回 (json, 装下的条数)。
+
+    与老代码的区别只有一句：**按整条累加，绝不切字符**。老写法把 json 字符串整个
+    切到 20 万字符，会产出非法 JSON，读取端解析失败后当空目录 —— 一部
+    184 集的剧就这样整部消失。宁可少装几条（剩余条目由 `n_files` 标出「被截」），
+    也不能产出读不回来的字符串。
+    """
+    if not items:
+        return "[]", 0
+    kept: list = []
+    total = 2                                   # "[]"
+    for it in items:
+        piece = json.dumps(it, ensure_ascii=False)
+        cost = len(piece.encode("utf-8")) + (1 if kept else 0)
+        if total + cost > max_bytes:
+            break
+        kept.append(it)
+        total += cost
+    return json.dumps(kept, ensure_ascii=False), len(kept)
+
+
+def _manifest_max_bytes(db: Session, key: str) -> int:
+    """清单单个目录的体积上限（字节）。0 或读不到 → 回落模块默认值。"""
+    try:
+        kb = int(runtime_config.get(db, key) or 0)
+    except (TypeError, ValueError):
+        kb = 0
+    return max(0, kb) * 1024 if kb > 0 else MANIFEST_MAX_FILE_BYTES
+
+
 
 def load_dir_manifest(db: Session, rule_id: int) -> dict[str, dict]:
-    """把上次的 A 库目录清单读进内存（一次查询、零接口调用）。"""
+    """把上次的 A 库目录清单读进内存（一次查询、零接口调用）。
+
+    v2.1.48：解析失败不再静默当成「空目录」——
+      · `files_broken=True` 传下去，`_has_video` 据此**不判「没有视频」**，
+        作品不会因为它从 A 库发现结果里消失；
+      · 内存里的 `utime` 归 0，`_walk_source` 的「缓存可复用」判据必然不成立 →
+        本轮强制重列这个目录，重列后写回合法 JSON，坏行自愈。
+    """
     out: dict[str, dict] = {}
     try:
         rows = db.scalars(select(MirrorDirScan).where(
@@ -1342,23 +1413,39 @@ def load_dir_manifest(db: Session, rule_id: int) -> dict[str, dict]:
     except Exception as exc:      # 老库未迁移等异常：退化成「没有缓存」，走全量
         logger.warning("[mirror] 读取目录清单失败（按无缓存处理）：%s", exc)
         return out
+    broken = 0
     for r in rows:
+        files_broken = False
         try:
             files = json.loads(r.files_json or "[]")
+            if not isinstance(files, list):
+                files, files_broken = [], True
         except Exception:
-            files = []
+            files, files_broken = [], True
+        if files_broken:
+            broken += 1
         try:
             children = json.loads(r.children_json or "[]")
+            if not isinstance(children, list):
+                children = []
         except Exception:
             children = []
         out[str(r.dir_id)] = {
-            "utime": int(r.utime or 0), "files": files, "children": children,
+            # 坏行的 utime 归 0：与真实 utime 对不上，轻量扫描必然重列它
+            "utime": 0 if files_broken else int(r.utime or 0),
+            "files": files, "children": children,
+            # v2.1.48：真实文件条数与「清单是否可信」。两者一起判「看不看得全」
+            "n_files": int(r.n_files or 0), "files_broken": files_broken,
             "name": r.name or "", "path": r.path or "", "parent": r.parent_id or "",
-            "depth": int(r.depth or 0), "n_files": int(r.n_files or 0),
+            "depth": int(r.depth or 0),
             "n_dirs": int(r.n_dirs or 0),
             # v2.1.43：深度兜底判据 —— 深层目录多久没被真列过了
             "last_listed_at": r.last_listed_at,
         }
+    if broken:
+        logger.warning(
+            "[mirror] A 库目录清单有 %d 个目录的文件清单无法解析（多半是老版按字符"
+            "硬截留下的坏行）→ 本轮强制重列这些目录，重列后自动修好", broken)
     return out
 
 
@@ -1370,7 +1457,7 @@ def save_dir_manifest(db: Session, rule_id: int, nodes: dict[str, dict],
     是这一轮的新采样，所以只有它们刷新 `last_listed_at`；其余只刷 `last_seen_at`，
     证明确实还在树上、并把新的 utime 记下来供下一轮比较。
     """
-    out = {"added": 0, "updated": 0, "listed": len(listed or ())}
+    out = {"added": 0, "updated": 0, "listed": len(listed or ()), "truncated": 0}
     try:
         rows = {str(r.dir_id): r for r in db.scalars(select(MirrorDirScan).where(
             MirrorDirScan.rule_id == rule_id)).all()}
@@ -1378,6 +1465,8 @@ def save_dir_manifest(db: Session, rule_id: int, nodes: dict[str, dict],
         logger.warning("[mirror] 目录清单不可写（跳过保存）：%s", exc)
         return out
     now = utcnow()
+    max_files = _manifest_max_bytes(db, "mirror_manifest_max_files_kb")
+    max_children = _manifest_max_bytes(db, "mirror_manifest_max_children_kb")
     for did, node in nodes.items():
         did = str(did)
         row = rows.get(did)
@@ -1407,11 +1496,21 @@ def save_dir_manifest(db: Session, rule_id: int, nodes: dict[str, dict],
         if fresh:
             files = node.get("files") or []
             children = node.get("children") or []
-            row.files_json = json.dumps(files, ensure_ascii=False)[:200000]
-            row.children_json = json.dumps(children, ensure_ascii=False)[:200000]
+            # v2.1.48：**按整条装、绝不切字符**（老写法把 json 字符串切到 20 万字符，
+            # 会写出非法 JSON，读取端当成空目录 → 整部作品从 A 库消失）。
+            row.files_json, kept_files = _dump_items_capped(files, max_files)
+            row.children_json, kept_dirs = _dump_items_capped(children, max_children)
+            # 真实条数（不是「装下几条」）：两者不一致即「清单被截」，
+            # `_has_video` 据此知道「看不到全部文件」，不会误判成没有视频。
             row.n_files = len(files)
             row.n_dirs = len(children)
             row.last_listed_at = now
+            if kept_files < len(files) or kept_dirs < len(children):
+                logger.warning(
+                    "[mirror] 目录 %s 的清单超过体积上限（文件 %d 条存下 %d 条、"
+                    "子目录 %d 条存下 %d 条）—— 已如实记为被截，作品不会被判成空",
+                    did, len(files), kept_files, len(children), kept_dirs)
+                out["truncated"] = int(out.get("truncated", 0)) + 1
     try:
         db.commit()
     except Exception as exc:
@@ -1552,7 +1651,11 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                     "utime": int(c.get("utime") or 0),
                     "depth": int(lv),
                     "files": list(c.get("files") or []),
-                    "children": list(c.get("children") or []), "cached": True}
+                    "children": list(c.get("children") or []), "cached": True,
+                    # v2.1.48：把「清单可信度」一起带进节点 —— 少了这两项，
+                    # 缓存复用的目录会被当成「没有视频」而丢掉整部作品。
+                    "n_files": int(c.get("n_files") or 0),
+                    "files_broken": bool(c.get("files_broken"))}
             nodes[cur] = node
             n += 1
             for _c in node["children"]:
@@ -1581,7 +1684,10 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                     continue
                 c = manifest.get(did)
                 same = (c is not None and int(c.get("utime") or 0) == int(ut or 0)
-                        and c.get("files") is not None)
+                        and c.get("files") is not None
+                        # v2.1.48：清单坏行不可复用 —— 坏行的 utime 已被置 0，
+                        # 这里再挡一次，保证它一定被重列（否则整部作品一直看不到）
+                        and not c.get("files_broken"))
                 if same:
                     cached_dirs += _materialize_cached(did, lv)
                 else:
@@ -1611,7 +1717,9 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
             node = {"id": did, "name": name, "parent": parent, "path": display,
                     "utime": int(ut or 0), "ctime": int(ct or 0),
                     "depth": int(lv),
-                    "files": [], "children": [], "cached": False}
+                    "files": [], "children": [], "cached": False,
+                    # v2.1.48：刚列过的目录文件清单是完整的，可信
+                    "n_files": 0, "files_broken": False}
             nodes[did] = node
             if listed_out is not None:
                 listed_out.add(did)
@@ -1630,6 +1738,7 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                 else:
                     node["files"].append(it)
                     a_files += 1
+            node["n_files"] = len(node["files"])
         frontier = nxt
     if stats is not None:
         stats["walk_dirs"] = len(nodes)
@@ -1640,6 +1749,10 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         # v2.1.43：这轮有多少目录是「用缓存、没真列」的（轻量扫描的核心指标）
         stats["walk_cached_dirs"] = cached_dirs
         stats["walk_light"] = bool(light)
+        # v2.1.48：清单看不全的目录数（坏行 + 被体积上限截断），0 才是「干净」
+        stats["walk_manifest_broken"] = sum(
+            1 for n in nodes.values()
+            if n.get("files_broken") or int(n.get("n_files") or 0) > len(n.get("files") or []))
     return nodes, complete
 
 
@@ -1778,6 +1891,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
              # v2.1.43：本轮扫描模式（light 轻量 / full 全量）与缓存复用目录数
              "walk_scan_mode": "full", "walk_scan_reason": "", "walk_cached_dirs": 0,
              "walk_force_dirs": 0, "walk_manifest_saved": {},
+             # v2.1.48：清单看不全的目录数（坏行 / 被体积上限截断），0 才算干净
+             "walk_manifest_broken": 0,
              # v2.1.41：本轮「已复制作品有新集/变化」的增量优先批次
              "increment_works": 0, "increment_new_files": 0,
              "increment_changed_files": 0, "queue_size": 0, "stock_left": 0,
@@ -2586,6 +2701,13 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     if stats.get("walk_truncated"):
         rule.last_message += (" · ⚠ A 库目录数超过单轮上限，本轮只扫了一部分，"
                              "「已无作品」的清理判定已暂停（不要把没扫到当成已删除）")
+    # v2.1.48：清单看不全的目录必须明示 —— 这是「作品可能漏采」的唯一线索。
+    # 真机事故：一个目录的清单被按字符硬截成非法 JSON，读回空列表，整部作品
+    # 从 A 库发现结果里消失，而页面上一个字都没提。
+    _broken = int(stats.get("walk_manifest_broken") or 0)
+    if _broken:
+        rule.last_message += (f" · ⚠ {_broken} 个目录的清单看不全（老版按字符硬截留下的"
+                              "坏行本轮已强制重列）；若下轮仍出现，把清单体积上限调大")
     # v2.1.41：每轮开始时的增量预检结果如实回显——用户要看到「优先处理了什么」。
     _incr = int(stats.get("increment_works") or 0)
     if _incr:
