@@ -379,8 +379,8 @@ def test_frontend_shows_drift_hint():
 
 def test_version_is_current_everywhere():
     """版本锁（v2.1.47 建立，此后每版随发版一起推进）。"""
-    assert 'version="2.1.48"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert "v2.1.48 · Asia/Shanghai" in APP_VUE
+    assert 'version="2.1.49"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
+    assert "v2.1.49 · Asia/Shanghai" in APP_VUE
     assert json.loads((ROOT / "frontend/package.json").read_text(
-        encoding="utf-8"))["version"] == "2.1.48"
-    assert "当前版本：v2.1.48" in (ROOT / "README.md").read_text(encoding="utf-8")
+        encoding="utf-8"))["version"] == "2.1.49"
+    assert "当前版本：v2.1.49" in (ROOT / "README.md").read_text(encoding="utf-8")

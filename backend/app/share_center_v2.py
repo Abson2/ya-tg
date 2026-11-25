@@ -1472,6 +1472,28 @@ def _category_today_count(db: Session, category_key: str) -> int:
     ) or 0)
 
 
+def _category_today_counts(db: Session) -> dict[str, int]:
+    """**批量**版：当日各分类已建任务数（条），省掉逐分类查库。
+
+    v2.1.49：一键 AI 调度要按「今天这个分类还能推多少」算名额，逐个分类查会
+    在 27 个分类 × 一次点击里打 27 次全表聚合。口径与 `_category_today_count`
+    完全一致（作废任务不计、上海自然日、单位是条）。
+    """
+    now_sh = datetime.now(shanghai_tz())
+    day_start = datetime(now_sh.year, now_sh.month, now_sh.day,
+                         tzinfo=shanghai_tz()).astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    rows = db.execute(
+        select(SCPushListItem.category_key, func.count(SCPublishTask.id))
+        .join(SCPushListItem, SCPublishTask.list_item_id == SCPushListItem.id)
+        .where(SCPublishTask.status.notin_(VOID_TASK_STATUSES),
+               SCPublishTask.created_at >= day_start,
+               SCPublishTask.created_at < day_end)
+        .group_by(SCPushListItem.category_key)
+    ).all()
+    return {str(k): int(n or 0) for k, n in rows if k}
+
+
 def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
     """周期计划**日**配额门禁（v2.1.0 真实消费，此前只落库）。
 
@@ -1810,21 +1832,88 @@ def build_even_plan(db: Session) -> dict[str, Any]:
     open_hours = {c.category_key: _schedule_open_hours(
         sched_map.get(c.category_key), quiet, win) for c in cats}
 
+    # v2.1.49（真机问题：方案把整点额度押在「今天根本排不出」的分类上）
+    # ------------------------------------------------------------------
+    # 真机表现（用户原话）：「20 点整条 0 任务，额度白白作废」。
+    # 根因是名额分配只看「在库待排量」，没看「今天还能不能推」：
+    #   ① 某分类当日已到 `category_day_max`，`plan_engine` 侧的 `_sched_allows_core`
+    #      会直接拒掉它，可方案里照样给它排了名额 → 该整点 0 任务；
+    #   ② 排期表里还可能有一行「动作冒险」这种**没有任何作品归属的分类键**
+    #      （TMDB 官方分类是「动作」「冒险」两条，不存在合并的那种），它有排期行
+    #      但库存恒为 0，同样白占名额。
+    # 现在把「今天真能推多少部」作为唯一可分配量：
+    #   · 可排部数 = min(在库待排量, 今日剩余条数 ÷ 启用渠道数)；
+    #   · 到顶 / 无货的分类不进方案，改为带可读原因进 `skipped` 回显；
+    #   · 权重与每小时上限都用这个可排部数 —— 同一小时里额度只会流向真能出货的分类。
+    # **刻意不做逐小时扣减**：方案是「每小时最多排几部」的上限，不是全天预算切片。
+    # 逐小时扣减会把下午之后的小时写成 0，而用户的排期本来就与入库交替进行
+    # （排完一批又入库），那样只会造成「下午起再也排不出东西」的假象。
+    cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
+    day_cap = max(0, int(cycle.get("day_max") or 0))
+    # 一部作品对每个启用的渠道各建一条任务 → 条数折部数要除以渠道数。
+    # 单渠道部署时除数为 1，与旧行为完全一致。
+    channels_n = max(1, int(db.scalar(
+        select(func.count(Channel.id)).where(Channel.enabled.is_(True))) or 1))
+    today_counts = _category_today_counts(db)
+    room_works: dict[str, int] = {}
+    skipped: list[dict[str, str]] = []
+    for c in cats:
+        key = c.category_key
+        stock = int(backlog.get(key) or 0)
+        if stock <= 0:
+            skipped.append({"name": _category_display_name(key),
+                            "reason": "当前没有在库待排作品"})
+            continue
+        if cycle_day_max:
+            left_tasks = max(0, cycle_day_max - int(today_counts.get(key, 0)))
+            left_works = left_tasks // channels_n
+            if left_works <= 0:
+                skipped.append({"name": _category_display_name(key),
+                                "reason": "今日已达单分类每日上限"})
+                continue
+            stock = min(stock, left_works)
+        room_works[key] = stock
+    if not room_works:
+        at_cap = sum(1 for s in skipped if "上限" in s["reason"])
+        no_stock = len(skipped) - at_cap
+        return {"ok": False,
+                "reason": (f"今天所有分类都排不出作品了：{at_cap} 个已到当日上限、"
+                           f"{no_stock} 个当前没有在库作品。把「单分类每日上限」调大，"
+                           "或者明天再点一次。"),
+                "skipped": skipped}
+
+    # 全局每日总上限（条）也折成部数：已经用满就没必要再生成方案（调度侧
+    # `_cycle_quota_gate` 本来就会整轮拒绝），如实拒绝比给一份假的分配更有用。
+    if day_cap:
+        now_sh = datetime.now(shanghai_tz())
+        day_start = datetime(now_sh.year, now_sh.month, now_sh.day,
+                             tzinfo=shanghai_tz()).astimezone(timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        used_tasks = int(db.scalar(select(func.count(SCPublishTask.id)).where(
+            SCPublishTask.status.notin_(VOID_TASK_STATUSES),
+            SCPublishTask.created_at >= day_start,
+            SCPublishTask.created_at < day_end)) or 0)
+        if (day_cap - used_tasks) // channels_n <= 0:
+            return {"ok": False,
+                    "reason": ("今天的推送总上限已经用完了，再分配也排不出去。"
+                               "明天再点，或者把「单日推送总上限」调大。"),
+                    "skipped": skipped}
+
     items: dict[str, dict[str, int]] = {}
     for h in range(24):
-        cands = [c for c in cats if h in open_hours.get(c.category_key, [])]
+        cands = [c for c in cats
+                 if c.category_key in room_works and h in open_hours.get(c.category_key, [])]
         if not cands:
             continue
-        weights = {c.category_key: max(1, int(backlog.get(c.category_key) or 0))
-                   for c in cands}
+        # 权重 = 今天真能推的部数（不是原始库存）：临近当日上限的分类权重自然变小，
+        # 额度会流向还有余量的分类。
+        weights = {c.category_key: max(1, int(room_works[c.category_key])) for c in cands}
         quotas = _largest_remainder(weights, cap)
-        # v2.1.47：名额必须夹到「这一小时真能排几部」以内（在库存量与单分类每小时
-        # 上限取小），削下来的按剩余余量回流给还有货的分类。此前只有一个「按权重分」
-        # 的静态名额，小分类拿着用不完的名额空转，大分类被自己的配额卡住。
-        room = {c.category_key: max(0, int(backlog.get(c.category_key) or 0))
-                for c in cands}
+        # 名额夹到「这一小时真能排几部」（可排部数 与 单分类每小时上限取小），
+        # 削下来的按剩余余量回流给还有货的分类。
+        room = {c.category_key: int(room_works[c.category_key]) for c in cands}
         if cycle_hour_max:
-            room = {k: (min(v, cycle_hour_max) if v > 0 else 0) for k, v in room.items()}
+            room = {k: min(v, cycle_hour_max) for k, v in room.items()}
         quotas = _fit_quota_to_backlog(quotas, room)
         if quotas:
             items[str(h)] = quotas
@@ -1832,7 +1921,8 @@ def build_even_plan(db: Session) -> dict[str, Any]:
     if not items:
         return {"ok": False,
                 "reason": ("按当前分类时段与静默保护，全天没有任何可排期的小时——"
-                           "先检查分类时间排期与主推送窗口。")}
+                           "先检查分类时间排期与主推送窗口。"),
+                "skipped": skipped}
 
     now_sh = datetime.now(shanghai_tz())
     plan = {
@@ -1847,6 +1937,11 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         # 页面据此对比当前库存，判断方案是不是已经跟不上入库进度
         # （用户原话：「我们的排期是排期完成后又入库的」）。
         "backlog_snapshot": {k: int(v) for k, v in backlog.items() if int(v) > 0},
+        # v2.1.49：今天每个分类**真能推**的部数（在库待排量 与 当日剩余额度取小）。
+        # 页面用它解释「为什么这个分类只分到这么多」，不参与调度。
+        "room_works": {k: int(v) for k, v in room_works.items() if int(v) > 0},
+        # 排不上的分类 + 可读原因（库存空 / 今日已到上限）。
+        "skipped": skipped,
         "items": items,
     }
     cfg[EVEN_PLAN_KEY] = plan
@@ -1879,7 +1974,13 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         "categories": len(cats),
         "hours": len(items),
         "slots_total": plan["slots_total"],
+        # 回显只用中文分类名，**绝不带 `genre:` 这类内部键**（页面红线）。
+        "capacity": sorted(
+            [{"name": _category_display_name(k), "works": int(v)}
+             for k, v in room_works.items()],
+            key=lambda x: (-x["works"], x["name"])),
         "detail": detail,
+        "skipped": skipped,
     }
 
 
@@ -1940,6 +2041,11 @@ def api_even_plan(db: Session = Depends(get_db)):
         "categories": int(plan.get("categories") or 0),
         "hours": int(plan.get("hours") or 0),
         "slots_total": int(plan.get("slots_total") or 0),
+        # v2.1.49：今天每类真能推的部数（中文名）+ 「排不上的分类 + 原因」。
+        # 两者都只用于解释「为什么方案里没有它 / 只分到这么多」，不参与调度。
+        "capacity": [{"name": _category_display_name(k), "works": int(v)}
+                     for k, v in (plan.get("room_works") or {}).items()],
+        "skipped": plan.get("skipped") or [],
         "snapshot_works": int(snapshot_works),
         "current_works": int(current_works),
         "drift": int(drift),

@@ -163,7 +163,7 @@ const scRuleTab = ref('基础规则') // 基础规则 / 分类时间排期
 const scCycleTab = ref('小时')     // 小时 / 日度（周度、月度已于 v2.1.45 下线）
 // v2.1.46 一键 AI 调度 · 均匀排期：只分配「每个时段排多少部」，
 // 不动分类时段配置，也不动时段 AI 建议。
-const scEvenPlan = ref({ active: false, detail: [], hint: '' })
+const scEvenPlan = ref({ active: false, detail: [], skipped: [], capacity: [], hint: '' })
 const scEvenBusy = ref(false)
 const scEvenDetailOpen = ref(false)
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
@@ -3673,7 +3673,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.48 · Asia/Shanghai</span>
+          <span>v2.1.49 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5376,6 +5376,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <span v-if="scEvenPlan.stale" class="hint sc-even-drift">
                       库存已变化 {{ scEvenPlan.drift > 0 ? '+' : '' }}{{ scEvenPlan.drift }} 部（生成时 {{ scEvenPlan.snapshot_works }} 部 → 现在 {{ scEvenPlan.current_works }} 部），建议重新点一次「一键 AI 调度」
                     </span>
+                    <!-- v2.1.49：排不上的分类不再静默消失，状态条上说清楚有几个 -->
+                    <span v-if="scEvenPlan.skipped && scEvenPlan.skipped.length" class="hint sc-even-skip">
+                      另有 {{ scEvenPlan.skipped.length }} 个分类今天排不出作品、没分到名额（点明细看原因）
+                    </span>
                     <el-button size="small" text type="primary" @click="scEvenDetailOpen = true">按分类看明细（{{ scEvenPlan.detail.length }}）</el-button>
                     <el-button size="small" text @click="scClearEvenPlan">撤销</el-button>
                   </template>
@@ -5396,6 +5400,15 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-table-column label="合计部数" width="100" align="right"><template #default="s"><b>{{ s.row.works }}</b></template></el-table-column>
                   </el-table>
                   <p class="hint">这份方案只决定「每个时段排多少部」，分类时段与时段 AI 建议原样不动；改过分类时段后建议再点一次「一键 AI 调度」重算。</p>
+                  <!-- v2.1.49：为什么有的分类方案里没有它 —— 一行一句原因，不藏起来 -->
+                  <div v-if="scEvenPlan.skipped && scEvenPlan.skipped.length" class="sc-even-skip-box">
+                    <p class="hint"><b>本次没有分到名额的分类</b>（今天排不出作品，名额已让给还有库存的分类）</p>
+                    <ul class="sc-even-skip-items">
+                      <li v-for="(s, i) in scEvenPlan.skipped" :key="i">
+                        <b>{{ s.name }}</b><span>：{{ s.reason }}</span>
+                      </li>
+                    </ul>
+                  </div>
                 </el-dialog>
                 <div class="sc-table-scroll sc-sched-scroll">
                 <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420"
@@ -6256,6 +6269,12 @@ button{font-family:inherit}
 .sc-even-when{font-variant-numeric:tabular-nums}
 /* v2.1.47：库存漂移提示（生成时 vs 现在），只在库存真的变了才出现 */
 .sc-even-drift{color:#cf7f1c !important;font-weight:600;font-variant-numeric:tabular-nums}
+/* v2.1.49：没分到名额的分类（今日到顶 / 无库存）。单独成条，不与库存漂移混色 */
+.sc-even-skip{color:#8a6d3b !important;font-variant-numeric:tabular-nums}
+.sc-even-skip-box{margin-top:12px;padding:10px 12px;border:1px solid #f0e0c0;border-radius:8px;background:#fffaf0}
+.sc-even-skip-items{margin:6px 0 0;padding-left:18px;font-size:13px;line-height:1.9}
+.sc-even-skip-items li b{font-weight:600}
+.sc-even-skip-items li span{color:#7a6a4a}
 html.dark .sc-even-strip{background:var(--yg-panel);border-color:var(--yg-line)}
 /* v2.1.44：整体镜像进度（A 库 → B 库）—— 看板不能只有 B 库的数 */
 .mirror-overall{background:var(--yg-surface);border:1px solid var(--yg-line);border-radius:var(--yg-radius-sm);padding:12px 14px;margin-bottom:12px}
