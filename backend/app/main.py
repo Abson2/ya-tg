@@ -1143,7 +1143,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.41", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.42", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1154,7 +1154,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.41", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.42", "app": "Ya-TG"}
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -2999,10 +2999,16 @@ def mirror_status(db: Session = Depends(get_db)):
     retryable_files = list(db.scalars(select(MirrorFile).where(
         MirrorFile.status.in_(sorted(mirror.RETRYABLE_FILE_STATUS))
     ).order_by(MirrorFile.id.desc()).limit(100)).all())
+    # v2.1.42（真机反馈）：自动复制试满上限（运行时配置，默认 3）的文件不再自动排队，
+    # 但**仍然留在这张清单里** —— 它就是「需要人工处理」的入口。这里逐行标出
+    # 已自动尝试几次、是否已停止自动重试，页面据此打标，用户一眼看出该点哪个按钮。
+    _max_att = mirror.max_file_attempts(db)
     retryable_rows = [{"id": f.id, "work": titles.get(f.media_id, ""),
                        "file": f.file_name, "task_id": f.task_id or "",
                        "error": f.error or "", "status": f.status,
-                       "status_label": _file_status_label(f.status)}
+                       "status_label": _file_status_label(f.status),
+                       "attempts": int(f.attempts or 0),
+                       "auto_stopped": mirror.file_attempts_exhausted(f, _max_att)}
                       for f in retryable_files]
     # v2.1.38（真机反馈）：用户确认源文件已删后可手动清理归档。归档行不再计入
     # `files_retryable`，所以「N 项待处理」会如实下降；这里另出一份归档明细，
@@ -3305,6 +3311,12 @@ def mirror_status(db: Session = Depends(get_db)):
             # v2.1.38：用户手动清理归档的行（不含在 files_retryable 里，不计入待处理）
             "files_archived": db.query(MirrorFile).filter(
                 MirrorFile.status == mirror.ARCHIVED_FILE_STATUS).count(),
+            # v2.1.42（真机反馈）：自动试满次数、已停止自动重试、等人工处理的行。
+            # 它们**仍在** files_retryable 里（状态还是「复制失败」），所以这是一个
+            # 子集计数；明细见下方 retryable_files 里 auto_stopped=true 的那些行。
+            "files_auto_stopped": db.query(MirrorFile).filter(
+                MirrorFile.status == "failed",
+                func.coalesce(MirrorFile.attempts, 0) >= mirror.max_file_attempts(db)).count(),
             # v0.8.6：改名进度与卡点
             "files_renamed": db.query(MirrorFile).filter(
                 MirrorFile.rename_status == "done").count(),

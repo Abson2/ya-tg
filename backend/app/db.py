@@ -386,6 +386,8 @@ _COLUMNS = {
         "target_name": "TEXT DEFAULT ''",
         "rename_status": "TEXT DEFAULT ''",
         "rename_error": "TEXT DEFAULT ''",
+        # v2.1.42：自动复制已尝试次数（达上限后不再自动重试，转人工）
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
     },
     # 阶段二路线B：严格顺序执行序列持久化（旧库 ALTER 补列，旧数据默认空/0）
     "mirror_tasks": {

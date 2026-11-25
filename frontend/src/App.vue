@@ -156,7 +156,7 @@ const scSchedSelection = ref([]), scSchedTableRef = ref(null)
 // v2.1.2：分类偏好排名（真实派生：字典优先级 + 已成功推送数），决定高峰独占时段分配
 const scPreference = ref({ items: [], segments: [], peak_segments: [], day_segments: [], night_segments: [], full_day_window: [0, 24], segment_hours: 2, source: '' })
 const scBasicRules = ref({ quick_publish_enabled: 'true', update_detect_minutes: '10', quick_publish_hourly_limit: '3', conflict_policy: 'prefer_release' })
-const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24, week_max: 1200, week_rest_enabled: false, month_max: 5000 })
+const scCyclePlan = ref({ hour_max: 60, category_hour_max: 8, category_day_max: 0, quiet_start: 0, quiet_end: 7, quiet_enabled: false, day_max: 180, window_start: 0, window_end: 24, week_rest_enabled: false })
 const scRuleTab = ref('基础规则') // 基础规则 / 分类时间排期
 const scCycleTab = ref('小时')     // 小时 / 日度 / 周度 / 月度
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
@@ -3554,7 +3554,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.41 · Asia/Shanghai</span>
+          <span>v2.1.42 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3993,16 +3993,17 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
             <p class="hint">这些是历史「清理无效映射」或 B 库清空重整留下的僵尸行：B 库目录已不存在、映射已清，下轮同步会从 A 库自动重建，<b>不需要也不应该手工建目录</b>。勾选后点「重建选中」可立即定向重建，不必等下一轮同步；确认这些行彻底无用时点「清空已清理映射」从清单移除，不影响资源 / 分享 / 队列。</p>
           </div>
           <div v-if="mirrorStatus.retryable_files?.length || mirrorStatus.counts?.files_retryable" class="panel">
-            <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button><el-button size="small" type="warning" plain :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="archiveFiles">清理选中 ({{ fileErrSelected.length }})</el-button></div>
+            <div class="panel-head"><h3>待重试文件</h3><el-tag type="danger" size="small">{{ mirrorStatus.counts?.files_retryable || 0 }} 个</el-tag><el-tag v-if="mirrorStatus.counts?.files_auto_stopped" type="warning" size="small" effect="plain">{{ mirrorStatus.counts.files_auto_stopped }} 项已停止自动重试</el-tag><el-tag v-if="(mirrorStatus.counts?.files_retryable || 0) > (mirrorStatus.retryable_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.retryable_files?.length || 0 }} 条</el-tag><el-button size="small" type="primary" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="retryFailedFiles">批量重试选中 ({{ fileErrSelected.length }})</el-button><el-button size="small" type="warning" plain :loading="mirrorBusy" :disabled="mirrorBusy || !fileErrSelected.length" @click="archiveFiles">清理选中 ({{ fileErrSelected.length }})</el-button></div>
             <div class="table-scroll"><el-table ref="retryTableRef" :data="mirrorStatus.retryable_files || []" size="small" row-key="id" @selection-change="v => fileErrSelected = v.map(x => x.id)">
               <el-table-column type="selection" width="42" align="center" reserve-selection/>
               <el-table-column prop="work" label="作品" min-width="160"/>
               <el-table-column prop="file" label="文件名" min-width="200"/>
               <el-table-column label="状态" width="110"><template #default="s"><span>{{ s.row.status_label || '—' }}</span></template></el-table-column>
+              <el-table-column label="自动重试" width="130"><template #default="s"><el-tag v-if="s.row.auto_stopped" type="warning" size="small">已停止自动处理</el-tag><span v-else>已试 {{ s.row.attempts || 0 }} 次</span></template></el-table-column>
               <el-table-column prop="task_id" label="任务 ID" min-width="140"/>
               <el-table-column label="原因" min-width="320"><template #default="s"><span style="color:#c0392b">{{ s.row.error || '未记录原因' }}</span></template></el-table-column>
             </el-table></div>
-            <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。<br><b>如果确认源文件已在 A 库被删除</b>（补复制客观上不可能成功），勾选后点「清理选中」把它们归档：立刻从待处理里移除、不再每轮重算也不再反复报警；<b>不删任何文件与历史记录</b>，源文件放回 A 库后下一轮同步会自动恢复并重新复制。</p>
+            <p class="hint">这张表和上方「待处理 N 项」里的文件数是<b>同一份数据</b>：待复制 / 复制中 / 复制失败 / 状态待确认四类文件全在这里，一个不漏。此前只列了「复制失败」，<b>「待复制」的文件被算进数字却没有任何清单可点开</b>，于是出现「提示 2 项、点开只有已完成的复制任务」。<br><b>「待复制」是怎么来的</b>：每轮同步会只读核对 B 库，若某条记录标着已同步、但在 B 库里找不到对应文件，系统会把它打回「待复制」并自动重新入复制队列（原因列会写「B 库未找到已同步文件，自动重新复制」）。这是<b>自愈</b>，不是报错，正常情况下下一轮会自己补上。<br><b>如果它反复出现</b>，说明 B 库那边确实没落地（文件被删 / B 库换了目录 / 复制没完成），点「批量重试选中」立即定向重发——只扫这些文件所属作品的 A 库目录、不扫整个源头库，B 库已存在的直接回填不重复复制，成功后自动走入库→识别→推送入队；也可等下一轮「立即同步」全量重试。<br><b>如果确认源文件已在 A 库被删除</b>（补复制客观上不可能成功），勾选后点「清理选中」把它们归档：立刻从待处理里移除、不再每轮重算也不再反复报警；<b>不删任何文件与历史记录</b>，源文件放回 A 库后下一轮同步会自动恢复并重新复制。<br><b>「已停止自动处理」是什么意思</b>：同一个文件自动复制<b>试满 3 次</b>仍不成功（源文件被删、B 库拒收、重名冲突这类永久性失败），系统就不再每轮自动重跑它了——继续硬试只会让那部作品每轮空转、汇总里的「重试 N」永远不归零。这类行<b>仍留在本清单里等你处理</b>，两种走法：① 确认还能救，勾选点「批量重试选中」，会<b>重新给满 3 次机会</b>；② 确认救不回来，勾选点「清理选中」归档。<br><b>限流不算失败</b>：被网盘限流打回的文件只标「待复制」，不消耗这 3 次额度，下一轮有额度会接着试。</p>
           </div>
           <div v-if="mirrorStatus.archived_files?.length || mirrorStatus.counts?.files_archived" class="panel">
             <div class="panel-head"><h3>已手动清理（源文件已删除）</h3><el-tag type="info" size="small">{{ mirrorStatus.counts?.files_archived || 0 }} 项</el-tag><el-tag v-if="(mirrorStatus.counts?.files_archived || 0) > (mirrorStatus.archived_files?.length || 0)" type="info" size="small">仅显示最近 {{ mirrorStatus.archived_files?.length || 0 }} 条</el-tag><el-button size="small" type="danger" plain style="margin-left:auto" :loading="mirrorBusy" :disabled="mirrorBusy || !archivedSelected.length" @click="purgeArchivedFiles">删除选中记录 ({{ archivedSelected.length }})</el-button></div>
@@ -5143,12 +5144,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <label class="hint">主推送窗口止<br><el-input-number v-model="scCyclePlan.window_end" :min="1" :max="24" size="small"/></label>
                   </template>
                   <template v-else-if="scCycleTab==='周度'">
-                    <label class="hint">每周推送总配额<br><el-input-number v-model="scCyclePlan.week_max" :min="0" size="small"/></label>
                     <label class="hint">周度休闲窗口<br><el-switch v-model="scCyclePlan.week_rest_enabled"/></label>
+                    <p class="hint sc-source-note">周推送总配额已下线（v2.1.42）：推送量只按<b>日上限</b>控，一周推多少由每天的日上限自然累计，不再有第二道周闸门。这里只剩「到点暂停普通排期」的休止窗口。</p>
                   </template>
                   <template v-else>
-                    <label class="hint">月度推送总量配额<br><el-input-number v-model="scCyclePlan.month_max" :min="0" size="small"/></label>
                     <label class="hint">月度休刊<br><el-switch v-model="scCyclePlan.month_rest_enabled"/></label>
+                    <p class="hint sc-source-note">月推送总量配额已下线（v2.1.42）：同上，只按日上限控量。这里只剩「月末最后一天暂停普通排期」的休刊开关。</p>
                   </template>
                 </div>
               </div>

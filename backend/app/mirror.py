@@ -300,6 +300,57 @@ RETRYABLE_FILE_STATUS = {"pending", "copying", "failed", "unknown"}
 # 不物理删除，历史行与执行记录必须留），源文件放回 A 库后下一轮同步会按同一行
 # 复活重新复制（见 sync_rule 里 archived_rows 的分支）。
 ARCHIVED_FILE_STATUS = "archived"
+# v2.1.42（真机反馈）：单个文件**自动**复制尝试上限的兜底值（真值走运行时配置
+# `mirror_max_file_attempts`，缺省即此值）。达上限后：
+#   · 不再进 `retry_rows`（不会被自动补复制）；
+#   · 不再让所属作品进 `_works_with_pending_files`（不会被每轮无条件排到队首）；
+#   · 状态仍是 `failed`、原因里写清「已停止自动重试，需人工处理」——
+#     所以它依然出现在「待重试文件」清单里，人工可「批量重试选中」（清零重算）
+#     或「清理选中」（归档）。
+MAX_FILE_ATTEMPTS_FALLBACK = 3
+
+
+def max_file_attempts(db: Session) -> int:
+    """当前生效的「自动复制最多试几次」。只读运行时配置，缺省/非法值回落 3。"""
+    try:
+        raw = runtime_config.get(db, "mirror_max_file_attempts")
+        val = int(str(raw).strip() or MAX_FILE_ATTEMPTS_FALLBACK)
+    except (TypeError, ValueError):
+        val = MAX_FILE_ATTEMPTS_FALLBACK
+    return max(1, val)
+
+
+def file_attempts_exhausted(row, limit: int) -> bool:
+    """这一行是否已经「自动试满、该停手了」。
+
+    只对 `failed` 生效：`pending` / `copying` / `unknown` 一律继续自动重试 ——
+    限流打回的 pending 不是真失败，不该吃掉重试额度。
+    """
+    return (str(getattr(row, "status", "") or "") == "failed"
+            and int(getattr(row, "attempts", 0) or 0) >= int(limit or 1))
+
+
+# 达上限后追加在原因后面的说明。必须让用户看懂「为什么不再自动跑了、我该点哪里」。
+AUTO_STOP_NOTE = ("。已自动尝试 {n} 次仍未成功，已停止自动重试，需人工处理："
+                  "勾选这一行点「批量重试选中」会重新给 {n} 次机会，"
+                  "或点「清理选中」把它归档（归档不删文件，源文件放回来会自动恢复）")
+
+
+def mark_file_failed(row, msg: str, limit: int) -> int:
+    """把一个文件行标记为复制失败，并累加「已自动尝试次数」。
+
+    返回累加后的次数。达到上限时在原因后追加 `AUTO_STOP_NOTE`，让页面直接告诉
+    用户「已停止自动处理、下一步该点哪里」——不再只是把失败原因重复写一遍。
+    """
+    n = int(getattr(row, "attempts", 0) or 0) + 1
+    row.attempts = n
+    row.status = "failed"
+    text = str(msg or "").strip() or "复制失败（未记录原因）"
+    if n >= int(limit or 1):
+        text = text + AUTO_STOP_NOTE.format(n=int(limit or 1))
+    row.error = text[:500]
+    row.updated_at = utcnow()
+    return n
 # v0.9.6：prune 已清理的目录映射标记。带此标记的 missing 行是「B 库不存在、映射已清、
 # 下轮同步从 A 库重建」的僵尸行，不需用户手工建目录；展示层据此从「待创建目录」排除，
 # 并在用户确认后由 /api/mirror/mappings/clear-pruned 真正删除（不违反自动 prune 不删行的红线）。
@@ -435,12 +486,21 @@ def _works_with_pending_files(db: Session, rule_id: int) -> set[str]:
 
     口径：MirrorFile.status ∈ RETRYABLE_FILE_STATUS（pending/copying/failed/unknown）
     的行，按其所属 MirrorMedia.work_key 归集。**只读，不改任何状态**。
+
+    v2.1.42（真机反馈）：**自动试满上限的失败行不再算「待处理」**。这类文件是
+    永久性失败（源文件被删、B 库拒收、重名冲突），每轮排它到队首只会让那部作品
+    每轮重做一遍、汇总里的「重试 N」永远不归零。现在它们归人工处理：行还在
+    「待重试文件」清单里，但不再自动排队。pending / copying / unknown 不受影响
+    （限流打回的 pending 不是真失败，不该吃掉额度）。
     """
+    limit = max_file_attempts(db)
     rows = db.execute(
         select(MirrorMedia.work_key)
         .join(MirrorFile, MirrorFile.media_id == MirrorMedia.id)
         .where(MirrorMedia.rule_id == rule_id,
-               MirrorFile.status.in_(sorted(RETRYABLE_FILE_STATUS)))
+               MirrorFile.status.in_(sorted(RETRYABLE_FILE_STATUS)),
+               or_(MirrorFile.status != "failed",
+                   func.coalesce(MirrorFile.attempts, 0) < limit))
     ).all()
     return {str(k or "") for (k,) in rows if str(k or "").strip()}
 
@@ -1458,6 +1518,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # v2.1.13：跳过时按文件落 sequence 行，序号从这里连续推进（供「恢复被跳过项」）。
     seq_no = 0
     stats["purged_legacy"] = _purge_legacy_failed(db, rule.id)
+    # v2.1.42（真机反馈）：自动复制最多试几次（运行时配置，缺省 3）。整轮只读一次。
+    _max_att = max_file_attempts(db)
+    stats["max_file_attempts"] = _max_att
+    stats["files_auto_stopped"] = 0   # 本轮结束时按库内实况回填（见 last_message 段）
     # v2.1.41：A 树必须走全量。老代码 `max_dirs` 默认 400 且撞上限不报错 →
     # 线上 1436+ 个目录每轮只看到约 28%，「A库共 N 部」是个残缺视图，
     # 用户要的「按顺序把 A 库全量镜像过去」在数据层面永远达不成。
@@ -1768,8 +1832,15 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             synced_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
                            for m in all_rows if m.status == "synced"}
             synced_identities = {m.identity for m in all_rows if m.status == "synced"}
+            # v2.1.42（真机反馈）：自动试满上限的失败行**不再进自动重试**。
+            # 永久性失败（源文件被删 / B 库拒收 / 重名冲突）每轮被拉起来重做一遍，
+            # 只会让那部作品每轮空转、汇总里的「重试 N」永远不归零。这类行留给人工：
+            # 仍在「待重试文件」清单里，可「批量重试选中」或「清理选中」。
+            # 注意只排 `failed` 且次数达上限的行 —— pending / copying / unknown 照常重试。
             retry_rows = {(m.source_file_id, _fp_size(m.fingerprint)): m
-                          for m in all_rows if m.status in RETRYABLE_FILE_STATUS}
+                          for m in all_rows
+                          if m.status in RETRYABLE_FILE_STATUS
+                          and not file_attempts_exhausted(m, _max_att)}
             # v2.1.38（真机反馈）：用户手动归档过的行，源文件回到 A 库后按**同一行**复活。
             # 不复用就必须新建行，而 (media_id, source_file_id, fingerprint) 是唯一键，
             # 归档行还留在库里 → 新插入直接撞唯一约束。所以复活走这里，不新建。
@@ -1892,7 +1963,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     target_parent = sub_id
                 if not target_parent:
                     if row is not None:
-                        row.status, row.error = "failed", "B 库子目录未就绪，本次未发起复制"
+                        # v2.1.42：走统一失败出口，累加自动尝试次数并在达上限时改人工
+                        mark_file_failed(row, "B 库子目录未就绪，本次未发起复制", _max_att)
                         stats["file_errors"].append(f"{title}/{fname}：B 库子目录未就绪")
                     stats["skipped"] += 1
                     continue
@@ -1934,9 +2006,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     else:
                         why = ("A 库该文件内容已变化，旧记录不再补复制（已按新文件重新排队）")
                         stats["source_changed"] = int(stats.get("source_changed", 0) or 0) + 1
-                    row.status, row.error = "failed", why
+                    # v2.1.42：统一失败出口。这两类都是「自动补复制客观上做不成」，
+                    # 一直挂着只会每轮重算一遍；累加次数到达上限后转人工处理。
+                    mark_file_failed(row, why, _max_att)
                     row.target_file_id = ""
-                    row.updated_at = utcnow()
                     stats["file_errors"].append(f"{title}/{row.file_name}：{why}")
                     del retry_rows[(_fid, _fps)]
                 db.commit()
@@ -2047,10 +2120,12 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                         for row, _fid in chunk:
                             # v2.1.9：限流耗尽的行标记为 pending（待重试），不是 failed ——
                             # 限流是瞬时状态，下一轮有额度就该再试；真失败才写 failed。
+                            # v2.1.42：只有真失败才累加自动尝试次数（限流的 pending 不吃额度，
+                            # 否则三次限流就把一个完全健康的文件判成「需人工处理」）。
                             if RENAME_RATE_LIMIT_MARK in msg:
                                 row.status, row.error = "pending", msg
                             else:
-                                row.status, row.error = "failed", msg
+                                mark_file_failed(row, msg, _max_att)
                         stats["errors"].append(
                             f"{title}/{len(chunk)} 个文件批量复制失败 {msg[:160]}")
                         stats["file_errors"].extend(
@@ -2077,7 +2152,8 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     stats["done"] += 1
                 elif task.status == "failed":
                     for r_ in rows:
-                        r_.status, r_.error = "failed", task.error
+                        # v2.1.42：复制任务真失败 → 累加自动尝试次数，达上限转人工
+                        mark_file_failed(r_, task.error, _max_att)
                     stats["failed"] += 1
                     msg = (f"{title}：复制任务 {task.task_id} 失败"
                            f"（{task.error or 'status=' + (task.raw_status or '未知')}）")
@@ -2173,6 +2249,19 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         rule.last_message += (
             f" · 增量优先 {_incr} 部（新增 {int(stats.get('increment_new_files') or 0)} 项"
             f" · 变化 {int(stats.get('increment_changed_files') or 0)} 项）")
+    # v2.1.42（真机反馈）：有文件自动试满次数已被停手时，必须让用户看到「有几项卡住、
+    # 归谁处理」——否则它们只是从数字里消失，用户以为已经自愈。
+    try:
+        _stopped = int(db.scalar(select(func.count(MirrorFile.id)).where(
+            MirrorFile.rule_id == rule.id,
+            MirrorFile.status == "failed",
+            func.coalesce(MirrorFile.attempts, 0) >= _max_att)) or 0)
+    except Exception:
+        _stopped = int(stats.get("files_auto_stopped") or 0)
+    stats["files_auto_stopped"] = _stopped
+    if _stopped:
+        rule.last_message += (f" · 已停止自动重试 {_stopped} 项（自动试满 {_max_att} 次，"
+                             "等人工处理：在「待重试文件」里批量重试或清理选中）")
     if max_works > 0:
         _left = int(stats.get("stock_left", max(0, stats.get("total_works", 0)
                                                 - stats["batch_size"])) or 0)
@@ -3406,6 +3495,9 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
         MirrorTask.rule_id == rule.id, MirrorTask.status.in_(["pending", "running", "unknown"]))).all())
     done = 0
     failed = 0
+    # v2.1.42：这条路径也是自动重试（补轮询历史任务），失败同样要累加尝试次数，
+    # 否则一个永远失败的任务能被反复轮询、永远挂在「状态待确认」。
+    _lim = max_file_attempts(db)
     for task in tasks:
         task.status = "running"
         rows = list(db.scalars(select(MirrorFile).where(
@@ -3423,7 +3515,7 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
             # v0.8.4：明确失败的任务把文件标 failed，下一轮同步会重新发起复制
             failed += 1
             for row in rows:
-                row.status, row.error = "failed", task.error
+                mark_file_failed(row, task.error, _lim)
             if task.media_id:
                 media = db.get(MirrorMedia, task.media_id)
                 if media:
@@ -3536,6 +3628,13 @@ async def retry_failed_files(db: Session, rule: MirrorRule, file_ids: list[int],
     rows = list(db.scalars(select(MirrorFile).where(
         MirrorFile.rule_id == rule.id, MirrorFile.id.in_(ids))).all())
     by_id = {r.id: r for r in rows}
+    # v2.1.42（人工介入入口）：手动「批量重试选中」= 用户明确要求再试一次 →
+    # **清零已自动尝试次数**，重新给满额度。否则自动路径刚试满的文件，人工点完
+    # 一次失败后仍会被判「已停止自动重试」，自动侧再也不接手，用户会觉得点了没用。
+    for r in rows:
+        if int(getattr(r, "attempts", 0) or 0):
+            r.attempts = 0
+    db.commit()
     # 按作品分组：一部作品只 walk 一次 A 目录 + 列一次 B 库候选
     groups: dict[int, list] = {}
     for fid in ids:

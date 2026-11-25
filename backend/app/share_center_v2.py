@@ -1456,11 +1456,17 @@ def _category_today_count(db: Session, category_key: str) -> int:
 
 
 def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
-    """周期计划日/周/月配额与休止窗口门禁（v2.1.0 真实消费，此前只落库）。
+    """周期计划**日**配额与休止窗口门禁（v2.1.0 真实消费，此前只落库）。
 
-    统计口径：当日/周/月已提交的任务数（submitted_at 或 created_at 落库时间），
-    0 = 不限。休止窗口命中时直接拦截（周末/月末指定小时后停普通排期），
-    quiet 已在调用方处理。返回 (是否拦截, 原因)。
+    v2.1.42（用户口径）：**周 / 月限额已下线，只保留日度限额**。
+    原来 `week_max` / `month_max` 与日上限并排拦截，但周/月额度长期远未触顶、
+    只会让「到底被哪一层拦了」变得难解释；用户明确要求砍掉这两层，只按天控量。
+    库里保存的旧 `week_max` / `month_max` 值**原样保留**（历史配置不删、不清零），
+    只是不再参与任何判定 —— 想恢复成按周/月控量需要改代码，不是改配置。
+
+    统计口径：当日已建任务数（按 created_at 落库时间），0 = 不限。
+    休止窗口命中时直接拦截（周末/月末指定小时后停普通排期），quiet 已在调用方处理。
+    返回 (是否拦截, 原因)。
     """
     now_sh = datetime.now(shanghai_tz())
     # 周度休止：如「周六 20:00 后暂停普通排期」
@@ -1483,18 +1489,17 @@ def _cycle_quota_gate(db: Session, cycle: dict[str, Any]) -> tuple[bool, str]:
                 hour=0, minute=0, second=0, microsecond=0)
         return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-    checks = (("day_max", "day"), ("week_max", "week"), ("month_max", "month"))
+    # v2.1.42：只剩日度一层。周 / 月不再参与判定（故意留在这里的是「只按天控量」
+    # 这一条口径，不是漏配——前端也已撤掉那两个输入框）。
+    checks = (("day_max", "day"),)
     for key, kind in checks:
         cap = int(cycle.get(key) or 0)
         if cap <= 0:
             continue
         start = period_start(now_sh, kind).astimezone(timezone.utc)
-        if kind == "day":
-            end = start + timedelta(days=1)
-        elif kind == "week":
-            end = start + timedelta(days=7)
-        else:
-            end = (period_start(now_sh, kind) + timedelta(days=32)).replace(day=1).astimezone(timezone.utc)
+        # v2.1.42：只剩「日」这一层，窗口固定一天。周 / 月分支已随功能下线删除，
+        # 不留死代码（否则以后有人看到分支会以为还能按周/月控量）。
+        end = start + timedelta(days=1)
         used = db.scalar(select(func.count(SCPublishTask.id)).where(
             SCPublishTask.created_at >= start, SCPublishTask.created_at < end)) or 0
         if int(used) >= cap:
@@ -2530,11 +2535,10 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     # （`_cycle_quota_gate`，读的是发布规则的 `cycle_plan.day_max/week_max/month_max`
     # 与休止窗口）也接到预测侧来 —— 此前只有实跑消费它，于是额度吃满时出现
     # 「实跑 0 部、排期表照旧预测一堆」的同屏矛盾（v2.1.19 红线：预测与实跑同口径）。
+    # v2.1.42（用户口径）：周 / 月限额已下线，这里只剩日度与休止窗口。
     quota_blocked, quota_code = _cycle_quota_gate(db, cycle)
     quota_reason = {
         "day_quota": "今日推送部数已达发布规则上限",
-        "week_quota": "本周推送部数已达发布规则上限",
-        "month_quota": "本月推送部数已达发布规则上限",
         "weekly_rest": "已到本周休止时段，普通排期暂停",
         "monthly_rest": "已到本月休止日，普通排期暂停",
     }.get(quota_code, "已达发布规则上限")
@@ -6909,8 +6913,10 @@ def api_save_basic_rules(body: Payload, db: Session = Depends(get_db)):
 CYCLE_PLAN_DEFAULTS = {
     "hour_max": 60, "category_hour_max": 8, "quiet_start": 0, "quiet_end": 7,
     "quiet_enabled": False, "day_max": 180, "window_start": 0, "window_end": 24,
-    "week_max": 1200, "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
-    "month_max": 5000, "month_rest_enabled": False,
+    # v2.1.42（用户口径）：周 / 月限额下线，只保留日度限额。休止窗口是另一件事
+    # （到点停普通排期），保留。
+    "week_rest_enabled": False, "week_rest_day": 6, "week_rest_hour": 20,
+    "month_rest_enabled": False,
     # v2.1.6：单分类每日上限——分类排期表移除「日上限」列后，
     # 分类级日限流统一由周期计划约束（此前无处可配，分类级日限流是死配置）。
     "category_day_max": 0,
@@ -6936,8 +6942,8 @@ def api_save_cycle_plan(body: Payload, db: Session = Depends(get_db)):
     saved = {k: body.payload.get(k, v) for k, v in CYCLE_PLAN_DEFAULTS.items() if k in body.payload}
     cycle = {**CYCLE_PLAN_DEFAULTS, **(cfg.get("cycle_plan") or {}), **saved}
     # 数值夹逼，防非法输入破坏调度
-    for k in ("hour_max", "category_hour_max", "category_day_max",
-              "day_max", "week_max", "month_max"):
+    # v2.1.42：周 / 月限额已下线，不再接受这两个键的写入（旧值原样留在 config_json 里）。
+    for k in ("hour_max", "category_hour_max", "category_day_max", "day_max"):
         cycle[k] = max(0, int(cycle.get(k) or 0))
     for k in ("quiet_start", "window_start", "week_rest_hour"):
         cycle[k] = max(0, min(23, int(cycle.get(k) or 0)))
@@ -7021,8 +7027,8 @@ def api_diagnostics(db: Session = Depends(get_db)):
             "category_hour_max": int(cycle.get("category_hour_max") or 0),
             "category_day_max": int(cycle.get("category_day_max") or 0),
             "day_max": int(cycle.get("day_max") or 0),
-            "week_max": int(cycle.get("week_max") or 0),
-            "month_max": int(cycle.get("month_max") or 0),
+            # v2.1.42：周 / 月限额已下线，规则体检不再回显这两项（配了也不生效）。
+            "quota_scope": "day_only",
             "category_schedules_enabled": int(db.scalar(select(func.count(SCCategorySchedule.id)).where(
                 SCCategorySchedule.enabled.is_(True))) or 0),
             "quick_publish_enabled": _on(runtime_config.get(db, "sc_quick_publish_enabled")),

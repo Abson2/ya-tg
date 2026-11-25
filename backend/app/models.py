@@ -502,6 +502,10 @@ class MirrorFile(Base):
     utime: Mapped[int] = mapped_column(BigInteger, default=0)
     fingerprint: Mapped[str] = mapped_column(String(128), default="")      # size + utime
     status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/copying/synced/superseded/failed
+    # v2.1.42（真机反馈）：自动复制**已尝试次数**。达到上限（运行时配置
+    # `mirror_max_file_attempts`，默认 3）后不再自动重试，改由人工在「待重试文件」
+    # 里定向重试（清零重算）或清理归档。只由自动路径累加，手动重试不占这个额度。
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     task_id: Mapped[str] = mapped_column(String(64), default="")
     error: Mapped[str] = mapped_column(Text, default="")
     # v0.8.6：B 库改名结果。rename_status: ""(未处理)/done/failed/skipped_ascii。

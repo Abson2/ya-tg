@@ -154,25 +154,31 @@ def test_forecast_resumes_when_rule_raises_the_cap():
     assert out["today_total"] > 0
 
 
-def test_week_quota_also_comes_from_rule():
-    """周上限同一套口径，不是只有日的写死/漏接。"""
+def test_week_quota_is_retired_and_no_longer_blocks():
+    """v2.1.42（用户口径）：周限额功能已下线，配了也不再拦截。
+
+    注意：这条是**行为侧**回归，真正的守门人是下面的源码契约
+    （`checks` 只剩日度一层、且窗口只有一天）—— 单靠行为断言不够，
+    因为窗口已经不具备「按周统计」的能力。
+    """
     with SessionLocal() as db:
         _seed(db, cycle={"week_max": 1}, already=1)
         out = sc2.forecast_schedule(db)
+        engine = sc2.plan_engine(db)
 
-    assert _predicted(out) == [], "周额度已满却还在预测"
-    tells = [h.get("blocked") for h in out["hours"]] + list(out["notes"])
-    assert any("本周" in str(t) for t in tells), f"没说明是本周额度满了：{tells}"
+    assert engine.get("quota") != "week_quota", f"周限额应已下线，实际仍拦：{engine}"
+    assert _predicted(out), "周限额已下线，预测不该被拦空"
 
 
-def test_month_quota_also_comes_from_rule():
+def test_month_quota_is_retired_and_no_longer_blocks():
+    """v2.1.42（用户口径）：月限额功能同样下线（行为侧回归，见上一条说明）。"""
     with SessionLocal() as db:
         _seed(db, cycle={"month_max": 1}, already=1)
         out = sc2.forecast_schedule(db)
+        engine = sc2.plan_engine(db)
 
-    assert _predicted(out) == [], "月额度已满却还在预测"
-    tells = [h.get("blocked") for h in out["hours"]] + list(out["notes"])
-    assert any("本月" in str(t) for t in tells), f"没说明是本月额度满了：{tells}"
+    assert engine.get("quota") != "month_quota", f"月限额应已下线，实际仍拦：{engine}"
+    assert _predicted(out), "月限额已下线，预测不该被拦空"
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +189,9 @@ def test_forecast_and_engine_share_the_same_quota_gate():
            / "backend/app/share_center_v2.py").read_text(encoding="utf-8")
     # def 一行 + plan_engine 一处 + forecast 一处
     assert src.count("_cycle_quota_gate(") >= 3, \
-        "预测侧没有复用 plan_engine 的日/周/月额度门禁"
-    # 上限从发布规则（cycle）读，不写死
-    assert 'checks = (("day_max", "day"), ("week_max", "week"), ("month_max", "month"))' in src
+        "预测侧没有复用 plan_engine 的额度门禁"
+    # v2.1.42：只剩日度一层（周/月限额已下线，勿把这两个键加回来）
+    assert 'checks = (("day_max", "day"),)' in src, "额度门禁应只剩日度一层"
+    assert '"week_max"' not in src and '"month_max"' not in src, \
+        "周/月限额已下线，代码里不应再出现这两个键"
     assert "cap = int(cycle.get(key) or 0)" in src
