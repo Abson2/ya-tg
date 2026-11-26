@@ -1167,7 +1167,8 @@ def _sched_allows_core(sched: SCCategorySchedule | None, *,
                        per_category_count: int,
                        cycle_hour_max: int,
                        cycle_day_max: int,
-                       today_count: int = 0) -> bool:
+                       today_count: int = 0,
+                       check_window: bool = True) -> bool:
     """纯判定：该分类在 `hour` 点这一刻是否允许排期。**不访问数据库**。
 
     判定顺序与 `plan_engine` 原闭包逐条一致：
@@ -1175,18 +1176,23 @@ def _sched_allows_core(sched: SCCategorySchedule | None, *,
       ② 小时不在窗口内 → 拒绝（支持跨午夜窗口）；
       ③ 已达分类每小时上限 → 拒绝；
       ④ 已达分类当日上限 → 拒绝。
+
+    v2.1.53（空档补位）：新增 `check_window`。补位时段里，方案是**跨分类时段窗口**
+    指定的（否则「剧情」永远进不了 15 点，等于补不了），所以那几小时只跳过 ②，
+    ③④ 两条上限照旧全部生效 —— 补位绝不能突破每小时 / 每日额度。
     """
     if sched is None:
         return True
-    ws, we = _sched_window_for(sched, weekday)
-    if we > ws:
-        in_win = ws <= hour < we
-    elif we < ws:
-        in_win = hour >= ws or hour < we      # 跨午夜
-    else:
-        in_win = True                          # 起止相同 = 全天
-    if not in_win:
-        return False
+    if check_window:
+        ws, we = _sched_window_for(sched, weekday)
+        if we > ws:
+            in_win = ws <= hour < we
+        elif we < ws:
+            in_win = hour >= ws or hour < we      # 跨午夜
+        else:
+            in_win = True                          # 起止相同 = 全天
+        if not in_win:
+            return False
     if cycle_hour_max and per_category_count >= cycle_hour_max:
         return False
     if cycle_day_max and today_count >= cycle_day_max:
@@ -1756,6 +1762,82 @@ def _even_allows(quota: dict[str, int] | None, category_key: str, used: int) -> 
     return cap > 0 and int(used) < cap
 
 
+# ---------------------------------------------------------------------------
+# v2.1.53：空档时段补位（用户原话：「能否让 ai 一键调度后让无作品的分类让作品多的
+# 分类做替补，弥补时段无作品可推的情况」）
+#
+# 真机（2026-11-26 15:04）：方案生成了、额度 60 也生效了，但 12–17 点在方案里**完全
+# 没有配额** —— 那几小时的分类（未分类到上限 / 儿童 / 纪录 / 冒险 / 肥皂剧 / 西部 /
+# 动作冒险）要么没货、要么已到日上限，`build_even_plan` 凑不出候选就 `continue`，
+# 于是「额度再大也没用」：没有可分配的对象。
+#
+# 注意这不是「同段内让位」不够用 —— 同段内的让位 `_fit_quota_to_backlog` 早就做了。
+# 缺的只有一种情况：**整个时段的分类一个都出不了货**，只能跨时段借人。
+#
+# 三条边界（改代码才动，不是配置）：
+#   ① 只补**当前小时到当天 24 点**：已经过去的小时补了也没意义（用户拍板的口径）；
+#   ② 绝不突破用户主动关掉的时间：主推送窗口之外、静默保护之内一律不补；
+#      「可发布时间」是硬约束，「哪个分类发」才是可以商量的；
+#   ③ 不发明额度：`cap` 仍只来自发布规则，「每小时 / 每日上限」照旧全部生效。
+# ---------------------------------------------------------------------------
+def _borrow_enabled(db: Session) -> bool:
+    """空档补位开关（`sc_even_borrow_enabled`，默认开）。读不到按开处理。"""
+    try:
+        raw = str(runtime_config.get(db, "sc_even_borrow_enabled") or "true")
+    except Exception:
+        return True
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _hour_open_for_borrow(hour: int, quiet: tuple[int, int] | None,
+                          win: tuple[int, int] | None) -> bool:
+    """补位小时必须落在「用户明确允许发布的时间」内。
+
+    主推送窗口之外 / 静默保护之内 → 一律不补。用户把某段时间关掉是明确的意思表示，
+    不能用「补位」把它绕开。
+    """
+    hour = int(hour)
+    if win and not (int(win[0]) <= hour < int(win[1])):
+        return False
+    if quiet and _in_quiet_hour(hour, quiet):
+        return False
+    return True
+
+
+def _borrow_quota(room_works: dict[str, int], cap: int,
+                  cycle_hour_max: int) -> dict[str, int]:
+    """空档时段按「全库今天真能推的部数」分一份配额。
+
+    用的是与正常小时**同一套** `_largest_remainder` + `_fit_quota_to_backlog`：
+    额度只有 `cap` 一份，削下来的回流给还有货的分类 —— 不新增任何额度来源。
+    作品多的分类多担、作品少的少担，正是用户说的「让作品多的分类做替补」。
+    """
+    weights = {k: max(1, int(v)) for k, v in (room_works or {}).items() if int(v) > 0}
+    if not weights or int(cap) <= 0:
+        return {}
+    quotas = _largest_remainder(weights, int(cap))
+    room = dict(weights)
+    if cycle_hour_max:
+        room = {k: min(v, int(cycle_hour_max)) for k, v in room.items()}
+    return _fit_quota_to_backlog(quotas, room)
+
+
+def _borrowed_hours(plan: dict[str, Any]) -> set[int]:
+    """方案里的「补位时段」（方案没生成过 / 老方案没这个字段 → 空集，行为零变化）。"""
+    raw = (plan or {}).get("borrowed_hours")
+    if not isinstance(raw, list):
+        return set()
+    out: set[int] = set()
+    for x in raw:
+        try:
+            h = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= h < 24:
+            out.add(h)
+    return out
+
+
 def _category_hour_counts(db: Session, hour_start: datetime) -> dict[str, int]:
     """本小时**已经建好**的分类作品数（上海自然小时，按 created_at 落库时间）。
 
@@ -1900,10 +1982,24 @@ def build_even_plan(db: Session) -> dict[str, Any]:
                     "skipped": skipped}
 
     items: dict[str, dict[str, int]] = {}
+    borrowed: list[int] = []
+    # v2.1.53：补位只算「当前小时 → 当天 24 点」。已经过去的小时补了也没意义，
+    # 而且是用户拍板的口径（「只补当前和未来到 24 点的区间」）。
+    now_hour = datetime.now(shanghai_tz()).hour
+    borrow_on = _borrow_enabled(db)
     for h in range(24):
         cands = [c for c in cats
                  if c.category_key in room_works and h in open_hours.get(c.category_key, [])]
         if not cands:
+            # 空档补位：本小时窗口内的分类全都没货 / 全到上限 → 从全库有货的分类里
+            # 按「今天真能推的部数」分一份配额补上，记进 `borrowed_hours`。
+            # 调度侧据此只跳过「分类自己的时段窗口」这一条，每小时/每日上限照旧生效。
+            if (borrow_on and h >= now_hour
+                    and _hour_open_for_borrow(h, quiet, win)):
+                _bq = _borrow_quota(room_works, cap, cycle_hour_max)
+                if _bq:
+                    items[str(h)] = _bq
+                    borrowed.append(h)
             continue
         # 权重 = 今天真能推的部数（不是原始库存）：临近当日上限的分类权重自然变小，
         # 额度会流向还有余量的分类。
@@ -1942,6 +2038,9 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         "room_works": {k: int(v) for k, v in room_works.items() if int(v) > 0},
         # 排不上的分类 + 可读原因（库存空 / 今日已到上限）。
         "skipped": skipped,
+        # v2.1.53：这几个小时是「窗口内分类都没货」的空档，由库存最多的分类补位。
+        # 调度侧只据此跳过「分类自己的时段窗口」，其余上限一律照旧。
+        "borrowed_hours": list(borrowed),
         "items": items,
     }
     cfg[EVEN_PLAN_KEY] = plan
@@ -1981,6 +2080,9 @@ def build_even_plan(db: Session) -> dict[str, Any]:
             key=lambda x: (-x["works"], x["name"])),
         "detail": detail,
         "skipped": skipped,
+        # v2.1.53：补位时段（回显用）。页面据此提示「哪几个小时是库存最多的分类补位」。
+        "borrowed_hours": list(borrowed),
+        "borrow_enabled": bool(borrow_on),
     }
 
 
@@ -2019,9 +2121,15 @@ def api_even_plan(db: Session = Depends(get_db)):
             row = per_cat.setdefault(key, {"hours": 0, "works": 0})
             row["hours"] += 1
             row["works"] += int(n)
+    # v2.1.53：补上 `backlog`（在库待排作品数）。此前这里漏写这个字段，前端只能写
+    # 「backlog != null ? 值 : '—'」→ 整列永远显示「—」，用户看到的是「方案生成了
+    # 却一部待排作品都没有」的假象（真机 2026-11-26：那一列全是「—」）。
+    # 口径与 `build_even_plan` 的 detail 一致：取方案生成那一刻的库存快照。
+    _snap = plan.get("backlog_snapshot") or {}
     detail = [{"name": _category_display_name(k), "hours": v["hours"],
                "works": v["works"],
-               "per_hour": round(v["works"] / v["hours"], 2) if v["hours"] else 0}
+               "per_hour": round(v["works"] / v["hours"], 2) if v["hours"] else 0,
+               "backlog": int(_snap.get(k) or 0)}
               for k, v in per_cat.items()]
     detail.sort(key=lambda x: (-x["works"], x["name"]))
     # v2.1.47：库存漂移（生成时 vs 现在）。取不到当前库存时如实报 0 差额并标不可比。
@@ -2050,6 +2158,9 @@ def api_even_plan(db: Session = Depends(get_db)):
         "current_works": int(current_works),
         "drift": int(drift),
         "stale": bool(current_works >= 0 and drift != 0),
+        # v2.1.53：哪几个小时是「窗口内分类都没货」的空档、由库存最多的分类补位。
+        # 前端据此在这几个小时上加提示，别让人以为分类时段配置失效了。
+        "borrowed_hours": sorted(_borrowed_hours(plan)),
         "detail": detail,
     }
 
@@ -2443,17 +2554,24 @@ def plan_engine(db: Session) -> dict[str, int]:
         select(SCCategory).where(SCCategory.enabled.is_(True))
         .order_by(SCCategory.priority.desc(), SCCategory.id)
     ).all())[:category_limit]
+    # v2.1.53：均匀排期方案整轮只读一次。下面两处都要用：
+    # ① `even_quota`（本小时各分类还能出几部）；② `borrowed_hours`（空档补位时段）。
+    # 补位时段里方案是**跨分类时段窗口**指定的 —— 所以那几小时要跳过「单分类缩表」
+    # 和「分类自己的窗口」两条判定，否则补了也排不出来（用户要的就是别空着）。
+    sh_hour = datetime.now(shanghai_tz()).hour
+    even_plan = even_plan_of(db, version)
+    borrowed_hours = _borrowed_hours(even_plan)
     # v2.0.4：小时分类排期真正驱动调度——当前时段绑定了真实分类时，只为该分类生成任务。
     # 绑定 key 不在启用分类字典中（如分类被停用）时退回全局轮转，不产出空清单。
+    # v2.1.53：补位时段不缩表 —— 绑定分类正是「没货才需要补位」的那个，缩了就没得补。
     hour_window = _current_hour_window(db, version)
-    if hour_window and hour_window.category_key:
+    if hour_window and hour_window.category_key and sh_hour not in borrowed_hours:
         scoped = [c for c in categories if c.category_key == hour_window.category_key]
         if scoped:
             categories = scoped
     # v2.1.0：SCCategorySchedule 分类-时间排期真实生效——每分类按自己的窗口时段与
     # hourly/daily 上限过滤。此前整表只落库不被消费，前端配的排期不产生调度效果。
     # 某分类未启用排期行/配了窗口但当前小时不在窗口内 → 跳过该分类；上限 0 = 不限。
-    sh_hour = datetime.now(shanghai_tz()).hour
     # v2.1.4：周维度配置生效——按**当天星期**取该分类配置的那一天时段。
     # 没有周维度配置的行走原来的单一 window_start/window_end 口径（向后兼容）。
     iso_weekday = datetime.now(shanghai_tz()).isoweekday()
@@ -2470,7 +2588,7 @@ def plan_engine(db: Session) -> dict[str, int]:
     cycle_day_max = max(0, int(cycle.get("category_day_max") or 0))
     # v2.1.46：均匀排期配额（没生成过 → None，下面所有判定原样走老路）。
     # 只影响「本小时这个分类还能再出几部」，不改任何时段配置。
-    even_quota = even_hour_quota(even_plan_of(db, version), sh_hour)
+    even_quota = even_hour_quota(even_plan, sh_hour)
     even_used: dict[str, int] = {}
     if even_quota is not None:
         hour_start = datetime.now(shanghai_tz()).replace(
@@ -2502,7 +2620,10 @@ def plan_engine(db: Session) -> dict[str, int]:
                                   per_category_count=per_category_count,
                                   cycle_hour_max=cycle_hour_max,
                                   cycle_day_max=cycle_day_max,
-                                  today_count=today)
+                                  today_count=today,
+                                  # v2.1.53：补位时段只跳过「分类自己的时段窗口」，
+                                  # 每小时 / 每日上限仍然全部生效。
+                                  check_window=sh_hour not in borrowed_hours)
 
 
     # v2.1.1：清单不再每轮新建。此前每轮 plan_engine 都用 uuid 建一条新 SCPushList，
@@ -3194,6 +3315,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
     # 全部走老路径）。这里同时把「已建任务」按分类×小时统计出来，作为配额的已用部位，
     # 与 plan_engine 的 `_category_hour_counts` 同源，保证预测与实跑算同一笔账。
     even_plan = even_plan_of(db, version)
+    # v2.1.53：补位时段。预测必须与 `plan_engine` 同步放行「分类自己的时段窗口」，
+    # 否则同一个小时实跑排得出、预测却是 0 —— 那就是骗用户（v2.1.19 红线）。
+    borrowed_hours = _borrowed_hours(even_plan)
     built_key_counts: dict[int, dict[str, int]] = {}
     if even_plan:
         for _h in (built_by_hour or {}):
@@ -3351,7 +3475,8 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
 
         cats = kept
         bound_key = str(getattr(win, "category_key", "") or "") if win else ""
-        if bound_key:
+        # v2.1.53：补位时段不缩表（绑定分类正是没货才要补的那个），与 plan_engine 同源。
+        if bound_key and h not in borrowed_hours:
             scoped = [c for c in kept if c.category_key == bound_key]
             if scoped:
                 cats = scoped
@@ -3439,7 +3564,9 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
                                       per_category_count=cat_counts.get(key, 0),
                                       cycle_hour_max=cycle_hour_max,
                                       cycle_day_max=cycle_day_max,
-                                      today_count=today_counts.get(key, 0)):
+                                      today_count=today_counts.get(key, 0),
+                                      # v2.1.53：补位时段与实跑同一份放行口径
+                                      check_window=h not in borrowed_hours):
                 continue
             built = 0
             titles: list[str] = []

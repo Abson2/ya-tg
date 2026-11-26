@@ -143,6 +143,15 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "sc_quick_publish_enabled": ("sc_quick_publish_enabled", "true"),
     "sc_update_detect_minutes": ("sc_update_detect_minutes", "10"),
     "sc_quick_publish_hourly_limit": ("sc_quick_publish_hourly_limit", "3"),
+    # v2.1.53（用户原话：「能否让 ai 一键调度后让无作品的分类让作品多的分类做替补，
+    # 弥补时段无作品可推的情况」）：空档时段补位。
+    # 一键调度时，若某个整点「窗口内的分类全都没货／全到上限」，方案会从**全库还有货的
+    # 分类**里按「真能推的部数」分一份配额补上，这些小时记为「补位时段」。
+    # 边界（改代码才动，不是配置）：补位**绝不突破用户主动关掉的时间** —— 主推送窗口之外、
+    # 静默保护之内、小时窗口没覆盖到的小时，一律不补；分类自己的时段窗口才会被让位
+    # （否则「剧情」永远进不了 15 点，等于没法补）。
+    # 填 false = 关闭，回到「空档就空着」的旧行为（方案与排期都与改前一致）。
+    "sc_even_borrow_enabled": ("sc_even_borrow_enabled", "true"),
     "sc_conflict_policy": ("sc_conflict_policy", "prefer_release"),
     # 阶段二（资源库解耦）灰度开关：true=识别入口只发资源事件（携带 channel_targets），
     # 推送决策完全由分享中心 consume_resource_events→submit_to_dispatch 新链接管；

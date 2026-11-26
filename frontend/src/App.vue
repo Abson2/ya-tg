@@ -3657,7 +3657,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.52 · Asia/Shanghai</span>
+          <span>v2.1.53 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5364,6 +5364,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <span v-if="scEvenPlan.skipped && scEvenPlan.skipped.length" class="hint sc-even-skip">
                       另有 {{ scEvenPlan.skipped.length }} 个分类今天排不出作品、没分到名额（点明细看原因）
                     </span>
+                    <!-- v2.1.53：空档补位。这几个小时原本一个可排的分类都没有，方案改让
+                         库存最多的分类补上 —— 必须说出来，否则会被误读成「分类时段配置失效了」。 -->
+                    <span v-if="scEvenPlan.borrowed_hours && scEvenPlan.borrowed_hours.length" class="hint sc-even-borrow">
+                      其中 {{ scEvenPlan.borrowed_hours.map(h => h + ' 点').join('、') }} 原本没有有货的分类，已改由库存最多的分类补位
+                    </span>
                     <el-button size="small" text type="primary" @click="scEvenDetailOpen = true">按分类看明细（{{ scEvenPlan.detail.length }}）</el-button>
                     <el-button size="small" text @click="scClearEvenPlan">撤销</el-button>
                   </template>
@@ -5384,6 +5389,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-table-column label="合计部数" width="100" align="right"><template #default="s"><b>{{ s.row.works }}</b></template></el-table-column>
                   </el-table>
                   <p class="hint">这份方案只决定「每个时段排多少部」，分类时段与时段 AI 建议原样不动；改过分类时段后建议再点一次「一键 AI 调度」重算。</p>
+                  <p class="hint" v-if="scEvenPlan.borrowed_hours && scEvenPlan.borrowed_hours.length">
+                    补位说明：{{ scEvenPlan.borrowed_hours.map(h => h + ' 点').join('、') }} 这个时段的分类今天都排不出作品，方案改让库存最多的分类来补。
+                    你自己关掉的时段（主推送窗口外、静默保护内）不会被补位占用。
+                  </p>
                   <!-- v2.1.49：为什么有的分类方案里没有它 —— 一行一句原因，不藏起来 -->
                   <div v-if="scEvenPlan.skipped && scEvenPlan.skipped.length" class="sc-even-skip-box">
                     <p class="hint"><b>本次没有分到名额的分类</b>（今天排不出作品，名额已让给还有库存的分类）</p>
@@ -6260,6 +6269,8 @@ button{font-family:inherit}
 .sc-even-drift{color:#cf7f1c !important;font-weight:600;font-variant-numeric:tabular-nums}
 /* v2.1.49：没分到名额的分类（今日到顶 / 无库存）。单独成条，不与库存漂移混色 */
 .sc-even-skip{color:#8a6d3b !important;font-variant-numeric:tabular-nums}
+/* v2.1.53：空档补位提示 —— 与「排不上的分类」同色系，但用蓝底区分「这不是问题，是补救」 */
+.sc-even-borrow{color:#1f5f8b !important;font-variant-numeric:tabular-nums}
 .sc-even-skip-box{margin-top:12px;padding:10px 12px;border:1px solid #f0e0c0;border-radius:8px;background:#fffaf0}
 .sc-even-skip-items{margin:6px 0 0;padding-left:18px;font-size:13px;line-height:1.9}
 .sc-even-skip-items li b{font-weight:600}
