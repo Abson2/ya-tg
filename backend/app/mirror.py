@@ -1696,6 +1696,95 @@ def pending_work_dirs(db: Session, rule_id: int) -> set[str]:
     return {str(x) for x in rows if str(x or "").strip()}
 
 
+# ---------- v2.1.52：轻量扫描「必列」按业务角色判，不按层数 ----------
+# 真机事故（2026-11-26）：「庶女 (2026)」A 库 S01E01–E06 整批换源（新 fileId、
+# size 3–5 亿 → 15–21 亿、2160p.HDR Vivid），B 库与 DB 仍旧版，几天不动。
+#
+# 根因不是 utime 判据错，而是「必列哪几层」被硬编码成层数：
+#   `MANIFEST_ALWAYS_LIST_DEPTH = 2` 的注释写的是「0=源根、1=分类目录、2=作品目录」，
+#   这个前提只在**分类只有一级**时成立。一旦是多级分类
+#   （`A根/国产剧/古装/庶女/Season 1`），作品根落到 depth 3 → 走「缓存可复用」
+#   分支 → `_materialize_cached` 把季目录的**旧 utime** 一起带进 A 树 → 季目录
+#   也被判「未变」→ 换源产生的新 fileId 永远进不了 A 树，`detect_increments`
+#   无从发现。唯一能补的通道只剩 24 小时深度兜底。
+#
+# 修法不是加深层数（那等于慢慢退回全量），而是把判据换成业务角色：
+#   · **已知作品目录**（`MirrorMedia.source_dir_id`）每轮必列 —— 列它的唯一目的
+#     就是拿到季目录的**实时 utime**（作品目录自身 utime 不会变，见常量注释）；
+#   · 这些目录的**分类祖先链**也每轮必列 —— 多级分类层不列，新增作品
+#     （分类目录里多出一个子目录）同样看不见。
+# 祖先链靠 `manifest[dir]["parent"]` 内存追溯，零接口请求。
+#
+# 红线：本函数只决定「列哪几层」，**绝不向下传染**（那是「有未完成文件」时
+# `force_dirs` 的语义）。季/集目录仍由 utime + 深度兜底决定，轻量扫描不退化。
+ALWAYS_LIST_MAX_ANCHOR = 64        # 祖先前追溯的防御性上限（parent 成环也不死循环）
+
+
+def known_work_dirs(db: Session, rule_id: int) -> set[str]:
+    """本规则**已建立映射**的作品在 A 库侧的目录 id。读不到就返回空集，不阻断同步。"""
+    try:
+        rows = db.scalars(select(MirrorMedia.source_dir_id).where(
+            MirrorMedia.rule_id == rule_id)).all()
+    except Exception as exc:
+        logger.warning("[mirror] 读取已知作品目录失败（本轮不做按角色必列）：%s", exc)
+        return set()
+    return {str(x).strip() for x in rows if str(x or "").strip()}
+
+
+def always_list_limit(db: Session) -> int:
+    """按角色必列的每轮上限。返回 0=全部，-1=关闭，N>0=每轮最多 N 部（轮转）。
+
+    `mirror_always_list_works`：留空或 `all` = 全部作品每轮必列（默认，单级分类
+    结构下与 v2.1.51 的调用量完全相同）；`off` / `0` = 关闭本机制（退回 v2.1.51
+    行为，只靠层数判据）；填 N = 每轮取「最久没真列过」的 N 部，N 轮覆盖全库。
+    """
+    raw = str(runtime_config.get(db, "mirror_always_list_works") or "").strip().lower()
+    if not raw or raw == "all":
+        return 0
+    if raw in ("off", "none", "0"):
+        return -1
+    return int(raw) if raw.isdigit() else 0
+
+
+def _pick_stalest_dirs(dirs: set[str], manifest: dict[str, dict], limit: int) -> list[str]:
+    """按「上次真列的时刻」升序取前 `limit` 个；没有采样时刻的排最前（最饿）。"""
+    def _age(did: str) -> float:
+        node = manifest.get(did) or {}
+        ts = as_utc(node.get("last_listed_at"))
+        return ts.timestamp() if ts else 0.0
+    return sorted(dirs, key=lambda d: (_age(d), d))[:max(0, int(limit or 0))]
+
+
+def always_list_dirs(db: Session, rule_id: int,
+                     manifest: dict[str, dict] | None = None) -> set[str]:
+    """v2.1.52：轻量扫描「每轮必列」的目录集合（已知作品目录 + 其分类祖先链）。
+
+    返回的目录**只列这一层、不向下传染**：列作品目录是为了拿季目录的实时 utime，
+    列分类目录是为了发现新增作品。季/集目录照旧只按 utime 下探。
+    """
+    work_dirs = known_work_dirs(db, rule_id)
+    if not work_dirs:
+        return set()
+    limit = always_list_limit(db)
+    if limit < 0:                     # 配置为 off：退回 v2.1.51 的纯层数判据
+        return set()
+    manifest = manifest or {}
+    if limit > 0 and len(work_dirs) > limit:
+        work_dirs = set(_pick_stalest_dirs(work_dirs, manifest, limit))
+    out: set[str] = set()
+    for did in work_dirs:
+        cur = did
+        for _ in range(ALWAYS_LIST_MAX_ANCHOR):
+            if not cur or cur in out:
+                break
+            out.add(cur)
+            node = manifest.get(cur)
+            if not node:
+                break
+            cur = str(node.get("parent") or "")
+    return out
+
+
 def plan_light_scan(db: Session, rule_id: int, manifest: dict[str, dict], *,
                     deep_minutes: int = 0) -> dict:
     """v2.1.43：决定这一轮「轻量扫描」还是「全量建清单」。
@@ -1707,8 +1796,8 @@ def plan_light_scan(db: Session, rule_id: int, manifest: dict[str, dict], *,
          那一支就会一直被缓存挡住，永远看不到新集。周期全量是唯一的自愈通道；
       3. 调用方显式要求（`sync_rule?full=1`，排查用）。
     """
-    info = {"light": bool(manifest), "force_dirs": set(), "deep_due": False,
-            "reason": "", "deep_minutes": int(deep_minutes or 0)}
+    info = {"light": bool(manifest), "force_dirs": set(), "always_dirs": set(),
+            "deep_due": False, "reason": "", "deep_minutes": int(deep_minutes or 0)}
     if not manifest:
         info["reason"] = "首次运行，生成 A/B 目录清单"
         return info
@@ -1725,7 +1814,16 @@ def plan_light_scan(db: Session, rule_id: int, manifest: dict[str, dict], *,
                 info["reason"] = f"深层目录已 {int(deep_minutes)} 分钟未全量核对，本轮改为全量"
                 break
     if info["light"] and not info["reason"]:
-        info["reason"] = "轻量扫描：分类与作品层照列，更深目录只下探有变化的"
+        # v2.1.52：按角色必列 —— 已知作品目录 + 分类祖先链，不看层数。
+        # 只在轻量轮算：全量轮本来就整棵列，算了也用不上（省一次查询）。
+        try:
+            info["always_dirs"] = always_list_dirs(db, rule_id, manifest)
+        except Exception as exc:
+            logger.warning("[mirror] 计算按角色必列目录失败（本轮退回层数判据）：%s", exc)
+            info["always_dirs"] = set()
+        _n_always = len(info["always_dirs"])
+        info["reason"] = ("轻量扫描：分类与作品层照列，更深目录只下探有变化的"
+                          + (f"（按角色必列 {_n_always} 个目录）" if _n_always else ""))
     return info
 
 
@@ -1737,6 +1835,7 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
                        manifest: dict | None = None,
                        light: bool = False,
                        force_dirs: set[str] | None = None,
+                       always_dirs: set[str] | None = None,
                        listed_out: set[str] | None = None) -> tuple[dict[str, dict], bool]:
     """只读遍历 A 库目录树，返回 {dirId: 节点} 与批次完整性。
 
@@ -1772,12 +1871,25 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         用户能一眼看出「这轮到底真列了多少、复用多少」。
       - `listed_out`（可选出参）：本轮**真的发过列目录请求**的目录 id 集合。缓存复用的
         不进去 —— 调用方只应拿它去刷新清单的采样时间，不能被缓存冒充成新采样。
+
+    v2.1.52（真机事故：多级分类下换源永远同步不过去）：
+      - 新增 `always_dirs`：**不看层数**、每轮必须真列的目录（已知作品目录 + 其分类
+        祖先链，由 `always_list_dirs()` 算出）。原因：`MANIFEST_ALWAYS_LIST_DEPTH=2`
+        只在「分类只有一级」时等于「分类 + 作品」；多级分类时作品落到 depth 3 →
+        被 caching 挡住 → 季目录的实时 utime 拿不到 → 换源的新 fileId 进不了 A 树。
+      - `always_dirs` **只列这一层，不向下传染**（与 `force_dirs` 严格区分）：
+        传染就等于对这些作品做全量下探，轻量扫描直接废掉。季/集目录仍只按 utime 下探。
+      - 因 `always_dirs` 真列了的目录数记进 `stats["walk_always_listed"]`，
+        `last_message` 能回显，用户能看出「这轮多列的是哪些层」。
     """
     root = str(root_id or "*")
     nodes: dict[str, dict] = {}
     manifest = manifest or {}
     # 复制一份：命中「有未完成文件」的目录会把强制下探**向下传染**给子目录
     force = set(force_dirs or ())
+    # v2.1.52：按角色必列的目录 —— **故意不传染**，所以单独一份，绝不并进 force
+    always = {str(x) for x in (always_dirs or ()) if str(x or "").strip()}
+    always_listed = 0
     complete = True
     a_files = 0
     list_calls = 0
@@ -1837,6 +1949,13 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
             for t in level:
                 did, _nm, _pth, _par, lv, ut, _ct = t
                 if lv <= MANIFEST_ALWAYS_LIST_DEPTH or did in force:
+                    still.append(t)
+                    continue
+                # v2.1.52：已知作品目录 / 其分类祖先链 —— 不看层数，每轮必列。
+                # 只列**这一层**：列作品目录拿到的是季目录的实时 utime，下一层的季
+                # 目录照旧按 utime 判，所以不会退化成全量。
+                if did in always:
+                    always_listed += 1
                     still.append(t)
                     continue
                 c = manifest.get(did)
@@ -1906,6 +2025,9 @@ async def _walk_source(api: GuangYaWebFiles, root_id: str,
         # v2.1.43：这轮有多少目录是「用缓存、没真列」的（轻量扫描的核心指标）
         stats["walk_cached_dirs"] = cached_dirs
         stats["walk_light"] = bool(light)
+        # v2.1.52：按角色必列的真实开销 —— 有多少目录是「因为它是作品/分类」才多列的
+        stats["walk_always_dirs"] = len(always)
+        stats["walk_always_listed"] = always_listed
         # v2.1.48：清单看不全的目录数（坏行 + 被体积上限截断），0 才是「干净」
         stats["walk_manifest_broken"] = sum(
             1 for n in nodes.values()
@@ -2095,7 +2217,10 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     nodes, complete = await _walk_source(
         api, rule.source_root_id, max_dirs=_walk_max, stats=stats,
         concurrency=_walk_conc, manifest=_manifest, light=_plan["light"],
-        force_dirs=_plan["force_dirs"], listed_out=_listed)
+        force_dirs=_plan["force_dirs"], listed_out=_listed,
+        # v2.1.52：按角色必列（已知作品目录 + 分类祖先链）。不传就等于退回
+        # 「只看层数」的老判据，多级分类下换源又会同步不过去。
+        always_dirs=_plan.get("always_dirs") or set())
     if not complete:
         raise WebFileError("A 库分页不完整，已中止本次镜像（禁止用不完整批次做变更）")
     stats["walk_manifest_saved"] = save_dir_manifest(db, rule.id, nodes, _listed)
@@ -2864,6 +2989,11 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         _forced = int(stats.get("walk_force_dirs") or 0)
         if _forced:
             rule.last_message += f"（{_forced} 部有未完成文件的作品已强制重查）"
+        # v2.1.52：多级分类下作品层不在「按层数必列」范围内，靠角色补列才能发现
+        # 换源/加集。多列了多少必须能被核对，否则用户无法判断轻量扫描有没有退化。
+        _always = int(stats.get("walk_always_listed") or 0)
+        if _always:
+            rule.last_message += f"（含 {_always} 个作品或分类目录的定点补查）"
     elif _manifest:
         rule.last_message += f" · 本轮全量核对：{stats['walk_scan_reason'] or '按周期全量核对'}"
         if _cached:
