@@ -268,7 +268,14 @@ def test_build_skips_quiet_hours():
     assert hours, "静默之外的小时必须有排期"
 
 
-def test_build_respects_category_window():
+def test_built_hours_are_inside_each_category_window():
+    """v2.1.54：一键调度**会重排分类时段**（用户口径「调整当前及后续排期分类、
+    时间搭配，填充无排期的空白时段」），所以「方案不会排到 8–10 以外」这条
+    旧断言已经不成立了。
+
+    现在锁的是更本质的一条：方案里每个「分类 × 小时」都必须落在**该分类自己的
+    时段（主段 + 额外段）**内 —— 绝不允许把分类排到它自己的窗口之外。
+    """
     with SessionLocal() as db:
         ver = _seed(db, cycle={"hour_max": 0})
         db.add(SCCategorySchedule(plan_version_id=ver.id, category_key=CAT_A,
@@ -278,17 +285,37 @@ def test_build_respects_category_window():
         _set_hourly(db, 3)
         out = sc2.build_even_plan(db)
         plan = sc2.even_plan_of(db)
+        sched = {r.category_key: r
+                 for r in db.scalars(select(SCCategorySchedule)).all()}
 
     assert out["ok"] is True, out
-    a_hours = {int(h) for h, row in plan["items"].items() if CAT_A in row}
-    assert a_hours <= {8, 9}, f"分类只配了 8–10 点，方案却排到 {sorted(a_hours)}"
+    for h, row in plan["items"].items():
+        for key in row:
+            s = sched.get(key)
+            if s is None:
+                # 没有排期行 = 不设时段限制（既有兼容语义：`_sched_allows_core` 的 ①）。
+                # 这个测试类只给 CAT_A 建了排期行，CAT_B 走的正是这条分支。
+                continue
+            wins = ([(int(s.window_start or 0), int(s.window_end or 0))]
+                    + sc2._sched_extra_windows(s))
+            assert any(sc2._hour_in_window(int(h), a, b) for a, b in wins), (
+                f"{key} 被排到 {h} 点，但它的时段是 {wins}")
 
 
-def test_build_never_touches_category_schedule():
-    """用户红线：不能影响原有的分类时段和时段的 AI 建议。"""
-    cols = ("window_start", "window_end", "week_windows", "ai_window_start",
-            "ai_window_end", "ai_week_windows", "hourly_limit", "daily_limit",
-            "enabled", "window_auto", "ai_adopted")
+def test_build_only_retimes_never_touches_limits():
+    """v2.1.54：一键调度**允许改时段**（用户明确要求「调整当前及后续排期分类、
+    时间搭配，填充无排期的空白时段」），但下面八列一个都不许动：
+
+      · `week_windows` / `ai_week_windows` / `ai_window_*` —— 周维度配置与 AI 建议；
+      · `hourly_limit` / `daily_limit` —— 限流上限（被改 = 限流失效）；
+      · `enabled` —— 启用状态（被改 = 用户关掉的分类被偷偷打开）；
+      · `ai_adopted` —— 采纳标记。
+
+    同时锁住「改出来的时段必须合法」：主段必须还是 2 小时颗粒度的段池成员，
+    额外段必须落在 0-24 内 —— 不许出现 25 点、负数、或 3 小时的怪窗口。
+    """
+    cols = ("week_windows", "ai_window_start", "ai_window_end", "ai_week_windows",
+            "hourly_limit", "daily_limit", "enabled", "ai_adopted")
     with SessionLocal() as db:
         ver = _seed(db, cycle={"hour_max": 0})
         db.add(SCCategorySchedule(
@@ -305,11 +332,23 @@ def test_build_never_touches_category_schedule():
         out = sc2.build_even_plan(db)
         db.expire_all()
         after = {}
-        for row in db.scalars(select(SCCategorySchedule)).all():
+        rows_after = list(db.scalars(select(SCCategorySchedule)).all())
+        for row in rows_after:
             after[row.category_key] = tuple(getattr(row, c) for c in cols)
 
     assert out["ok"] is True, out
-    assert before == after, "生成均匀排期改动了分类排期行（时段或 AI 建议被覆盖）"
+    assert before == after, "一键调度动了不该动的列（周维度配置 / AI 建议 / 上限 / 启用状态）"
+
+    # 时段合法性：主段必须来自段池；额外段必须 0-24 且起 < 止
+    valid = set(sc2.CATEGORY_WINDOW_SEGMENTS) | {sc2.FULL_DAY_WINDOW, (8, 24), (0, 8)}
+    for row in rows_after:
+        if row.category_key not in before:
+            continue
+        assert (int(row.window_start or 0), int(row.window_end or 0)) in valid, (
+            f"{row.category_key} 的主时段 "
+            f"{row.window_start}-{row.window_end} 不在合法段池里")
+        for s, e in sc2._sched_extra_windows(row):
+            assert 0 <= s < e <= 24, f"{row.category_key} 的额外时段 {s}-{e} 非法"
 
 
 def test_build_body_has_no_schedule_write():

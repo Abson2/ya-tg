@@ -427,6 +427,15 @@ def test_publisher_dedup_survives_second_dispatch(env, monkeypatch):
         r = _teddy_resource(db)
         ch = _bot_channel(db)
         _publish_task(db, resource_ids=[r.id])
+        # v2.1.54：分类时段改为「段数按库存、段位按热门」之后，本分类可能只拿到
+        # 某个固定的 2 小时段，冻结时刻不一定落在里面 —— dispatch 会先因时段不符
+        # 跳过，队列里就没有行。这对「去重」这个断言纯属噪声（本用例验的不是时段）。
+        # 把分类时段放宽到全天，让断言与真实墙钟时段无关；生产行为不受影响。
+        from app.models import SCCategorySchedule
+        for _sched in db.scalars(select(SCCategorySchedule)).all():
+            _sched.window_start, _sched.window_end = 0, 24
+            _sched.extra_windows = ""
+        db.commit()
         # 第一轮：入队
         asyncio.run(sc2.dispatch_ready_tasks(db, limit=20))
         q = db.scalar(select(QueueItem))

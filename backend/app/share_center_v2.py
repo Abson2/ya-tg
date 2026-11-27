@@ -26,6 +26,9 @@ from . import runtime_config, utils
 from .db import get_db
 from .guangya import GuangYaShareClient, create_share_parsed
 from .push_gate import evaluate_push_gate
+# v2.1.54：genre 名归一的**唯一入口**。资源库分组（main.py）与本文件的主分类
+# 必须共用它 —— 此前各写一份，导致同一部作品在三个页面显示成三个分类。
+from .tmdb import genre_name_cn as _genre_name_cn
 from .models import (
     AuditLog,
     Channel,
@@ -218,6 +221,11 @@ def _category_display_name(category_key: str) -> str:
         return "未分类"
     # 归一化后的中文名仍可能是有效 TMDB 分类（字典按 normalize 生成，此处兜底匹配）
     tail = key.split(":", 1)[-1]
+    # v2.1.54：先把 tail 过一遍官方归一。`genre:scifi&fantasy` 这种脏键
+    # 认得出是「科幻奇幻」就直接给中文名，不必等迁移跑完才显示对。
+    cn = _genre_name_cn(tail)
+    if cn and utils.normalize_work_name(cn) != tail:
+        return cn
     for cat in _tmdb_genre_catalog():
         if utils.normalize_work_name(str(cat["name"])) == tail:
             return str(cat["name"])
@@ -450,6 +458,15 @@ def ensure_defaults(db: Session) -> None:
     # 升级只在「仍是未绑定分类的旧整点模板」时做，用户自定义过的时段保持不动。
     if _upgrade_hour_windows(db, version.id):
         changed = True
+    # v2.1.54：**先**把历史脏分类键迁到官方中文键，**再**种子字典。
+    # 顺序不能反：TMDB 漏翻时（线上实测 `Sci-Fi & Fantasy` 2438 条资源、
+    # `War & Politics` 1408 条）会生成 `genre:scifi&fantasy` 这类不在 27 项
+    # 官方字典里的键，界面上只能显示「未分类」、排期表里也没有对应的行。
+    # 迁移是幂等的，每轮调度跑一次也只是几十行查询。
+    try:
+        migrate_legacy_category_keys(db)
+    except Exception:
+        db.rollback()
     # v2.0.5：种子 TMDB 官方 genre 全集（27 项）作为分类字典。
     # priority=-1 让其排在真实归类（priority>=0）之后，不抢占 category_limit 轮转名额；
     # 用户启用/停用、改名、分类排期都在这套字典上操作。
@@ -721,6 +738,7 @@ def _hour_segments() -> list[tuple[int, int]]:
 def _assign_category_windows(
     prefs: list[dict[str, Any]],
     quiet: tuple[int, int] | None = None,
+    stock: dict[str, int] | None = None,
 ) -> dict[str, tuple[int, int]]:
     """按偏好排名给分类分配 2 小时粒度的默认时段（热门白天、冷门夜间）。
 
@@ -780,6 +798,13 @@ def _assign_category_windows(
     night = [seg for seg in segments if seg in night_set]
     # 热门先占白天段，其后占夜间段（夜间段序里 (22,24) 黄金深夜档排最前）。
     primary = day + night
+    # v2.1.54：给了库存信息就按新口径分（段数按库存、段位按热门）。
+    # 这里只返回每个分类的**第一段**（主时段），完整多段见
+    # `_assign_category_segments` —— 老调用方全都只认一个窗口，不能改签名。
+    if stock:
+        groups = _segments_by_stock(prefs, primary, stock)
+        if groups:
+            return {k: v[0] for k, v in groups.items()}
     # v2.1.9 修正三：溢出池改为**全部可用段**（白天段同样参与复用）。
     # 此前溢出池只有夜间 3 段 → 27 个分类里 19 个挤在 0-8 点，
     # 而全局总闸封死 0-8 时这些分类彻底死掉、且 12-16 黄金段产出极稀。
@@ -792,6 +817,79 @@ def _assign_category_windows(
         else:
             out[key] = overflow_pool[(idx - len(primary)) % len(overflow_pool)]
     return out
+
+
+def _segments_by_stock(prefs: list[dict[str, Any]],
+                       primary: list[tuple[int, int]],
+                       stock: dict[str, int]) -> dict[str, list[tuple[int, int]]]:
+    """v2.1.54：把时段分给分类 —— **段数按库存、段位按热门**。
+
+    用户口径逐条落地：
+      · 「结合资源库各分类的作品数量，均匀排期」→ 段数由库存占比决定；
+      · 「现在空档的时段太多」→ **库存为 0 的分类一段都不给**，
+        给了也是空的（它那 2 小时里没有任何作品可排）；
+      · 「允许作品数量多的多时段推送」→ 同一分类拿多段，`_largest_remainder`
+        保证每段都落到有货的分类上；
+      · 「全天默认 12 个分类（根据库存情况允许重复）」→ 段池 12 段全部分完，
+        有货分类不足 12 个时就重复占段。
+
+    段**位**仍按偏好序（人工优先级 → 已推送热度）：热门分类先拿白天段，
+    冷门分类拿夜间段（v2.1.6 口径不变）。段数与段位是两件事，不能互相顶替。
+
+    返回 `{分类键: [段, 段, …]}`，主段排第一。
+    """
+    weights = {str(k): int(v or 0) for k, v in (stock or {}).items() if int(v or 0) > 0}
+    if not weights or not primary:
+        return {}
+    # 名额分配直接复用「名额按部」的同一套最大余数法：
+    # 每类至少 1 段（有货就不该被饿死），总额恰为段池大小（12 段铺满全天）。
+    counts = _largest_remainder(weights, len(primary))
+    if not counts:
+        return {}
+    order = [str(p.get("category_key") or "") for p in prefs]
+    known = set(order)
+    # 有货但不在偏好表里的键补到最后：它的库存不能凭空消失
+    order += sorted(k for k in counts if k not in known)
+    out: dict[str, list[tuple[int, int]]] = {}
+    idx = 0
+    for key in order:
+        n = int(counts.get(key, 0) or 0)
+        if n <= 0:
+            continue
+        picked: list[tuple[int, int]] = []
+        for _ in range(n):
+            picked.append(primary[idx % len(primary)])
+            idx += 1
+        out[key] = picked
+    return out
+
+
+def _assign_category_segments(prefs: list[dict[str, Any]],
+                              quiet: tuple[int, int] | None = None,
+                              stock: dict[str, int] | None = None,
+                              ) -> dict[str, list[tuple[int, int]]]:
+    """v2.1.54：每个分类应占的**全部**时段（主段在前）。
+
+    只有 `_ensure_schedules` 用它 —— 主段写 `window_start/window_end`，
+    其余写 `extra_windows`。其余调用方一律走 `_assign_category_windows`（单窗口）。
+    """
+    segments = list(CATEGORY_WINDOW_SEGMENTS)
+    if quiet:
+        segments = [seg for seg in segments if not _window_overlaps_quiet(seg, quiet)]
+    if not segments:
+        return {str(p.get("category_key") or ""): [CATEGORY_WINDOW_SEGMENTS[0]]
+                for p in prefs}
+    day_set = set(CATEGORY_DAY_SEGMENTS)
+    night_set = set(CATEGORY_NIGHT_SEGMENTS)
+    primary = ([s for s in segments if s in day_set]
+               + [s for s in segments if s in night_set])
+    if stock:
+        groups = _segments_by_stock(prefs, primary, stock)
+        if groups:
+            return groups
+    # 没有库存信息（老库、测试、全库空）→ 退回一分类一段的旧口径，
+    # 但同样返回列表，让调用方只有一条代码路径。
+    return {k: [v] for k, v in _assign_category_windows(prefs, quiet).items()}
 
 
 def _fallback_window(
@@ -926,6 +1024,14 @@ def _work_titles(db: Session, work_keys) -> dict[str, str]:
 
 
 def _primary_category(resource: Resource) -> tuple[str, str]:
+    """资源的主分类键（`genre:<中文名>`）与媒体类型。
+
+    v2.1.54：取到的 genre 名**先过 `tmdb.genre_name_cn()` 归一**再拼键。
+    此前直接把 TMDB 返回的原文往键里塞，而 TMDB 的 zh-CN 对两个 TV 专用分类
+    没有翻译 → 线上出现 `genre:scifi&fantasy`（2438 条资源）这种不在
+    27 项官方字典里的脏键，界面上只能显示成「未分类」，排期表里也没有对应的行，
+    这批作品永远排不出去。归一后统一落到 `genre:科幻奇幻`。
+    """
     media_type = str(getattr(resource, "media_type", "") or "")
     genres = _jload(getattr(resource, "genres", "[]"), [])
     primary = ""
@@ -939,8 +1045,31 @@ def _primary_category(resource: Resource) -> tuple[str, str]:
                 break
     elif isinstance(genres, str) and genres.strip():
         primary = genres.strip()
+    if primary:
+        primary = _genre_name_cn(primary)
     category_key = f"genre:{utils.normalize_work_name(primary)}" if primary else "genre:unknown"
     return category_key, media_type
+
+
+def _work_category(rows: list[Resource]) -> tuple[str, str]:
+    """一部作品的主分类：**扫它的全部资源**，取第一个能判出非「未分类」的分类。
+
+    v2.1.54：此前是拿 `ordered[0]` 这一条资源的 genres 做判据。一部剧有几十个
+    文件，只要排在最前那条恰好没识别出 genres，整部作品就被判成「未分类」，
+    而且后续资源识别回了类型也不会再纠正（见 `sync_library_versions` 的
+    一次性写入 bug）。线上实测 586 部「未分类」里有 504 部的资源其实带着类型。
+
+    顺序仍用调用方给的稳定序（file_id 升序），保证结果可复现：
+    同一批资源无论扫几遍，判出来的分类都一样。
+    """
+    fallback_media = ""
+    for res in rows:
+        key, media_type = _primary_category(res)
+        if not fallback_media and media_type:
+            fallback_media = media_type
+        if key != "genre:unknown":
+            return key, media_type or fallback_media
+    return "genre:unknown", fallback_media
 
 
 def _ensure_category(db: Session, category_key: str, media_type: str, name: str = "") -> None:
@@ -961,7 +1090,15 @@ def _ensure_category(db: Session, category_key: str, media_type: str, name: str 
 
 
 def sync_library_versions(db: Session) -> dict[str, int]:
-    """按资源事实生成作品级版本快照与唯一主归属。"""
+    """按资源事实生成作品级版本快照与唯一主归属。
+
+    v2.1.54（真机：资源库 586 部作品卡在「未分类」，其中 504 部的资源其实带类型）：
+    归类从「首次创建时写一次」改为**每轮按最新资源重算**。两个旧写法共同把错误固化了：
+      ① `if exists: continue` —— 版本指纹没变就整段跳过，连重算的机会都没有；
+      ② `if not ownership: …` —— 归属只在第一轮写入，之后资源识别回填了 genres 也永不更新。
+    实测证据：`朱雀堂` 资源识别 05:48:34、归类 05:48:38（识别早 4 秒，genres 当时已在库），
+    仍被判成未分类 —— 说明不是时序问题，就是「只写一次、从不重算」。
+    """
     resources = list(db.scalars(select(Resource)).all())
     grouped: dict[str, list[Resource]] = {}
     for res in resources:
@@ -969,8 +1106,32 @@ def sync_library_versions(db: Session) -> dict[str, int]:
 
     created = 0
     categories = 0
+    updated = 0
+    ensured: set[str] = set()   # 本轮已确保存在的分类键，省掉重复查询
     for work_key, rows in grouped.items():
         ordered = sorted(rows, key=lambda r: (str(r.file_id or ""), int(r.size or 0), int(r.utime or 0)))
+        # v2.1.54：归类**每轮重算**，且扫全部资源而不是只看 ordered[0]。
+        # 这两点必须放在指纹判断**之前** —— 指纹只反映内容身份（file_id:size），
+        # 它不变不代表 genres 没被识别回填过。
+        category_key, media_type = _work_category(ordered)
+        if category_key not in ensured:
+            _ensure_category(db, category_key, media_type)
+            ensured.add(category_key)
+        ownership = db.scalar(select(SCWorkCategory).where(SCWorkCategory.work_key == work_key))
+        if ownership is None:
+            db.add(SCWorkCategory(work_key=work_key, category_key=category_key,
+                                  media_type=media_type, source="tmdb", confidence=1.0))
+            categories += 1
+        elif str(ownership.category_key or "") != category_key:
+            # 只改真正变了的行。已经判对的归属一律不碰 —— 不刷新 assigned_at，
+            # 让「这部作品是什么时候归到这个分类的」保持可追溯。
+            ownership.category_key = category_key
+            if media_type:
+                ownership.media_type = media_type
+            ownership.source = "tmdb"
+            ownership.confidence = 1.0
+            ownership.assigned_at = utcnow()
+            updated += 1
         # v2.1.6 真实缺陷修复（泰迪熊2 双推·治触发源）：指纹**不含 utime**。
         #
         # 原指纹 = sha256(file_id:size:utime)。utime 是文件元数据的修改时间，
@@ -1000,8 +1161,6 @@ def sync_library_versions(db: Session) -> dict[str, int]:
                 SCLibraryVersion.work_key == work_key)
         ) or 0
         rep = ordered[0]
-        category_key, media_type = _primary_category(rep)
-        _ensure_category(db, category_key, media_type)
         metadata = {
             "title": getattr(rep, "media_title", "") or getattr(rep, "name", ""),
             "poster_path": getattr(rep, "poster_path", ""),
@@ -1021,15 +1180,158 @@ def sync_library_versions(db: Session) -> dict[str, int]:
             change_type="created" if latest_no == 0 else "updated",
         ))
         created += 1
+    db.commit()
+    # `categories_created` / `categories_updated` 分开报：
+    # 前者是首次入库的作品数，后者是这次真正被纠正的归属数（v2.1.54 新增）。
+    # 两个数都要能对上明细，见 `recompute_work_categories()` 的同口径统计。
+    return {"versions_created": created, "categories_created": categories,
+            "categories_updated": updated, "works": len(grouped)}
 
-        ownership = db.scalar(select(SCWorkCategory).where(SCWorkCategory.work_key == work_key))
-        if not ownership:
+
+# ---------------------------------------------------------------------------
+# v2.1.54：归类修复的两件工具
+# ---------------------------------------------------------------------------
+def migrate_legacy_category_keys(db: Session, *, dry_run: bool = False) -> dict[str, Any]:
+    """把历史脏分类键迁到官方中文键（幂等，可反复跑）。
+
+    判定不看硬编码清单，而是**拿每个键过一遍 `genre_name_cn`**：
+    归一后拼出来的键与自己不同 → 就是脏键。这样将来 TMDB 再漏翻别的分类，
+    也自动被这一步收掉，不需要再加一张映射表。
+
+    三张表都要迁，缺一张就会留下「分类字典有 A、排期表有 B、作品归属还是 A」的裂痕：
+      · `sc_categories`        —— 分类字典（category_key 唯一）
+      · `sc_category_schedules` —— 分类排期（(版本, 键) 唯一）
+      · `sc_work_categories`   —— 作品归属（work_key 唯一）
+
+    目标键已存在时**保留目标键那一行、删掉脏键行**：目标键是官方中文键，
+    其排期/优先级才是页面在用的那一份；脏键行只是同一分类的影子。
+    """
+    moves: list[dict[str, str]] = []
+
+    # ① 分类字典
+    cats = list(db.scalars(select(SCCategory)).all())
+    by_key = {str(r.category_key or ""): r for r in cats}
+    for row in cats:
+        key = str(row.category_key or "")
+        if not key.startswith("genre:"):
+            continue
+        tail = key.split(":", 1)[1]
+        cn = _genre_name_cn(tail)
+        canon = f"genre:{utils.normalize_work_name(cn)}" if cn else ""
+        if not canon or canon == key:
+            continue
+        moves.append({"table": "categories", "from": key, "to": canon})
+        if dry_run:
+            continue
+        if canon in by_key and by_key[canon] is not row:
+            db.delete(row)               # 目标行已在 → 删影子行
+            by_key.pop(key, None)
+        else:
+            row.category_key = canon
+            row.name = cn
+            row.updated_at = utcnow()
+            by_key.pop(key, None)
+            by_key[canon] = row
+
+    # ② 分类排期（按 (版本, 键) 唯一，逐版本处理）
+    scheds = list(db.scalars(select(SCCategorySchedule)).all())
+    sched_by = {(int(r.plan_version_id or 0), str(r.category_key or "")): r for r in scheds}
+    for row in scheds:
+        key = str(row.category_key or "")
+        if not key.startswith("genre:"):
+            continue
+        cn = _genre_name_cn(key.split(":", 1)[1])
+        canon = f"genre:{utils.normalize_work_name(cn)}" if cn else ""
+        if not canon or canon == key:
+            continue
+        moves.append({"table": "schedules", "from": key, "to": canon})
+        if dry_run:
+            continue
+        slot = (int(row.plan_version_id or 0), canon)
+        if slot in sched_by and sched_by[slot] is not row:
+            db.delete(row)               # 该版本下目标键已有排期行 → 删影子行
+        else:
+            row.category_key = canon
+            row.updated_at = utcnow()
+            sched_by[slot] = row
+        sched_by.pop((int(row.plan_version_id or 0), key), None)
+
+    # ③ 作品归属（work_key 唯一，直接改键，不会冲突）
+    owners = list(db.scalars(select(SCWorkCategory).where(
+        SCWorkCategory.category_key.like("genre:%"))).all())
+    for row in owners:
+        key = str(row.category_key or "")
+        cn = _genre_name_cn(key.split(":", 1)[1])
+        canon = f"genre:{utils.normalize_work_name(cn)}" if cn else ""
+        if not canon or canon == key:
+            continue
+        moves.append({"table": "work_categories", "from": key, "to": canon})
+        if not dry_run:
+            row.category_key = canon
+            row.assigned_at = utcnow()
+
+    if not dry_run and moves:
+        db.commit()
+    return {"moved": len(moves), "dry_run": dry_run,
+            "details": moves[:200], "truncated": max(0, len(moves) - 200)}
+
+
+def recompute_work_categories(db: Session, *, dry_run: bool = False) -> dict[str, Any]:
+    """按最新资源重算每部作品的主分类 —— **只动归属表，不生成版本快照**。
+
+    为什么不直接跑 `sync_library_versions`：那个函数会为指纹变化的作品写
+    `sc_library_versions` 新版本（`change_type=updated`），而新版本是追更推送的
+    触发源。只想修归类的时候，绝不能顺手造出一批「更新」事件。
+
+    `dry_run=True` 返回将要变更的明细（影响清单），一个字都不写库。
+    """
+    resources = list(db.scalars(select(Resource)).all())
+    grouped: dict[str, list[Resource]] = {}
+    for res in resources:
+        grouped.setdefault(utils.work_group_key(res), []).append(res)
+
+    owners = {str(r.work_key or ""): r for r in db.scalars(select(SCWorkCategory)).all()}
+    ensured: set[str] = set()
+    changes: list[dict[str, Any]] = []
+    created = 0
+    for work_key, rows in grouped.items():
+        ordered = sorted(rows, key=lambda r: (str(r.file_id or ""), int(r.size or 0), int(r.utime or 0)))
+        category_key, media_type = _work_category(ordered)
+        row = owners.get(work_key)
+        before = str(row.category_key or "") if row is not None else ""
+        if before == category_key:
+            continue
+        changes.append({"work_key": work_key, "from": before or "(无)", "to": category_key,
+                        "title": (str(getattr(ordered[0], "media_title", "") or "")
+                                  or str(getattr(ordered[0], "name", "")))})
+        if dry_run:
+            continue
+        if category_key not in ensured:
+            _ensure_category(db, category_key, media_type)
+            ensured.add(category_key)
+        if row is None:
             db.add(SCWorkCategory(work_key=work_key, category_key=category_key,
                                   media_type=media_type, source="tmdb", confidence=1.0))
-            categories += 1
-    db.commit()
-    return {"versions_created": created, "categories_created": categories,
-            "works": len(grouped)}
+            created += 1
+        else:
+            row.category_key = category_key
+            if media_type:
+                row.media_type = media_type
+            row.source = "tmdb"
+            row.confidence = 1.0
+            row.assigned_at = utcnow()
+    if not dry_run:
+        db.commit()
+    # 迁移后库存分布：页面要用它解释「为什么排期变了」，所以一并回传
+    stock: dict[str, int] = {}
+    src = changes if dry_run else None
+    if dry_run:
+        for ch in changes:
+            stock[ch["to"]] = stock.get(ch["to"], 0) + 1
+    return {"works": len(grouped), "changed": len(changes), "created": created,
+            "dry_run": dry_run, "items": changes[:300],
+            "truncated": max(0, len(changes) - 300),
+            "target_stock": stock if src is not None else {}}
 
 
 def merge_update_windows(db: Session, window_seconds: int = 0) -> dict[str, int]:
@@ -1162,6 +1464,44 @@ def _sched_window_for(sched: SCCategorySchedule, weekday: int) -> tuple[int, int
     return int(sched.window_start or 0), int(sched.window_end or 0)
 
 
+def _sched_extra_windows(sched: SCCategorySchedule) -> list[tuple[int, int]]:
+    """该分类的**额外时段**（v2.1.54：库存多的分类一天可以占多个时段）。
+
+    读 `extra_windows`（JSON `[[起,止],…]`）。脏值一律丢掉 —— 宁可少一个时段，
+    也不让一个写坏的窗口把分类放到推不出去的小时里。
+    """
+    raw = getattr(sched, "extra_windows", "") or ""
+    if not raw:
+        return []
+    try:
+        arr = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(arr, list):
+        return []
+    out: list[tuple[int, int]] = []
+    for pair in arr:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            s, e = int(pair[0]), int(pair[1])
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s <= 24 and 0 <= e <= 24):
+            continue
+        out.append((s, e))
+    return out
+
+
+def _hour_in_window(hour: int, ws: int, we: int) -> bool:
+    """`hour` 是否落在 [ws, we) 内（支持跨午夜，起止相同视为全天）。"""
+    if we > ws:
+        return ws <= hour < we
+    if we < ws:
+        return hour >= ws or hour < we      # 跨午夜
+    return True                             # 起止相同 = 全天
+
+
 def _sched_allows_core(sched: SCCategorySchedule | None, *,
                        hour: int, weekday: int,
                        per_category_count: int,
@@ -1180,18 +1520,16 @@ def _sched_allows_core(sched: SCCategorySchedule | None, *,
     v2.1.53（空档补位）：新增 `check_window`。补位时段里，方案是**跨分类时段窗口**
     指定的（否则「剧情」永远进不了 15 点，等于补不了），所以那几小时只跳过 ②，
     ③④ 两条上限照旧全部生效 —— 补位绝不能突破每小时 / 每日额度。
+
+    v2.1.54：② 改为「主时段 + 额外时段，任一命中即放行」。库存多的分类一天占多个
+    时段（`extra_windows`），只认主时段会让它多出来的那些段形同虚设。
     """
     if sched is None:
         return True
     if check_window:
         ws, we = _sched_window_for(sched, weekday)
-        if we > ws:
-            in_win = ws <= hour < we
-        elif we < ws:
-            in_win = hour >= ws or hour < we      # 跨午夜
-        else:
-            in_win = True                          # 起止相同 = 全天
-        if not in_win:
+        windows = [(ws, we)] + _sched_extra_windows(sched)
+        if not any(_hour_in_window(hour, s, e) for s, e in windows):
             return False
     if cycle_hour_max and per_category_count >= cycle_hour_max:
         return False
@@ -1697,8 +2035,15 @@ def _schedule_open_hours(row: "SCCategorySchedule | None",
         hours = list(range(24))
     else:
         ws = int(row.window_start or 0)
-        we = int(row.window_end or 24)
+        we = int(row.window_end or 0)
         hours = list(range(24)) if we <= ws else list(range(ws, min(24, we)))
+        # v2.1.54：**额外时段**同样算「能排期的小时」。库存多的分类一天占多个时段，
+        # 只认主时段会让它多出来的那几段在方案里凭空消失（配了却不生效）。
+        extra = _sched_extra_windows(row)
+        if extra:
+            for s, e in extra:
+                hours.extend(h for h in range(24) if _hour_in_window(h, s, e))
+            hours = sorted(set(hours))
     if win:
         hours = [h for h in hours if int(win[0]) <= h < int(win[1])]
     if quiet:
@@ -1862,6 +2207,98 @@ def _category_hour_counts(db: Session, hour_start: datetime) -> dict[str, int]:
     return {str(k): int(n or 0) for k, n in rows if k}
 
 
+def _stock_segment_pool(quiet: tuple[int, int] | None,
+                        win: tuple[int, int] | None) -> list[tuple[int, int]]:
+    """可用于分配的时段池：先按静默保护剔除，再按**主推送窗口**剔除。
+
+    v2.1.54：主推送窗口外的小时本来就推不出去，把分类排过去等于让它整天零产出
+    （v2.1.9 真机就是这么死的：19 个分类被塞进 0-8，而全局总闸封死 0-8）。
+    顺序仍是「热门先拿白天段」——白天段在前、夜间段在后。
+    """
+    segs = []
+    for seg in CATEGORY_WINDOW_SEGMENTS:
+        if quiet and _window_overlaps_quiet(seg, quiet):
+            continue
+        segs.append(seg)
+    if win:
+        # 优先挑**完全落在主推送窗口内**的段：只覆盖一半的段会让分类有一半小时
+        # 推不出去（例：主窗口 9-21，8-10 那个段的前一小时是废的）。
+        inside = [s for s in segs if int(s[0]) >= int(win[0]) and int(s[1]) <= int(win[1])]
+        if inside:
+            segs = inside
+        else:
+            # 窗口比任何一段都窄（如 9-10）：退回有交集的那几段，至少还能推一部分
+            segs = [s for s in segs if int(s[0]) < int(win[1]) and int(s[1]) > int(win[0])]
+    day_set = set(CATEGORY_DAY_SEGMENTS)
+    night_set = set(CATEGORY_NIGHT_SEGMENTS)
+    return ([s for s in segs if s in day_set]
+            + [s for s in segs if s in night_set])
+
+
+def _retime_schedules_by_stock(db: Session, version: "SCSharePlanVersion",
+                               quiet: tuple[int, int] | None,
+                               win: tuple[int, int] | None,
+                               stock: dict[str, int]) -> dict[str, Any]:
+    """v2.1.54：按库存重排分类时段（「一键 AI 调度」与「批量采纳」共用）。
+
+    用户口径：「一键 AI 调度：调整当前及后续排期分类、时间搭配，填充无排期的空白时段」。
+    此前一键调度**只改每小时排几部**，分类时段一行都不动 —— 于是空档小时依然空着，
+    只能靠 v2.1.53 的运行时补位打补丁。这里从配置层根治：
+
+      · 段数按库存、段位按热门（与 `_ensure_schedules` 同一套算法）；
+      · 库存 0 的分类**一段都不分**（分了也是空的），其额外时段同时收掉；
+      · 只改时段与 `window_auto`，**不动**启用状态、不动上限、不动已建任务。
+
+    与推送队列的联动边界（v2.1.34 红线）：已建任务的推送时间是既成事实，
+    本函数一个字都不改它们。时段改完后 `forecast_schedule` 立刻按新时段重算预测，
+    而队列里在途的任务原样不动 —— 两边仍然对得上。
+    """
+    prefs = _category_preference(db)
+    primary = _stock_segment_pool(quiet, win)
+    if not primary:
+        return {"moved": 0, "details": [], "truncated": 0,
+                "reason": "主推送窗口与静默保护把全天时段都排除掉了，没有可分配的时段"}
+    groups = _segments_by_stock(prefs, primary, stock)
+    if not groups:
+        return {"moved": 0, "details": [], "truncated": 0,
+                "reason": "资源库里没有在库待排作品，时段无从分配"}
+    rows = list(db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version.id)).all())
+    by_key = {r.category_key: r for r in rows}
+    moved = 0
+    details: list[dict[str, str]] = []
+    for key, group in groups.items():
+        row = by_key.get(key)
+        if row is None:
+            continue                      # 没排期行就不造行（造了页面会多出一行）
+        main = group[0]
+        extra = [tuple(s) for s in group[1:]]
+        before_main = (int(row.window_start or 0), int(row.window_end or 0))
+        before_extra = [tuple(x) for x in _sched_extra_windows(row)]
+        if before_main == tuple(main) and before_extra == extra:
+            continue
+        row.window_start, row.window_end = int(main[0]), int(main[1])
+        row.extra_windows = _jdump([list(s) for s in extra]) if extra else ""
+        row.window_auto = True            # 重新交回系统托管
+        row.updated_at = utcnow()
+        moved += 1
+        details.append({
+            "name": _category_display_name(key),
+            "before": "、".join([f"{before_main[0]}:00–{before_main[1]}:00"]
+                                + [f"{s}:00–{e}:00" for s, e in before_extra]),
+            "after": "、".join(f"{s}:00–{e}:00" for s, e in group),
+        })
+    # 库存 0 却还挂着额外时段的：收掉。主时段保留 —— 用户可能就想让它固定在那儿，
+    # 等以后有货时能直接出货，不该被系统悄悄改掉。
+    for key, row in by_key.items():
+        if int(stock.get(key) or 0) > 0 or not str(row.extra_windows or ""):
+            continue
+        row.extra_windows = ""
+        row.updated_at = utcnow()
+    return {"moved": moved, "details": details[:60],
+            "truncated": max(0, len(details) - 60)}
+
+
 def build_even_plan(db: Session) -> dict[str, Any]:
     """算一份均匀排期方案并落库到活动版本的 `config_json.even_plan`。
 
@@ -1908,6 +2345,10 @@ def build_even_plan(db: Session) -> dict[str, Any]:
     except (TypeError, ValueError):
         win = None
     cycle_hour_max = max(0, int(cycle.get("category_hour_max") or 0))
+    # v2.1.54（用户口径）：一键 AI 调度**连分类时段一起调**，把没有排期的空白时段填上。
+    # 此前这一步只分配「每小时几部」，分类时段一行不动 → 空档依然空着，
+    # 只能靠 v2.1.53 的运行时补位打补丁。现在从配置层根治。
+    retimed = _retime_schedules_by_stock(db, version, quiet, win, backlog)
     sched_map = {s.category_key: s for s in db.scalars(
         select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == version.id)).all()}
@@ -2038,6 +2479,8 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         "room_works": {k: int(v) for k, v in room_works.items() if int(v) > 0},
         # 排不上的分类 + 可读原因（库存空 / 今日已到上限）。
         "skipped": skipped,
+        # v2.1.54：这次调度顺手改了哪些分类时段（落库，「刷新页面也看得到」）。
+        "retimed": retimed,
         # v2.1.53：这几个小时是「窗口内分类都没货」的空档，由库存最多的分类补位。
         # 调度侧只据此跳过「分类自己的时段窗口」，其余上限一律照旧。
         "borrowed_hours": list(borrowed),
@@ -2083,6 +2526,9 @@ def build_even_plan(db: Session) -> dict[str, Any]:
         # v2.1.53：补位时段（回显用）。页面据此提示「哪几个小时是库存最多的分类补位」。
         "borrowed_hours": list(borrowed),
         "borrow_enabled": bool(borrow_on),
+        # v2.1.54：这次调度顺手改了哪些分类的时段（不是只改数量）。
+        # 前端要如实列出来，否则用户会以为「点了一键调度，分类时段没动」。
+        "retimed": retimed,
     }
 
 
@@ -2161,6 +2607,8 @@ def api_even_plan(db: Session = Depends(get_db)):
         # v2.1.53：哪几个小时是「窗口内分类都没货」的空档、由库存最多的分类补位。
         # 前端据此在这几个小时上加提示，别让人以为分类时段配置失效了。
         "borrowed_hours": sorted(_borrowed_hours(plan)),
+        # v2.1.54：上次调度改了哪些分类时段（落库的快照，刷新页面也还在）
+        "retimed": plan.get("retimed") or {"moved": 0, "details": [], "truncated": 0},
         "detail": detail,
     }
 
@@ -6822,7 +7270,20 @@ def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
         不再出现「无建议跳过」导致采纳率极低；
       - 支持传 category_keys 只处理勾选的分类；不传 = 全部。
 
-    静默保护开启时，落在静默区间的建议时段会被跳过（而不是强行写入冲突时段）。
+    v2.1.54（用户口径：根据分类作品数量、结合热门分类的观影热门时段做优化，
+    使排期不会大面积落空）：
+      - **库存为 0 的分类不再参与采纳**。线上 27 个分类里 15 个零库存，
+        给它们写时段等于制造空档 —— 采纳后那 15 段必然一个作品都排不出来。
+        跳过的分类带可读原因回显，不是静默丢弃。
+        前提是「库里有货」：全库库存都是 0（资源库没同步过）时不做这个过滤，
+        照 v2.1.6 的口径全量采纳，否则点一次批量采纳会什么都不发生。
+      - 库存多的分类除了主时段（实测观影时段优先）还拿**额外时段**
+        （库存分配里除主段以外的段），一天可以推多个时段。
+      - 采纳完做一次**覆盖校验**：算出哪些小时一个启用分类都盖不到，
+        用库存最多的分类补上，并把补位结果如实回显。
+
+    静默保护开启时，落在静默区间的建议时段会退回库存分配的段（已避开静默），
+    而不是直接跳过这个分类 —— 跳过就等于让它彻底排不出东西。
     """
     p = body.payload or {}
     version = _active_version(db)
@@ -6837,29 +7298,105 @@ def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
     if wanted:
         rows = [r for r in rows if r.category_key in wanted]
     quiet = _quiet_window(_cycle_plan_of(db, version.id))
+    stock = _category_stock(db)
+    # 库存过滤只在**库里确实有货**时生效。全库零库存有两种情况：
+    # 资源库还没同步过（此时用户点采纳就是为了先有一张建议表，不能什么都不做），
+    # 或者真的全空（那就更没有"让哪个分类让位"的依据）。
+    # 这两种情况一律按 v2.1.6 口径全量采纳 —— 否则按钮点了没反应，
+    # 又退回到当年"有的按钮是灰的"那种体验。
+    stock_known = sum(int(v or 0) for v in stock.values()) > 0
+    prefs = _category_preference(db)
     fallback_map = _preference_windows(db, quiet)
+    cycle = _jload(version.config_json, {}).get("cycle_plan") or {}
+    win = None
+    try:
+        _ws = int(cycle.get("window_start") or 0)
+        _we = int(cycle.get("window_end") or 24)
+        if 0 <= _ws < _we <= 24:
+            win = (_ws, _we)
+    except (TypeError, ValueError):
+        win = None
+    # 库存分配（含多段）——额外时段的来源，也用作实测窗口撞静默时的退路
+    groups = _segments_by_stock(prefs, _stock_segment_pool(quiet, win), stock)
     adopted = 0
     skipped = 0
+    skipped_items: list[dict[str, str]] = []
     for row in rows:
+        name = _category_display_name(row.category_key)
+        st = int(stock.get(row.category_key) or 0)
+        if stock_known and st <= 0:
+            skipped += 1
+            skipped_items.append({
+                "name": name,
+                "reason": ("资源库里这个分类没有待排作品，先不给它占时段 —— "
+                           "占了那一小时也排不出任何东西")})
+            continue
         sug_start, sug_end, sug_source = _category_suggest_window(
             db, row.category_key, fallback_map.get(row.category_key, FULL_DAY_WINDOW))
         # v2.1.6：起点 0 合法，用来源标记判定有没有建议。
         if not sug_source:
             skipped += 1
+            skipped_items.append({"name": name, "reason": "拿不到这个分类的观影时段"})
             continue
+        grp = [tuple(s) for s in (groups.get(row.category_key) or [])]
         if quiet and _window_overlaps_quiet((sug_start, sug_end), quiet):
-            skipped += 1
-            continue
-        row.window_start, row.window_end = sug_start, sug_end
-        row.ai_window_start, row.ai_window_end = sug_start, sug_end
+            # 实测时段撞静默 → 退回库存分配的段（那一套已经避开静默）
+            if not grp:
+                skipped += 1
+                skipped_items.append({
+                    "name": name, "reason": "实测时段落在静默保护里，库存分配也没给出可用时段"})
+                continue
+            sug_start, sug_end = grp[0]
+            sug_source = "stock"
+        # 额外时段 = 库存分配里除主段以外的段（一天多时段推送）
+        extra = [s for s in grp if s != (int(sug_start), int(sug_end))]
+        row.window_start, row.window_end = int(sug_start), int(sug_end)
+        row.extra_windows = _jdump([list(s) for s in extra]) if extra else ""
+        row.ai_window_start, row.ai_window_end = int(sug_start), int(sug_end)
         row.week_windows = ""
         row.ai_adopted = True
         # 采纳是用户手工动作 → 该行不再被系统自动刷新覆盖。
         row.window_auto = False
         row.updated_at = utcnow()
         adopted += 1
+
+    # ---- 覆盖校验：采纳完还有哪些小时一个启用分类都盖不到 ----
+    hours_all: set[int] = set(range(24))
+    if win:
+        hours_all = {h for h in hours_all if int(win[0]) <= h < int(win[1])}
+    if quiet:
+        hours_all = {h for h in hours_all if not _in_quiet_hour(h, quiet)}
+    covered: set[int] = set()
+    all_rows = db.scalars(select(SCCategorySchedule).where(
+        SCCategorySchedule.plan_version_id == version.id)).all()
+    for row in all_rows:
+        if not row.enabled:
+            continue
+        covered |= set(_schedule_open_hours(row, quiet, win))
+    gaps = sorted(hours_all - covered)
+    filled_hours: list[int] = []
+    filled_by = ""
+    if gaps and stock_known:
+        # 用库存最多的分类补：它的作品最多，补上去最不容易再次落空
+        top_key = max((k for k, v in stock.items() if int(v or 0) > 0),
+                      key=lambda k: int(stock[k]), default="")
+        top_row = next((r for r in all_rows if r.category_key == top_key), None)
+        if top_row is not None:
+            extra = _sched_extra_windows(top_row)
+            for h in gaps:
+                seg = (h, min(24, h + HOUR_SEGMENT_HOURS))
+                if seg not in extra:
+                    extra.append(seg)
+            top_row.extra_windows = _jdump([list(s) for s in extra])
+            top_row.updated_at = utcnow()
+            filled_hours = gaps
+            filled_by = _category_display_name(top_key)
     db.commit()
-    return {"ok": True, "adopted": adopted, "skipped": skipped, "total": len(rows)}
+    return {"ok": True, "adopted": adopted, "skipped": skipped,
+            "total": len(rows), "skipped_items": skipped_items[:60],
+            # v2.1.54：采纳后仍有空档的小时 + 由谁补上，如实回显。
+            # 空列表 = 这次采纳后每个可推小时都至少有一个有货的分类。
+            "gaps": gaps, "filled_hours": filled_hours, "filled_by": filled_by}
 
 
 @router.get("/pacing-rules")
@@ -6992,6 +7529,22 @@ def _default_schedule_for(media_type: str,
     return ws, we, hl, dl
 
 
+def _category_stock(db: Session) -> dict[str, int]:
+    """每个分类**在库待排**的作品数（时段分配的权重来源）。
+
+    与 `build_even_plan` / `plan_engine` / `forecast_schedule` 同一份在库口径
+    （`_category_backlog`）：只认每部作品的最新快照 + `live_keys`。
+    拿不到就返回空 —— 绝不编一个库存出来，否则时段会被分给没货的分类。
+
+    v2.1.54：这是「段数按库存」的唯一数据源。空档的根因就是分配完全不看它：
+    线上 27 个分类里 15 个零库存，却各自占着一个 2 小时段。
+    """
+    try:
+        return _category_backlog(db, _live_work_keys(db))
+    except Exception:
+        return {}
+
+
 def _preference_windows(db: Session,
                         quiet: tuple[int, int] | None = None) -> dict[str, tuple[int, int]]:
     """当前偏好排名对应的分类默认时段窗口（分类 key → (起, 止)）。
@@ -6999,10 +7552,14 @@ def _preference_windows(db: Session,
     v2.1.6：改用「热门白天 / 冷门夜间」的 2 小时粒度分配（见
     _assign_category_windows），不再是 v2.1.2 的「高峰独占段」。
 
+    v2.1.54：**把库存一起传下去**（`_category_stock`）。段数按库存算、
+    段位按偏好序算 —— 只有一边看库存，空档就还在。库存为空（新库 / 全库没货）
+    时自动退回旧口径（一分类一段），行为与改前一致。
+
     quiet 传入静默保护区间时，落进静默的段会被整段跳过——默认时间表
     **必须避开静默时段**，否则「一键恢复默认」会把分类排到推不出去的小时。
     """
-    return _assign_category_windows(_category_preference(db), quiet)
+    return _assign_category_windows(_category_preference(db), quiet, _category_stock(db))
 
 
 def _is_untouched_schedule(row: SCCategorySchedule) -> bool:
@@ -7068,22 +7625,33 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
 
     v2.1.6：偏好分配改为「热门白天 / 冷门夜间」的 2 小时粒度，
     且**避开静默保护时段**（静默开启时落进静默的段不分配给任何分类）。
+
+    v2.1.54（用户口径：结合各分类作品数量均匀排期，空档太多，货多的多时段推送）：
+      ⑤ 时段分配改为**段数按库存、段位按热门**：库存 0 的分类不再白占一个 2 小时段
+         （线上 27 个分类里 15 个零库存，各占一段 → 那 15 段必然空档）；
+         库存多的分类拿多段，多出来的段写进 `extra_windows`。
     """
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
-    windows = _preference_windows(db, _quiet_window(_cycle_plan_of(db, version_id)))
+    quiet = _quiet_window(_cycle_plan_of(db, version_id))
+    # 传库存进去 —— 这一步就是「空档消失」的关键。库里一部待排作品都没有时
+    # `_category_stock` 返回空，`_assign_category_segments` 自动退回一分类一段的旧口径。
+    seg_map = _assign_category_segments(_category_preference(db), quiet, _category_stock(db))
     added = False
     changed = False
     for cat in _tmdb_genre_catalog():
         key = cat["category_key"]
-        win = windows.get(key, FULL_DAY_WINDOW)
-        ws, we, hl, dl = _default_schedule_for(cat.get("media_type") or "", win)
+        segs = seg_map.get(key) or [FULL_DAY_WINDOW]
+        ws, we = segs[0]
+        extra = segs[1:]
+        extra_json = _jdump([list(s) for s in extra]) if extra else ""
+        ws, we, hl, dl = _default_schedule_for(cat.get("media_type") or "", (ws, we))
         existing = rows.get(key)
         if existing is None:
             row = SCCategorySchedule(plan_version_id=version_id, category_key=key,
                                      window_start=ws, window_end=we, hourly_limit=hl,
                                      daily_limit=dl, ai_adopted=False, enabled=True,
-                                     window_auto=True)
+                                     window_auto=True, extra_windows=extra_json)
             db.add(row)
             added = True
             continue
@@ -7097,8 +7665,10 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
                     or int(existing.daily_limit or 0) != dl
                     or int(existing.window_start or 0) != ws
                     or int(existing.window_end or 0) != we
+                    or str(existing.extra_windows or "") != extra_json
                     or not existing.enabled):
                 existing.window_start, existing.window_end = ws, we
+                existing.extra_windows = extra_json
                 existing.hourly_limit, existing.daily_limit = hl, dl
                 existing.enabled = True
                 existing.window_auto = True
@@ -7113,8 +7683,10 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
         if not _is_system_managed_schedule(existing):
             continue
         if (int(existing.window_start or 0) != ws
-                or int(existing.window_end or 0) != we):
+                or int(existing.window_end or 0) != we
+                or str(existing.extra_windows or "") != extra_json):
             existing.window_start, existing.window_end = ws, we
+            existing.extra_windows = extra_json
             existing.updated_at = utcnow()
             changed = True
     if added or changed:
@@ -7351,7 +7923,10 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
         SCCategorySchedule.plan_version_id == version.id)).all())
     untouched_keys = {r.category_key for r in before if _is_untouched_schedule(r)}
     rows = _ensure_schedules(db, version.id)
-    windows = _preference_windows(db, _quiet_window(_cycle_plan_of(db, version.id)))
+    # v2.1.54：按**库存**分配（段数按库存、段位按热门），并把多出来的段写进额外时段。
+    seg_map = _assign_category_segments(
+        _category_preference(db), _quiet_window(_cycle_plan_of(db, version.id)),
+        _category_stock(db))
     applied = 0
     updated = 0
     for row in rows:
@@ -7360,14 +7935,18 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
             continue
         cat = next((c for c in _tmdb_genre_catalog()
                     if c["category_key"] == row.category_key), None)
-        win = windows.get(row.category_key, FULL_DAY_WINDOW)
+        segs = seg_map.get(row.category_key) or [FULL_DAY_WINDOW]
+        win = segs[0]
+        extra_json = (_jdump([list(s) for s in segs[1:]]) if len(segs) > 1 else "")
         ws, we, hl, dl = _default_schedule_for((cat or {}).get("media_type") or "", win)
         if not force and row.category_key not in untouched_keys:
             continue
         changed = (int(row.window_start or 0) != ws
                    or int(row.window_end or 0) != we
+                   or str(row.extra_windows or "") != extra_json
                    or not row.enabled)
         row.window_start, row.window_end = ws, we
+        row.extra_windows = extra_json
         # v2.1.6：分类级「每小时上限 / 日上限」已移除，统一由周期计划管理约束，
         # 因此这里不再回写分类级上限。
         row.enabled = True
@@ -7397,10 +7976,17 @@ def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get
     media_type = cat.get("media_type") if cat else ""
     # v2.1.6：时段取**默认时间表**（热门白天 / 冷门夜间，避开静默），
     # 与「一键恢复默认」同一口径。
-    win = _preference_windows(db, _quiet_window(_cycle_plan_of(db))).get(
-        row.category_key, FULL_DAY_WINDOW)
+    # v2.1.54：默认时间表按库存分配，可能给这个分类多个时段，一并写回。
+    quiet_now = _quiet_window(_cycle_plan_of(db))
+    segs = _assign_category_segments(
+        _category_preference(db), quiet_now, _category_stock(db)).get(row.category_key)
+    win = segs[0] if segs else FULL_DAY_WINDOW
     ws, we, hl, dl = _default_schedule_for(media_type, win)
     row.window_start, row.window_end = ws, we
+    row.extra_windows = (_jdump([list(s) for s in segs[1:]])
+                         if segs and len(segs) > 1 else "")
+    # 恢复默认 = 交回系统托管，让后续分配能继续刷新它
+    row.window_auto = True
     row.ai_adopted = False
     # v2.1.6：分类级上限已移除，统一由周期计划管理约束——
     # 恢复默认只改时段，不回写分类级 hourly/daily。
@@ -7455,6 +8041,9 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
         d["pref_rank"] = pref_rank.get(r.category_key, 0)
         # v2.1.4：已采纳的周维度配置窗口（调度仍兼容读取）
         d["week_windows"] = _jload(r.week_windows, {}) if r.week_windows else {}
+        # v2.1.54：额外时段结构化下发（库存多的分类一天占多个时段）。
+        # 覆盖 `_model_dict` 给的原始 JSON 字符串 —— 前端只认这个列表。
+        d["extra_windows"] = [list(x) for x in _sched_extra_windows(r)]
         # v2.1.4：静默冲突标记（前端据此提示，默认时段推荐也要避开静默区）
         conflict = False
         if quiet:
@@ -7524,6 +8113,27 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
                 return {"ok": False,
                         "reason": _quiet_conflict_reason((d_start, d_end), quiet)}
             cleaned[str(int(day))] = [d_start, d_end]
+    # v2.1.54：额外时段（同一分类一天可以占多个时段）。
+    # 只接受 [[起,止],…]，逐对夹到 0-24、并逐对校验静默冲突 ——
+    # 静默区间的时段绝不写进去（否则该分类会在用户关掉的时段被推送）。
+    extra_cleaned: list[list[int]] | None = None
+    if "extra_windows" in p:
+        raw_extra = p.get("extra_windows")
+        extra_cleaned = []
+        if isinstance(raw_extra, (list, tuple)):
+            for pair in raw_extra:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                try:
+                    e_ws = max(0, min(23, int(pair[0])))
+                    e_we = max(e_ws + 1, min(24, int(pair[1])))
+                except (TypeError, ValueError):
+                    continue
+                if quiet and _window_overlaps_quiet((e_ws, e_we), quiet):
+                    return {"ok": False,
+                            "reason": _quiet_conflict_reason((e_ws, e_we), quiet)}
+                if [e_ws, e_we] not in extra_cleaned:
+                    extra_cleaned.append([e_ws, e_we])
     row = db.scalar(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version_id,
         SCCategorySchedule.category_key == category_key))
@@ -7532,6 +8142,8 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
         db.add(row)
     row.window_start = ws
     row.window_end = we
+    if extra_cleaned is not None:
+        row.extra_windows = _jdump(extra_cleaned) if extra_cleaned else ""
     if cleaned is not None:
         row.week_windows = _jdump(cleaned)
     elif "week_windows" in p:
@@ -7558,8 +8170,17 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     # 这正是用户反馈「配置时间段默认值应该与偏好档位推荐值一样」的真正根因。
     # v2.1.6：比较基准必须用**与默认时间表同口径**的窗口（含静默避让），
     # 否则用户保存的就是系统刚推的默认时段，却被判成「手工设定」。
-    pref_win = _preference_windows(db, quiet).get(category_key, FULL_DAY_WINDOW)
-    if (ws, we) != tuple(pref_win):
+    #
+    # v2.1.54：基准同时包含**额外时段**。库存多的分类系统会给它 2-3 段，
+    # 前端「保存全部」原样提交回来时必须仍判成「系统托管」，
+    # 否则点一次保存就全表变手工，以后分配再也不刷新（v2.1.4 踩过的同一个坑）。
+    segs = _assign_category_segments(
+        _category_preference(db), quiet, _category_stock(db)).get(category_key)
+    pref_win = segs[0] if segs else FULL_DAY_WINDOW
+    pref_extra = sorted([int(s), int(e)] for s, e in (segs[1:] if segs else []))
+    extra_now = extra_cleaned if extra_cleaned is not None else _sched_extra_windows(row)
+    extra_now_sorted = sorted([int(s), int(e)] for s, e in extra_now)
+    if (ws, we) != tuple(pref_win) or extra_now_sorted != pref_extra:
         row.window_auto = False
     row.updated_at = utcnow()
     db.commit()

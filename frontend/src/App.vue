@@ -150,6 +150,10 @@ const scHourSaving = ref(false)
 // v2.0.5 设计稿：分类-时间排期 / 基础规则 / 周期计划 / 趋势粒度 / 搜索筛选 / 选中详情
 const scTrendPeriod = ref('day')
 const scGenreCatalog = ref([])   // TMDB 官方 genre 字典（来自 /sc/categories/catalog）
+// v2.1.54：下拉选项在这里就把「显示名 / 提交值」拆成中性字段，
+// 模板区只认 label/value —— 页面不出现后端字段名（v2.1.4 红线）。
+const scGenreOptions = computed(() => (scGenreCatalog.value || []).map(
+  c => ({ value: c.category_key, label: c.name || c.category_key })))
 const scSchedRows = ref([]), scSchedSaving = ref(false)
 // v2.1.6：分类排期表勾选集（批量操作按勾选生效；未勾选或全勾选 = 全部）
 const scSchedSelection = ref([]), scSchedTableRef = ref(null)
@@ -166,6 +170,8 @@ const scCycleTab = ref('小时')     // 小时 / 日度（周度、月度已于 
 const scEvenPlan = ref({ active: false, detail: [], skipped: [], capacity: [], hint: '' })
 const scEvenBusy = ref(false)
 const scEvenDetailOpen = ref(false)
+// v2.1.54：一键 AI 调度「重排了哪些分类时段」的明细弹窗
+const scRetimeDetailOpen = ref(false)
 const scShareSearch = ref(''), scShareStatus = ref('全部'), scSelectedShares = ref([])
 const scTaskSearch = ref(''), scTaskTypeFilter = ref('全部'), scSelectedDetail = ref(null)
 const scTaskStatusFilter = ref(''), scLinkFilter = ref(''), scSelectedTasks = ref([])
@@ -1060,16 +1066,42 @@ async function onTplDefaultSwitch(val) {
 }
 
 let clockTimer = null, webqrTimer = null, mirrorPollTimer = null, sessionPollTimer = null
-// v0.9.10.2：进度看板实时轮询——任务运行中每 2 秒只拉 /mirror/status（不复跑整页 load），
-// 展示复制/改名/入库/分享/入队各阶段真实数量变化；空闲时降为 5 秒轻量刷新。
+// v0.9.10.2：进度看板实时轮询——只拉 /mirror/status，不复跑整页 load。
+// v2.1.54（真机假死复盘）：原来固定 2 秒一轮、24 小时不停，注释却写着「空闲降为 5 秒」
+// —— 代码里根本没有降频逻辑。假死期它就是在持续抢连接：池一满，每次请求还得干等
+// 30 秒才失败，几十个这样的请求叠起来就是内存与连接一起涨。
+// 现在按「有没有活」自适应：任务运行中 2 秒（要看清进度），空闲 10 秒（够用且安静），
+// 页面在后台（切走标签页/最小化）**完全不发请求**，切回来立刻补一次。
+const MIRROR_POLL_BUSY = 2000
+const MIRROR_POLL_IDLE = 10000
 function stageLabel(s) {
   return ({ copy: '复制到 B 库', rename: '英文改名', identify: '入库识别',
             share: '生成分享 / 推送', done: '收尾', failed: '失败' })[s] || '处理中'
+}
+// 注意：不要叫 mirrorBusy —— 那是按钮 loading 的 ref，重名会直接编译失败。
+function mirrorPollBusy() {
+  return !!(mirrorStatus.value?.progress?.running
+            || String(batchInfo.value?.status || '') === 'running')
 }
 async function pollMirrorStatus() {
   if (!authed.value) return
   try { mirrorStatus.value = await api('/mirror/status') } catch (e) {}
   try { batchInfo.value = await api('/mirror/batch/status') } catch (e) {}
+}
+// 自排程：一轮跑完再决定下一次等多久（不用固定 setInterval ——
+// 固定间隔在慢响应下会叠加请求，那正是假死期最怕的）。
+function scheduleMirrorPoll(delay) {
+  clearTimeout(mirrorPollTimer)
+  mirrorPollTimer = setTimeout(async () => {
+    if (document.visibilityState !== 'hidden') await pollMirrorStatus()
+    scheduleMirrorPoll(mirrorPollBusy() ? MIRROR_POLL_BUSY : MIRROR_POLL_IDLE)
+  }, delay)
+}
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible' && authed.value) {
+    pollMirrorStatus().finally(() => scheduleMirrorPoll(
+      mirrorPollBusy() ? MIRROR_POLL_BUSY : MIRROR_POLL_IDLE))
+  }
 }
 // 阶段二路线B C4：批次控制（暂停/恢复/跳过/取消），危险操作二次确认
 // v2.1.11：按批次真实状态禁用按钮 + 后端返回 applied/reason 后给**真实反馈**。
@@ -3084,13 +3116,31 @@ async function scAdoptAllAi() {
   const scope = keys.length >= scSchedRows.value.length ? '全部分类' : `选中的 ${keys.length} 个分类`
   try {
     await ElMessageBox.confirm(
-      `批量采纳${scope}的建议时段？建议优先取该分类的真实发布分布，无实测时用默认时间表兜底；落在静默保护区间内的分类会被跳过。`,
+      `按${scope}的作品数量与观影时段重排推送时间？
+
+· 有作品且有实测观影记录的分类：用它真实发布的时间；
+· 有作品但没有实测记录的：按作品数量分配时段；
+· 资源库里没有待排作品的分类：不占时段（占了也排不出任何东西，只会留出空档）；
+· 作品多的分类会拿到额外时段，一天可以推多段。
+
+采纳后还会自动检查哪些小时一个分类都盖不到，并用作品最多的分类补上。确定执行？`,
       '批量采纳 AI 建议', { type: 'warning' })
     scAdoptingAllAi.value = true
     const d = await api('/sc/category-schedules/adopt-ai-all', { method: 'POST', body: JSON.stringify({ payload: {
       category_keys: keys } }) })
     if (!d.ok) { ElMessage.warning(d.reason || '批量采纳失败'); return }
-    ElMessage.success(`已采纳 ${d.adopted || 0} 个分类的建议时段${d.skipped ? `，跳过 ${d.skipped} 个与静默时段冲突的分类` : ''}`)
+    const parts = [`已采纳 ${d.adopted || 0} 个分类`]
+    if (d.skipped) parts.push(`跳过 ${d.skipped} 个`)
+    if (d.filled_hours && d.filled_hours.length) {
+      parts.push(`${d.filled_hours.map(h => h + ' 点').join('、')}原本空着，已由${d.filled_by || '作品最多的分类'}补上`)
+    }
+    ElMessage.success(parts.join('；'))
+    // 跳过原因要能看见，不能只在提示里说个数
+    if (d.skipped_items && d.skipped_items.length) {
+      ElMessageBox.alert(
+        d.skipped_items.map(s => `· ${s.name}：${s.reason}`).join('\n'),
+        '这些分类本次没有采纳', { type: 'info' })
+    }
     await loadSc()
   } catch (e) { if (e !== 'cancel' && e?.message !== 'cancel') ElMessage.error(String(e?.message || e)) }
   finally { scAdoptingAllAi.value = false }
@@ -3240,12 +3290,20 @@ function scSchedTargetKeys() {
 // 分类级上限已从表中移除，速率统一由周期计划管理约束。
 // 若继续携带，历史值会被原样写回（后端只在显式携带时写入），前端无从清理；
 // 故此处彻底不带这两个字段。
+// v2.1.54：保存时一并带上**额外时段**（库存多的分类一天占多个时段）。
+// 不带上就等于每次保存都把这些时段抹掉。
+function scSchedPayloadOf(row) {
+  return {
+    plan_version_id: scOverview.value.active_version_id,
+    category_key: row.ref || row.category_key,
+    window_start: row.window_start, window_end: row.window_end,
+    extra_windows: (row.extra_windows || []).map(p => [Number(p[0]), Number(p[1])]),
+    ai_adopted: !!row.ai_adopted, enabled: !!row.enabled,
+  }
+}
 async function scSaveSchedRow(row) {
   try {
-    const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
-      plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
-      window_start: row.window_start, window_end: row.window_end,
-      ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
+    const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: scSchedPayloadOf(row) }) })
     if (!d.ok) { ElMessage.warning(d.reason || '保存失败'); return }
     ElMessage.success(`${row.name || '分类'} 排期已保存`)
     await loadSc()
@@ -3257,10 +3315,7 @@ async function scSaveAllSchedRows() {
   scSchedSaving.value = true
   try {
     for (const row of targets) {
-      const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
-        plan_version_id: scOverview.value.active_version_id, category_key: row.ref || row.category_key,
-        window_start: row.window_start, window_end: row.window_end,
-        ai_adopted: !!row.ai_adopted, enabled: !!row.enabled } }) })
+      const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: scSchedPayloadOf(row) }) })
       if (!d.ok) throw new Error(d.reason || '保存失败')
     }
     ElMessage.success(`已保存 ${targets.length} 个分类排期`)
@@ -3275,6 +3330,50 @@ async function scAdoptSchedAI(row) {
     ElMessage.success(`已采纳建议时段 ${d.window_start}:00–${d.window_end}:00`)
     await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
+}
+// ---- v2.1.54：额外时段（一个分类一天占多个时段）----
+// 用户口径「允许作品数量多的多时段推送」。
+// 主时段仍是那一行的「配置时间段」，这里管的是**多出来的段**。
+function scSchedAddWindow(row) {
+  if (!row.extra_windows) row.extra_windows = []
+  // 默认接在主时段之后，避免用户每次都要从 0 点开始拨
+  const last = row.extra_windows.length
+    ? row.extra_windows[row.extra_windows.length - 1]
+    : [row.window_end, Math.min(24, Number(row.window_end || 0) + 2)]
+  const s = Math.min(22, Math.max(0, Number(last[1] || 0)))
+  row.extra_windows.push([s, Math.min(24, s + 2)])
+}
+function scSchedRemoveWindow(row, idx) {
+  if (!row.extra_windows) return
+  row.extra_windows.splice(idx, 1)
+}
+// ---- v2.1.54：新增一条排期规则（分类下拉取全部 TMDB 官方分类）----
+const scAddRuleOpen = ref(false)
+const scAddRuleBusy = ref(false)
+const scAddRuleForm = ref({ genre: '', window_start: 8, window_end: 10 })
+function scOpenAddRule() {
+  scAddRuleForm.value = { genre: '', window_start: 8, window_end: 10 }
+  scAddRuleOpen.value = true
+}
+async function scSubmitAddRule() {
+  const f = scAddRuleForm.value
+  if (!f.genre) { ElMessage.warning('先选一个分类'); return }
+  if (Number(f.window_end) <= Number(f.window_start)) {
+    ElMessage.warning('结束时间必须晚于开始时间'); return
+  }
+  scAddRuleBusy.value = true
+  try {
+    const d = await api('/sc/category-schedules', { method: 'POST', body: JSON.stringify({ payload: {
+      plan_version_id: scOverview.value.active_version_id,
+      category_key: f.genre,
+      window_start: f.window_start, window_end: f.window_end,
+      enabled: true } }) })
+    if (!d.ok) { ElMessage.warning(d.reason || '添加失败'); return }
+    ElMessage.success(`已添加 ${scSchedName(f.genre)} 的排期规则`)
+    scAddRuleOpen.value = false
+    await loadSc()
+  } catch (e) { ElMessage.error(String(e?.message || e)) }
+  finally { scAddRuleBusy.value = false }
 }
 // v2.1.6：「复制」按钮已下线（用户口径：去掉每个分类后的复制按钮）。
 // 批量场景改用表格勾选 + 「保存」，无需逐行复制。
@@ -3369,8 +3468,9 @@ async function scSaveCyclePlan() {
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
 // ---- v2.1.46 一键 AI 调度 · 均匀排期 ----
-// 只做一件事：按各分类当前在库作品量，把每小时的排期名额分匀。
-// 不写 SCCategorySchedule、不改时段与时段 AI 建议（后端也只读它们）。
+// v2.1.54：从「只分每小时几部」升级为「连分类时段一起调」——
+// 用户口径「调整当前及后续排期分类、时间搭配，填充无排期的空白时段」。
+// 仍然不动启用状态、不动上限、不动已建的推送任务与队列（时间是既成事实）。
 async function loadScEvenPlan() {
   try {
     const d = await api('/sc/even-plan')
@@ -3380,17 +3480,23 @@ async function loadScEvenPlan() {
 async function scApplyEvenPlan() {
   try {
     await ElMessageBox.confirm(
-      '按各分类当前的待排作品量，重新分配每个时段的排期数量。不会改动你配的分类时段，也不会动时段 AI 建议。确定执行？',
+      '按各分类当前的待排作品量，同时做两件事：\n' +
+      '① 重新分配每个时段排多少部；\n' +
+      '② 重排分类与时间的搭配 —— 作品多的分类多占时段，没有作品的分类让出时段，把空着的时段填上。\n\n' +
+      '只改时段与数量：不会打开你停用的分类，不改限流上限，也不动已经建好的推送任务与队列。确定执行？',
       '一键 AI 调度', { type: 'info' })
   } catch { return }
   scEvenBusy.value = true
   try {
     const d = await api('/sc/even-plan/apply', { method: 'POST', body: JSON.stringify({ payload: {} }) })
     if (!d.ok) { ElMessage.warning(d.reason || '生成失败'); return }
-    ElMessage.success(`均匀排期已生效：每小时 ${d.base_cap} 部，覆盖 ${d.categories} 个分类、${d.hours} 个时段，合计 ${d.slots_total} 部`)
+    let msg = `均匀排期已生效：每小时 ${d.base_cap} 部，覆盖 ${d.categories} 个分类、${d.hours} 个时段，合计 ${d.slots_total} 部`
+    if (d.retimed && d.retimed.moved) msg += `；本次有 ${d.retimed.moved} 个分类的时段被重排`
+    ElMessage.success(msg)
     await loadScEvenPlan()
-    // 排期预测与调度同源，配额一变就要重算，否则同屏两处又对不上
+    // 排期预测与调度同源，配额与方法一变就要重算，否则同屏两处又对不上
     loadScForecast()
+    await loadSc()
   } catch (e) { ElMessage.error(String(e?.message || e)) } finally { scEvenBusy.value = false }
 }
 async function scClearEvenPlan() {
@@ -3612,10 +3718,12 @@ onMounted(async () => {
   }
   // 会话状态 30s 轮询一次（只读，不刷新活跃时间），剩余时间到期由服务端 401 强制退出
   sessionPollTimer = setInterval(pollSession, 30000)
-  // v0.9.10.2：实时进度轮询，登录后才启动；2 秒一次不影响服务器（单条只读查询）
-  mirrorPollTimer = setInterval(pollMirrorStatus, 2000)
+  // v0.9.10.2：实时进度轮询，登录后才启动。
+  // v2.1.54：改为自排程（运行中 2 秒 / 空闲 10 秒 / 后台页不发请求）。
+  scheduleMirrorPoll(MIRROR_POLL_BUSY)
+  document.addEventListener('visibilitychange', onVisibilityChange)
 })
-onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearInterval(mirrorPollTimer); clearInterval(sessionPollTimer) })
+onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearTimeout(mirrorPollTimer); clearInterval(sessionPollTimer); document.removeEventListener('visibilitychange', onVisibilityChange) })
 </script>
 
 <template>
@@ -3657,7 +3765,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.53 · Asia/Shanghai</span>
+          <span>v2.1.54 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -3915,7 +4023,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
           <div class="page-head"><div><h2>镜像同步</h2><p>A 源头库只读 → B 镜像库；单集/电影文件按英文剧名改名 → 自动刷新入库 → 识别 → 按分发规则推送本轮新识别影视</p></div><el-tag :type="mirrorCfg.enabled ? 'success' : 'info'" size="small">{{ mirrorCfg.enabled ? '已启用' : '未启用' }}</el-tag></div>
           <!-- v0.9.8 #195：流程节点 + 同步进度，用户能看出卡在哪一步 -->
           <div class="panel">
-            <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中 · 每 2 秒自动刷新' : '实时状态 · 每 2 秒自动刷新' }}</span></div>
+            <div class="panel-head"><h3>处理流程与进度</h3><span class="hint">{{ mirrorStatus.progress?.running ? '任务运行中 · 每 2 秒自动刷新' : '实时状态 · 空闲每 10 秒刷新' }}</span></div>
             <div class="sync-progress">
               <div class="sync-progress-track"><i :style="{ width: (mirrorStatus.progress?.percent || 0) + '%' }"></i></div>
               <!-- v2.1.11：进度文字与进度条同源——都取后端 progress.label。
@@ -3951,7 +4059,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
               </div>
             </div>
             <p class="hint" v-else style="margin-top:12px">本轮还没有任务记录。点「立即同步」后，这里只显示<b>本轮</b>处理的作品数与文件数；历史累计请看下面「同步状态」的作品级 / 目录级 / 文件级三栏。</p>
-            <p class="hint" style="margin-top:12px">任务运行中每 2 秒自动刷新，实时显示复制 / 改名 / 入库 / 分享 / 入队各阶段数量。「入库识别 / 生成分享 / 推送入队」按 TMDB 作品去重显示<b>剧集部数 / 电影部数</b>（非集数）；进度条只有分享队列清空、全部推送完成后才到 100%。若本轮入队为 0，节点会显示拦截原因（无海报 / 路由未匹配 / 未配置目标等）。</p>
+            <p class="hint" style="margin-top:12px">任务运行中每 2 秒自动刷新、空闲时每 10 秒刷新（切到后台标签页会暂停，切回来立刻补一次），实时显示复制 / 改名 / 入库 / 分享 / 入队各阶段数量。「入库识别 / 生成分享 / 推送入队」按 TMDB 作品去重显示<b>剧集部数 / 电影部数</b>（非集数）；进度条只有分享队列清空、全部推送完成后才到 100%。若本轮入队为 0，节点会显示拦截原因（无海报 / 路由未匹配 / 未配置目标等）。</p>
           </div>
           <!-- v0.9.9 #200：A/B 库设置与同步状态并列，减少纵向滚动 -->
           <div class="two-col mirror-two-col">
@@ -5341,11 +5449,13 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                    - 批量操作（一键恢复默认 / 批量采纳建议 / 保存）按勾选生效，
                      未勾选或全勾选 = 全部。 -->
               <div class="sc-card sc-hour-card sc-rule-full" v-show="scRuleTab==='分类时间排期'">
-                <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段；默认按观影习惯分配 2 小时一段（热门分类排白天、冷门分类排夜间，自动避开静默时段），共 {{ scSchedRows.length }} 类</p></div>
+                <div class="sc-card-head"><span class="sc-ico">◷</span><div><h3>分类-时间排期配置</h3><p>按 TMDB 官方分类配置推送时段；默认按作品数量分配 2 小时一段（作品多的分类占多段、作品多的排白天，自动避开静默时段），共 {{ scSchedRows.length }} 类</p></div>
+                  <el-button size="small" plain @click="scOpenAddRule">添加排期规则</el-button>
                   <el-button size="small" plain :loading="scSchedSaving" @click="scApplySchedDefaults">一键恢复默认</el-button>
                   <el-button size="small" plain :loading="scAdoptingAllAi" @click="scAdoptAllAi">批量采纳 AI 建议</el-button>
-                  <!-- v2.1.46：一键 AI 调度 —— 只重新分配每个时段「排多少部」，
-                       不动上面这些时段配置，也不动「推荐时间段」里的 AI 建议。 -->
+                  <!-- v2.1.54：一键 AI 调度 —— 除了分名额，还会**重排分类与时间的搭配**、
+                       把空着的时段填上（用户口径 3-2）。只改时段与数量，
+                       不动启用状态、不动上限、不动已建任务与队列。 -->
                   <el-button size="small" type="success" plain :loading="scEvenBusy" @click="scApplyEvenPlan">一键 AI 调度</el-button>
                   <el-button size="small" type="primary" :loading="scSchedSaving" @click="scSaveAllSchedRows">保存</el-button></div>
                 <!-- v2.1.46 均匀排期状态条：生效时数字与「按分类看明细」同源（同一份方案） -->
@@ -5369,6 +5479,12 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <span v-if="scEvenPlan.borrowed_hours && scEvenPlan.borrowed_hours.length" class="hint sc-even-borrow">
                       其中 {{ scEvenPlan.borrowed_hours.map(h => h + ' 点').join('、') }} 原本没有有货的分类，已改由库存最多的分类补位
                     </span>
+                    <!-- v2.1.54：这次调度顺手重排了哪些分类的时段 —— 用户口径 3-2 要求
+                         「调整分类、时间搭配，填充空白时段」，改了就必须说出来。 -->
+                    <span v-if="scEvenPlan.retimed && scEvenPlan.retimed.moved" class="hint sc-even-borrow">
+                      本次有 {{ scEvenPlan.retimed.moved }} 个分类的时段被重排
+                      <el-button size="small" text type="primary" @click="scRetimeDetailOpen = true">看改了哪些</el-button>
+                    </span>
                     <el-button size="small" text type="primary" @click="scEvenDetailOpen = true">按分类看明细（{{ scEvenPlan.detail.length }}）</el-button>
                     <el-button size="small" text @click="scClearEvenPlan">撤销</el-button>
                   </template>
@@ -5388,7 +5504,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                     <el-table-column label="每小时" width="90" align="right"><template #default="s">{{ s.row.per_hour }}</template></el-table-column>
                     <el-table-column label="合计部数" width="100" align="right"><template #default="s"><b>{{ s.row.works }}</b></template></el-table-column>
                   </el-table>
-                  <p class="hint">这份方案只决定「每个时段排多少部」，分类时段与时段 AI 建议原样不动；改过分类时段后建议再点一次「一键 AI 调度」重算。</p>
+                  <p class="hint">这份方案决定「每个时段排多少部」，同时会按作品量重排分类与时间的搭配；启用状态、限流上限、已建任务与队列原样不动。改过分类时段后建议再点一次「一键 AI 调度」重算。</p>
                   <p class="hint" v-if="scEvenPlan.borrowed_hours && scEvenPlan.borrowed_hours.length">
                     补位说明：{{ scEvenPlan.borrowed_hours.map(h => h + ' 点').join('、') }} 这个时段的分类今天都排不出作品，方案改让库存最多的分类来补。
                     你自己关掉的时段（主推送窗口外、静默保护内）不会被补位占用。
@@ -5402,6 +5518,22 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       </li>
                     </ul>
                   </div>
+                </el-dialog>
+                <!-- v2.1.54：一键调度「重排了哪些分类时段」明细。
+                     改了就必须看得见 —— 否则用户会以为分类时段被系统偷偷改了。 -->
+                <el-dialog v-model="scRetimeDetailOpen" title="本次调度重排了这些分类的时段" width="620px" append-to-body>
+                  <el-table :data="(scEvenPlan.retimed && scEvenPlan.retimed.details) || []" size="small" max-height="420" stripe>
+                    <el-table-column label="分类" width="130"><template #default="s"><b>{{ s.row.name }}</b></template></el-table-column>
+                    <el-table-column label="原来" min-width="150"><template #default="s">{{ s.row.before || '—' }}</template></el-table-column>
+                    <el-table-column label="现在" min-width="150"><template #default="s">{{ s.row.after }}</template></el-table-column>
+                  </el-table>
+                  <p class="hint" v-if="scEvenPlan.retimed && scEvenPlan.retimed.truncated">
+                    另有 {{ scEvenPlan.retimed.truncated }} 个分类也做了调整，列表只显示前 60 个。
+                  </p>
+                  <p class="hint">
+                    分工口径：作品多的分类多占时段，作品少或没作品的分类让出时段 —— 让出来的小时会被有货的分类填上。
+                    启用状态、限流上限、已经建好的推送任务与队列都没有改。
+                  </p>
                 </el-dialog>
                 <div class="sc-table-scroll sc-sched-scroll">
                 <el-table :data="scPrefSortRows(scSchedRows)" stripe size="small" max-height="420"
@@ -5421,7 +5553,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                       <div v-if="s.row.pref_rank" class="sc-suggest-rank">偏好第 {{ s.row.pref_rank }} 名</div>
                     </template>
                   </el-table-column>
-                  <el-table-column label="配置时间段" width="196">
+                  <el-table-column label="配置时间段" width="250">
                     <template #default="s">
                       <div class="sc-time-cell">
                         <el-select v-model="s.row.window_start" size="small" class="sc-hour-select" placeholder="起">
@@ -5432,6 +5564,21 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                           <el-option v-for="h in scEndHourOptions" :key="'e'+h" :label="h + ':00'" :value="h" :disabled="scEndHourDisabled(h)"/>
                         </el-select>
                       </div>
+                      <!-- v2.1.54：额外时段。作品多的分类一天可以占多个时段，
+                           主时段仍由上面那一对控制，这里只列多出来的段。 -->
+                      <div class="sc-extra-wins" v-if="(s.row.extra_windows || []).length">
+                        <span class="sc-extra-chip" v-for="(p, i) in s.row.extra_windows" :key="'x'+i">
+                          <el-select v-model="s.row.extra_windows[i][0]" size="small" class="sc-hour-select">
+                            <el-option v-for="h in scStartHourOptions" :key="'xs'+h" :label="h + ':00'" :value="h"/>
+                          </el-select>
+                          <span class="sc-time-dash">–</span>
+                          <el-select v-model="s.row.extra_windows[i][1]" size="small" class="sc-hour-select">
+                            <el-option v-for="h in scEndHourOptions" :key="'xe'+h" :label="h + ':00'" :value="h"/>
+                          </el-select>
+                          <button class="sc-extra-del" type="button" title="删除这个时段" @click="scSchedRemoveWindow(s.row, i)">×</button>
+                        </span>
+                      </div>
+                      <button class="sc-extra-add" type="button" @click="scSchedAddWindow(s.row)">+ 时段</button>
                       <div v-if="s.row.quiet_conflict" class="sc-cell-warn">与静默保护时段重叠</div>
                     </template>
                   </el-table-column>
@@ -5445,9 +5592,36 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearI
                 </el-table>
                 </div>
                 <div v-if="!scSchedRows.length" class="empty">暂无分类排期，点击「一键恢复默认」按 TMDB 官方分类初始化</div>
+                <!-- v2.1.54：新增排期规则（分类下拉取 TMDB 官方全集） -->
+                <el-dialog v-model="scAddRuleOpen" title="添加排期规则" width="420px" append-to-body>
+                  <p class="hint">选一个 TMDB 官方分类，再给它配一段推送时间。已经配过的分类会直接更新那一段，不会重复建行。</p>
+                  <el-form label-width="88px">
+                    <el-form-item label="分类">
+                      <el-select v-model="scAddRuleForm.genre" filterable size="small" placeholder="搜索或选择分类" style="width:100%">
+                        <el-option v-for="c in scGenreOptions" :key="'g'+c.value"
+                                   :label="c.label" :value="c.value"/>
+                      </el-select>
+                    </el-form-item>
+                    <el-form-item label="推送时段">
+                      <div class="sc-time-cell">
+                        <el-select v-model="scAddRuleForm.window_start" size="small" class="sc-hour-select">
+                          <el-option v-for="h in scStartHourOptions" :key="'as'+h" :label="h + ':00'" :value="h"/>
+                        </el-select>
+                        <span class="sc-time-dash">–</span>
+                        <el-select v-model="scAddRuleForm.window_end" size="small" class="sc-hour-select">
+                          <el-option v-for="h in scEndHourOptions" :key="'ae'+h" :label="h + ':00'" :value="h"/>
+                        </el-select>
+                      </div>
+                    </el-form-item>
+                  </el-form>
+                  <template #footer>
+                    <el-button size="small" @click="scAddRuleOpen = false">取消</el-button>
+                    <el-button size="small" type="primary" :loading="scAddRuleBusy" @click="scSubmitAddRule">添加</el-button>
+                  </template>
+                </el-dialog>
                 <p class="hint sc-source-note">分类来自 tmdb.py 官方 genre（{{ scGenreCatalog.length }} 项）；推荐时间段为**单一时间段**（2 小时颗粒度），来源标注「实测」= 该分类真实发布的小时分布，「习惯基线」= 默认时间表派生的作息基线——每个分类都有建议，采纳按钮始终可用。</p>
                 <p v-if="scQuietOn" class="hint sc-source-note">静默保护已开启（{{ scCyclePlan.quiet_start }}:00–{{ scCyclePlan.quiet_end }}:00），配置时间段中落在静默区间的小时**不可选**，默认时间表也会自动避开静默时段。</p>
-                <p class="hint sc-source-note">默认时间表按观影习惯排布：热门分类优先占白天段、冷门分类排夜间段，每段 2 小时（{{ (scPreference.day_segments || []).length }} 个白天段 + {{ (scPreference.night_segments || []).length }} 个夜间段），段用完的分类保持全天 {{ (scPreference.full_day_window || [0, 24])[0] }}:00–{{ (scPreference.full_day_window || [0, 24])[1] }}:00。偏好排名由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）。速率上限统一由「周期计划管理」约束，不在分类表内单独配置。</p>
+                <p class="hint sc-source-note">默认时间表按**库存 + 观影习惯**排布：全天 00:00–24:00 共 12 段，每 2 小时一段（{{ (scPreference.day_segments || []).length }} 个白天段 + {{ (scPreference.night_segments || []).length }} 个夜间段）。段数按各分类待排作品数量分配 —— 作品多的分类一天占多个时段，资源库里没有待排作品的分类暂不占时段（占了那一小时也排不出东西）；段位按热门定，热门分类优先占白天段、冷门分类排夜间段，同一时段有多个分类时按库存让位。偏好排名由分类字典的人工优先级与该分类已成功推送条数真实派生（人工优先、热度次之）。速率上限统一由「周期计划管理」约束，不在分类表内单独配置。</p>
               </div>
               </div>
             </div>
@@ -6518,6 +6692,17 @@ html.dark .sc-even-strip{background:var(--yg-panel);border-color:var(--yg-line)}
 .sc-time-dash{color:var(--yg-muted);font-size:11px}
 /* 与静默保护时段重叠的提示 */
 .sc-cell-warn{margin-top:3px;font-size:10px;color:#e5526b;line-height:1.3}
+/* v2.1.54：额外时段（作品多的分类一天占多个时段）。
+   主时段在上一行，额外段以 chip 形式往下排，可加可删；chip 内是起止两个下拉。 */
+.sc-extra-wins{margin-top:3px;display:flex;flex-direction:column;gap:3px}
+.sc-extra-chip{display:flex;align-items:center;gap:3px}
+.sc-extra-chip .sc-hour-select{width:76px}
+.sc-extra-del{border:0;background:transparent;color:var(--yg-muted);cursor:pointer;
+  font-size:13px;line-height:1;padding:0 3px}
+.sc-extra-del:hover{color:#e5526b}
+.sc-extra-add{margin-top:3px;border:1px dashed var(--yg-border);background:transparent;
+  color:var(--yg-primary);font-size:11px;border-radius:4px;padding:1px 6px;cursor:pointer}
+.sc-extra-add:hover{background:rgba(109,94,252,.06)}
 /* v2.1.6：推送渠道单元格（频道/群 各一行，格式「群:名称（群id或用户名）」） */
 .sc-target-cell{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
 /* v2.1.6：推荐时间段单元格（单一时间段 + 来源标签 + 偏好排名） */

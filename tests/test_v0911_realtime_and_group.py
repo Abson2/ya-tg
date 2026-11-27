@@ -221,10 +221,13 @@ def test_overview_compact_70(db):
         assert len(seg) <= 72
 
 
-# ---------- 前端：2 秒轮询 + stageLabel + 并排按钮提示 ----------
+# ---------- 前端：轮询 + stageLabel + 并排按钮提示 ----------
 def test_frontend_realtime_poll_and_labels():
-    assert "setInterval(pollMirrorStatus, 2000)" in APP
-    assert "mirrorPollTimer" in APP and "clearInterval(mirrorPollTimer)" in APP
+    # v2.1.54：固定 2 秒轮询改成自排程（运行中 2 秒 / 空闲 10 秒 / 后台不发请求），
+    # 断言随之改为「自排程入口在、固定间隔不再出现」，其余口径不变。
+    assert "setInterval(pollMirrorStatus, 2000)" not in APP
+    assert "scheduleMirrorPoll(MIRROR_POLL_BUSY)" in APP
+    assert "mirrorPollTimer" in APP and "clearTimeout(mirrorPollTimer)" in APP
     assert "复制到 B 库" in APP and "生成分享 / 推送" in APP
     assert "剧集部数" in APP and "电影部数" in APP
     assert "每 2 秒自动刷新" in APP

@@ -38,6 +38,70 @@ TMDB_GENRES = {
     10759: "动作冒险", 10762: "儿童", 10763: "新闻", 10764: "真人秀", 10765: "科幻奇幻",
     10766: "肥皂剧", 10767: "访谈", 10768: "战争政治",
 }
+
+# ---------------------------------------------------------------------------
+# v2.1.54：TMDB 官方 genre 的**英文原名 → 中文名**。
+#
+# 为什么需要这张表：TMDB 的 zh-CN 翻译对 TV 专用分类有缺口，实测线上
+# （2026-11-27 只读扫描 25657 条资源、26 个唯一 genre 名）**只有两个是英文**：
+#   Sci-Fi & Fantasy → 2438 条资源
+#   War & Politics    → 1408 条资源
+# 其余 24 个都拿到了中文。于是同一部作品在三个地方显示成三个样：
+#   资源库列表   → 「Sci-Fi & Fantasy」（genres[0] 原文直出）
+#   分享中心     → 「未分类」（归一成 genre:scifi&fantasy，不在官方字典里）
+#   分类排期配置 → 「科幻奇幻」（唯一权威的中文键）
+#
+# 这张表是**唯一归一入口**：`genre_name_cn()`。三处都必须调它，
+# 绝不允许再各写一份判断（v2.1.54 的根因就是判据有两份实现）。
+TMDB_GENRES_EN = {
+    "Action": "动作", "Adventure": "冒险", "Animation": "动画", "Comedy": "喜剧",
+    "Crime": "犯罪", "Documentary": "纪录", "Drama": "剧情", "Family": "家庭",
+    "Fantasy": "奇幻", "History": "历史", "Horror": "恐怖", "Music": "音乐",
+    "Mystery": "悬疑", "Romance": "爱情", "Science Fiction": "科幻",
+    "TV Movie": "电视电影", "Thriller": "惊悚", "War": "战争", "Western": "西部",
+    "Action & Adventure": "动作冒险", "Kids": "儿童", "News": "新闻",
+    "Reality": "真人秀", "Sci-Fi & Fantasy": "科幻奇幻", "Soap": "肥皂剧",
+    "Talk": "访谈", "War & Politics": "战争政治",
+}
+
+
+def _genre_key(name: str) -> str:
+    """genre 名的归一指纹：小写、去掉空格/连字符/下划线/点/逗号/间隔点/冒号。
+
+    与 utils.normalize_work_name 的字符处理保持一致，但不剥年份、不剥括号——
+    genre 名里不会出现 `(2026)` 这类噪声，多做一步反而可能把合法名字改坏。
+    """
+    return re.sub(r"[\s\-_.,·:：&]+", "", str(name or "")).lower()
+
+
+# 归一指纹 → 中文官方名。同时收「英文原名」与「中文名」两条，
+# 这样无论上游给的是 `Sci-Fi & Fantasy`、`sci-fi & fantasy` 还是 `科幻奇幻`，
+# 都能落到同一个键上。
+_GENRE_FINGERPRINT: dict[str, str] = {}
+for _gid, _cn in TMDB_GENRES.items():
+    _GENRE_FINGERPRINT[_genre_key(_cn)] = _cn
+for _en, _cn in TMDB_GENRES_EN.items():
+    _GENRE_FINGERPRINT[_genre_key(_en)] = _cn
+
+
+def genre_name_cn(name: str) -> str:
+    """把任意写法的 TMDB 分类名归一到**官方中文名**；认不出来原样返回（去掉首尾空白）。
+
+    **这是全项目唯一的 genre 名归一入口。** 资源库分组、分享中心主分类、
+    分类排期配置三处必须共用它，否则同一部作品会在页面上显示成三个分类。
+
+    认不出来的名字不硬套：原样返回，由调用方决定是「未分类」还是「保留原名」。
+    绝不把不认识的名字猜成某个官方分类——那会把作品塞进错误库存。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    hit = _GENRE_FINGERPRINT.get(_genre_key(s))
+    if hit:
+        return hit
+    return s
+
+
 COUNTRY_NAMES = {
     "US": "美国", "GB": "英国", "CN": "中国", "HK": "中国香港", "TW": "中国台湾",
     "MO": "中国澳门", "JP": "日本", "KR": "韩国", "FR": "法国", "DE": "德国",

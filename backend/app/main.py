@@ -16,10 +16,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session
 
 from . import (admin_session, ai_assist, async_scan_state, bot_listener,
@@ -27,7 +28,7 @@ from . import (admin_session, ai_assist, async_scan_state, bot_listener,
                mirror, mirror_batch, runtime_config, share_center_v2, tg_stats,
                tg_stats_api, tg_stats_service, tgto, tmdb)
 from .config import VALID_DURATIONS, settings
-from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine
+from .db import DEFAULT_TEMPLATE, TEMPLATE_PRESETS, Base, SessionLocal, get_db, json_dumps, migrate, engine, pool_status
 from .guangya import (GuangYaError, GuangYaOpenAPI, GuangYaShareClient, GuangYaWebFiles,
                       WebFileError, create_share_parsed)
 from .identify_batch import count_pending, mark_attempted, select_identify_batch
@@ -866,12 +867,30 @@ def _run_share_cycle_in_thread(limit: int = 20) -> dict:
             return {"built": 0, "submitted": 0, "skipped": 0, "failed": 0, "error": True}
 
 
+# v2.1.54：分享中心单轮硬上限。
+# 真机（2026-11-27）：share_center 从 21:44 起一轮永不结束，之后每 5 秒都 skipped，
+# 整整挂了 10 小时。dispach 内部虽有 60 秒预算，但它只在"开始下一个任务前"检查——
+# 一旦某个 await 本身不返回，预算检查根本轮不到。这里在整轮外面再兜一层：
+# 超时后协程被取消、函数返回、`with SessionLocal()` 退出 → **连接一定归还**。
+SHARE_CENTER_CYCLE_TIMEOUT_SECONDS = 180
+
+
 def _run_share_center_v2_cycle_in_thread(limit: int = 20) -> dict:
     """分享中心 v2 调度周期：全部在 sc_* 新表上运行，线程内独立 Session。"""
     with SessionLocal() as db:
         try:
             share_center_v2.ensure_defaults(db)
-            return asyncio.run(share_center_v2.run_cycle(db, limit=limit))
+            return asyncio.run(asyncio.wait_for(
+                share_center_v2.run_cycle(db, limit=limit),
+                timeout=SHARE_CENTER_CYCLE_TIMEOUT_SECONDS,
+            ))
+        except asyncio.TimeoutError:
+            # v2.1.54：超时是"本轮放弃"，不是业务失败——任务状态原样留在库里，
+            # 下一轮自然会被重新捞起。关键是**别让这一轮继续挂着连接**。
+            db.rollback()
+            logger.error("[share_center_v2] 单轮超过 %ss 硬上限，本轮放弃（任务留待下轮）",
+                         SHARE_CENTER_CYCLE_TIMEOUT_SECONDS)
+            return {"enabled": True, "error": True, "timeout": True}
         except Exception as exc:
             db.rollback()
             logger.warning("[share_center_v2] 调度周期异常（线程内）", exc_info=True)
@@ -1142,7 +1161,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.53", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.54", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1153,7 +1172,28 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.53", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.54", "app": "Ya-TG"}
+
+
+@app.exception_handler(PoolTimeoutError)
+async def _db_pool_timeout_handler(request, exc):
+    """v2.1.54：连接池耗尽 → 立刻 503 + 打一行带池占用的 ERROR。
+
+    真机（2026-11-27）表现是"整站假死"：15 个连接被占满后，每个请求都要等满
+    `pool_timeout` 才抛错，页面因此完全没有响应，用户连"打开看看什么卡了"都做不到。
+    v2.1.54 把 API 池的 pool_timeout 缩到 5 秒，再在这里把异常收成 503 —— 快速失败
+    比白屏等 30 秒有用得多，而且这行日志会记下**两个池各自的 checkedout / overflow**，
+    下次再出问题能一眼看出是 job 池还是 API 池被占满。
+    """
+    st = pool_status()
+    logger.error("[db] 连接池耗尽，快速失败：%s %s pool=%s",
+                 request.method, request.url.path, st)
+    return JSONResponse(
+        status_code=503,
+        content={"ok": False,
+                 "error": "服务繁忙：数据库连接已占满，请稍后重试",
+                 "pool": st},
+    )
 
 
 # ---------- v0.9.20：管理后台会话登录（未活跃 idle 到期强制重新输入密码） ----------
@@ -3385,7 +3425,10 @@ def mirror_level_detail(level: str, scope: str, limit: int = 200,
         raise HTTPException(400, "未知状态")
     total = int(q[level][scope].count())
     rows = list(q[level][scope].order_by(None).limit(n).all())
-    titles = {m.id: m.title_standard for m in db.scalars(select(MirrorMedia)).all()}
+    # v2.1.54：只取两列投影（id → 标准名），不再 `select(MirrorMedia).all()` 实例化整表实体。
+    # 这个接口是前端明细抽屉/假死期排查时的高频调用，整表实体建出来只为了查几十个名字。
+    titles = {row[0]: (row[1] or "") for row in db.execute(
+        select(MirrorMedia.id, MirrorMedia.title_standard)).all()}
     out: list[dict] = []
     if level == "work":
         failed_counts: dict[int, int] = {}
@@ -3440,7 +3483,11 @@ def mirror_status(db: Session = Depends(get_db)):
     # MirrorFile.error / MirrorTask.error 落库持久化，刷新页面依然可查。
     failed_files = list(db.scalars(select(MirrorFile).where(
         MirrorFile.status == "failed").order_by(MirrorFile.id.desc()).limit(50)).all())
-    titles = {m.id: m.title_standard for m in db.scalars(select(MirrorMedia)).all()}
+    # v2.1.54：这里原来 `select(MirrorMedia).all()` —— 为了给下面几十条明细补作品名，
+    # 却把**整张映射表的 ORM 实体**都建出来塞进 identity map。假死期前端每 2 秒调一次
+    # 这个接口，等于每 2 秒白建一遍全表对象。改成只取两列投影，语义完全一致。
+    titles = {row[0]: (row[1] or "") for row in db.execute(
+        select(MirrorMedia.id, MirrorMedia.title_standard)).all()}
     file_errors = [{"id": f.id, "work": titles.get(f.media_id, ""),
                     "file": f.file_name, "task_id": f.task_id or "",
                     "error": f.error or "", "status": f.status}
@@ -4821,9 +4868,17 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         try:
             from .tmdb import TMDB_GENRES as _TG
             from .tmdb import as_list as _as_list
-            for _name in _as_list(x.genres):
-                if not _name:
+            from .tmdb import genre_name_cn as _gcn
+            for _raw in _as_list(x.genres):
+                if not _raw:
                     continue
+                # v2.1.54：**先归一到官方中文名再判**。
+                # 此前直接把 TMDB 原文塞进 primary_genre，而 `Sci-Fi & Fantasy`
+                # `War & Politics` 这两个 TV 专用分类 TMDB 的 zh-CN 没有翻译 →
+                # 资源库列表显示英文，分享中心那边归一后查不到官方字典显示「未分类」，
+                # 排期配置里却是「科幻奇幻」——同一个作品三个地方三个分类。
+                # 归一后三处同一份判据（tmdb.genre_name_cn 是唯一入口）。
+                _name = _gcn(_raw)
                 if not g["primary_genre"]:
                     g["primary_genre"] = _name
                 if _name in _TG.values() and _name not in g["genre_names"]:

@@ -1150,6 +1150,14 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                              and _fp_size(a_source_fps[r.source_file_id])
                              != _fp_size(str(r.fingerprint or "")))
             # 只在「该作品本轮会被选」的范围内做 B 库核对，控制接口开销
+            #
+            # v2.1.54：反查 B 库是网络调用（每部几秒），而上面那一大段全是读——
+            # 不在这里收口，这个 for 循环就会全程持着一条连接跑完整轮预扫描。
+            # 与 `_resolve_english_title` 同一个范式：只读做完立刻 commit 释放读快照，
+            # 网络 await 期间不持任何事务。commit 后 ORM 行会 expire，后续按需重查，
+            # 语义不变（这里本来每部都要重新读一次 rows 的字段）。
+            db.expire_on_commit = False
+            db.commit()
             candidates, verified = await api_b_candidates_safe(api, media)
             if not verified:
                 prepass["skipped"] += 1
@@ -2214,8 +2222,27 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     _manifest = load_dir_manifest(db, rule.id)
     _plan = plan_light_scan(db, rule.id, _manifest, deep_minutes=_deep_min)
     _listed: set[str] = set()
+    # v2.1.54：列目录前的**事务边界**（这是"整轮持连接"的最大一处）。
+    #
+    # 上面这一串——_purge_legacy_failed / max_file_attempts / 多次 runtime_config.get /
+    # load_dir_manifest / plan_light_scan——**全是读操作**，但它们都在同一个未结束的事务里：
+    # SQLAlchemy 第一次查询就 checkout 连接，直到 commit/rollback 才归还。而下面
+    # `_walk_source` 是纯网络（递归列目录，轻量轮几分钟、全量轮几十分钟、最坏九十分钟）。
+    # 不在这里收口，一个"只是看看目录"的流程就会整轮占着一条连接，把池拖到耗尽——
+    # 2026-11-27 那次整站假死里，镜像锁持有 5296 秒就是这么来的。
+    #
+    # commit 而非 rollback：上面若真有未落库的写入（_purge_legacy_failed 删过行），
+    # 本来就该落库；这里只是把事务边界前移，不改变任何业务语义。
+    #
+    # `expire_on_commit = False` 是必须的搭档：默认 commit 会把所有 ORM 对象标脏，
+    # 下面 `rule.source_root_id` 一取值就隐式 SELECT —— 刚归还的连接立刻被抢回来，
+    # 前面那次 commit 等于白做（本用例 `test_v2154_conn_not_held` 就是这么抓到的）。
+    # 关掉之后对象保留已加载的值，网络期间一次查询都不发。
+    _src_root = rule.source_root_id
+    db.expire_on_commit = False
+    db.commit()
     nodes, complete = await _walk_source(
-        api, rule.source_root_id, max_dirs=_walk_max, stats=stats,
+        api, _src_root, max_dirs=_walk_max, stats=stats,
         concurrency=_walk_conc, manifest=_manifest, light=_plan["light"],
         force_dirs=_plan["force_dirs"], listed_out=_listed,
         # v2.1.52：按角色必列（已知作品目录 + 分类祖先链）。不传就等于退回
@@ -3132,6 +3159,11 @@ async def backfill_target_file_ids(db: Session, rule: MirrorRule) -> int:
             MirrorFile.status.in_(["synced", "copying", "failed", "unknown", "pending"]))).all())
         if not pending:
             continue
+        # v2.1.54：列 B 库是网络调用，而上面查 pending 已经把连接 checkout 了。
+        # 不在网络前收口，就是这个 for 循环每部都持着连接去列目录（几十部 = 几分钟）。
+        # commit 后 ORM 行 expire，`_lookup_b_file` 按需重读字段，语义不变。
+        db.expire_on_commit = False
+        db.commit()
         candidates, _verified = await _b_file_candidates(api, media)
         if not candidates:
             continue
@@ -4126,6 +4158,10 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
         if not do_file:
             break
         stats["media_checked"] += 1
+        # v2.1.54：这个循环每部都要列一次 B 库（网络），而 medias 一查完连接就被
+        # checkout 了。不在每次网络前收口，整批 max_media 部就全程持着一条连接。
+        db.expire_on_commit = False
+        db.commit()
         try:
             candidates, verified = await _b_file_candidates(api, media)
         except Exception as exc:
@@ -4231,6 +4267,9 @@ async def prune_missing_media_rows(db: Session, rule: MirrorRule, *,
         MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id.desc())).all())
     for media in medias[:max_media]:
         stats["media_checked"] += 1
+        # v2.1.54：同 prune_stale_mappings —— 网络前收口，别让整批反查持着连接。
+        db.expire_on_commit = False
+        db.commit()
         try:
             candidates, verified = await _b_file_candidates(api, media)
         except Exception as exc:
@@ -4276,6 +4315,20 @@ async def poll_pending_tasks(db: Session, rule: MirrorRule, *,
         task.status = "running"
         rows = list(db.scalars(select(MirrorFile).where(
             MirrorFile.task_id == task.task_id)).all())
+        # v2.1.54：**网络轮询前收口事务**（这条路径以前整轮只 commit 一次）。
+        #
+        # `_poll_task` 内部是「sleep(2s) → 查任务状态 → 再 sleep」的 5 轮循环，单个任务
+        # 就要 10 秒以上；tasks 一多，这条连接就被占着跑完整个循环。更糟的是它跨 await
+        # 持有读事务，正好撞在"SQLite 只允许一个写者"上 —— 别的 job 想写只能干等到
+        # 30 秒 busy_timeout 超时（2026-11-27 那次 share_center 从 21:44 起一轮不结束，
+        # 就是这条链路在等锁/等连接）。
+        #
+        # 先 commit 把 `running` 落库并归还连接：autoflush=False 下 `_poll_task` 内部那些
+        # 赋值只是内存态，不占写锁；网络期间也就不持有任何 DB 资源。
+        # expire_on_commit=False：否则 `_poll_task` 里 `task.task_id` 一取值就隐式 SELECT，
+        # 连接又被拿回去（这条是行为用例逼出来的，不是推测）。
+        db.expire_on_commit = False
+        db.commit()
         if await _poll_task(api, task, max_polls=max_polls, interval=interval):
             done += 1
             for row in rows:

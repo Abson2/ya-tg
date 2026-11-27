@@ -161,9 +161,12 @@ def test_plan_engine_creates_list_items_tasks_and_cursors(env):
         # 至少有一个游标推进，且推进的分类确实拥有该作品。
         advanced = [c for c in cursors if c.last_library_version_id > 0]
         assert advanced, "有作品的分类必须推进游标"
-        # 测试资源的 genres 是英文 "Drama" → 归类 key 为 genre:drama。
+        # 测试资源的 genres 是英文 "Drama"。v2.1.54 起归类前先过
+        # `tmdb.genre_name_cn()` 归一，于是 key 变成 genre:剧情 ——
+        # 改前是 genre:drama，那正是线上 586 部「未分类」的成因（英文名
+        # 进不了 27 项官方字典），所以这里断言的是修好之后的口径。
         # 断言推进游标的分类必须是该作品真实归属的分类（而不是所有分类）。
-        assert all(c.category_key == "genre:drama" for c in advanced), \
+        assert all(c.category_key == "genre:剧情" for c in advanced), \
             "只应推进真实拥有作品的分类"
 
 

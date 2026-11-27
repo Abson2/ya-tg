@@ -165,6 +165,21 @@ def clock_1500(monkeypatch):
 EMPTY_SLOT_HOURS = list(range(8, 18))       # 西部独占窗口、却没货 → 空档
 
 
+@pytest.fixture(autouse=True)
+def _no_retime(monkeypatch):
+    """v2.1.54：一键调度现在会**先按库存重排分类时段**（`_retime_schedules_by_stock`），
+    空档从配置层就不存在了 —— 那正是用户要的效果。
+
+    本文件验证的是**运行时补位兜底**（配置层万一没排满时的那道保险），
+    所以这里把重排关掉，让补位机制单独被验证。重排本身由
+    `test_v2154_schedule_by_stock.py` 负责锁。
+    """
+    from app import share_center_v2 as _sc2
+    monkeypatch.setattr(
+        _sc2, "_retime_schedules_by_stock",
+        lambda *a, **k: {"moved": 0, "details": [], "truncated": 0})
+
+
 # ===========================================================================
 # 一、纯函数
 # ===========================================================================

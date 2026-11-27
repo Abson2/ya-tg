@@ -1007,6 +1007,15 @@ class SCCategorySchedule(Base):
     # v2.1.1：该行时段是否由系统按用户偏好自动分配（1=自动，0=用户手工设定）。
     # 自动分配的行可被「按偏好分配时段」刷新；手工设定的行永不被覆盖。
     window_auto: Mapped[bool] = mapped_column(Boolean, default=True)
+    # v2.1.54：**额外时段**（JSON，形如 [[16,18],[20,22]]）。
+    # 用户口径「结合各分类的作品数量均匀排期，现在空档的时段太多，
+    # 允许作品数量多的多时段推送」——库存多的分类要能在一天里占多个时段。
+    #
+    # 为什么不做成「同一分类多行」：本表有 (plan_version_id, category_key) 唯一约束，
+    # 而 SQLite 去掉约束必须重建整表（项目历史上从未做过重建表迁移，风险不成比例）。
+    # 用一个 JSON 列表达多时段，代价是一条 ALTER ADD COLUMN，风险几乎为零。
+    # 主时段仍是 window_start/window_end（老代码、老接口全部照旧读这两个字段）。
+    extra_windows: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (

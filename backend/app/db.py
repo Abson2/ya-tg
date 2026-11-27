@@ -14,10 +14,37 @@ if _IS_SQLITE:
     # 30 秒队列 worker）与手动同步、定时扫描并发写时，默认 5 秒等待极易抛
     # `database is locked`。把等待放宽到 30 秒，并开 WAL 让读写不再互斥。
     args["timeout"] = 30
-engine = create_engine(settings.database_url, connect_args=args, pool_pre_ping=True)
+
+# v2.1.54（真机事故 2026-11-27：整站假死）
+#
+# 现场：容器 Up 但 unhealthy，`/api/health`、`/docs` 全部超时，CPU 0%、进程都在。
+# 日志报 `QueuePool limit of size 5 overflow 10 reached, connection timed out 30.00`。
+# 从 21:44 起 share_center 一轮不结束持续 skipped，随后 rename_pending 等 job 全部
+# 被拖下水，09:14 起调度器大面积 missed，连静态文档都打不开。
+#
+# 结构性问题：**所有 HTTP 请求与所有后台 job 共用同一个 15 连接池**。这意味着
+# 任何一方都能把另一方拖死——一个卡住的 job 占满池，用户连"打开页面看看什么卡了"
+# 都做不到；反过来前端秒级轮询刷得凶，也会把同步流程饿死。这是"整站假死"的成因，
+# 不是某个接口慢的问题。
+#
+# 改法：拆成两个池 + 两套超时语义。
+#   job 池（小、等待长）：后台 job 是长任务，偶尔排队没关系，但绝不能被 API 挤占；
+#   API 池（大、等待短）：页面请求必须**快速失败**而不是全员卡 30 秒——池满时立刻
+#   返回错误，用户看得到"忙"，而不是白屏。
+POOL_KW_JOB: dict = {}
+POOL_KW_API: dict = {}
+if _IS_SQLITE:
+    # 8+8=16 ≥ 改动前的 15，容量不缩；只是把"谁来等"换成了"谁能先拿到"。
+    POOL_KW_JOB = dict(pool_size=8, max_overflow=8, pool_timeout=15)
+    POOL_KW_API = dict(pool_size=10, max_overflow=20, pool_timeout=5)
+
+engine = create_engine(settings.database_url, connect_args=args,
+                       pool_pre_ping=True, **POOL_KW_JOB)
+# v2.1.54：HTTP 请求专用池。get_db() 走这个，与后台 job 完全隔离。
+api_engine = create_engine(settings.database_url, connect_args=args,
+                           pool_pre_ping=True, **POOL_KW_API)
 
 if _IS_SQLITE:
-    @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_conn, _record):
         """每个新连接都生效；journal_mode=WAL 是库级持久设置，重复执行无副作用。
 
@@ -37,8 +64,17 @@ if _IS_SQLITE:
                 # 内存库 / 只读文件系统 / 并发写锁等场景单项失败不影响其余设置
                 pass
 
+    # v2.1.54：两个池都要装。WAL 是库级设置（重复执行无副作用），
+    # busy_timeout 是连接级、必须每条新连接都设，漏一个池就等于那个池没有等待保护。
+    event.listen(engine, "connect", _sqlite_pragmas)
+    event.listen(api_engine, "connect", _sqlite_pragmas)
+
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+# v2.1.54：HTTP 请求专用（bind 到 api_engine），与后台 job 池完全隔离。
+# 新增这个 maker 时必须同时给它装归档过滤（见文件末尾 _install_archive_filter 两次调用），
+# 否则页面能看到已归档行 —— 这是 v2.1.11 的老红线。
+ApiSessionLocal = sessionmaker(bind=api_engine, autoflush=False, autocommit=False)
 
 
 # v2.1.11：归档过滤的旁路开关（ContextVar，线程/任务级隔离）。
@@ -85,8 +121,12 @@ def _collect_table_names(clause, names: set[str]) -> None:
         _collect_table_names(right, names)
 
 
-def _install_archive_filter() -> None:
+def _install_archive_filter(maker) -> None:
     """给所有 SELECT 自动追加「排除归档行」条件。
+
+    v2.1.54：加 `maker` 形参 —— 连接池拆成 job / API 两个后，两个 sessionmaker
+    都必须装上同一个过滤器。**漏装哪一个，那个池的查询就会把已归档行漏给页面**
+    （归档行被重新识别、重新入队推送），这是 v2.1.11 定的红线。
 
     只对 resources / push_queue 两张表生效；其余模型完全不受影响。
 
@@ -198,7 +238,7 @@ def _install_archive_filter() -> None:
             tree = out
         return tree
 
-    @event.listens_for(SessionLocal, "do_orm_execute")
+    @event.listens_for(maker, "do_orm_execute")
     def _apply_archive_filter(state):  # pragma: no cover - 由 SQLAlchemy 事件驱动
         if not state.is_select:
             return
@@ -215,15 +255,39 @@ def _install_archive_filter() -> None:
             logger.warning("[archive] 归档过滤补丁异常，本次查询按原样执行：%s", exc)
 
 
-_install_archive_filter()
+_install_archive_filter(SessionLocal)
+_install_archive_filter(ApiSessionLocal)
 
 
 def get_db():
-    db = SessionLocal()
+    """HTTP 请求的 DB 会话。
+
+    v2.1.54：bind 到 api_engine（独立池）。后台 job 把 job 池占满也不会让页面
+    打不开——这正是 2026-11-27 那次"整站假死"要防的事。
+    """
+    db = ApiSessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+def pool_status() -> dict:
+    """两个连接池的实时占用，池满/超时时打日志用（v2.1.54）。
+
+    排查需要知道"到底是谁把连接占光了"：以前只有一句 QueuePool TimeoutError，
+    看不出池里有几个在用、几个在等。这里一次给出两池的 size / checkedout /
+    overflow，配合下方 api_pool_guard 的超时日志使用。
+    """
+    def _one(eng) -> dict:
+        try:
+            p = eng.pool
+            return {"size": p.size(), "checkedout": p.checkedout(),
+                    "overflow": p.overflow(), "timeout": p._timeout}
+        except Exception:
+            return {}
+
+    return {"job": _one(engine), "api": _one(api_engine)}
 
 
 # v0.1.0 -> v0.2.0 轻量迁移：SQLite 不支持 CREATE COLUMN IF NOT EXISTS，逐列检查后 ALTER。
@@ -352,6 +416,9 @@ _COLUMNS = {
         "enabled": "BOOLEAN DEFAULT 1",
         # v2.1.1：时段是否由系统按用户偏好自动分配（1=自动，可被刷新；0=用户手工设定）
         "window_auto": "BOOLEAN DEFAULT 1",
+        # v2.1.54：额外时段（JSON，[[起,止],…]）。库存多的分类占多个时段，
+        # 主时段仍读 window_start/window_end，这一列只装「多出来的那些段」。
+        "extra_windows": "TEXT DEFAULT ''",
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
     },
