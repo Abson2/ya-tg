@@ -11,6 +11,9 @@
 本文件锁死：
   ① `_new_release_state` 三态：returning 在映 / ended 按 last_air_date 次日 0 点过期 /
      电影按 30 天窗口 / 数据不足返回 None（绝不猜）；
+     v2.1.56 起 returning 也要看 `last_air_date`（长期停更转存量），
+     本文件那条「拿不到播出日」的用例仍按原行为算新上映，
+     「播出日太老」的边界由 `test_v2156_new_release_returning.py` 锁；
   ② 时段匀速：间隔 = 四舍五入(时段分钟 ÷ 部数)，站台锚定时段起点；
   ③ `_period_pace` / `_period_released` 与预测同一口径（预测不许比实跑偏快）；
   ④ 终态记录不显示「存量排期」；
@@ -64,7 +67,12 @@ def _sh(dt: datetime) -> datetime:
 # ① 「新上映」过期口径（用户口径 3）
 # ---------------------------------------------------------------------------
 def test_new_release_state_returning_stays_valid():
-    """returning（连载中）→ 一直是「新上映」，与上映多久无关。"""
+    """returning 但**拿不到**最后一集播出日 → 无从判断，仍算「新上映」。
+
+    v2.1.56：returning 不再是「无条件永不过期」——播出日超过
+    `RETURNING_STALE_DAYS` 天会转存量（见 `test_v2156_new_release_returning.py`）。
+    本条锁的是「拿不到日期时不猜」这一半：宁可继续算新上映，也不编一个日期。
+    """
     now = _sh(datetime.now(timezone.utc))
     assert sc2._new_release_state(
         release_date="2020-01-01", last_air_date="", finish_status="returning",

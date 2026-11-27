@@ -327,20 +327,55 @@ def test_three_refresh_entries_all_reconcile_with_allow_empty(db):
     assert all(c.kwargs.get("batch_id") == b.id for c in rc.await_args_list)
 
 
-def test_scheduled_scan_still_never_reconciles(db):
-    """定时扫描保持「不自动删数据」，不能被三个入口的统一改造带跑。"""
+def test_scheduled_scan_reconciles_but_never_with_empty_batch(db):
+    """v2.1.56（用户口径 2026-11-28）：定时扫描发现 B 库已无的内容，资源库也要移除。
+
+    此前定时扫描**完全不做对账**，B 库整部删掉后资源库那行会一直挂着，
+    用户看到的表现就是「资源库里的作品删不掉」。现在接入对账，但**绝不传
+    allow_empty** —— 定时扫描不许用空批次清库，接口抖动时宁可保留旧数据。
+    """
     @contextmanager
     def _sess():
         yield db
 
+    b = _batch(db)
+    scan_data = {"files": 0, "directories": 3, "resumed": False, "complete": True,
+                 "seen_file_ids": [], "batch_id": b.id, "change_events": []}
     with patch("app.main.SessionLocal", _sess), \
          patch("app.main._effective_scan_root", return_value=(B_ROOT, "mirror_b")), \
-         patch("app.main.run_scan", new=AsyncMock(return_value={})), \
+         patch("app.main.run_scan", new=AsyncMock(return_value=scan_data)), \
          patch("app.main._post_scan_identify", new=AsyncMock(return_value={})), \
          patch("app.main.process_change_events", return_value={}), \
-         patch("app.main._reconcile_library", new=AsyncMock()) as rc:
+         patch("app.main._reconcile_library",
+               new=AsyncMock(return_value={"removed": 0})) as rc:
         _run(main._scheduled_scan(B_ROOT))
-    assert rc.await_count == 0
+    assert rc.await_count == 1, "定时扫描必须对账"
+    kw = rc.await_args.kwargs
+    assert kw.get("allow_empty") is False, "定时扫描绝不可以用空批次清库"
+    assert kw.get("batch_id") == b.id
+    assert kw.get("scan_complete") is True
+    assert kw.get("resumed") is False
+
+
+def test_scheduled_scan_reconcile_failure_does_not_break_the_round(db):
+    """对账单独 try：它失败不能把这一轮的扫描 / 识别一起废掉。"""
+    @contextmanager
+    def _sess():
+        yield db
+
+    b = _batch(db)
+    scan_data = {"files": 5, "directories": 3, "resumed": False, "complete": True,
+                 "seen_file_ids": ["OLD_0"], "batch_id": b.id, "change_events": []}
+    ident = AsyncMock(return_value={})
+    with patch("app.main.SessionLocal", _sess), \
+         patch("app.main._effective_scan_root", return_value=(B_ROOT, "mirror_b")), \
+         patch("app.main.run_scan", new=AsyncMock(return_value=scan_data)), \
+         patch("app.main._post_scan_identify", new=ident), \
+         patch("app.main.process_change_events", return_value={}), \
+         patch("app.main._reconcile_library",
+               new=AsyncMock(side_effect=RuntimeError("对账炸了"))):
+        _run(main._scheduled_scan(B_ROOT))
+    assert ident.await_count == 1, "对账失败后识别仍要继续"
 
 
 # ---------- 3. 多层分类目录树 1:1 镜像 ----------

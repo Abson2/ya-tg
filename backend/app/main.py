@@ -781,11 +781,21 @@ def _schedule_queue_worker(trigger) -> None:
 
 
 async def _scheduled_scan(root: str) -> None:
-    """v0.7.1：Cron 定时全量扫描 B 库 → 自动识别 → 完结回填（需求3-1）。
+    """v0.7.1：Cron 定时全量扫描 B 库 → 对账 → 自动识别 → 完结回填（需求3-1）。
 
-    与手动「重新扫描库」的区别：定时任务**不做对账删除**，避免断点/接口抖动
-    造成误删；对账只由用户主动点击「重新扫描库」触发。全程独立 Session，
-    不复用请求级 db，异常自行吞掉并由 run_scan 写入 ScanTask.last_status。
+    v2.1.56（用户口径 2026-11-28）：「定时扫描到 B 库没有了，是需要将资源库中的内容移除」。
+    此前这里**明确不做对账删除**（只由用户主动点「重新扫描库」触发），后果是——
+    B 库整部删掉之后，资源库里那些行会一直挂着，直到用户偶然点一次主动扫描；
+    用户看到的表现就是「资源库里的作品删不掉」。现在定时扫描也走 `_reconcile_library`。
+
+    与主动扫描的唯一区别是**不传 `allow_empty`**：定时扫描绝不允许用「空批次」清库，
+    必须同时满足批次 `success` + `complete` + 非断点 + `reconcile_allowed` 才归档
+    （`_reconcile_library` 内部的硬门槛），接口抖动时宁可保留旧数据。
+
+    归档口径仍是「**归档不物理删除**」：`clean_state='cleaned'`，历史行保留，A 库补齐后
+    下轮扫描会重新入库。
+
+    全程独立 Session，不复用请求级 db，异常自行吞掉并由 run_scan 写入 ScanTask.last_status。
 
     v2.1.11：纳入**流水线闸门**。这一轮做的是「扫描入库 → 识别（翻译）→ 推送」，
     与镜像轮的「复制 → 改名」是同一条链路的两端；以前它**完全没有锁**，
@@ -801,10 +811,26 @@ async def _scheduled_scan(root: str) -> None:
             try:
                 # v0.8.1：每次执行都重新取 B 镜像库目录，用户在镜像设置里改 ID 后立即生效
                 effective, _ = _effective_scan_root(db)
-                await run_scan(effective, resume=False)
+                data = await run_scan(effective, resume=False)
+                db.commit()
+                # v2.1.56：按 B 库实际内容对账（B 库已无的作品归档出资源库）。
+                # 单独 try：对账失败不能把这一轮的扫描/识别一起废掉。
+                try:
+                    rec = await _reconcile_library(
+                        db, data.get("seen_file_ids") or [],
+                        scan_complete=bool(data.get("complete", False)),
+                        resumed=bool(data.get("resumed", False)),
+                        batch_id=data.get("batch_id") or None,
+                        allow_empty=False)
+                    if rec.get("removed"):
+                        logger.info("[scan] 定时扫描对账：归档 %s 条 B 库已无的资源",
+                                    rec["removed"])
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.warning("[scan] 定时扫描对账失败，本轮不归档", exc_info=True)
                 # v2.1.11：入库后回填「映射回 A 库」的作品名/影视号/类型，
                 # 让本轮识别用 A 库口径（顺序必须在识别之前）。
-                db.commit()
                 backfill_source_titles(db)
                 db.commit()
                 await _post_scan_identify(db, publish_after_identify=True)
@@ -1161,7 +1187,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.55", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.56", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1172,7 +1198,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.55", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.56", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -4288,9 +4314,22 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0, "skipped": skipped}
     if empty_ok and not seen:
         logger.info("[library] 用户主动刷新：B 库可信空批次，按实际内容清空资源库面板")
-    stale = [x for x in db.scalars(select(Resource).where(
-        or_(Resource.clean_state.is_(None), Resource.clean_state != "cleaned"))).all()
-        if x.file_id not in seen]
+    # v2.1.56：**投影查询，不再实例化 ORM**。
+    # 实测（tracemalloc，容器内）：单个 Resource ORM 对象 5.14 KiB，2.4 万行一起
+    # 加载 = +120.8 MiB。而这里只需要「哪些行没被扫到」这一个判断，归档那一步
+    # 改成批量 UPDATE 即可。定时扫描现在也会走本函数（用户口径 2026-11-28），
+    # 不这么改就是每天多背几十次 120 MiB。
+    from types import SimpleNamespace
+    rows = db.execute(select(
+        Resource.id, Resource.file_id, Resource.share_id,
+        Resource.share_dir_name, Resource.path_hint,
+        Resource.media_title, Resource.tmdb_id, Resource.media_type,
+    ).where(or_(Resource.clean_state.is_(None),
+                Resource.clean_state != "cleaned"))).all()
+    stale = [SimpleNamespace(id=r[0], file_id=r[1], share_id=r[2],
+                             share_dir_name=r[3], path_hint=r[4],
+                             media_title=r[5], tmdb_id=r[6], media_type=r[7])
+             for r in rows if str(r[1]) not in seen]
     if not stale:
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0}
     share_ids = {str(x.share_id) for x in stale if x.share_id}
@@ -4347,12 +4386,16 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
     # 此前是 db.delete(x) —— 一次 B 库重建空窗期的事故就把 4387 行彻底抹掉，
     # 事后完全无从追溯。归档后行还在（历史可查），只是不再出现在资源库面板、
     # 不再参与识别/分享/推送；A 库补齐后新一轮扫描会重新入库新的资源行。
-    for x in stale:
-        x.clean_state = "cleaned"
-        x.cleaned_at = now
-        x.clean_reason = "B库内容已移除，归档资源库记录"
-        # 分享态一并归零，避免归档行还被当作「已分享」复用旧链接
-        x.share_status = "not_created"
+    # v2.1.56：改成一条批量 UPDATE。上面 `stale` 已经是轻量对象，不能再逐行
+    # 赋值（那等于又把 ORM 拉回来）。分享态一并归零，避免归档行还被当作
+    # 「已分享」复用旧链接。
+    if ids:
+        db.query(Resource).filter(Resource.id.in_(ids)).update(
+            {Resource.clean_state: "cleaned",
+             Resource.cleaned_at: now,
+             Resource.clean_reason: "B库内容已移除，归档资源库记录",
+             Resource.share_status: "not_created"},
+            synchronize_session=False)
     add_audit(db, "library_reconciled", target_type="library",
               detail=json_dumps({"removed": len(ids), "shares_cancelled": cancelled,
                                  "queue_cleared": q, "empty_seen_allowed": empty_ok,

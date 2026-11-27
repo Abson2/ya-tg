@@ -618,6 +618,12 @@ CONFLICT_POLICY_ALIASES: dict[str, str] = {
 }
 # 新品上映判定窗口（天）：release_date 在最近 N 天内视为「新上映」。
 NEW_RELEASE_WINDOW_DAYS = 30
+# v2.1.56：「仍在更新（returning）」的停更兜底窗口（天）。
+# 真机反例：TMDB 把 2005 年就播完的《王保长后传》(tmdb 225764) 长期标成
+# Returning Series（`finish_status=returning`、`last_air_date=2005-06-11`），
+# 而 returning 分支原先「永不过期」，于是一部 21 年前的老剧被永久挂上「新上映」。
+# 现在：声称仍在更新、但最后一集播出日距今超过这个天数 → 按存量处理。
+RETURNING_STALE_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +642,10 @@ NEW_RELEASE_WINDOW_DAYS = 30
 #   new_release —— 「新上映至官方剧集更新完结（TMDB 数据）延后一天的 0 时转为存量」。
 #                  判据按 TMDB 连载状态分两类：
 #                    · 剧集（tv）：
-#                        finish_status=returning（仍在更新）→ 算新上映，不会过期；
+#                        finish_status=returning（仍在更新）→ 需同时看最后一集播出日：
+#                                                 距今未超过 RETURNING_STALE_DAYS 天才算新上映，
+#                                                 超过即视为长期停更转存量（v2.1.56）；
+#                                                 last_air_date 拿不到时不猜，维持算新上映；
 #                        finish_status=ended     → 以「最后一集播出日 + 1 天 0 点」为界，
 #                                                  过了就转存量（last_air_date 缺失时
 #                                                  无法判定截止日，按已完结处理 → 不算新上映）；
@@ -2907,7 +2916,9 @@ def _instant_candidates(db: Session, mode: str,
         and_(Resource.release_date.isnot(None), Resource.release_date != "",
              Resource.release_date >= rel_cutoff,
              Resource.release_date <= today),
-        # 剧集仍在更新
+        # 剧集仍在更新（v2.1.56：下面这条**故意不按 last_air_date 收紧** ——
+        # 停更兜底只在 `_new_release_state` 里判一份；SQL 再写一遍阈值就成了
+        # 两套判据，改一处忘一处会出现「标签说存量、插队说新上映」的分裂）
         Resource.finish_status == "returning",
         # 剧集刚完结：最后一集播出日 >= 今天（播出日次日 0 点才过期）
         and_(Resource.finish_status == "ended",
@@ -6637,17 +6648,33 @@ def _new_release_state(*, release_date: str, last_air_date: str,
       None  —— 任何可判定的日期都拿不到（无从判断，调用方据此决定是否给存量标签）。
 
     过期口径（用户原话）：「新上映至官方剧集更新完结（TMDB 数据）延后一天的 0 时转为存量」。
-      · 剧集 + returning                 → 仍在更新，True（不会过期）；
+      · 剧集 + returning + 最后一集播出日在 RETURNING_STALE_DAYS 天内 → True；
+      · 剧集 + returning + 最后一集播出日已超过该窗口     → False（长期停更，见下）；
+      · 剧集 + returning + 无最后一集播出日               → True（无从判断，不猜）；
       · 剧集 + ended + 有最后一集播出日   → 以「播出日 + 1 天 0 点」为界，之前 True；
       · 剧集 + ended + 无最后一集播出日   → 只知道已完结、不知何时完结 → False（不猜日期）；
       · 电影 / 剧集状态未知              → 沿用 30 天上映窗口（电影没有连载概念）。
     任何情况下「还没上映」（日期在未来）都不算新上映。
+
+    v2.1.56（真机 2026-11-28）：**returning 不再永不过期**。
+    原先 `returning` 分支只看上映日、不看 `last_air_date`，等于无条件信任 TMDB 的
+    `status` 字段。真机上《王保长后传》(tmdb 225764) 2005 年就播完、最后一集
+    `2005-06-11`，TMDB 仍把它标成 Returning Series，于是这部 21 年前的老剧
+    被永久算作「新上映」，压着一堆真新片抢排期。
+    同一库里《王保长歪传》因为是 `ended` → 走完结分支 → 老播出日直接转存量，
+    两部的唯一差别就是 TMDB 这个字段。
+    兜底：声称仍在更新、但最后一集播出日距今超过 `RETURNING_STALE_DAYS` 天 →
+    视为长期停更，按存量处理。`last_air_date` 拿不到时保持原行为（不猜）。
     """
     today = now_sh.date()
     rel = _parse_dt_date(release_date)
     is_tv = str(media_type or "").strip().lower() == "tv"
     state = str(finish_status or "").strip().lower()
     if is_tv and state == "returning":
+        air = _parse_dt_date(last_air_date)
+        # v2.1.56：停更兜底。air 为 None 时无从判断，保持「算新上映」。
+        if air is not None and (today - air).days > RETURNING_STALE_DAYS:
+            return False
         return not (rel is not None and rel > today)
     if is_tv and state == "ended":
         air = _parse_dt_date(last_air_date)
