@@ -8,6 +8,75 @@
 
 ---
 
+## v2.1.57 (2026-11-28)
+
+> 这一版只有一个主题，但贯穿三条链路：**分享、推送、快照都必须是作品级**，
+> 不许按季、不许按集。真机证据是用户两次贴图：群里推出来的标题与 hashtag 是
+> 单集文件名（`#TheLegendofCrazyMonk.2010.S01E07….mp4`），网盘「我的分享」里
+> 一条条也全是单集名，同一部剧还挂着 2–7 条链接。
+
+### 一、事故现场（线上只读复核）
+
+| 项 | 实测 |
+|---|---|
+| 版本快照 title 是文件名的 | **873 / 1166** |
+| 版本快照 `share_dir_name` 为空 | **880 / 1166** |
+| 版本快照目录 id 指着季目录 | **641 / 1166** |
+| 有分享的作品 | 246 部，**每一部都有 ≥2 条链接**（待删 364 条） |
+| 单集行还没识别（`identify_round=0`） | 7647 行（活佛济公 176、家有儿女 676） |
+
+`活佛济公` 的对照最直白：资源行里 `share_dir_id=1973331643253776389`（作品目录）、
+`share_dir_name=活·佛·济·公 (2010) {tmdb-111097}`、`media_title=活佛济公`，而版本快照
+v1138 里是 `title=活佛济公.2010.S01E07…mp4`、`share_dir_name=''`、
+`share_dir_id=1973331655262064654`（**S01 季目录**）。
+
+### 二、根因
+
+1. **快照抄了「代表资源行」那一刻的空值**。`sync_library_versions` 用 `ordered[0]` 的
+   `media_title / share_dir_name / share_dir_id` 生成 metadata，而扫描入库那一刻它们
+   还没回填（`share_dir_id` 还是季目录）。指纹只由 `file_id:size` 决定，之后不变 →
+   `if exists: continue` → **永不重算**，回填也只改 `resources`。
+2. **推送与建分享各自再抄一遍**。`publisher._build_message` 用
+   `res.media_title or res.name`，建分享用 `metadata.title` + `metadata.share_dir_id`。
+3. **建分享从不查同目录有没有现成链接**。同作品每个渠道一条任务，各自建各的 →
+   246 部作品全部重复。
+4. **未识别的单集行 `share_scope` 停在默认 `file`**，那条路径就给每一集各建一个分享。
+
+### 三、改动
+
+- **作品级元数据解析器**（`utils.work_display_meta`）：标题取多数派 `media_title` →
+  清理后的作品目录名（剥 `{tmdb-…}`、防和谐分隔符、尾随年份）→ 留空；
+  目录取多数派 `share_dir_id`，**排除任何成员的 `parent_id`（季目录）**，
+  同分时按 **TMDB 编号**取（同名不同剧不会串）；判不出**留空，绝不猜**。
+- **`recompute_version_metadata`**：按实时资源重算**最新版本**的 metadata_json。
+  不造新版本、不动 `fingerprint` / `version_no` / `change_type`（造版本＝伪造追更）、
+  幂等、支持 `dry_run`；接在定时扫描与手动扫描的识别之后。
+- **推送标题收口**（`publisher._work_title`）：快照作品名 → 清理目录名 → 识别名 →
+  去扩展名的文件名，**任何一步都不许把 `.mp4` 推给用户**；标题与 hashtag 都用它。
+- **建分享收口**（`_share_target` + `_existing_share_on_dir`）：目录换掉季目录、
+  名字用作品名、**同目录已有 active 链接就复用**，不再重复建。
+- **手动分享**（`main.create_share`）：只认 `share_scope=series_dir` 且目录不等于
+  `parent_id`；标题不再拼「第 N 季」。
+- **未识别不按集分享**（`publisher.ShareNotReady`）：多集作品的单集行若还没识别，
+  本轮不推、30 分钟后再看 —— 不再给用户刷一串没有入口的单集卡片。
+- **存量清理脚本**（`/tmp/ya_share_cleanup.py`，默认 dry-run）：同作品只留最早一条、
+  删其余、保留那条改名成作品名、库里指向被删链接的行统一改指保留链接。
+
+### 四、验证
+
+- 全量 **2392 passed**（v2.1.56 的 2376 + 新增 16 项）。
+- 反证：去掉「目录排除成员 `parent_id`」这一行 → `test_share_target_replaces_season_dir_
+  and_file_title` 立刻变红（`dir-season != dir-work`），确认这条规则真被覆盖。
+- 存量 dry-run：246 部作品、待删 364 条、改名 246 条，交叉校验**无**一条链接被多个
+  作品共用。
+
+### 五、回滚
+
+`IMAGE_TAG=v2.1.56` 重建容器。本版无库结构变更；存量清理是对网盘分享的删除与改名，
+不可逆，已按「保留最早一条」口径执行并留 plan 日志。
+
+---
+
 ## v2.1.56 (2026-11-28)
 
 > 这一版三批，都是真机反馈：

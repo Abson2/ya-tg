@@ -285,12 +285,12 @@ def test_static_allocation_path_is_gone():
 def test_version_is_current_everywhere():
     """版本六处 + 版本锁：发版前必须全部对齐（本用例就是那把锁）。"""
     main_src = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert 'version="2.1.56"' in main_src
-    assert '"version": "2.1.56"' in main_src
-    assert "v2.1.56 · Asia/Shanghai" in APP_VUE
+    assert 'version="2.1.57"' in main_src
+    assert '"version": "2.1.57"' in main_src
+    assert "v2.1.57 · Asia/Shanghai" in APP_VUE
     pkg = json.loads((ROOT / "frontend/package.json").read_text(encoding="utf-8"))
-    assert pkg["version"] == "2.1.56"
+    assert pkg["version"] == "2.1.57"
     lock = json.loads((ROOT / "frontend/package-lock.json").read_text(encoding="utf-8"))
-    assert lock["version"] == "2.1.56"
-    assert lock["packages"][""]["version"] == "2.1.56"
-    assert "当前版本：v2.1.56" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert lock["version"] == "2.1.57"
+    assert lock["packages"][""]["version"] == "2.1.57"
+    assert "当前版本：v2.1.57" in (ROOT / "README.md").read_text(encoding="utf-8")

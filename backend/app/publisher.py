@@ -16,9 +16,9 @@ from .db import DEFAULT_TEMPLATE, SessionLocal, json_dumps
 from .guangya import GuangYaError, GuangYaShareClient
 from .models import AuditLog, Bot, Channel, MessageTemplate, QueueItem, Resource, utcnow
 from .security import decrypt_secret
-from .utils import (backoff_seconds, is_video_file, parse_media_name, parse_tech_spec,
-                    plus_seconds, render_template, retry_after_seconds, version_spec,
-                    work_episode_numbers, work_group_key)
+from .utils import (backoff_seconds, clean_work_title, is_video_file, looks_like_file_name,
+                    parse_media_name, parse_tech_spec, plus_seconds, render_template,
+                    retry_after_seconds, version_spec, work_episode_numbers, work_group_key)
 
 MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
@@ -30,6 +30,49 @@ logger = logging.getLogger(__name__)
 # 每轮都打 "maximum number of running instances reached"。这里给单轮封顶，
 # 超预算就把剩余条目留给下一轮（它们仍是 pending/retry，下轮自然被捞起）。
 SEND_ROUND_BUDGET_SECONDS = 120
+
+
+class ShareNotReady(Exception):
+    """分享还没法建（v2.1.57）：作品尚未识别完成，只能按单集分享。
+
+    为什么单独一个类型：分发中心对「建分享失败」的既定处理是**照发消息、只是不带
+    链接**（v0.9.10 口径）。可这条属于「根本不该按集分享」——照发就是给用户刷一串
+    单集名卡片。所以调用方要能把它和真失败区分开：本轮不推，等识别完成再说。
+    """
+
+
+def _is_episode_row(res: Resource) -> bool:
+    """这行是不是「多集作品里的一集」——而不是电影单文件 / 整剧目录。"""
+    if getattr(res, "season", None) or getattr(res, "episode", None):
+        return True
+    _se, ep = work_episode_numbers(str(getattr(res, "name", "") or ""))
+    return ep is not None
+
+
+def _work_title(db: Session, res: Resource) -> str:
+    """作品级标题（v2.1.57）。
+
+    真机事故：推送标题与 hashtag 都是 `The Legend of Crazy Monk.2010.S01E07….mp4`
+    —— 因为这里写的是 `res.media_title or res.name`，该集还没识别，`media_title`
+    为空，于是把单集文件名当作品名，连 `.mp4` 一起推到群里。
+
+    解析顺序：快照里的作品名（能拒绝文件名）→ 清理过的作品目录名 → 识别名 →
+    去掉扩展名的文件名。**任何一步都不许把 `.mp4` 之类露给用户。**
+    """
+    title = ""
+    try:
+        from . import share_center_v2 as _sc2
+        wk = work_group_key(res)
+        title = str((_sc2._work_titles(db, [wk]) or {}).get(wk) or "").strip()
+    except Exception:
+        title = ""
+    if not title or looks_like_file_name(title) or title == "未知作品":
+        title = clean_work_title(str(getattr(res, "share_dir_name", "") or ""))
+    if not title:
+        title = str(getattr(res, "media_title", "") or "").strip()
+    if not title:
+        title = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", str(getattr(res, "name", "") or ""))
+    return title.strip()
 
 
 def human_size(size: int) -> str:
@@ -65,11 +108,19 @@ async def ensure_share(db: Session, res: Resource) -> str:
             db.commit()
             return res.share_url
     client = GuangYaShareClient(db)
-    # 剧集分享整目录，标题用「剧名 S01」；电影/无目录线索仍按单集
+    # 剧集分享整目录，标题用作品名；电影/无目录线索仍按单集
+    #
+    # v2.1.57（G）：**多集作品的单集行绝不按文件建分享**。真机上 176/676 集
+    # `share_scope` 还停在默认的 `file`（识别没跟上），这条路径就给每一集各建了
+    # 一个分享，网盘「我的分享」里直接刷成一串单集名。这类行抛 `ShareNotReady`，
+    # 调用方本轮不推、等识别完成后再按整剧分享。
+    if (scope != "series_dir" or not dir_id) and _is_episode_row(res):
+        raise ShareNotReady("作品尚未识别完成，暂不按单集建分享（识别后按整剧分享）")
     target_id = dir_id if (scope == "series_dir" and dir_id) else res.file_id
-    title = res.media_title or res.name or ""
-    if scope == "series_dir" and res.season:
-        title = f"{title} 第{int(res.season)}季" if title else f"第{int(res.season)}季"
+    # v2.1.57（用户口径 2026-11-28）：「分享、推送都不能按季、集，必须作品级」。
+    # 所以标题不再拼「第 N 季」—— 那是 v0.6.3 按季目录分享时代的写法，
+    # 现在目标目录是**作品目录**（整部剧），再挂个「第3季」自相矛盾。
+    title = _work_title(db, res)
     # 阶段四：统一走光鸭建分享解析适配器（三处散点字段口径收敛，发送逻辑不变）
     from .guangya import create_share_parsed
     share_id, share_url = await create_share_parsed(client, target_id, title, settings.share_duration)
@@ -143,7 +194,10 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
       追更「更新至 S01E12 · 连载中」/ 收齐「S01E24 · 完结」）。
     """
     esc = lambda v: html.escape(str(v if v is not None else ""), quote=False)
-    title = res.media_title or res.name
+    # v2.1.57：标题与 hashtag 一律用**作品级**名字。原先是
+    # `res.media_title or res.name`，未识别的单集会直接把 `….S01E07….mp4`
+    # 当作品名推出去，`#TheLegendofCrazyMonk.2010.S01E07….mp4` 就是这么来的。
+    title = _work_title(db, res)
     hint = parse_media_name(res.name)
     # v0.9.9 #202：技术规格分项（来源/画质/编码/音频），纯文件名解析、不联网
     spec = parse_tech_spec(res.name)
@@ -567,6 +621,8 @@ async def _process_queue_impl(limit: int = 20) -> dict:
 
 async def _process_queue_core(db: Session, limit: int = 20) -> dict:
     sent = failed = shared = 0
+    # v2.1.57：因「作品未识别、只能按单集分享」而缓推的条数（与 failed 区分开）
+    share_deferred = 0
 
     # v0.6.5：逐条发送节流，避免一次轮询连发多条触发 Telegram 风控
     try:
@@ -733,6 +789,16 @@ async def _process_queue_core(db: Session, limit: int = 20) -> dict:
                     await ensure_share(db, res)
                     if need_share:
                         shared += 1
+            except ShareNotReady as exc:
+                # v2.1.57（G）：作品还没识别完 → 只能按单集分享。本轮**不发**，
+                # 半小时后再看（识别完成后 share_scope 会变成 series_dir，
+                # 那时就是一条整剧链接）。不能走下面「照发但无链接」的既定口径，
+                # 那等于给用户刷一串没有入口的单集卡片。
+                q.error = str(exc)[:600]
+                q.next_retry_at = utcnow() + timedelta(minutes=30)
+                db.commit()
+                share_deferred += 1
+                continue
             except Exception as exc:
                 # v0.9.10：建分享失败不再跳过发送——分享只是消息里的「获取资源」入口，
                 # 失败时仍要把资源通知送出去（正文无链接、无按钮），否则群/频道一条都
@@ -822,7 +888,8 @@ async def _process_queue_core(db: Session, limit: int = 20) -> dict:
                     logger.warning("[publisher] 分享中心 v2 回写异常（不影响主链）", exc_info=True)
             # v0.9.10：本条发送结果立即落盘，绝不把写事务带进下一轮的 sleep / 网络 await。
             db.commit()
-        return {"sent": sent, "failed": failed, "shares_created": shared}
+        return {"sent": sent, "failed": failed, "shares_created": shared,
+                "share_deferred": share_deferred}
     finally:
         db.close()
 

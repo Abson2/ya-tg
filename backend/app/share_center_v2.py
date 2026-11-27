@@ -1032,6 +1032,68 @@ def _work_titles(db: Session, work_keys) -> dict[str, str]:
     return out
 
 
+def _share_target(db: Session, work_key: str, metadata: dict, rep: Resource,
+                  resolver=None, lv=None) -> tuple[str, str]:
+    """决定「建分享用哪个目录、叫什么名字」（v2.1.57）。
+
+    真机事故（2026-11-28）：网盘「我的分享」里一条条全是单集名，同一部剧还建了
+    两三条。根因有两个，都在这一个调用点上：
+      ① 名字：直接取快照里的 `metadata.title` —— 那是扫描那一刻的**单集文件名**；
+      ② 目录：直接取 `metadata.share_dir_id` —— 那时还指着**季目录**，
+         于是分享出去的是「某一季」而不是整部剧。
+
+    规则：
+      · 目录：候选 = 快照目录 + 各成员目录；**排除等于任何成员 `parent_id` 的值**
+              （那是季目录）；取第一个非空。都判不出才退回代表资源的文件 id。
+      · 标题：`_work_titles` 能拒绝文件名并回落到作品名 → 清理过的目录名 →
+              去掉扩展名的文件名（兜底也绝不把 `.mp4` 露给用户）。
+    """
+    members: list = []
+    if resolver is not None and lv is not None:
+        try:
+            members = list(resolver.work_members(lv) or [])
+        except Exception:      # 解析成员失败不影响建分享，退回代表资源单条
+            members = []
+    if not members:
+        members = [rep]
+
+    parents = {str(getattr(m, "parent_id", "") or "") for m in members}
+    parents.discard("")
+    cands = [str(metadata.get("share_dir_id") or "")]
+    cands += [str(getattr(m, "share_dir_id", "") or "") for m in members]
+    dir_id = next((c for c in cands if c and c not in parents), "")
+    if not dir_id:
+        dir_id = next((c for c in cands if c), "")
+
+    title = (_work_titles(db, [work_key]) or {}).get(work_key) or ""
+    if not _looks_like_title(title):
+        title = utils.clean_work_title(str(metadata.get("share_dir_name") or ""))
+    if not title:
+        title = utils.clean_work_title(str(getattr(rep, "share_dir_name", "") or ""))
+    if not title:
+        title = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", str(getattr(rep, "name", "") or ""))
+    return dir_id, title.strip()
+
+
+def _existing_share_on_dir(db: Session, dir_id: str) -> str:
+    """同一目录下已经建过的有效分享链接（v2.1.57：建之前先复用，不重复建）。
+
+    真机：235 部作品各有 ≥2 条独立分享，因为每个渠道一条任务、每条任务只认自己的
+    `share_url`，建分享这条路径从不看「同目录是不是已经有链接了」。
+    只复用 `share_status=active` 的行 —— 失效链接绝不能拿来顶。
+    """
+    if not dir_id:
+        return ""
+    try:
+        url = db.scalar(select(Resource.share_url).where(
+            Resource.share_dir_id == str(dir_id),
+            Resource.share_status == "active",
+            Resource.share_url != "").limit(1))
+    except Exception:
+        return ""
+    return str(url or "")
+
+
 def _primary_category(resource: Resource) -> tuple[str, str]:
     """资源的主分类键（`genre:<中文名>`）与媒体类型。
 
@@ -1170,13 +1232,20 @@ def sync_library_versions(db: Session) -> dict[str, int]:
                 SCLibraryVersion.work_key == work_key)
         ) or 0
         rep = ordered[0]
+        # v2.1.57（真机：推送标题、hashtag、分享目标全是单集信息）：元数据改成
+        # **按整组行**解析，不再照抄 `ordered[0]` 那一行。扫描入库那一刻它的
+        # `media_title` / `share_dir_name` 还是空、`share_dir_id` 还指着季目录，
+        # 抄下来就等于把「单集文件名 + 季目录」定格成作品级信息（1166 个版本里
+        # 873 个 title 是文件名、880 个 share_dir_name 是空）。
+        # 解析规则与「判不出就留空」见 `utils.work_display_meta`。
+        meta_work = utils.work_display_meta(ordered)
         metadata = {
-            "title": getattr(rep, "media_title", "") or getattr(rep, "name", ""),
-            "poster_path": getattr(rep, "poster_path", ""),
-            "share_dir_id": getattr(rep, "share_dir_id", "") or getattr(rep, "parent_id", ""),
-            "share_dir_name": getattr(rep, "share_dir_name", ""),
-            "tmdb_id": getattr(rep, "tmdb_id", 0),
-            "media_type": media_type,
+            "title": meta_work["title"],
+            "poster_path": meta_work["poster_path"] or getattr(rep, "poster_path", ""),
+            "share_dir_id": meta_work["share_dir_id"],
+            "share_dir_name": meta_work["share_dir_name"],
+            "tmdb_id": meta_work["tmdb_id"] or getattr(rep, "tmdb_id", 0),
+            "media_type": meta_work["media_type"] or media_type,
             "resource_count": len(ordered),
         }
         db.add(SCLibraryVersion(
@@ -1195,6 +1264,88 @@ def sync_library_versions(db: Session) -> dict[str, int]:
     # 两个数都要能对上明细，见 `recompute_work_categories()` 的同口径统计。
     return {"versions_created": created, "categories_created": categories,
             "categories_updated": updated, "works": len(grouped)}
+
+
+def recompute_version_metadata(db: Session, *, dry_run: bool = False) -> dict[str, Any]:
+    """按实时资源重算「最新版本快照」的展示元数据（v2.1.57，幂等）。
+
+    为什么需要它：`sync_library_versions` 只在**指纹变化时**才写新版本，而指纹
+    只由 `file_id:size` 集合决定。扫描入库那一刻作品级字段（`media_title` /
+    `share_dir_name` / 作品目录 id）还没回填，快照就把单集文件名与季目录定格了；
+    之后识别回填只改 `resources`，快照永远不重算 —— 真机 1166 个版本里
+    873 个 title 是文件名、880 个 share_dir_name 为空、641 个目录 id 指着季目录。
+
+    三条硬约束（都是既有红线）：
+      ① **不造新版本**：只原地改 `metadata_json`，`fingerprint` / `version_no` /
+         `change_type` / `created_at` 一个都不动 —— 造新版本等于伪造一次「追更」，
+         会触发推送（`recompute_work_categories` 同一条红线）。
+      ② **只改最新版本**：历史版本是当时的事实，改了就是把历史涂掉。
+      ③ **判不出就不动**：`work_display_meta` 返回空标题时保留原值，绝不猜。
+
+    资源侧只用 8 列投影，不实例化 `Resource` 实体（红线：2.4 万行实体 ≈ 120 MiB）。
+    """
+    from types import SimpleNamespace
+    from sqlalchemy import func as _func
+
+    rows = db.execute(select(
+        Resource.file_id, Resource.path_hint, Resource.share_dir_name,
+        Resource.media_title, Resource.tmdb_id, Resource.media_type,
+        Resource.share_dir_id, Resource.parent_id, Resource.poster_path,
+    )).all()
+    grouped: dict[str, list] = {}
+    for r in rows:
+        proj = SimpleNamespace(file_id=r[0], path_hint=r[1], share_dir_name=r[2],
+                               media_title=r[3], tmdb_id=r[4], media_type=r[5],
+                               share_dir_id=r[6], parent_id=r[7], poster_path=r[8])
+        grouped.setdefault(utils.work_group_key(proj), []).append(proj)
+
+    latest: dict[str, SCLibraryVersion] = {}
+    for v in db.scalars(select(SCLibraryVersion)).all():
+        wk = str(v.work_key or "")
+        cur = latest.get(wk)
+        if cur is None or int(v.version_no or 0) > int(cur.version_no or 0):
+            latest[wk] = v
+
+    checked = fixed = skipped = 0
+    samples: list[dict] = []
+    for wk, ver in latest.items():
+        checked += 1
+        members = grouped.get(wk) or []
+        if not members:
+            # 资源已不在库（归档/换源）：保留原样，不猜、不抹掉历史标题
+            skipped += 1
+            continue
+        meta = utils.work_display_meta(members)
+        old = _jload(ver.metadata_json, {}) or {}
+        new = dict(old)
+        for field in ("title", "share_dir_id", "share_dir_name",
+                      "media_type", "tmdb_id"):
+            val = meta.get(field)
+            if field in ("tmdb_id",):
+                if val:
+                    new[field] = val
+                continue
+            if str(val or "").strip():
+                new[field] = val
+        if not new.get("title"):
+            # 解析不出标题就整条不动（保留旧值，绝不写成空或文件名）
+            skipped += 1
+            continue
+        if new == old:
+            continue
+        fixed += 1
+        if len(samples) < 5:
+            samples.append({"work_key": wk, "version_no": int(ver.version_no or 0),
+                            "title": [str(old.get("title") or "")[:40],
+                                      str(new.get("title") or "")[:40]],
+                            "share_dir_id": [str(old.get("share_dir_id") or ""),
+                                             str(new.get("share_dir_id") or "")]})
+        if not dry_run:
+            ver.metadata_json = _jdump(new)
+    if not dry_run and fixed:
+        db.commit()
+    return {"checked": checked, "fixed": fixed, "skipped": skipped,
+            "dry_run": bool(dry_run), "samples": samples}
 
 
 # ---------------------------------------------------------------------------
@@ -4371,6 +4522,9 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
              "skipped": 0,
              # v2.1.16：复用已有有效分享链接的任务数（不重建链接，避免网盘堆废分享）
              "reused": 0,
+             # v2.1.57：同目录已有分享 → 复用（与 reused 的区别：reused 是任务自己
+             # 带着链接，linked 是同作品另一条任务/别的行建过的链接，属于「去重」）
+             "linked": 0,
              # v2.1.16：建分享失败 → 标记为「无效推送」的任务数
              "invalid": 0,
              # v2.1.23：因「本时段匀速额度已用完」而留到下一轮的任务数
@@ -4606,13 +4760,23 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
                 # "上一轮未结束"（真机刷了 24 小时的 maximum number of running
                 # instances reached）。这里给单次建分享封顶 45s，超时按失败处理
                 # （任务回到 planned，下轮重试），不再拖住整轮。
-                share_id, share_url = await asyncio.wait_for(
-                    create_share_parsed(
-                        client, str(metadata.get("share_dir_id") or rep.file_id),
-                        str(metadata.get("title") or task.work_key), 0,
-                    ),
-                    timeout=SHARE_BUILD_TIMEOUT_SECONDS,
-                )
+                # v2.1.57（真机「我的分享」里一条条单集名 + 同剧多条链接）：
+                # 名字用作品级标题、目录用作品目录（不是季目录），且**建之前先看
+                # 同目录有没有现成链接**——有就复用，不再重复建。
+                target_dir, share_title = _share_target(
+                    db, str(task.work_key or ""), metadata, rep, _rep_resolver, lv)
+                reuse_url = _existing_share_on_dir(db, target_dir)
+                if reuse_url:
+                    share_id, share_url = "", reuse_url
+                    stats["linked"] += 1
+                else:
+                    share_id, share_url = await asyncio.wait_for(
+                        create_share_parsed(
+                            client, target_dir or rep.file_id,
+                            share_title or str(task.work_key or ""), 0,
+                        ),
+                        timeout=SHARE_BUILD_TIMEOUT_SECONDS,
+                    )
                 task.share_url = share_url
                 task.link_state = "active"
                 task.status = "ready"

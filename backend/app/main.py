@@ -38,7 +38,7 @@ from .models import (AuditLog, AuthToken, Bot, Channel, ContributionRestore, Dis
                      MirrorMedia, MirrorRule, MirrorTask, QueueItem, Resource, ResourceScanBatch,
                      ResourceVersion, Rule, ScanCursor, ScanTask, UserContribution,
                      UserFeedback)
-from .publisher import ensure_share, process_queue
+from .publisher import _work_title, ensure_share, process_queue
 from .scanner import run_scan
 from .security import decrypt_secret, encrypt_secret, is_masked_secret, mask_secret
 logger = logging.getLogger(__name__)
@@ -834,6 +834,19 @@ async def _scheduled_scan(root: str) -> None:
                 backfill_source_titles(db)
                 db.commit()
                 await _post_scan_identify(db, publish_after_identify=True)
+                # v2.1.57：识别回填之后重算快照里的作品级元数据。
+                # 快照只在指纹变化时重建，而指纹不含识别字段 —— 首次入库时
+                # media_title / 作品目录还是空的，抄下来的就是单集文件名与季目录
+                # （真机 873/1166）。这一步幂等，只改最新版本的 metadata_json，
+                # 不造新版本、不动指纹（造版本＝伪造追更）。
+                try:
+                    _vm = recompute_version_metadata(db, dry_run=False)
+                    if _vm.get("fixed"):
+                        logger.info("[scan] 作品信息重算：修正 %s 个版本快照", _vm["fixed"])
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.warning("[scan] 作品信息重算失败，本轮跳过", exc_info=True)
                 process_change_events(db, publish=True)
                 db.commit()
             except Exception:
@@ -1187,7 +1200,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.56", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.57", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1198,7 +1211,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.56", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.57", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -4558,6 +4571,16 @@ async def _refresh_library_from_b(db: Session, *, reconcile: bool = True,
             allow_empty=allow_empty_reconcile)
     if auto_identify:
         out["identify"] = await _post_scan_identify(db, publish_after_identify=True)
+    # v2.1.57：识别完成后重算快照的作品级元数据（标题 / 作品目录 / TMDB 编号）。
+    # 幂等：只改最新版本的 metadata_json，不造新版本、不动指纹。
+    if auto_identify:
+        try:
+            out["version_meta"] = recompute_version_metadata(db, dry_run=False)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            out["version_meta"] = {"error": str(exc)[:200]}
+            logger.warning("[library] 作品信息重算失败", exc_info=True)
     try:
         out["changes"] = process_change_events(db, publish=True)
     except Exception as exc:
@@ -5291,14 +5314,18 @@ async def create_share(rid: int, duration: int = 0, db: Session = Depends(get_db
         raise HTTPException(404, "资源不存在")
     try:
         # v0.6.5：剧集一律按「剧集目录」分享，绝不按单集——单集分享是逐集推送的根因。
-        # 与 publisher.ensure_share 同口径：目录 fileId + 标题带季，链接同步给同目录所有单集。
+        # v2.1.57（用户口径 2026-11-28）：**分享/推送都必须是作品级**，不许按季按集。
+        # 所以这里三件事一起收口：
+        #   ① 只认 `share_scope=series_dir` 的目录（以前 `bool(dir_id)` 就算，
+        #      季目录混进来也照分享，于是网盘里出现「某一季」的分享）；
+        #   ② 目录不能等于该行的 `parent_id`（那是季目录）；
+        #   ③ 标题用作品名，不再拼「第 N 季」（目标已经是整部剧的目录）。
         dir_id = str(getattr(x, "share_dir_id", "") or "")
         scope = str(getattr(x, "share_scope", "") or "")
-        is_series = bool(dir_id)
+        parent_id = str(getattr(x, "parent_id", "") or "")
+        is_series = bool(dir_id) and scope == "series_dir" and dir_id != parent_id
         target_id = dir_id if is_series else x.file_id
-        title = x.media_title or x.name or ""
-        if is_series and x.season:
-            title = f"{title} 第{int(x.season)}季" if title else f"第{int(x.season)}季"
+        title = _work_title(db, x)
         # 同目录已有分享则直接复用，避免重复建链
         if is_series:
             sibling = db.scalar(select(Resource).where(
@@ -5337,7 +5364,7 @@ async def update_share(rid: int, duration: int = 0, db: Session = Depends(get_db
     if not x or not x.share_id:
         raise HTTPException(404, "分享记录不存在")
     try:
-        await GuangYaShareClient(db).update(x.share_id, x.media_title or x.name, duration)
+        await GuangYaShareClient(db).update(x.share_id, _work_title(db, x), duration)
         x.share_duration = duration
         add_audit(db, "share_updated", target_type="resource", target_id=str(rid))
         db.commit()

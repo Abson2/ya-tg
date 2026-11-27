@@ -136,7 +136,8 @@ def test_ensure_share_uses_dir_id_and_reuses_sibling():
     assert url_a == url_b == "https://share.test/dir_show"
     assert len(calls) == 1, calls          # 同目录只建一次分享
     assert calls[0][0] == "dir_show", calls  # 传的是目录 fileId，不是单集 fileId
-    assert "第1季" in calls[0][1]
+    # v2.1.57（用户口径）：分享标题必须是**作品级**，不再拼「第 N 季」
+    assert calls[0][1] == "天仙配", calls[0][1]
     _clean()
 
 

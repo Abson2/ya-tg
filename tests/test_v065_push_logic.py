@@ -223,7 +223,8 @@ def test_manual_share_uses_series_dir_not_single_file():
         def __init__(self, *a, **k): pass
         async def create(self, target_id, title, duration):
             assert target_id == dir_id, f"分享 target 应为剧集目录，实际 {target_id}"
-            assert "第1季" in title, title
+            # v2.1.57（用户口径）：分享/推送都是作品级，标题不带季集
+            assert "第1季" not in title and "剧" in title, title
             return {"data": {"shareId": "sid-manual", "shareUrl": "https://share/dir"}}
 
     with patch.object(m, "GuangYaShareClient", FakeClient):

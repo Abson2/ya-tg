@@ -320,6 +320,104 @@ def work_group_key(x) -> str:
     return f"file:{getattr(x, 'file_id', '')}"
 
 
+_TMDB_SUFFIX = re.compile(r"\{[^}]*tmdb[^}]*\}", re.I)
+_DOT_SEP = re.compile(r"[·・]")
+_TRAILING_YEAR = re.compile(r"\s*[\(（]\s*\d{4}\s*[\)）]\s*$")
+_VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".ts", ".rmvb", ".flv", ".wmv",
+               ".m2ts", ".mov", ".mpg", ".mpeg", ".iso", ".m4v")
+
+
+def clean_work_title(name: str) -> str:
+    """把「作品目录名」清理成可读标题（v2.1.57）。
+
+    真机：库里作品目录名是 `活·佛·济·公 (2010) {tmdb-111097}` —— 带防和谐分隔符、
+    带年份、带 TMDB 标记。直接当标题用会把这三样一起推给用户。
+    这里只做减法：去 TMDB 标记 → 去分隔符 → 去尾随年份。拿不到内容就返回空串。
+    """
+    s = _TMDB_SUFFIX.sub("", str(name or "")).strip()
+    s = _DOT_SEP.sub("", s).strip()
+    s = _TRAILING_YEAR.sub("", s).strip()
+    return s
+
+
+def looks_like_file_name(title: str) -> bool:
+    """这串是不是「单集文件名」（带视频扩展名）。用于兜底判定与存量体检。"""
+    return str(title or "").strip().lower().endswith(_VIDEO_EXTS)
+
+
+def work_display_meta(rows) -> dict:
+    """从同一作品的资源行里解析**作品级**展示元数据（v2.1.57）。
+
+    事故（真机 2026-11-28）：快照与推送都直接抄「代表资源行」的字段——而扫描入库
+    那一刻 `media_title` 还是空、`share_dir_id` 还指着**季目录**、`share_dir_name`
+    也是空，于是把「单集文件名 + 季目录」定格成作品级信息，推送标题、hashtag、
+    分享目标全跟着错。这里改成**按整组行投票**，并明确「判不出就留空，绝不猜」。
+
+    规则（顺序即优先级）：
+      · title         —— 任一成员非空 `media_title`（取多数派）；否则把
+                         `share_dir_name` 清理成可读名；都拿不到就留空。
+                         **绝不**把单集文件名当标题。
+      · share_dir_id  —— 候选 = 成员 `share_dir_id` 的多数派，但**排除**与任何成员
+                         `parent_id` 相同的值（那是季目录，不是作品目录）；
+                         同分时优先「tmdb 编号与全组多数派一致」的那个目录，
+                         这样同一名字下混了两部剧时不会串。
+      · share_dir_name—— 多数派非空的原始目录名（保留防和谐字符，仅作兜底展示）。
+      · media_type / tmdb_id —— 多数派非空值。
+
+    返回 dict（键固定，缺项为空串 / 0），调用方不需要再判 None。
+    """
+    from collections import Counter
+
+    rows = list(rows or [])
+    out = {"title": "", "share_dir_id": "", "share_dir_name": "",
+           "media_type": "", "tmdb_id": 0, "poster_path": ""}
+    if not rows:
+        return out
+
+    def _majority(values):
+        vals = [v for v in values if str(v or "").strip()]
+        return Counter(vals).most_common(1)[0][0] if vals else ""
+
+    # ① 标题：识别出来的 TMDB 名 > 清理后的作品目录名 > 留空
+    title = _majority([str(getattr(r, "media_title", "") or "").strip() for r in rows])
+    if not title:
+        title = clean_work_title(_majority(
+            [str(getattr(r, "share_dir_name", "") or "").strip() for r in rows]))
+    out["title"] = "" if looks_like_file_name(title) else title
+
+    # ② 目录：排除季目录，按 tmdb 编号取多数派
+    tmdb_major = _majority([getattr(r, "tmdb_id", 0) for r in rows])
+    parents = {str(getattr(r, "parent_id", "") or "") for r in rows}
+    parents.discard("")
+    dir_tmdb: dict[str, Counter] = {}
+    dir_count: Counter = Counter()
+    for r in rows:
+        did = str(getattr(r, "share_dir_id", "") or "")
+        if not did:
+            continue
+        dir_count[did] += 1
+        dir_tmdb.setdefault(did, Counter())[getattr(r, "tmdb_id", 0)] += 1
+    candidates = [d for d in dir_count if d not in parents]
+    if candidates:
+        def _rank(did):
+            same_tmdb = 1 if (tmdb_major and dir_tmdb[did].get(tmdb_major)) else 0
+            return (same_tmdb, dir_count[did])
+        out["share_dir_id"] = max(candidates, key=_rank)
+
+    out["share_dir_name"] = _majority(
+        [str(getattr(r, "share_dir_name", "") or "").strip() for r in rows])
+    out["media_type"] = _majority(
+        [str(getattr(r, "media_type", "") or "").strip() for r in rows])
+    try:
+        out["tmdb_id"] = int(tmdb_major or 0)
+    except (TypeError, ValueError):
+        out["tmdb_id"] = 0
+    out["poster_path"] = next(
+        (str(getattr(r, "poster_path", "") or "") for r in rows
+         if str(getattr(r, "poster_path", "") or "").strip()), "")
+    return out
+
+
 def is_video_file(x) -> bool:
     """整剧统计只算视频文件，排除字幕/nfo/海报/样片，否则集数与大小都会虚高。"""
     name = str(getattr(x, "name", "") or "")
