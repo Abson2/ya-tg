@@ -229,7 +229,13 @@ def _seed_plan(db, *, stock):
     return ver
 
 
-def test_ensure_schedules_writes_extra_windows(env):
+def test_ensure_schedules_writes_no_extra_windows(env):
+    """v2.1.55 口径变更：**建行只写内置单段**，不再按库存制造多时段。
+
+    原因（用户口径 5）：`_ensure_schedules` 在每次 GET `/category-schedules` 时都会跑，
+    如果它按库存写额外时段，「一键恢复默认」刚把多时段清掉，页面一刷新就又回来了 ——
+    用户看到的就是「默认点了没用」。多时段只由「一键 AI 调度 / 批量采纳」产生。
+    """
     from app import share_center_v2 as sc2
     from app.models import SCCategorySchedule
     from sqlalchemy import select
@@ -241,10 +247,36 @@ def test_ensure_schedules_writes_extra_windows(env):
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(
             SCCategorySchedule.plan_version_id == ver.id)).all()}
-    a_extra = sc2._sched_extra_windows(rows[CAT_A])
-    b_extra = sc2._sched_extra_windows(rows[CAT_B])
-    assert a_extra, "库存多的分类必须拿到额外时段（一天多时段推送）"
-    assert len(a_extra) > len(b_extra), "库存 5 倍应拿到更多额外段"
+    assert not sc2._sched_extra_windows(rows[CAT_A]), "建行不该写额外时段"
+    assert not sc2._sched_extra_windows(rows[CAT_B])
+    for row in rows.values():
+        assert int(row.window_end or 0) > int(row.window_start or 0), "每行仍要有单段时段"
+    db.close()
+
+
+def test_ensure_schedules_keeps_ai_extra_windows(env):
+    """带额外时段的行是 AI 的产物 —— 刷新页面不许把它抹回单段。"""
+    from app import share_center_v2 as sc2
+    from app.models import SCCategorySchedule
+    from sqlalchemy import select
+    S, _ = env
+    db = S()
+    ver = _seed_plan(db, stock={CAT_A: 30, CAT_B: 6})
+    sc2._ensure_schedules(db, ver.id)
+    db.commit()
+    row = db.scalar(select(SCCategorySchedule).where(
+        SCCategorySchedule.category_key == CAT_A))
+    row.extra_windows = json.dumps([[4, 6], [6, 8]])
+    row.window_start, row.window_end = 2, 4
+    row.window_auto = False
+    db.commit()
+    sc2._ensure_schedules(db, ver.id)
+    db.commit()
+    db.expire_all()
+    row = db.scalar(select(SCCategorySchedule).where(
+        SCCategorySchedule.category_key == CAT_A))
+    assert (int(row.window_start), int(row.window_end)) == (2, 4), "AI 定的主段不许被改写"
+    assert len(sc2._sched_extra_windows(row)) == 2, "AI 定的额外时段不许被抹掉"
     db.close()
 
 

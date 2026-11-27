@@ -419,6 +419,9 @@ _COLUMNS = {
         # v2.1.54：额外时段（JSON，[[起,止],…]）。库存多的分类占多个时段，
         # 主时段仍读 window_start/window_end，这一列只装「多出来的那些段」。
         "extra_windows": "TEXT DEFAULT ''",
+        # v2.1.55：1 = 该行是**系统因无库存自动关闭**的（有货时系统可自动打开）；
+        # 0 = 用户自己开的/关的（系统不擅自改）
+        "auto_disabled": "INTEGER DEFAULT 0",
         "created_at": "DATETIME",
         "updated_at": "DATETIME",
     },

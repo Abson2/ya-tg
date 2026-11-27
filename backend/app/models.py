@@ -1016,6 +1016,10 @@ class SCCategorySchedule(Base):
     # 用一个 JSON 列表达多时段，代价是一条 ALTER ADD COLUMN，风险几乎为零。
     # 主时段仍是 window_start/window_end（老代码、老接口全部照旧读这两个字段）。
     extra_windows: Mapped[str] = mapped_column(Text, default="")
+    # v2.1.55：该行是否由**系统按库存自动关闭**（1=系统关的，0=用户自己关的/开启的）。
+    # 用户口径「无作品的分类自动关闭，有作品时自动打开，把空出来的时段分给别的分类」——
+    # 必须能区分「系统关的」与「用户手工关的」：后者有作品时不许被系统擅自打开。
+    auto_disabled: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     __table_args__ = (

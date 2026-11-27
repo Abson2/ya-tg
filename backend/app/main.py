@@ -1161,7 +1161,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.54", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.55", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1172,7 +1172,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.54", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.55", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -2009,11 +2009,16 @@ class MirrorCleanupInput(BaseModel):
     dry_run 只返回预览清单不写库
     rule_id 限定镜像规则（0 = 当前生效规则）
     ids     限定只处理这些行 id（空 = 该 scope 下全部）
+    deep    v2.1.55：只有 scope=media 用。true（默认）= 本地判据之后**再逐部联网核对
+            B 库**；false = 只按本地判据清理，毫秒级返回。前端把它拆成两步：先
+            `deep=false` 秒清并刷新页面，再 `deep=true` 慢慢扫 B 库 —— 此前整批
+            核对要 1-2 分钟、期间页面毫无反馈，用户以为「按钮点了没反应」。
     """
     scope: str = "file"
     dry_run: bool = False
     rule_id: int = 0
     ids: list[int] = []
+    deep: bool = True
 
 
 @app.get("/api/mirror/config", dependencies=ADMIN)
@@ -2608,7 +2613,10 @@ async def mirror_cleanup(p: MirrorCleanupInput, db: Session = Depends(get_db)):
         return _cleanup_pruned_dirs(db, r.id, ids, dry_run=bool(p.dry_run))
 
     if scope == "media":
-        out = await mirror_media_clear_invalid_async(dry_run=p.dry_run, db=db)
+        # v2.1.55：把 ids / deep 一起传下去。此前这里完全忽略 p.ids，媒体清单
+        # 只能整批扫，用户勾了行也没用。
+        out = await mirror_media_clear_invalid_async(
+            dry_run=p.dry_run, ids=ids, deep=bool(p.deep), db=db)
         out["scope"] = scope
         return out
 
@@ -3006,6 +3014,8 @@ def mirror_mappings_clear_pruned(db: Session = Depends(get_db)):
 
 @app.post("/api/mirror/media/clear-invalid", dependencies=ADMIN)
 async def mirror_media_clear_invalid_async(dry_run: bool = False,
+                                           ids: list[int] | None = None,
+                                           deep: bool = True,
                                            db: Session = Depends(get_db)):
     """v0.9.10：清理影视映射清单的无效行——口径改为「B 库网盘文件已删除」。
 
@@ -3016,13 +3026,50 @@ async def mirror_media_clear_invalid_async(dry_run: bool = False,
     只删 A→B 映射登记（连同子 MirrorFile），不动资源 / 分享 / 队列 / B 库文件。
     列目录不可信时一律跳过该类，绝不误删；每步立即 commit，不跨 await 持写事务。
     dry_run=true 只返回预览清单不写库。
+
+    v2.1.55（真机反馈 2026-11-27：「这两部清理不了」）：**把 ② 提到 ① 之前**，并新增
+    `deep` 开关。根因不是判据不认，而是两个数字叠在一起：
+
+      · 线上 680 部里，`prune_missing_media_rows` 只扫**最新 200 部**（按 id desc），
+        那两部排第 419 / 461 位 —— 联网核对根本轮不到它们；
+      · 唯一能删它的 ② 又排在 ① **之后**，而 ① 实测单部 0.5 秒、200 部要 1-2 分钟。
+        于是一次点击要等 1-2 分钟才动手删，用户以为「没反应」就反复点。
+
+    改序后：② 是纯 DB 判据、毫秒级，点下去立刻删掉这类「零文件的僵尸映射行」；
+    ① 再慢慢核那些「有 synced 文件、但 B 库可能已整部删掉」的行 —— 那才是必须联网
+    才能判的部分。删除集合与改序前**完全相同**（原：B ∪ S1；现：先删 S1，再对幸存行
+    求 B，并集仍是 B ∪ S1，不会多删也不会漏删）。
+
+    `deep=false` 则跳过 ①，只做本地判据，用于前端「先秒清并刷新，再慢慢扫 B 库」。
+    `ids` 限定只处理这些行（此前 media 分支完全忽略它，无法定向清理）。
     """
     r = _mirror_rule(db)
+    if not r:
+        raise HTTPException(400, "请先在镜像设置里保存 A / B 库目录 ID")
+    wanted = [int(x) for x in (ids or []) if str(x).strip().isdigit()]
+
+    # ---------- ② 本地判据（纯 DB、毫秒级）：先做，点下去立刻见效 ----------
+    targets = _invalid_media_rows(db, r.id, ids=wanted)
+    local_media = len(targets)
+    local_files = sum(db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
+                      for m in targets)
+    if not dry_run and local_media:
+        for m in targets:
+            db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
+                synchronize_session=False)
+            db.delete(m)
+        db.commit()
+    # dry_run 时行没真删，但已计进 local_media —— 下面 ① 必须跳过它们，否则同一行
+    # 会被「本地判据 + 联网核对」各计一次，预览数字虚高。
+    removed_ids = [int(m.id) for m in targets]
+
+    # ---------- ① 联网只读核对 B 库（慢）：只核 ② 没删掉的幸存行 ----------
     checked = {"checked": 0, "b_deleted": 0, "b_files": 0, "skipped_has_files": 0,
                "skipped_unverified": 0, "samples": [], "errors": []}
-    if r and (r.target_root_id or "").strip():
+    if deep and (r.target_root_id or "").strip():
         try:
-            p = await mirror.prune_missing_media_rows(db, r, dry_run=dry_run)
+            p = await mirror.prune_missing_media_rows(
+                db, r, dry_run=dry_run, ids=wanted, skip_ids=removed_ids)
             checked = {"checked": p.get("media_checked", 0),
                        "b_deleted": p.get("media_deleted", 0),
                        "b_files": p.get("files_deleted", 0),
@@ -3032,35 +3079,24 @@ async def mirror_media_clear_invalid_async(dry_run: bool = False,
         except Exception as exc:
             checked["errors"].append(f"B 库核对失败：{str(exc)[:200]}")
             checked["skipped_unverified"] = -1  # 标记核对整体失败，不让本地清理冒充成功
-    # ② 本地口径僵尸行（无 synced 文件）只在真正执行时删；dry_run 仅统计
-    # v2.1.11：补 rule_id 过滤（此前查全表，多规则场景会跨删别的规则的映射行）
-    _rule = _mirror_rule(db)
-    targets = _invalid_media_rows(db, _rule.id if _rule else None)
-    local_media = len(targets)
-    local_files = sum(db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
-                      for m in targets)
-    removed_media = checked["b_deleted"] + (0 if dry_run else local_media)
-    removed_files = (checked["b_files"] if not dry_run else 0) + (0 if dry_run else local_files)
-    if not dry_run and local_media:
-        for m in targets:
-            db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
-                synchronize_session=False)
-            db.delete(m)
-        db.commit()
+    removed_media = checked["b_deleted"] + local_media
+    removed_files = checked["b_files"] + local_files
     if not dry_run and (removed_media or removed_files):
         add_audit(db, "mirror_media_clear_invalid", target_type="mirror",
                   detail=json_dumps({"b_deleted": checked["b_deleted"],
                                      "local_media": local_media,
-                                     "media": removed_media, "files": removed_files}))
+                                     "media": removed_media, "files": removed_files,
+                                     "deep": bool(deep)}))
         db.commit()
     return {"ok": True, "removed_media": removed_media,
             "removed_files": removed_files,
+            "local_media": local_media,
             "b_checked": checked["checked"],
             "b_deleted": checked["b_deleted"],
             "skipped_has_files": checked["skipped_has_files"],
             "skipped_unverified": checked["skipped_unverified"],
             "samples": checked["samples"], "errors": checked["errors"],
-            "dry_run": bool(dry_run)}
+            "deep": bool(deep), "dry_run": bool(dry_run)}
 
 
 def mirror_media_clear_invalid(db: Session) -> dict:
@@ -3084,7 +3120,8 @@ def mirror_media_clear_invalid(db: Session) -> dict:
     return {"ok": True, "removed_media": removed_media, "removed_files": removed_files}
 
 
-def _invalid_media_rows(db: Session, rule_id: int | None = None) -> list:
+def _invalid_media_rows(db: Session, rule_id: int | None = None,
+                        ids: list[int] | None = None) -> list:
     """v0.9.9 #205：判定「历史无效影视映射」——没有任何 synced 文件、且不在进行中的僵尸行。
 
     v0.9.8 口径只认 failed/blocked，真机上大量「status=synced 但 B 库文件已删」或
@@ -3098,11 +3135,17 @@ def _invalid_media_rows(db: Session, rule_id: int | None = None) -> list:
     v2.1.11：加 rule_id 过滤——此前查全表 MirrorMedia，多规则场景下
     「清理无效影视映射」会跨规则删除别的规则的映射行。当前部署是单规则，
     但这是防御性缺口，补上以免将来多规则时误删。
+
+    v2.1.55：加 ids 过滤（定向清理某几行）。此前 `scope=media` 完全忽略入参 ids，
+    媒体清单只能整批扫 200 部、1-2 分钟才轮到，用户勾了行也没用。
     """
     in_progress = {"copying", "syncing", "pending"}
     stmt = select(MirrorMedia).order_by(MirrorMedia.id.desc())
     if rule_id:
         stmt = stmt.where(MirrorMedia.rule_id == int(rule_id))
+    want = [int(x) for x in (ids or []) if str(x).strip().isdigit()]
+    if want:
+        stmt = stmt.where(MirrorMedia.id.in_(want))
     out = []
     for m in db.scalars(stmt).all():
         status = str(getattr(m, "status", "") or "").strip().lower()
@@ -4499,14 +4542,21 @@ async def scan_now(resume: bool = True, auto_identify: bool = True,
 
     `resume` 仅为兼容旧调用保留，统一为全量扫描，不再断点续扫。
     """
+    # v2.1.55：与定时扫描 / 镜像轮共用同一把流水线锁（此前这条路径完全不参与，
+    # 真机上手动扫描与整点定时扫描并发跑过，内存翻倍、批次卡 running）。
+    if not _mirror_lock.acquire(blocking=False, owner="立即扫描"):
+        raise HTTPException(409, "已有扫描或镜像任务在运行，等它结束再点「立即扫描」")
     try:
-        out = await _refresh_library_from_b(db, auto_identify=auto_identify,
-                                            allow_empty_reconcile=True)
-        add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(out))
-        db.commit()
-        return out
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        try:
+            out = await _refresh_library_from_b(db, auto_identify=auto_identify,
+                                                allow_empty_reconcile=True)
+            add_audit(db, "scan_manual", target_type="scan", detail=json_dumps(out))
+            db.commit()
+            return out
+        except Exception as e:
+            raise HTTPException(502, str(e))
+    finally:
+        _mirror_lock.release()
 
 
 # ---------- v0.9.10：手动扫描异步化（解决 Failed to fetch / 页面卡死） ----------
@@ -4545,43 +4595,63 @@ def _async_scan_persist() -> None:
 async def _run_async_scan(mode: str) -> None:
     """后台执行扫描管线，全程独立 Session；状态写内存 + DB 快照（B-04）。"""
     global _async_scan_task
+    # v2.1.55：**手动扫描必须与定时扫描 / 镜像轮共用同一把流水线锁**。
+    # 此前只有 `_scheduled_scan`（定时）与 `_job_rename_pending` / 定时镜像拿锁，
+    # 手动扫描这条路径**完全不参与**，于是真机上确实并发跑起来过：
+    # 15:52 的手动扫描还没结束，16:00 的整点定时扫描又启动了一个批次，两个
+    # `run_scan` 各持一份全量目录树与 2.4 万资源行 —— 容器内存直接翻到 1GB
+    # （单进程 RSS 1019MiB，峰值 1169MiB），之前的 264 号批次也是同样原因
+    # 卡在 running 永不结束。并发还会互相覆盖 `scan_cursors`，让批次判不完整，
+    # 对账因此读到错的 seen。
+    _async_scan["stage"] = "等待上一轮任务结束"
+    _async_scan_persist()
+    if not await _mirror_lock.acquire_async(f"手动扫描（{mode}）",
+                                            timeout=PIPELINE_WAIT_SECONDS):
+        _async_scan.update({"error": "等待上一轮任务结束超时，本次扫描未启动",
+                            "stage": "超时放弃", "running": False,
+                            "finished_at": utcnow().isoformat()})
+        _async_scan_task = None
+        _async_scan_persist()
+        return
     try:
-        with SessionLocal() as db:
-            if mode == "refresh":
-                _async_scan["stage"] = "扫描并重建资源库"
-                out = await _refresh_library_from_b(db, auto_identify=True,
-                                                    allow_empty_reconcile=True)
-                add_audit(db, "library_refresh_async", target_type="scan", detail=json_dumps(out))
-            elif mode == "rescan":
-                _async_scan["stage"] = "重新扫描库"
-                out = await _refresh_library_from_b(db, reconcile=True, auto_identify=True,
-                                                    allow_empty_reconcile=True)
-                add_audit(db, "library_rescan_async", target_type="scan", detail=json_dumps(out))
-            else:  # scan
-                _async_scan["stage"] = "立即扫描"
-                out = await _refresh_library_from_b(db, auto_identify=True,
-                                                    allow_empty_reconcile=True)
-                add_audit(db, "scan_manual_async", target_type="scan", detail=json_dumps(out))
-            db.commit()
-            # v0.9.10：手动扫描也写本轮任务快照，进度节点反映本次扫描处理量
-            if isinstance(out, dict):
-                ident = out.get("identify") or {}
-                _write_pipeline_snapshot(
-                    db, _mirror_rule(db), mode="手动扫描", stage="done", running=False,
-                    copied=0, renamed=0,
-                    identified=int(ident.get("identified", 0) or 0),
-                    queued=int(ident.get("queued", 0) or 0),
-                    scan_files=int(out.get("files", 0) or 0),
-                    enqueue_diag=dict(ident.get("enqueue_diag") or {}),
-                    works=dict(ident.get("work_stats") or {}))
+        try:
+            with SessionLocal() as db:
+                if mode == "refresh":
+                    _async_scan["stage"] = "扫描并重建资源库"
+                    out = await _refresh_library_from_b(db, auto_identify=True,
+                                                        allow_empty_reconcile=True)
+                    add_audit(db, "library_refresh_async", target_type="scan", detail=json_dumps(out))
+                elif mode == "rescan":
+                    _async_scan["stage"] = "重新扫描库"
+                    out = await _refresh_library_from_b(db, reconcile=True, auto_identify=True,
+                                                        allow_empty_reconcile=True)
+                    add_audit(db, "library_rescan_async", target_type="scan", detail=json_dumps(out))
+                else:  # scan
+                    _async_scan["stage"] = "立即扫描"
+                    out = await _refresh_library_from_b(db, auto_identify=True,
+                                                        allow_empty_reconcile=True)
+                    add_audit(db, "scan_manual_async", target_type="scan", detail=json_dumps(out))
                 db.commit()
-        _async_scan["result"] = out if isinstance(out, dict) else {}
-        _async_scan["stage"] = "完成"
-    except Exception as exc:
-        logger.exception("[async-scan] 后台扫描失败")
-        _async_scan["error"] = f"{type(exc).__name__}: {exc}"[:1000]
-        _async_scan["stage"] = "失败"
+                # v0.9.10：手动扫描也写本轮任务快照，进度节点反映本次扫描处理量
+                if isinstance(out, dict):
+                    ident = out.get("identify") or {}
+                    _write_pipeline_snapshot(
+                        db, _mirror_rule(db), mode="手动扫描", stage="done", running=False,
+                        copied=0, renamed=0,
+                        identified=int(ident.get("identified", 0) or 0),
+                        queued=int(ident.get("queued", 0) or 0),
+                        scan_files=int(out.get("files", 0) or 0),
+                        enqueue_diag=dict(ident.get("enqueue_diag") or {}),
+                        works=dict(ident.get("work_stats") or {}))
+                    db.commit()
+            _async_scan["result"] = out if isinstance(out, dict) else {}
+            _async_scan["stage"] = "完成"
+        except Exception as exc:
+            logger.exception("[async-scan] 后台扫描失败")
+            _async_scan["error"] = f"{type(exc).__name__}: {exc}"[:1000]
+            _async_scan["stage"] = "失败"
     finally:
+        _mirror_lock.release()
         _async_scan["running"] = False
         _async_scan["finished_at"] = utcnow().isoformat()
         _async_scan_task = None
@@ -4612,15 +4682,21 @@ def scan_async_status():
 async def rescan_library(auto_identify: bool = True, reconcile: bool = True,
                          db: Session = Depends(get_db)):
     """v0.8.7：「重新扫描库」与顶部刷新、立即扫描共用同一重建管线。"""
+    # v2.1.55：同 scan_now —— 不参与流水线锁就会与定时扫描并发
+    if not _mirror_lock.acquire(blocking=False, owner="重新扫描库"):
+        raise HTTPException(409, "已有扫描或镜像任务在运行，等它结束再点「重新扫描库」")
     try:
-        out = await _refresh_library_from_b(db, reconcile=reconcile,
-                                            auto_identify=auto_identify,
-                                            allow_empty_reconcile=True)
-        add_audit(db, "library_rescan", target_type="library", detail=json_dumps(out))
-        db.commit()
-        return {"ok": True, **out}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        try:
+            out = await _refresh_library_from_b(db, reconcile=reconcile,
+                                                auto_identify=auto_identify,
+                                                allow_empty_reconcile=True)
+            add_audit(db, "library_rescan", target_type="library", detail=json_dumps(out))
+            db.commit()
+            return {"ok": True, **out}
+        except Exception as e:
+            raise HTTPException(502, str(e))
+    finally:
+        _mirror_lock.release()
 
 
 @app.post("/api/library/refresh", dependencies=ADMIN)
@@ -4630,13 +4706,19 @@ async def refresh_library(db: Session = Depends(get_db)):
     B 库已无该影视时清出面板并取消分享；空批次只有「批次完整且确实扫到目录」
     才被信任，接口抖动不会误清整个资源库。
     """
+    # v2.1.55：同 scan_now —— 不参与流水线锁就会与定时扫描并发
+    if not _mirror_lock.acquire(blocking=False, owner="刷新资源库"):
+        raise HTTPException(409, "已有扫描或镜像任务在运行，等它结束再刷新")
     try:
-        out = await _refresh_library_from_b(db, allow_empty_reconcile=True)
-        add_audit(db, "library_refresh", target_type="library", detail=json_dumps(out))
-        db.commit()
-        return {"ok": True, **out}
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        try:
+            out = await _refresh_library_from_b(db, allow_empty_reconcile=True)
+            add_audit(db, "library_refresh", target_type="library", detail=json_dumps(out))
+            db.commit()
+            return {"ok": True, **out}
+        except Exception as e:
+            raise HTTPException(502, str(e))
+    finally:
+        _mirror_lock.release()
 
 
 # ---------- 资源与分享 ----------

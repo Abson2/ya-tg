@@ -4242,7 +4242,9 @@ async def prune_stale_mappings(db: Session, rule: MirrorRule, *,
 
 async def prune_missing_media_rows(db: Session, rule: MirrorRule, *,
                                    dry_run: bool = False,
-                                   max_media: int = 200) -> dict:
+                                   max_media: int = 200,
+                                   ids: list[int] | None = None,
+                                   skip_ids: list[int] | None = None) -> dict:
     """v0.9.10：影视映射清单「清理无效影视映射」——只读核对 B 库，删除整部已不存在的映射行。
 
     用户口径（2026-11-19 确认）：影视映射清单要清的是「B 库网盘文件已删除」的历史遗留行，
@@ -4257,14 +4259,24 @@ async def prune_missing_media_rows(db: Session, rule: MirrorRule, *,
          QueueItem / DistributionEvent，不删 B 库文件。
       3. 每次删立即 `db.commit()`，绝不跨 await 持有写事务（设计红线 8）。
       4. dry_run 只返回清单不写库，供预览确认。
+
+    v2.1.55：加 `ids`（只核这几部，定向清理）与 `skip_ids`（调用方已经按本地判据
+    处理过的行，别再核一遍——否则 dry_run 预览会把同一行计两次，数字虚高）。
+    `max_media` 的截断在**排除 skip_ids 之后**做，否则跳过的行会白占名额，
+    真正该核的反而扫不到。
     """
     api = GuangYaWebFiles(db)
     stats = {"ok": True, "dry_run": bool(dry_run), "media_checked": 0,
              "media_deleted": 0, "skipped_verified_has_files": 0,
              "skipped_unverified": 0, "files_deleted": 0,
              "samples": [], "errors": []}
-    medias = list(db.scalars(select(MirrorMedia).where(
-        MirrorMedia.rule_id == rule.id).order_by(MirrorMedia.id.desc())).all())
+    stmt = select(MirrorMedia).where(MirrorMedia.rule_id == rule.id)
+    want = [int(x) for x in (ids or []) if str(x).strip().isdigit()]
+    if want:
+        stmt = stmt.where(MirrorMedia.id.in_(want))
+    skip = {int(x) for x in (skip_ids or []) if str(x).strip().isdigit()}
+    medias = [m for m in db.scalars(stmt.order_by(MirrorMedia.id.desc())).all()
+              if m.id not in skip]
     for media in medias[:max_media]:
         stats["media_checked"] += 1
         # v2.1.54：同 prune_stale_mappings —— 网络前收口，别让整批反查持着连接。

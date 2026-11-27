@@ -2247,7 +2247,9 @@ def _retime_schedules_by_stock(db: Session, version: "SCSharePlanVersion",
 
       · 段数按库存、段位按热门（与 `_ensure_schedules` 同一套算法）；
       · 库存 0 的分类**一段都不分**（分了也是空的），其额外时段同时收掉；
-      · 只改时段与 `window_auto`，**不动**启用状态、不动上限、不动已建任务。
+      · 库存 0 的分类**自动关闭排期**、有货时自动打开（v2.1.55 用户口径；
+        只动系统自己关的行，用户手工关的不擅自打开）；
+      · 只改时段 / `window_auto` / 启停，**不动**上限、不动已建任务。
 
     与推送队列的联动边界（v2.1.34 红线）：已建任务的推送时间是既成事实，
     本函数一个字都不改它们。时段改完后 `forecast_schedule` 立刻按新时段重算预测，
@@ -2279,7 +2281,11 @@ def _retime_schedules_by_stock(db: Session, version: "SCSharePlanVersion",
             continue
         row.window_start, row.window_end = int(main[0]), int(main[1])
         row.extra_windows = _jdump([list(s) for s in extra]) if extra else ""
-        row.window_auto = True            # 重新交回系统托管
+        # v2.1.55：AI 定过的时段**不再交给系统自动刷新**（window_auto=False）。
+        # 否则页面下一次刷新时 `_ensure_schedules` 会按内置单段把它抹回去，
+        # 用户视角就是「一键调度跑完，一刷新就变回去了」。
+        # 「一键恢复默认」会把它设回 True，那是用户明确要回默认的动作。
+        row.window_auto = False
         row.updated_at = utcnow()
         moved += 1
         details.append({
@@ -2295,8 +2301,14 @@ def _retime_schedules_by_stock(db: Session, version: "SCSharePlanVersion",
             continue
         row.extra_windows = ""
         row.updated_at = utcnow()
+    # v2.1.55（用户口径 3）：无作品 → 自动关闭让出时段；有作品 → 自动打开。
+    # 段已经只分给有货的分类（`_segments_by_stock`），这里把「让位」这半个动作做完：
+    # 关闭的行不再占任何小时，被让出来的小时就成了别的分类的时段。
+    toggled = _apply_stock_enabled(rows, stock,
+                                   known=sum(int(v or 0) for v in stock.values()) > 0)
     return {"moved": moved, "details": details[:60],
-            "truncated": max(0, len(details) - 60)}
+            "truncated": max(0, len(details) - 60),
+            "closed": toggled["closed"], "opened": toggled["opened"]}
 
 
 def build_even_plan(db: Session) -> dict[str, Any]:
@@ -7320,16 +7332,26 @@ def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
     groups = _segments_by_stock(prefs, _stock_segment_pool(quiet, win), stock)
     adopted = 0
     skipped = 0
+    closed = 0
     skipped_items: list[dict[str, str]] = []
     for row in rows:
         name = _category_display_name(row.category_key)
         st = int(stock.get(row.category_key) or 0)
         if stock_known and st <= 0:
+            # v2.1.55（用户口径 3）：无作品的分类**自动关闭排期**而不是只跳过。
+            # 关闭才是真的让位 —— 关闭的行不占任何小时，那几个小时会落到有货的分类上。
+            if row.enabled:
+                row.enabled = False
+                row.auto_disabled = 1
+                row.updated_at = utcnow()
+            # 无论之前是不是已经关着，本次采纳之后它都是关闭状态 →
+            # 都计进 closed，页面那句「N 个没有作品已自动关闭」才对得上账。
+            closed += 1
             skipped += 1
             skipped_items.append({
                 "name": name,
-                "reason": ("资源库里这个分类没有待排作品，先不给它占时段 —— "
-                           "占了那一小时也排不出任何东西")})
+                "reason": ("资源库里这个分类没有待排作品，已自动关闭它的排期 —— "
+                           "空出来的时段分给有作品的分类；等它有作品了会自动打开")})
             continue
         sug_start, sug_end, sug_source = _category_suggest_window(
             db, row.category_key, fallback_map.get(row.category_key, FULL_DAY_WINDOW))
@@ -7392,7 +7414,7 @@ def api_adopt_schedule_ai_all(body: Payload, db: Session = Depends(get_db)):
             filled_hours = gaps
             filled_by = _category_display_name(top_key)
     db.commit()
-    return {"ok": True, "adopted": adopted, "skipped": skipped,
+    return {"ok": True, "adopted": adopted, "skipped": skipped, "closed": closed,
             "total": len(rows), "skipped_items": skipped_items[:60],
             # v2.1.54：采纳后仍有空档的小时 + 由谁补上，如实回显。
             # 空列表 = 这次采纳后每个可推小时都至少有一个有货的分类。
@@ -7545,6 +7567,45 @@ def _category_stock(db: Session) -> dict[str, int]:
         return {}
 
 
+def _apply_stock_enabled(rows: list[SCCategorySchedule], stock: dict[str, int],
+                         *, known: bool) -> dict[str, int]:
+    """v2.1.55：按库存自动开关排期行 —— 无作品关闭、有作品打开。
+
+    用户口径：「当分类无作品时，可通过不启用排期来减少空窗（如无作品的分类，
+    或 ai 批量采纳自动关闭无作品的分类，有作品时自动打开，需将空余的时段
+    分配到其他分类上去）」。空出来的小时怎么分，由 `_segments_by_stock`
+    只给有货的分类分段来完成 —— 这两件事是一套：**先让零库存的让位，再把段分完**。
+
+    三个必须守住的边界：
+
+      ① `known=False`（全库零库存 = 资源库还没同步过）时**一个都不许关**。
+         否则新装用户打开页面看到 27 个分类全关，等于排期功能整个是坏的。
+      ② 只自动打开**系统自己关的**（`auto_disabled=1`）。用户手工关掉的行
+         `auto_disabled=0`，即使有货也不许擅自打开 —— 那是用户的决定。
+      ③ 只碰 `enabled` / `auto_disabled`，**不动时段、不动上限、不动已建任务**。
+
+    返回 `{"closed": n, "opened": n}`，供端点如实回显。
+    """
+    out = {"closed": 0, "opened": 0}
+    if not known:
+        return out
+    for row in rows:
+        has = int(stock.get(row.category_key) or 0) > 0
+        if not has:
+            if row.enabled:
+                row.enabled = False
+                row.auto_disabled = 1
+                row.updated_at = utcnow()
+                out["closed"] += 1
+            continue
+        if int(getattr(row, "auto_disabled", 0) or 0) and not row.enabled:
+            row.enabled = True
+            row.auto_disabled = 0
+            row.updated_at = utcnow()
+            out["opened"] += 1
+    return out
+
+
 def _preference_windows(db: Session,
                         quiet: tuple[int, int] | None = None) -> dict[str, tuple[int, int]]:
     """当前偏好排名对应的分类默认时段窗口（分类 key → (起, 止)）。
@@ -7634,17 +7695,17 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
     rows = {r.category_key: r for r in db.scalars(
         select(SCCategorySchedule).where(SCCategorySchedule.plan_version_id == version_id)).all()}
     quiet = _quiet_window(_cycle_plan_of(db, version_id))
-    # 传库存进去 —— 这一步就是「空档消失」的关键。库里一部待排作品都没有时
-    # `_category_stock` 返回空，`_assign_category_segments` 自动退回一分类一段的旧口径。
-    seg_map = _assign_category_segments(_category_preference(db), quiet, _category_stock(db))
+    # v2.1.55（用户口径 5）：建行/回填一律用**内置单段**时段（热门白天 / 冷门夜间）。
+    # 之前这里按库存把多出来的段也写进额外时段 —— 于是「恢复默认」刚把多时段清掉，
+    # 页面下一次刷新（GET 会调本函数）又把它写回来了，用户视角就是「默认点了没用」。
+    # 多时段只由「一键 AI 调度」和「批量采纳」产生，本函数不再制造它。
+    win_map = _assign_category_windows(_category_preference(db), quiet)
     added = False
     changed = False
     for cat in _tmdb_genre_catalog():
         key = cat["category_key"]
-        segs = seg_map.get(key) or [FULL_DAY_WINDOW]
-        ws, we = segs[0]
-        extra = segs[1:]
-        extra_json = _jdump([list(s) for s in extra]) if extra else ""
+        ws, we = win_map.get(key) or FULL_DAY_WINDOW
+        extra_json = ""
         ws, we, hl, dl = _default_schedule_for(cat.get("media_type") or "", (ws, we))
         existing = rows.get(key)
         if existing is None:
@@ -7654,6 +7715,10 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
                                      window_auto=True, extra_windows=extra_json)
             db.add(row)
             added = True
+            continue
+        # v2.1.55：带着额外时段的行是「AI 调度 / 批量采纳」的产物，本函数不碰它 ——
+        # 否则每次打开页面都会把它抹回单段，AI 调的排期白调。
+        if str(existing.extra_windows or "").strip():
             continue
         # v2.1.1：用户手工设定过的行（window_auto=False）永不被系统回填覆盖——
         # 即使用户恰好保存了 0/0 上限 + 8-24 时段，也属于「已配置」，不该被改写。
@@ -7691,8 +7756,16 @@ def _ensure_schedules(db: Session, version_id: int) -> list[SCCategorySchedule]:
             changed = True
     if added or changed:
         db.flush()
-    return list(db.scalars(select(SCCategorySchedule).where(
+    all_rows = list(db.scalars(select(SCCategorySchedule).where(
         SCCategorySchedule.plan_version_id == version_id)).all())
+    # v2.1.55：库存决定启停 —— 无作品的分类自动关闭、让出时段；有作品时自动打开。
+    stock_now = _category_stock(db)
+    if _apply_stock_enabled(all_rows, stock_now,
+                            known=sum(int(v or 0) for v in stock_now.values()) > 0)["closed"]:
+        changed = True
+    if changed:
+        db.flush()
+    return all_rows
 
 
 def _ai_suggest_window(db: Session, category_key: str) -> tuple[int, int]:
@@ -7923,10 +7996,12 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
         SCCategorySchedule.plan_version_id == version.id)).all())
     untouched_keys = {r.category_key for r in before if _is_untouched_schedule(r)}
     rows = _ensure_schedules(db, version.id)
-    # v2.1.54：按**库存**分配（段数按库存、段位按热门），并把多出来的段写进额外时段。
-    seg_map = _assign_category_segments(
-        _category_preference(db), _quiet_window(_cycle_plan_of(db, version.id)),
-        _category_stock(db))
+    # v2.1.55（用户口径 5）：恢复默认 = 回到**内置的分类推送时段**（热门白天 / 冷门夜间，
+    # 一分类一段），**不再**按库存把多出来的段写进额外时段。
+    # 「同分类多时段」是 AI 调度/批量采纳的产物，不该由「恢复默认」制造出来 ——
+    # 用户点默认，期待的就是那张熟悉的一张分类一个时段的老表。
+    win_map = _assign_category_windows(
+        _category_preference(db), _quiet_window(_cycle_plan_of(db, version.id)))
     applied = 0
     updated = 0
     for row in rows:
@@ -7935,18 +8010,16 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
             continue
         cat = next((c for c in _tmdb_genre_catalog()
                     if c["category_key"] == row.category_key), None)
-        segs = seg_map.get(row.category_key) or [FULL_DAY_WINDOW]
-        win = segs[0]
-        extra_json = (_jdump([list(s) for s in segs[1:]]) if len(segs) > 1 else "")
+        win = win_map.get(row.category_key) or FULL_DAY_WINDOW
         ws, we, hl, dl = _default_schedule_for((cat or {}).get("media_type") or "", win)
         if not force and row.category_key not in untouched_keys:
             continue
         changed = (int(row.window_start or 0) != ws
                    or int(row.window_end or 0) != we
-                   or str(row.extra_windows or "") != extra_json
+                   or bool(str(row.extra_windows or ""))
                    or not row.enabled)
         row.window_start, row.window_end = ws, we
-        row.extra_windows = extra_json
+        row.extra_windows = ""      # v2.1.55：恢复默认不带多时段
         # v2.1.6：分类级「每小时上限 / 日上限」已移除，统一由周期计划管理约束，
         # 因此这里不再回写分类级上限。
         row.enabled = True
@@ -7956,8 +8029,13 @@ def api_apply_schedule_defaults(body: Payload, db: Session = Depends(get_db)):
         applied += 1
         if changed:
             updated += 1
+    # v2.1.55：恢复默认之后同样要按库存启停 —— 有货的打开，没货的关掉让出时段。
+    stock_now = _category_stock(db)
+    toggled = _apply_stock_enabled(rows, stock_now,
+                                   known=sum(int(v or 0) for v in stock_now.values()) > 0)
     db.commit()
-    return {"ok": True, "applied": applied, "updated": updated, "total": len(rows)}
+    return {"ok": True, "applied": applied, "updated": updated, "total": len(rows),
+            "closed": toggled["closed"], "opened": toggled["opened"]}
 
 
 @router.post("/category-schedules/reset-default")
@@ -7976,18 +8054,22 @@ def api_reset_category_schedule_default(body: Payload, db: Session = Depends(get
     media_type = cat.get("media_type") if cat else ""
     # v2.1.6：时段取**默认时间表**（热门白天 / 冷门夜间，避开静默），
     # 与「一键恢复默认」同一口径。
-    # v2.1.54：默认时间表按库存分配，可能给这个分类多个时段，一并写回。
+    # v2.1.55（用户口径 5）：单行「默认」也只回到**内置单段**时段，
+    # 之前按库存分给它的额外时段一并清掉 —— 「默认」不该等于「多时段」。
     quiet_now = _quiet_window(_cycle_plan_of(db))
-    segs = _assign_category_segments(
-        _category_preference(db), quiet_now, _category_stock(db)).get(row.category_key)
-    win = segs[0] if segs else FULL_DAY_WINDOW
+    win = _assign_category_windows(
+        _category_preference(db), quiet_now).get(row.category_key) or FULL_DAY_WINDOW
     ws, we, hl, dl = _default_schedule_for(media_type, win)
     row.window_start, row.window_end = ws, we
-    row.extra_windows = (_jdump([list(s) for s in segs[1:]])
-                         if segs and len(segs) > 1 else "")
+    row.extra_windows = ""
     # 恢复默认 = 交回系统托管，让后续分配能继续刷新它
     row.window_auto = True
     row.ai_adopted = False
+    # v2.1.55：启停跟着库存走 —— 没货的恢复默认后仍是关闭状态（不白占时段），
+    # 有货的打开。用户手工关掉的行（auto_disabled=0）此处不动。
+    stock_now = _category_stock(db)
+    _apply_stock_enabled([row], stock_now,
+                         known=sum(int(v or 0) for v in stock_now.values()) > 0)
     # v2.1.6：分类级上限已移除，统一由周期计划管理约束——
     # 恢复默认只改时段，不回写分类级 hourly/daily。
     row.updated_at = utcnow()
@@ -8019,6 +8101,8 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
     # 偏好排名（档位）——与推荐时间段合并展示。
     pref_rank = {p["category_key"]: p.get("rank")
                  for p in _category_preference(db)}
+    # v2.1.55：库存（在库待排作品数）—— 表里那一列的数就取这里，与调度同源。
+    stock_map = _category_stock(db)
     items = []
     for r in rows:
         d = _model_dict(r)
@@ -8061,6 +8145,13 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
                     except (TypeError, ValueError):
                         continue
         d["quiet_conflict"] = conflict
+        # v2.1.55：这一行是不是「因无作品被系统自动关闭」的（中性名，页面据此提示）。
+        d["auto_closed"] = bool(int(getattr(r, "auto_disabled", 0) or 0)) and not r.enabled
+        # v2.1.55（用户口径）：表里加一列「库存」，数字直接取资源库在库待排作品数。
+        # 与「一键 AI 调度 / 批量采纳 / 均匀排期」**同一份判据**（`_category_backlog`），
+        # 页面另给一份同谓词明细可点开（`/sc/category-works`），
+        # 不允许只甩一个数字出来（v2.1.36 红线）。
+        d["stock"] = int(stock_map.get(r.category_key) or 0)
         # v2.1.1：补媒体类型（前端不再展示「周期维度」列，仍随行下发备用）
         d["media_type"] = cat_map.get(r.category_key, {}).get("media_type", "")
         items.append(d)
@@ -8074,6 +8165,40 @@ def api_category_schedules(version_id: int = 0, db: Session = Depends(get_db)):
             "quiet_enabled": bool(quiet),
             "quiet_start": quiet[0] if quiet else 0,
             "quiet_end": quiet[1] if quiet else 0}
+
+
+@router.get("/category-works")
+def api_category_works(category_key: str = "", limit: int = 200,
+                       db: Session = Depends(get_db)):
+    """某个分类「在库待排」的作品明细（v2.1.55）。
+
+    红线（v2.1.36）：页面每个计数都必须有一份**同谓词**明细可点开。
+    表里新加的「库存」列是个数字，所以这里用**与 `_category_backlog` 完全相同的
+    谓词**（最新快照 + live_keys）把作品列出来 —— 两处对不上就说明有一处是错的。
+
+    只读：不触发同步、不改任何状态。
+    """
+    key = str(category_key or "").strip()
+    if not key:
+        return {"ok": False, "reason": "缺少分类", "items": [], "total": 0}
+    live = _live_work_keys(db)
+    if not live:
+        return {"ok": True, "items": [], "total": 0}
+    latest_ids = select(func.max(SCLibraryVersion.id)).group_by(SCLibraryVersion.work_key)
+    rows = db.execute(
+        select(SCLibraryVersion.work_key, SCLibraryVersion.media_type)
+        .join(SCWorkCategory, SCWorkCategory.work_key == SCLibraryVersion.work_key)
+        .where(SCLibraryVersion.id.in_(latest_ids))
+        .where(SCLibraryVersion.work_key.in_(live))
+        .where(SCWorkCategory.category_key == key)
+        .order_by(SCLibraryVersion.work_key)
+    ).all()
+    cap = max(1, min(int(limit or 200), 1000))
+    items = [{"work": str(wk).split(":", 1)[-1],
+              "media_type": str(mt or "")}
+             for wk, mt in rows[:cap]]
+    return {"ok": True, "items": items, "total": len(rows),
+            "shown": len(items), "category": _category_display_name(key)}
 
 
 @router.post("/category-schedules")
@@ -8163,6 +8288,10 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     # （未显式带 enabled）会把该分类意外停用，排期形同虚设。
     if "enabled" in p:
         row.enabled = bool(p.get("enabled"))
+        if row.enabled:
+            # v2.1.55：用户手工把它打开了 → 清掉「系统自动关闭」标记，
+            # 否则有货时系统会以为这还是它关的（虽然结果一样，但状态会说不清）。
+            row.auto_disabled = 0
     # v2.1.4：只有当提交的时段**确实不等于偏好推荐值**时，才判定为「用户手工设定」。
     # 此前无条件置 window_auto=False，而前端「保存全部」会逐行提交**所有**行
     # （含用户根本没碰过的行），于是点一次保存全部，全表都变成「手工设定」，
@@ -8174,13 +8303,23 @@ def api_upsert_category_schedule(body: Payload, db: Session = Depends(get_db)):
     # v2.1.54：基准同时包含**额外时段**。库存多的分类系统会给它 2-3 段，
     # 前端「保存全部」原样提交回来时必须仍判成「系统托管」，
     # 否则点一次保存就全表变手工，以后分配再也不刷新（v2.1.4 踩过的同一个坑）。
-    segs = _assign_category_segments(
-        _category_preference(db), quiet, _category_stock(db)).get(category_key)
-    pref_win = segs[0] if segs else FULL_DAY_WINDOW
-    pref_extra = sorted([int(s), int(e)] for s, e in (segs[1:] if segs else []))
+    #
+    # v2.1.55：系统现在有**两种**合法形态，必须都认：
+    #   口径 A —— 内置单段（建行 / 恢复默认的产物，无额外时段）
+    #   口径 B —— 按库存多段（AI 调度 / 批量采纳的产物）
+    # 只认一种的话，另一个入口刚写好的表一保存就整表变「手工设定」。
+    prefs = _category_preference(db)
+    candidates: list[tuple[tuple[int, int], list[list[int]]]] = [
+        (tuple(_assign_category_windows(prefs, quiet).get(category_key)
+               or FULL_DAY_WINDOW), [])]
+    segs = _assign_category_segments(prefs, quiet, _category_stock(db)).get(category_key)
+    if segs:
+        candidates.append((tuple(segs[0]),
+                           sorted([int(s), int(e)] for s, e in segs[1:])))
     extra_now = extra_cleaned if extra_cleaned is not None else _sched_extra_windows(row)
     extra_now_sorted = sorted([int(s), int(e)] for s, e in extra_now)
-    if (ws, we) != tuple(pref_win) or extra_now_sorted != pref_extra:
+    if not any((ws, we) == main and extra_now_sorted == extra
+               for main, extra in candidates):
         row.window_auto = False
     row.updated_at = utcnow()
     db.commit()
