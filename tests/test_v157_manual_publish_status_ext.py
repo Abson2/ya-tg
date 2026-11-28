@@ -37,4 +37,7 @@ def test_publish_endpoint_keeps_queue_item_consumable():
 def test_manual_publish_button_preserved():
     app = (ROOT / "frontend/src/App.vue").read_text(encoding="utf-8")
     assert "publishResource" in app, "手动推送按钮处理函数必须保留"
-    assert "@click=\"seriesRepresentative(g) && publishResource" in app
+    # v2.1.61：写法从 `seriesRepresentative(g) && publishResource(...)` 改为直接调用
+    # ——那是「查不到代表资源就短路」的缺陷（678 部里绝大多数点推送没反应）。
+    # 本用例守护的不变量只有一条：作品卡片的推送按钮与处理函数都还在。
+    assert '@click="publishResource(seriesRepresentative(g))"' in app

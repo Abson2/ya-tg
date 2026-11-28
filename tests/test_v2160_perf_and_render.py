@@ -229,7 +229,8 @@ def test_load_sends_critical_first_then_idle():
     assert ".then(v => applyLoadItem(i, v)).catch(() => applyLoadItem(i, null))" in seg
 
 
-def test_version_locked_to_2160():
-    assert 'app = FastAPI(title="Ya-TG", version="2.1.60"' in MAIN
-    assert '"version": "2.1.60"' in MAIN
-    assert "v2.1.60 · Asia/Shanghai" in APP
+def test_version_locked_to_current():
+    """版本锁跟着当前版本走（本文件其余用例锁的仍是 v2.1.60 的行为）。"""
+    assert 'app = FastAPI(title="Ya-TG", version="2.1.61"' in MAIN
+    assert '"version": "2.1.61"' in MAIN
+    assert "v2.1.61 · Asia/Shanghai" in APP

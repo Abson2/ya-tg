@@ -2633,14 +2633,42 @@ async function clearLibrary() {
 // 作品视图操作：用组内已识别的代表资源执行，避免对散落单集逐个操作
 // v2.1.11：代表资源可能还没回填 A 库映射，此时用作品组上的映射兜底
 // （手动修正窗口要靠它预填正确剧名与影视号）。
+// v2.1.61（真机：点「推送」没反应）：`resources` 来自 `/api/resources`，
+// 默认只带最新 **100** 行（上限 500），而资源库有 **678** 部作品 —— 绝大多数
+// 代表作都不在这 100 行里，于是这里 `return null`。卡片上「分享/识别/手动修正」
+// 因为模板里写了 `|| {id,name}` 兜底还能用，唯独「推送」写的是
+// `seriesRepresentative(g) && publishResource(...)`，null 直接被短路 ——
+// **按钮点了什么都不发生，也没有任何提示**。
+// 现在改成**永不返回 null**：查不到就用作品组上的字段拼一个，只要 id 正确，
+// 四个操作（推送/分享/取消分享/识别）都只依赖 `row.id`，手动修正需要的剧名、
+// 类型、影视号组上本来就有。这样任何卡片、任何操作都不会再静默失效。
 function seriesRepresentative(g) {
+  const src = {
+    source_title: g.source_title || '',
+    source_tmdb_id: g.source_tmdb_id || 0,
+    source_media_type: g.source_media_type || ''
+  }
   const hit = resources.value.find(r => r.id === g.representative_id)
-  if (!hit) return null
+  if (hit) {
+    return {
+      ...hit,
+      source_title: hit.source_title || src.source_title,
+      source_tmdb_id: hit.source_tmdb_id || src.source_tmdb_id,
+      source_media_type: hit.source_media_type || src.source_media_type
+    }
+  }
+  // 兜底对象：字段全部取自作品组（标题是组内最好的那个名字，不是文件名）。
+  // path_hint 拿不到就给空串——手动修正窗口会退到用作品名搜索，比拿 B 库英文名
+  // 或单集文件名去搜更准，且这里绝不编造一个路径。
   return {
-    ...hit,
-    source_title: hit.source_title || g.source_title || '',
-    source_tmdb_id: hit.source_tmdb_id || g.source_tmdb_id || 0,
-    source_media_type: hit.source_media_type || g.source_media_type || ''
+    id: g.representative_id,
+    name: g.title || '',
+    media_title: g.title || '',
+    media_type: g.media_type || '',
+    poster_path: g.poster_path || '',
+    tmdb_id: g.tmdb_id || 0,
+    path_hint: '',
+    ...src
   }
 }
 // ---------- LitePan 风格「重新匹配元数据」 ----------
@@ -3954,7 +3982,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.60 · Asia/Shanghai</span>
+          <span>v2.1.61 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -5045,11 +5073,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
                   </div>
                   <div class="media-body"><b :title="g.title">{{ g.title }}</b><small>{{ mediaLabel(g.media_type) }}{{ g.year ? ' · ' + g.year : '' }}{{ g.episode_label ? ' · ' + g.episode_label : '' }}</small><div class="media-meta"><span v-if="g.tmdb_id">TMDB #{{ g.tmdb_id }}</span><span v-if="g.vote_average">评分 {{ Number(g.vote_average).toFixed(1) }}</span><span v-if="g.identified_count && g.identified_count < g.count" class="identify-chip">{{ g.identified_count }}/{{ g.count }} 已识别</span><span v-else-if="g.identify_status && g.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(g.identify_status) }}</span></div></div>
                   <div class="media-actions" @click.stop>
-                    <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="seriesRepresentative(g) && publishResource(seriesRepresentative(g))">推送</el-button>
-                    <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">取消分享</el-button>
-                    <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
-                    <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
-                    <el-button size="small" text @click="openMatch(seriesRepresentative(g) || {id:g.representative_id, name:g.title, path_hint:''})">手动修正</el-button>
+                    <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="publishResource(seriesRepresentative(g))">推送</el-button>
+                    <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g))">取消分享</el-button>
+                    <el-button v-else size="small" @click="createShare(seriesRepresentative(g))">分享</el-button>
+                    <el-button size="small" text @click="identify(seriesRepresentative(g), true)">识别</el-button>
+                    <el-button size="small" text @click="openMatch(seriesRepresentative(g))">手动修正</el-button>
                     <el-dropdown size="small" trigger="click" @command="c => setFinish(g, c)">
                       <el-button size="small" text>完结状态 ▾</el-button>
                       <template #dropdown><el-dropdown-menu>
@@ -5088,11 +5116,11 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
               </div>
               <div class="media-body"><b :title="g.title">{{ g.title }}</b><small>{{ mediaLabel(g.media_type) }}{{ g.year ? ' · ' + g.year : '' }}{{ g.episode_label ? ' · ' + g.episode_label : '' }}</small><div class="media-meta"><span v-if="g.tmdb_id">TMDB #{{ g.tmdb_id }}</span><span v-if="g.vote_average">评分 {{ Number(g.vote_average).toFixed(1) }}</span><span v-if="g.identified_count && g.identified_count < g.count" class="identify-chip">{{ g.identified_count }}/{{ g.count }} 已识别</span><span v-else-if="g.identify_status && g.identify_status !== 'identified'" class="identify-chip">{{ identifyLabel(g.identify_status) }}</span></div></div>
               <div class="media-actions" @click.stop>
-                <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="seriesRepresentative(g) && publishResource(seriesRepresentative(g))">推送</el-button>
-                <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">取消分享</el-button>
-                <el-button v-else size="small" @click="createShare(seriesRepresentative(g) || {id:g.representative_id, name:g.title})">分享</el-button>
-                <el-button size="small" text @click="identify(seriesRepresentative(g) || {id:g.representative_id, name:g.title}, true)">识别</el-button>
-                <el-button size="small" text @click="openMatch(seriesRepresentative(g) || {id:g.representative_id, name:g.title, path_hint:''})">手动修正</el-button>
+                <el-button size="small" type="primary" plain :loading="publishing === g.representative_id" @click="publishResource(seriesRepresentative(g))">推送</el-button>
+                <el-button v-if="g.share_url" size="small" @click="cancelShare(seriesRepresentative(g))">取消分享</el-button>
+                <el-button v-else size="small" @click="createShare(seriesRepresentative(g))">分享</el-button>
+                <el-button size="small" text @click="identify(seriesRepresentative(g), true)">识别</el-button>
+                <el-button size="small" text @click="openMatch(seriesRepresentative(g))">手动修正</el-button>
                 <el-dropdown size="small" trigger="click" @command="c => setFinish(g, c)">
                   <el-button size="small" text>完结状态 ▾</el-button>
                   <template #dropdown><el-dropdown-menu>
