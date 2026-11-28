@@ -72,8 +72,10 @@ def test_load_applies_each_item_as_it_arrives():
     assert ".then(v => applyLoadItem(i, v))" in APP
     # 反证：旧的「先 await allSettled 再 const v = i => settled... 统一赋」不许回来
     assert "const settled = await Promise.allSettled(keys.map(k => api('/' + k)))" not in APP
-    # 完成语义仍在：仍 await 全部落定，供总闸收敛
-    assert "await Promise.allSettled(keys.map((k, i) =>" in APP
+    # 完成语义仍在：首屏关键接口仍 await 落定，供总闸收敛。
+    # v2.1.60：await 的范围收窄到前 LOAD_CRITICAL 项（其余空闲补），
+    # 语义从「等全部 23 个」变成「等首屏那 8 个」——这是本版刻意的改动。
+    assert "await Promise.allSettled(keys.slice(0, LOAD_CRITICAL).map((k, i) => fire(k, i)))" in APP
 
 
 # ---------- 四、library_series 内存投影（不许全量 ORM） ----------

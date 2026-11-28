@@ -3,6 +3,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 from .config import settings
 
@@ -223,8 +224,15 @@ def source_query_hint(x) -> tuple[str, str, int, str]:
     return name, path_hint, src_tmdb, src_type
 
 
+@lru_cache(maxsize=8192)
 def normalize_work_name(s: str) -> str:
-    """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。"""
+    """归一化作品名：去掉 (2026)/(1)/[高清剧集网] 等括号噪声与分隔符，供聚合键共用。
+
+    v2.1.60：加 `lru_cache`。本函数被 `work_group_key` 每行调一次，而资源库
+    24,096 行里同一部剧的 N 集目录名完全一样（实测只有 678 组唯一值）——
+    原先是把同一串正则跑 24,096 遍（实测 226 ms）。纯函数、无外部状态，
+    记忆化不改变任何结果；上限 8192 防止扫描期海量文件名把内存顶高。
+    """
     if not s:
         return ""
     # v0.7.1：{} 也要纳入括号噪声。A 库目录标准格式含 {tmdb-135646} 标记，

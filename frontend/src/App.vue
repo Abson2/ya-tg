@@ -1443,6 +1443,55 @@ function toggleSelect(key) {
     ? selectedSeries.value.filter(k => k !== key)
     : [...selectedSeries.value, key]
 }
+// ---------- v2.1.60：资源库卡片墙分批渲染 ----------
+// 真机：资源库 678 部作品，两个视图都是 `v-for` 直出全部卡片，每张卡含
+// el-image + 6 个 el-button + el-dropdown + 8 个角标，合计约 5,400 个
+// Element Plus 组件一次性挂载，主线程被占住数秒——用户看到的就是「数据都
+// 出来了但要点很久才有反应」。
+// 改为首屏 60 张，滚到底自动追加 60 张。**不做分页器、不点下一页**：
+// 观感还是一整面海报墙，只是不再一次全挂出来。所有按钮一个不少。
+// 筛选/排序/分组变化时回到首批，避免筛选后仍停在很长的列表尾部。
+const SERIES_BATCH = 60
+const seriesLimit = ref(SERIES_BATCH)
+const seriesHasMore = computed(() => seriesLimit.value < filteredSeries.value.length)
+// 已渲染的作品键集合：分组视图按「整组优先」取舍，尽量不把某个分类切一半
+const seriesVisibleKeys = computed(() => {
+  const keys = new Set()
+  const limit = seriesLimit.value
+  if (groupByCategory.value) {
+    let n = 0
+    for (const grp of seriesGroupsByCategory.value) {
+      if (n >= limit) break
+      for (const g of grp.items) { keys.add(g.key); n++ }
+    }
+    return keys
+  }
+  const list = filteredSeries.value
+  const n = Math.min(limit, list.length)
+  for (let i = 0; i < n; i++) keys.add(list[i].key)
+  return keys
+})
+function visibleSeriesItems(items) {
+  const keys = seriesVisibleKeys.value
+  return (items || []).filter(g => keys.has(g.key))
+}
+function loadMoreSeries() {
+  if (seriesHasMore.value) seriesLimit.value += SERIES_BATCH
+}
+// 筛选条件一变就回到首批（否则筛出 3 部却还保留 600 的额度，等于没分页）
+watch(() => filteredSeries.value, () => { seriesLimit.value = SERIES_BATCH })
+// 滚到底自动追加：哨兵元素进入「视口下方 800px」就再放一批。
+// IntersectionObserver 不可用（极老内核）时哨兵退化成可点的「加载更多」。
+const seriesSentinel = ref(null)
+let seriesObserver = null
+watch(seriesSentinel, (el) => {
+  if (seriesObserver) { seriesObserver.disconnect(); seriesObserver = null }
+  if (!el || typeof IntersectionObserver === 'undefined') return
+  seriesObserver = new IntersectionObserver((entries) => {
+    if (entries.some(e => e.isIntersecting)) loadMoreSeries()
+  }, { rootMargin: '800px 0px' })
+  seriesObserver.observe(el)
+}, { flush: 'post' })
 function repIdOf(g) { return g.representative_id }
 function durLabel(sec) {
   const n = Number(sec || 0)
@@ -1588,28 +1637,54 @@ function applyLoadItem(i, v) {
     case 22: feedbacks.value = v || feedbacks.value; break
   }
 }
+// v2.1.60（真机：进入页面各项数据要等很久）：首屏只发「看得见」的那几个接口，
+// 其余等浏览器空闲再补。
+// 病根：一次 load() 同时发 23 个 GET，浏览器对同源只有 6 个并发连接，
+// 真正决定首屏的 overview / scan-task / resources / library-series 要和
+// audit / logs / contributions / feedback 抢队列；抢不到就一直空着。
+// 现在前 LOAD_CRITICAL 项先发（严格按顺序，保证首屏内容排在最前），
+// 其余在 requestIdleCallback 里补——补的这批依然走 applyLoadItem 逐条回填。
+const LOAD_CRITICAL = 8
+function whenIdle(fn) {
+  try {
+    if (typeof window !== 'undefined' && window.requestIdleCallback) {
+      window.requestIdleCallback(fn, { timeout: 800 })
+      return
+    }
+  } catch (e) {}
+  setTimeout(fn, 300)
+}
 async function load() {
   // 阶段三 D-07：无依赖的纯 GET 并行拉取（单个失败不影响其它）。
   // v2.1.59：每条 fulfilled 即回填（见 applyLoadItem），不再等全量。
+  // v2.1.60：前 LOAD_CRITICAL 项 await，其余空闲补（见上）。
   const keys = ['overview', 'scan-task', 'resources', 'library/series', 'review', 'queue',
     'templates', 'templates/presets', 'audit', 'diagnostics', 'telegram/config',
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
     'contributions?limit=50', 'media-requests?limit=50', 'logs/overview', 'feedback?limit=50']
-  await Promise.allSettled(keys.map((k, i) =>
-    api('/' + k).then(v => applyLoadItem(i, v)).catch(() => applyLoadItem(i, null))))
-  // 分享中心：统一走新数据体系（/api/sc/*），失败不影响主界面
-  try { await loadSc() } catch (e) {}
-  // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
-  try { await loadTgExtra() } catch (e) {}
-  try { await loadPushStats() } catch (e) {}
-  // v2.1.58：这三个此前是**裸 await**，前面 loadSc/loadTgExtra/loadPushStats 都有
-  // try/catch 兜底，唯独它们会往外抛。虽然启动失败已由 onMounted 的兜底接住，
-  // 但同一个加载流程两种口径本身是隐患（抛错会把整个 load 重跑一遍的人都带沟里），
-  // 统一按「单个模块失败不影响主界面」的既有约定收口。
-  try { await loadAuth() } catch (e) {}
-  try { await loadTmdb() } catch (e) {}
-  try { await loadAi() } catch (e) {}
+  const fire = (k, i) => api('/' + k)
+    .then(v => applyLoadItem(i, v)).catch(() => applyLoadItem(i, null))
+  await Promise.allSettled(keys.slice(0, LOAD_CRITICAL).map((k, i) => fire(k, i)))
+  // 剩下的接口 + 6 个独立模块，统一在浏览器空闲时补。
+  // v2.1.60：这 6 个模块此前是**串行** await（loadSc → loadTgExtra → loadPushStats
+  // → loadAuth → loadTmdb → loadAi），一次刷新就是 6 个来回叠加在 23 个并发之后。
+  // 彼此无依赖、各自有 try/catch 兜底，改为并发发起，不再互相排队。
+  whenIdle(() => {
+    keys.slice(LOAD_CRITICAL).forEach((k, j) => fire(k, j + LOAD_CRITICAL))
+    // 分享中心：统一走新数据体系（/api/sc/*），失败不影响主界面
+    loadSc().catch(() => {})
+    // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
+    loadTgExtra().catch(() => {})
+    loadPushStats().catch(() => {})
+    // v2.1.58：这三个此前是**裸 await**，前面 loadSc/loadTgExtra/loadPushStats 都有
+    // try/catch 兜底，唯独它们会往外抛。虽然启动失败已由 onMounted 的兜底接住，
+    // 但同一个加载流程两种口径本身是隐患（抛错会把整个 load 重跑一遍的人都带沟里），
+    // 统一按「单个模块失败不影响主界面」的既有约定收口。
+    loadAuth().catch(() => {})
+    loadTmdb().catch(() => {})
+    loadAi().catch(() => {})
+  })
 }
 async function loadLogs() {
   try {
@@ -3879,7 +3954,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.59 · Asia/Shanghai</span>
+          <span>v2.1.60 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
@@ -4954,7 +5029,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
                 <span class="lib-group-hint">{{ grp.collapsed ? '展开' : '折叠' }}</span>
               </button>
               <div v-show="!grp.collapsed" class="media-grid">
-                <div v-for="g in grp.items" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
+                <div v-for="g in visibleSeriesItems(grp.items)" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
                   <div class="media-poster">
                     <el-image v-if="g.poster_path" :src="'https://image.tmdb.org/t/p/w342'+g.poster_path" fit="cover" style="width:100%;height:100%"/>
                     <div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ mediaLabel(g.media_type) || 'MEDIA' }}</span></div>
@@ -4990,10 +5065,14 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
           </div>
+          <!-- v2.1.60：分组视图的「加载更多」哨兵（滚到视口下方 800px 自动追加一批） -->
+          <div v-if="groupByCategory && seriesHasMore" ref="seriesSentinel" class="series-more" @click="loadMoreSeries">
+            已显示 {{ seriesLimit }} / {{ filteredSeries.length }} 部 · 继续下滑自动加载
+          </div>
 
           <!-- 平铺视图（不分组）：与分组视图共用同一批卡片，操作完全一致 -->
           <div v-else class="media-grid">
-            <div v-for="g in filteredSeries" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
+            <div v-for="g in visibleSeriesItems(filteredSeries)" :key="g.key" class="media-card series-card" :class="{picked:selectedSeries.includes(g.key)}" @click="toggleSelect(g.key)">
               <div class="media-poster">
                 <el-image v-if="g.poster_path" :src="'https://image.tmdb.org/t/p/w342'+g.poster_path" fit="cover" style="width:100%;height:100%"/>
                 <div v-else class="no-poster"><svg class="ico" viewBox="0 0 24 24"><path :d="icon('image')"/></svg><span>{{ mediaLabel(g.media_type) || 'MEDIA' }}</span></div>
@@ -5026,6 +5105,10 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
               </div>
             </div>
             <div v-if="!filteredSeries.length" class="empty big">没有匹配的作品，试试点「重新扫描」或清空扫描结果后重扫</div>
+          </div>
+          <!-- v2.1.60：平铺视图的「加载更多」哨兵放在网格外层，避免占掉一格卡片位置 -->
+          <div v-if="!groupByCategory && seriesHasMore" ref="seriesSentinel" class="series-more" @click="loadMoreSeries">
+            已显示 {{ seriesLimit }} / {{ filteredSeries.length }} 部 · 继续下滑自动加载
           </div>
 
           <!-- v0.8.1：原「扫描设置」页已合并到资源库；扫描根目录只读引用镜像同步里的 B 库 ID -->
@@ -6634,6 +6717,9 @@ html.dark .sc-even-strip{background:var(--yg-panel);border-color:var(--yg-line)}
 .cursor-box{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.cursor-box small{display:block;color:var(--yg-muted);font-size:11px;margin-bottom:5px}.cursor-box b{font-size:18px}
 .view-switch{display:flex;border:1px solid var(--yg-line);border-radius:9px;overflow:hidden}.view-switch button{border:0;background:var(--yg-surface);padding:7px 10px;cursor:pointer;color:var(--yg-muted)}.view-switch button.on{background:var(--yg-tone-violet-bg);color:var(--yg-primary)}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(172px,1fr));gap:14px}
+/* v2.1.60：卡片墙分批渲染的「加载更多」哨兵——滚到视口下方 800px 自动追加一批 */
+.series-more{margin:14px 0 2px;padding:12px;text-align:center;font-size:12px;color:var(--yg-muted);border:1px dashed var(--yg-line);border-radius:var(--yg-radius-sm);cursor:pointer}
+.series-more:hover{color:var(--yg-primary);border-color:var(--yg-primary)}
 /* v0.6.4：参考 STRM 刮削海报墙——紧凑竖版卡片、统一 2:3 海报、状态角标 */
 .series-card{border-radius:11px}.series-card .media-poster{height:auto;aspect-ratio:2/3;background:var(--yg-bg)}.series-card .media-body{padding:9px 10px}.series-card .media-body b{font-size:12px}.series-card .media-body small{font-size:10px;color:var(--yg-muted);margin-top:3px}
 .series-card .media-meta{flex-wrap:wrap;gap:4px 8px;margin-top:6px}.series-card .media-actions{padding:0 9px 10px}.series-card .media-actions .el-button{margin:0 2px 4px 0;padding:5px 8px;font-size:11px}

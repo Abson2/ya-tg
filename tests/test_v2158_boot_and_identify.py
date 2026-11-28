@@ -119,11 +119,16 @@ def test_api_reports_timeout_not_scan_message():
 
 
 def test_load_tail_awaits_are_guarded():
-    assert "try { await loadAuth() } catch (e) {}" in APP
-    assert "try { await loadTmdb() } catch (e) {}" in APP
-    assert "try { await loadAi() } catch (e) {}" in APP
+    # v2.1.60：这 6 个模块不再串行 await（每次刷新白等 6 个来回），改为在
+    # whenIdle 里并发发起；但「单个模块失败不许把 load() 抛出去」这条口径不变——
+    # 每个调用都必须挂 .catch() 兜底。
+    assert "loadAuth().catch(() => {})" in APP
+    assert "loadTmdb().catch(() => {})" in APP
+    assert "loadAi().catch(() => {})" in APP
     # 反证：裸 await 回来就是「load() 会抛」
     assert "\n  await loadAuth()\n" not in APP
+    assert "\n  await loadTmdb()\n" not in APP
+    assert "\n  await loadAi()\n" not in APP
 
 
 def test_boot_has_timeout_gate_and_settles():

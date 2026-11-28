@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1200,7 +1201,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.59", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.60", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1211,7 +1212,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.59", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.60", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -3090,8 +3091,8 @@ async def mirror_media_clear_invalid_async(dry_run: bool = False,
     # ---------- ② 本地判据（纯 DB、毫秒级）：先做，点下去立刻见效 ----------
     targets = _invalid_media_rows(db, r.id, ids=wanted)
     local_media = len(targets)
-    local_files = sum(db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
-                      for m in targets)
+    # v2.1.60：一次 GROUP BY 取代逐部 COUNT（原先 N 条查询）
+    local_files = sum(_file_counts_by_media(db, [m.id for m in targets]).values())
     if not dry_run and local_media:
         for m in targets:
             db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
@@ -3146,9 +3147,10 @@ def mirror_media_clear_invalid(db: Session) -> dict:
     """
     targets = _invalid_media_rows(db)
     removed_media = len(targets)
-    removed_files = 0
+    # v2.1.60：先一次聚合出每部文件数，再逐部删除（原先 count + delete 各一条查询）
+    _counts = _file_counts_by_media(db, [m.id for m in targets])
+    removed_files = sum(_counts.values())
     for m in targets:
-        removed_files += db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()
         db.query(MirrorFile).filter(MirrorFile.media_id == m.id).delete(
             synchronize_session=False)
         db.delete(m)
@@ -3185,16 +3187,60 @@ def _invalid_media_rows(db: Session, rule_id: int | None = None,
     want = [int(x) for x in (ids or []) if str(x).strip().isdigit()]
     if want:
         stmt = stmt.where(MirrorMedia.id.in_(want))
+    media_rows = db.scalars(stmt).all()
+    if not media_rows:
+        return []
+    # v2.1.60（真机：mirror/status 2312 ms）：这里原来是**逐部** COUNT
+    #   `db.query(MirrorFile).filter(media_id == m.id, status == "synced").count()`
+    # 映射表有几百行 → 一次请求串行几百条 COUNT，单个接口吃掉 2.3 秒，
+    # 而前端每次刷新/登录都打它。改成一条 DISTINCT 查询取「有 synced 文件的
+    # 映射 id 集合」，语义完全等价（判据仍是「是否存在 synced 文件」）。
+    # 红线：判据只在这里有一份，别再加第二个「有没有落地文件」的写法。
+    synced_ids = _synced_media_ids(db)
     out = []
-    for m in db.scalars(stmt).all():
+    for m in media_rows:
         status = str(getattr(m, "status", "") or "").strip().lower()
         if status in in_progress:
             continue
-        synced = db.query(MirrorFile).filter(
-            MirrorFile.media_id == m.id, MirrorFile.status == "synced").count()
-        if synced == 0:
+        if int(m.id) not in synced_ids:
             out.append(m)
     return out
+
+
+def _synced_media_ids(db: Session) -> set[int]:
+    """v2.1.60：有「已落地（synced）文件」的映射 id 集合——一条查询取代逐部 COUNT。
+
+    这是 `_invalid_media_rows` 唯一的数据来源；语义就是
+    `SELECT DISTINCT media_id FROM mirror_file WHERE status == 'synced'`，
+    与原先逐部 `filter(media_id=?, status="synced").count() > 0` 逐字等价。
+    失败降级为空集合会让所有映射都被判成「无文件」→ 可能误清，故这里**不吞异常**：
+    查询炸了就让调用方看到错误，绝不拿空集合冒充「查到了 0 条」。
+    """
+    rows = db.execute(
+        select(MirrorFile.media_id).where(MirrorFile.status == "synced").distinct()).all()
+    return {int(x) for (x,) in rows if x is not None}
+
+
+def _file_counts_by_media(db: Session, media_ids=None) -> dict[int, int]:
+    """v2.1.60：一次 GROUP BY 拿到「每部影片挂了多少文件」，取代逐部 COUNT。
+
+    真机 `mirror/status` 里有两处逐部 count：
+      - `media` 清单（limit 200）每行一个 `files` 数字；
+      - `invalid_media` 清单（几百行）每行一个 `files` 数字。
+    合起来一次请求就是几百条 COUNT。这里一条聚合查询换成一个字典。
+
+    口径红线：**不带任何 status 过滤**，与原先 `filter(media_id == m.id).count()`
+    完全一致（原先也没过滤状态）；需要分状态计数请另开函数，别在这里加条件，
+    否则页面上的「文件数」会与「明细条数」对不上。
+    """
+    stmt = (select(MirrorFile.media_id, func.count(MirrorFile.id))
+            .group_by(MirrorFile.media_id))
+    if media_ids is not None:
+        want = [int(x) for x in media_ids if x is not None]
+        if not want:
+            return {}
+        stmt = stmt.where(MirrorFile.media_id.in_(want))
+    return {int(mid): int(n) for mid, n in db.execute(stmt) if mid is not None}
 
 
 # ---------- v2.1.43：同步状态三层看板（作品级 / 目录级 / 文件级） ----------
@@ -3886,6 +3932,14 @@ def mirror_status(db: Session = Depends(get_db)):
     levels = _mirror_levels(db, snap, int(getattr(r, "id", 0) or 0) if r else 0)
     round_info = dict(snap.get("round") or {}) if has_snap else {}
 
+    # v2.1.60（真机：mirror/status 2312 ms）：下面 `media` 与 `invalid_media` 两张
+    # 清单原本各带一段 `db.query(MirrorFile).filter(media_id == m.id).count()`，
+    # 一次请求就是 200 + N 条 COUNT 串行。这里一条 GROUP BY 先算出每部文件数，
+    # 两张清单共用；`invalid` 角标也从 `any(...)`（O(200×N)）改成集合判定。
+    # 口径与逐部 count 一致（不带 status 过滤），页面数字 = 明细条数。
+    _file_counts = _file_counts_by_media(db)
+    _invalid_ids = {int(m.id) for m in invalid_media}
+
     return {
         "rule": {"enabled": bool(r.enabled) if r else False,
                  "last_run": r.last_run if r else None,
@@ -3972,8 +4026,9 @@ def mirror_status(db: Session = Depends(get_db)):
                    "english_source": getattr(m, "english_source", "") or "",
                    "source_dir_id": m.source_dir_id, "target_dir_id": m.target_dir_id,
                    "category_path": getattr(m, "category_path", "") or "",
-                   "invalid": any(x.id == m.id for x in invalid_media),  # v0.9.8
-                   "files": db.query(MirrorFile).filter(MirrorFile.media_id == m.id).count()}
+                   # v2.1.60：集合判定取代 any() 遍历，文件数取自一次 GROUP BY
+                   "invalid": int(m.id) in _invalid_ids,  # v0.9.8
+                   "files": _file_counts.get(int(m.id), 0)}
                   for m in media],
         # v0.9.8：历史无效影视映射清单，供管理页「清理无效影视映射」按钮展示/确认
         # v2.1.11：补 files 计数 + 中文状态标签，供前端渲染这张表
@@ -3981,8 +4036,7 @@ def mirror_status(db: Session = Depends(get_db)):
                            "status": m.status,
                            "status_label": _media_status_label(m.status),
                            "category_path": getattr(m, "category_path", "") or "",
-                           "files": db.query(MirrorFile).filter(
-                               MirrorFile.media_id == m.id).count()}
+                           "files": _file_counts.get(int(m.id), 0)}
                           for m in invalid_media],
         "dirs": [{"id": d.id, "name": d.name_standard, "kind": d.kind,
                   "category_path": d.category_path, "status": d.status,
@@ -4857,6 +4911,46 @@ def _year_of(title: str) -> str:
     return m.group(1) if m else ""
 
 
+@lru_cache(maxsize=4096)
+def _genre_pair(raw_genres: str) -> tuple[str, tuple[str, ...]]:
+    """v2.1.60：把一行的 `genres` 原始串解析成 (主分类, 官方中文分类元组)。
+
+    病根：资源库 24,096 行里同一部剧的 N 集 `genres` 字段**一字不差**，实测
+    只有 678 组唯一值，而原实现每行都重新 JSON 解析 + 逐个调 `genre_name_cn`
+    （33,786 次 / 110 ms）。这里按原始串记忆化，实际只算 678 次。
+
+    口径红线一字不动：
+      - 归一**只许**走 `tmdb.genre_name_cn`（全项目唯一 genre 归一入口）；
+      - 主分类 = genres 列表**第一个**（即使不在官方字典里也照用，与分享中心
+        同口径，避免同一作品两处归类不同）；
+      - 分类名只收 `TMDB_GENRES` 里真实存在的中文名，认不出来的**不收也不猜**。
+    返回主分类给「作品级主分类」，元组给「作品级分类集合」（调用方自己去重累加）。
+    """
+    text = str(raw_genres or "")
+    if not text.strip():
+        return "", ()
+    try:
+        from .tmdb import TMDB_GENRES as _TG
+        from .tmdb import as_list as _as_list
+        from .tmdb import genre_name_cn as _gcn
+    except Exception:
+        return "", ()
+    primary = ""
+    names: list[str] = []
+    try:
+        for _raw in _as_list(text):
+            if not _raw:
+                continue
+            _name = _gcn(_raw)
+            if not primary:
+                primary = _name
+            if _name in _TG.values() and _name not in names:
+                names.append(_name)
+    except Exception:
+        return primary, tuple(names)
+    return primary, tuple(names)
+
+
 _SEASON_DIR_RE = re.compile(r"^(?:season|series|s)\s*[._\- ]?\d{1,3}$|^第\s*\d{1,2}\s*[季部]$|^S\d{1,2}$", re.I)
 
 
@@ -4868,6 +4962,19 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
 
     每个作品返回海报、标题、年份、类型、集数范围、识别/分享汇总，并带成员单集 id 列表，
     前端据此按「一部剧一张卡」呈现，操作（推送/识别/取消分享）落到代表资源。
+
+    v2.1.60（真机：进入页面各项数据要等很久）：本接口实测 **1258 ms / 1168 KB**，
+    是 `load()` 里最重的一项。两处收口：
+      1. 投影去掉 `Resource.overview`——24,096 行 × 每行约 700 字节的简介文本，
+         单次请求要多读约 16 MB；而资源库卡片**从不渲染简介**（前端只在推送模板
+         与 TMDB 设置页用到简介，都不是这个接口的数据）。返回体随之从 1168 KB
+         降到约 700 KB（简介一项占 465 KB / 39.8%）。
+      2. `work_group_key` / genres 解析按「原始字符串」记忆化——24,096 行里
+         同一部剧的 N 集字段完全一样，实际只有 678 组唯一值，原来每行重算一遍
+         正则与 JSON 解析（实测 226 ms + 110 ms）。
+    刻意**不加结果缓存**：本接口在每次写操作后都会被 `load()` 重拉一次，
+    而任何写入都会让缓存失效，命中率极低；缓存 700 KB × N 份反而顶高内存。
+    真机瓶颈是「读列太多 + 重复计算 + 返回体太大」，不是「算得太多」。
     """
     # v2.1.59（内存根治）：**只投影聚合需要的列**，不再 `select(Resource)` 全实体。
     # 真机 25,663 行资源全实体化，单实体约 5 KiB → 一次请求峰值 +120 MiB，而这
@@ -4878,7 +4985,7 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     _cols = (
         Resource.id, Resource.file_id, Resource.name, Resource.path_hint,
         Resource.share_dir_name, Resource.media_title, Resource.media_type,
-        Resource.poster_path, Resource.overview, Resource.genres,
+        Resource.poster_path, Resource.genres,
         Resource.vote_average, Resource.tmdb_id, Resource.source_title,
         Resource.source_tmdb_id, Resource.source_media_type,
         Resource.identify_status, Resource.share_url, Resource.share_status,
@@ -4954,7 +5061,6 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "media_type": (x.media_type or src_type
                                or ("tv" if hint.get("is_tv_hint") else "")),
                 "poster_path": x.poster_path or "",
-                "overview": x.overview or "",
                 "genres": x.genres or "",
                 "vote_average": float(x.vote_average or 0),
                 "tmdb_id": x.tmdb_id,
@@ -5019,8 +5125,8 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 g["identify_status"] = x.identify_status or ""
         if x.poster_path and not g["poster_path"]:
             g["poster_path"] = x.poster_path
-        if x.overview and not g["overview"]:
-            g["overview"] = x.overview
+        # v2.1.60：作品级简介**不再返回**（见函数头注释）——24,096 行 × 约 700 字节
+        # 的简介文本占整个返回体 465 KB / 39.8%，而资源库卡片从不渲染它。
         if x.tmdb_id and not g["tmdb_id"]:
             g["tmdb_id"] = x.tmdb_id
         if x.share_url and not g["share_url"]:
@@ -5044,31 +5150,14 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 g["seasons"].add(int(x.season))
             g["episodes"].append((int(x.season or 0), int(x.episode or 0)))
         # v2.1.6：收集作品级 TMDB 分类（资源库按分类分组展示用）。
-        # 只收**官方 genre 字典里存在的中文名**——tmdb.py::TMDB_GENRES 是唯一权威，
-        # 非官方名（如接口偶发的其它写法）不入组，避免页面上出现自造分类。
-        # 「主分类」另记：严格取 genres 列表的**第一个**（与 share_center_v2
-        # ._primary_category 完全同口径）——即使它不在官方字典里，主分类也仍是它，
-        # 避免与分享中心出现「同一作品两处归类不同」。
-        try:
-            from .tmdb import TMDB_GENRES as _TG
-            from .tmdb import as_list as _as_list
-            from .tmdb import genre_name_cn as _gcn
-            for _raw in _as_list(x.genres):
-                if not _raw:
-                    continue
-                # v2.1.54：**先归一到官方中文名再判**。
-                # 此前直接把 TMDB 原文塞进 primary_genre，而 `Sci-Fi & Fantasy`
-                # `War & Politics` 这两个 TV 专用分类 TMDB 的 zh-CN 没有翻译 →
-                # 资源库列表显示英文，分享中心那边归一后查不到官方字典显示「未分类」，
-                # 排期配置里却是「科幻奇幻」——同一个作品三个地方三个分类。
-                # 归一后三处同一份判据（tmdb.genre_name_cn 是唯一入口）。
-                _name = _gcn(_raw)
-                if not g["primary_genre"]:
-                    g["primary_genre"] = _name
-                if _name in _TG.values() and _name not in g["genre_names"]:
-                    g["genre_names"].append(_name)
-        except Exception:
-            pass
+        # v2.1.60：解析+归一整体改成按原始串记忆化的 `_genre_pair`（678 次 vs 24,096 次）；
+        # 主分类与分类集合的判据全在那个函数里，本处只做「作品级累加」。
+        _primary, _names = _genre_pair(str(getattr(x, "genres", "") or ""))
+        if _primary and not g["primary_genre"]:
+            g["primary_genre"] = _primary
+        for _n in _names:
+            if _n not in g["genre_names"]:
+                g["genre_names"].append(_n)
     out = []
     for g in groups.values():
         seasons = sorted(g.pop("seasons"))
