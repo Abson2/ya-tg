@@ -8,6 +8,46 @@
 
 ---
 
+## v2.1.62 (2026-11-28)
+
+> 纯代码清理，**零行为变化**：删掉 `App.vue` 的 `<script setup>` 里 6 个「定义了
+> 但模板和脚本里一次都没引用」的标识符。其中 `filteredResources` 是按 `resources`
+> （只有最新 100 行）过滤的单集列表——哪天真拿它当数据源，就会踩 v2.1.61
+> 「代表资源查不到」的同款坑。
+
+### 一、删除清单（全部只删定义）
+
+| 标识符 | 为什么是死的 | 现在谁负责 |
+|---|---|---|
+| `viewMode` | 视图切换入口早已不存在，值永远停在 `'series'` | 作品视图是唯一视图 |
+| `scGenreOptions` | 分类下拉已不存在 | 选项直接写在模板里 |
+| `scLinkStateLabel` | 分享管理页改消费后端下发的 `link_status_label` | `mediaLinkLabel`（资源库卡片）+ 后端标签 |
+| `filteredResources` | 单集列表视图自 v0.6.4 起已取消 | `filteredSeries`（作品视图） |
+| `repIdOf` | 一行函数，早已被 `selectedRepIds` 取代 | `selectedRepIds()` |
+| `scSchedName` | 排期表直接用目录里的 `name` | 目录字段 |
+
+### 二、红线核对（删了代码，没删能力）
+
+- **中文映射函数一个都没少**：资源库卡片的状态角标仍走 `mediaLinkLabel`，页面
+  不许出现 `link_state` / `suspicious` / `cleaned` 这类后端状态码；分享中心仍用
+  后端下发的 `link_status_label`。删除后重新核对了一遍模板里所有 `link_state`
+  插值，全部是「过映射函数」或「计数展示」。
+- **按钮零删减**：9 个 tab、分享中心 4 个子页、所有按钮原样保留（本版没碰模板结构）。
+- 版本锁断言随版本号同步（`scLinkStateLabel` 唯一那条守护断言改为指向
+  实际在用的 `mediaLinkLabel`，守护的不变量「必须有中文映射、不许渲染裸状态码」不变）。
+
+### 三、验证
+
+- 新增 `tests/test_v2162_dead_code_cleanup.py`（4 项）：6 个标识符确已消失、
+  替代物都在、分享中心不许出现裸 `link_state` 插值、版本锁。
+- 前端 `npm run build` 通过；全量 **2447 passed**。
+
+### 四、回滚
+
+- 回滚镜像：`IMAGE_TAG=v2.1.61`。本版无接口变化、无数据迁移、无行为变化。
+
+---
+
 ## v2.1.61 (2026-11-28)
 
 > 一件真机问题：资源库卡片上**点「推送」没反应**——不报错、不提示、什么都不发生。

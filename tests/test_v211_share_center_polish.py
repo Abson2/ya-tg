@@ -685,8 +685,11 @@ def test_frontend_no_backend_code_terms_in_share_center():
     # 这些字符串只允许出现在脚本里的字段引用，不得出现在用户可见文案里
     for bad in ("发布任务 link_state", "status=published", "UNKNOWN", "老链"):
         assert bad not in app, f"界面不得暴露后端名词：{bad}"
-    # 必须提供中文映射函数
-    assert "scLinkStateLabel" in app and "scTaskStatusLabel" in app
+    # 必须提供中文映射函数。
+    # v2.1.62：只被这段断言引用的 `scLinkStateLabel` 已作为死代码删除（分享管理页
+    # 改为消费后端下发的 link_status_label；资源库卡片走 mediaLinkLabel）。
+    # 本用例守护的红线不变：**必须有中文映射函数，裸状态码不许直接渲染**。
+    assert "mediaLinkLabel" in app and "scTaskStatusLabel" in app
     assert "已成功推送" in app and "待建链" in app
 
 

@@ -1,4 +1,4 @@
-"""v2.1.61 回归测试：资源库卡片「推送」点了没反应。
+"""v2.1.62 回归测试：资源库卡片「推送」点了没反应。
 
 真机背景（2026-11-28，v2.1.60 上线后）：
 - 资源库 678 部作品，`resources` 来自 `/api/resources`，**默认只带最新 100 行**
@@ -77,5 +77,5 @@ def test_all_card_buttons_still_present():
     assert APP.count("完结状态 ▾") == 2
 
 
-def test_version_locked_to_2161():
-    assert "v2.1.61 · Asia/Shanghai" in APP
+def test_version_locked_to_current():
+    assert "v2.1.62 · Asia/Shanghai" in APP

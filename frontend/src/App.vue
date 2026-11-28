@@ -36,7 +36,6 @@ function applyTheme(dark) {
 function toggleTheme() { applyTheme(!isDark.value) }
 applyTheme(isDark.value)  // 首屏即时应用，避免闪白
 const clock = ref('')
-const viewMode = ref('series')  // v0.6.4：作品视图为默认，单集按剧聚合，不再散落
 const keyword = ref('')
 const statusFilter = ref('')
 const seriesGroups = ref([])   // v0.6.4：/api/library/series 聚合结果
@@ -150,10 +149,6 @@ const scHourSaving = ref(false)
 // v2.0.5 设计稿：分类-时间排期 / 基础规则 / 周期计划 / 趋势粒度 / 搜索筛选 / 选中详情
 const scTrendPeriod = ref('day')
 const scGenreCatalog = ref([])   // TMDB 官方 genre 字典（来自 /sc/categories/catalog）
-// v2.1.54：下拉选项在这里就把「显示名 / 提交值」拆成中性字段，
-// 模板区只认 label/value —— 页面不出现后端字段名（v2.1.4 红线）。
-const scGenreOptions = computed(() => (scGenreCatalog.value || []).map(
-  c => ({ value: c.category_key, label: c.name || c.category_key })))
 const scSchedRows = ref([]), scSchedSaving = ref(false)
 // v2.1.6：分类排期表勾选集（批量操作按勾选生效；未勾选或全勾选 = 全部）
 const scSchedSelection = ref([]), scSchedTableRef = ref(null)
@@ -205,14 +200,6 @@ const SC_UNPUSHED_STATUS = ['planned', 'ready', 'building', 'submitted',
 const scShareRecords = ref([])
 // 分享管理统计卡：后端按「清单项 + 任务」真实聚合，口径与表格行数一致
 const scShareStats = computed(() => scOverview.value.share_stats || {})
-// v2.1.4：链接状态中文映射。
-// 分享管理页已改为消费后端下发的 `link_status_label` + `link_tone`
-// （后端翻译，唯一权威），此处保留脚本侧兜底映射作为回归锚点：
-// 任何入口拿到裸状态值都不得直接渲染，必须过这个函数。
-const scLinkStateLabel = (state) => ({
-  active: '有效', unknown: '待校验', suspicious: '疑似失效',
-  inactive: '已失效', cleaned: '已清理', manual_review: '待人工',
-}[state || 'unknown'] || '未知')
 // v2.1.3：资源库卡片的分享状态 / 链接状态中文化。
 // 红线：页面不得出现后端字段名或状态码（此前这里直接渲染 `link_state` 原值，
 // 会把「链接suspicious」「链接cleaned」这种内部码露给用户）。
@@ -1365,14 +1352,6 @@ function identifyLabel(s) {
 }
 function mediaLabel(t) { return t === 'tv' ? '剧集' : (t === 'movie' ? '电影' : '') }
 
-const filteredResources = computed(() => resources.value.filter(r => {
-  const hitKey = !keyword.value || (r.name + (r.media_title || '')).toLowerCase().includes(keyword.value.toLowerCase())
-  const hitStatus = !statusFilter.value || r.share_status === statusFilter.value
-  const hitType = !typeFilter.value || r.media_type === typeFilter.value
-  const hitIdentify = !identifyFilter.value || r.identify_status === identifyFilter.value
-  return hitKey && hitStatus && hitType && hitIdentify
-}))
-
 // v2.1.43（用户需求）：筛选后统一过一遍「按入库时间」排序（default 时原样返回）。
 const filteredSeries = computed(() => appliedLibSort(seriesGroups.value.filter(g => {
   const hitKey = !keyword.value || String(g.title || '').toLowerCase().includes(keyword.value.toLowerCase())
@@ -1492,7 +1471,6 @@ watch(seriesSentinel, (el) => {
   }, { rootMargin: '800px 0px' })
   seriesObserver.observe(el)
 }, { flush: 'post' })
-function repIdOf(g) { return g.representative_id }
 function durLabel(sec) {
   const n = Number(sec || 0)
   if (n === 0) return '永久'
@@ -3721,9 +3699,6 @@ async function scClearEvenPlan() {
     loadScForecast()
   } catch (e) { ElMessage.error(String(e?.message || e)) }
 }
-function scSchedName(key) {
-  return scGenreCatalog.value.find(c => c.category_key === key)?.name || key
-}
 // ---- 设计稿可视化：内联 SVG，数据全部来自 /sc/overview 真实聚合 ----
 const SC_DONUT_COLORS = ['#6d5efc', '#4a90e2', '#8e7cf0', '#f5a623', '#e8917a', '#b8bdd1']
 function scDonutColor(key) {
@@ -3982,7 +3957,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.61 · Asia/Shanghai</span>
+          <span>v2.1.62 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
