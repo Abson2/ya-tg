@@ -6,6 +6,110 @@
 
 > 文档分工：`README.md` 只讲功能、部署与使用；逐版本的变更与修复细节统一写在这里，不写进 README。
 
+## v2.1.67 (2026-11-28)
+
+> 把 B 库空目录壳清理**内置为项目自身能力**，废弃 v2.1.66 的独立脚本。
+> 用户口径：「不是要单独的清理脚本，我需要让项目本身有这种能力」；拍板「镜像同步轮 C 类里」+
+> 「默认开真删」+「C 类与存量幽灵都做」。只改镜像同步链路，不动门禁/队列/分享/页面。
+> 按用户指令「并入另一个任务一起发版」，本版同时合并另一路**内存优化**（热路径窄投影、
+> SQLite 连接池 page cache 回退、glibc 堆回收、GC 冻结），两路一次发版。
+
+### 一、事故现场（线上只读探针 + 容器实测，2026-11-28 23:5x）
+
+| 项 | 实测 |
+|---|---|
+| 线上版本 | `/api/health` 实读 **v2.1.66**（已部署），但诉讼女王 B 库空壳仍在 |
+| 脚本进不了容器 | `/app/scripts/purge_empty_archived_dirs.py` **不存在**——Dockerfile 只 COPY 了 `docker-entrypoint.sh`，从不 COPY scripts/ 目录（v2.1.58 的 rebuild_work_shares.py 同样进不去） |
+| 复活没触发 | 容器 23:38 才启动；定时扫描 cron `0 */6 * * *`，`last_run=14:48` 在部署前；批次 283 仍 running、对账门槛未满足 → 日志无任何复活记录 |
+| C 类覆盖缺口 | 诉讼女王 `mirror_media=0`、无任何映射指向其 B 目录；24 个归档 B 目录中 **22 个无映射幽灵**，C 类遍历 `select(MirrorMedia)` 100% 扫不到 |
+
+### 二、根因
+
+1. v2.1.66 把清理做成独立脚本 + Dockerfile 不打包 scripts/ → 脚本发版了但容器里跑不了。
+2. C 类删除只处理有 mirror_media 映射的作品，存量无映射幽灵目录（诉讼女王）进不了 C 类。
+
+### 三、收口（本版改动）
+
+**内置清理函数 `mirror._purge_empty_b_dir_tree(db, api, root_dir_id)`**
+- 递归列举整棵子树（≤4 层）确认**文件数恰好为 0** 才判空；列举失败 / 超深 / 未知 resType 一律整棵跳过。
+- 后序删（子目录先、父目录后），每删一个前**重新列举确认该层仍为空**，防运行期新写入误删。
+- 删后轮询 taskId=status=2 且 detail.code=0 才算删成；单目录失败只记录、不中断整轮。
+- 开关 `runtime_config.mirror_purge_empty_dirs` **默认 true（真删）**，设 false 只统计不删（dry-run）。
+- 只动网盘目录，不改库内任何行（归档历史、mirror_media、mirror_files 都不碰）。
+
+**两处调用（共用同一函数）**
+- **C 类（防新增残留）**：删完 B 库文件后，**先轮询删除任务落地**再判空目录（否则撞上未删完的文件误判非空），
+  再对 `media.target_dir_id` 调清理；target_dir_id 在清清单前捕获。
+- **存量幽灵扫描（清历史遗留）**：prepass 里用已归档行（`clean_state=cleaned` + clean_reason 前缀匹配）
+  的 distinct `share_dir_id` 作候选，要求完整 A 树 + 完整轮次（complete），数量上限
+  `mirror_purge_ghost_dirs_max` 默认 50；覆盖诉讼女王这类无映射存量。
+
+**废弃**：删除 `scripts/purge_empty_archived_dirs.py` 与其测试（逻辑已内置，避免两套并存）；
+Dockerfile 不改（无需脚本进镜像）。v2.1.66 的复活逻辑 `main._revive_archived_with_a_source()` 保留有效。
+
+### 四、合并内存优化（另一路任务并入本版，按用户指令一次发版）
+
+**现场数据**（另一路任务容器内实测，2026-11-29，记录于 `tests/test_v2167_memory_projection.py`
+文件头）：v2.1.66 容器跑 17 分钟 RSS 1.33 GB / VmHWM 1.36 GB / RssAnon 1.28 GB
+（RssFile 仅 28 MB，说明几乎全是 Python 堆）/ CPU 38%，日志里 `_job_share_center`
+每 5 秒都是 "maximum number of running instances reached"。定位到三个叠加来源，
+逐项对照如下：
+
+| 来源 | 实测 | 本版收口 |
+|---|---|---|
+| `sync_library_versions` 每 5 秒整表实例化 2.59 万行 `Resource` 实体 | 单次常驻 134.8 MiB / 峰值 147.9 MiB，连跑 8 轮 RSS 每轮 +2.2 MiB 单调上涨 | `share_center_v2.py` 改 `_SYNC_VERSION_COLS` 窄投影：同批数据 14.8 MiB、8 轮零增长、快近一倍 |
+| SQLite 连接池 `cache_size=-8192`（8 MiB/连接） | 每条连接实吃 9.5 MiB 且归还后只回 2.9 MiB；46 条上限约 171 MiB 常驻。库文件仅 139 MB，OS page cache 已兜住读放大 | `db.py` 回退到 `-2048`（2 MiB 默认） |
+| allocator 碎片不还 OS | `gc.collect()` 只回 11.6 MiB；`malloc_trim(0)` 一次回 45.7 MiB（连续再 trim 无额外收益） | 新增 `mem_trim.py`，按 60 轮节流接在调度周期 `finally` |
+
+**具体改动**
+- `share_center_v2.py`：`sync_library_versions()` / `recompute_work_categories()` 改用
+  `_SYNC_VERSION_COLS` 列投影（覆盖分组键、稳定序、`_primary_category`、`work_display_meta`
+  与快照元数据全部下游读取点）；`_RepResolver._build()` 保留 ORM 实体但用 `load_only`
+  排掉确定不读的三个大文本 `dir_chain_json` / `thumbnail` / `identify_note`，
+  `overview` / `genres` / `origin_country` / `share_url` 必须保留（publisher 会读）。
+- `publisher.py`：`_build_message()` 用 `_EPISODE_STAT_COLS`（14 列）投影替代整表实体，
+  整剧统计判据仍是 `work_group_key(s) == key` 精确比对，不退化成目录名粗匹配。
+- `db.py`：`PRAGMA cache_size` 回退 `-2048`；**池容量故意不动**
+  （`POOL_KW_JOB=8+8`、`POOL_KW_API=10+20`）——缩池只省约 30 MiB，却会让前端 23 个并发请求撞 5 秒超时。
+- `mem_trim.py`（新增）：ctypes 惰性探测 glibc `malloc_trim`，macOS / musl 无此符号时
+  静默返回 False、绝不抛异常；`trim_every(n)` 按轮数节流。`main.py` 接在
+  `_run_share_center_v2_cycle_in_thread()` 的 `finally`（成功 / 超时 / 异常都回收），
+  5 秒周期 × 60 轮 ≈ 5 分钟一次。
+- `Dockerfile`：`ENV MALLOC_ARENA_MAX=2`，限制 glibc arena 数量，收敛多线程交错分配碎片。
+- `main.py`：`lifespan` 在 `yield` 之前 `gc.freeze()`，把启动期长期存活对象升为永久代，
+  缩短每轮 gen2 扫描；只影响扫描与否，不改变可达性，异常静默跳过。
+
+**等价性保证**：`test_projection_equals_entity_on_same_rows` 在同一批行上分别用实体版与
+投影版计算分组键、分类、指纹、展示元数据与兄弟行筛选，结果逐项相同——换的只是取数方式，
+不是业务判据。
+
+### 五、验证
+
+- 新增 `tests/test_v2167_mirror_purge_empty_dirs.py`（8 项）：判空逻辑（真空壳/有文件/列举失败/未知项）、
+  dry-run 开关、空目录 id 跳过、删前二次确认、后序删除、源码锚点反证（C 类+存量两处调用、默认开、
+  轮询等待、不改库内行）。复活测试拆为 `tests/test_v2166_revive_archived.py`（4 项，保留）。
+- `tests/test_v2166_purge_empty_dirs.py` 的脚本测试部分删除（脚本已废弃）。
+- 新增 `tests/test_v2167_memory_projection.py`（13 项）：投影覆盖完整性、等价性比对、
+  cache_size 口径锁（`-2048`、不许回 `-8192`）、池容量不许缩、`malloc_trim` 跨平台静默降级、
+  节流计数、`finally` 接线、`gc.freeze()` 位置反证。
+- `tests/test_v2164_mirror_identity_by_source.py::test_sqlite_cache_size_set` 同步改为新口径
+  `-8192` → `-2048`，避免全量假红（历史背景保留在 docstring）。
+- 前端 `npm run build` 通过；合并后全量 **2505 passed, 0 failed, 0 error**（分块 ALL_GREEN）。
+
+### 六、边界与回滚
+
+- 清理只删实时确认 0 文件的目录壳，默认开真删；如需先观察可设 `mirror_purge_empty_dirs=false`
+  走 dry-run（日志看候选/跳过统计），确认后再打开。
+- 存量扫描只在完整 A 树 + 完整轮次跑，接口抖动/目录截断时不动刀；数量上限防接口风暴。
+- 复活仍由定时扫描对账触发（本版不动），需下一次扫描轮（cron `0 */6 * * *`）跑完才生效。
+- 内存优化边界：窄投影**只换取数方式不改判据**（有逐项等价性测试兜底）；池容量不动是为了前端并发不超时；
+  `malloc_trim` 在无 glibc 平台静默降级；`MALLOC_ARENA_MAX=2` 是进程级 ENV，必须重建容器才生效。
+- 内存收益数字来自另一路任务的容器内实测（2026-11-29），**本版发版前未在用户线上环境复测**，
+  部署后按「部署后验证」口径实读 RSS / VmHWM 再定论。
+- 回滚：`IMAGE_TAG=v2.1.66`（同时回退清理与内存两路改动）。
+
+---
+
 ## v2.1.66 (2026-11-28)
 
 > 两件同源问题：**① 已归档作品的 B 库空目录壳删不掉；② 归档行在 A 库还有文件时仍挂着异常标记**。

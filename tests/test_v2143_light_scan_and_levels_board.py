@@ -557,11 +557,11 @@ def test_frontend_round_labels_are_business_words():
 
 def test_version_is_143_everywhere():
     from app.main import app as _app  # noqa: F401  确认 main 可导入
-    assert 'version="2.1.66"' in MAIN_SRC
+    assert 'version="2.1.67"' in MAIN_SRC
     pkg = (ROOT / "frontend/package.json").read_text(encoding="utf-8")
-    assert '"version":"2.1.66"' in pkg or '"version": "2.1.66"' in pkg
+    assert '"version":"2.1.67"' in pkg or '"version": "2.1.67"' in pkg
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "2.1.66" in readme
+    assert "2.1.67" in readme
 
 
 # ===========================================================================

@@ -56,10 +56,24 @@ if _IS_SQLITE:
         for pragma in ("PRAGMA busy_timeout=30000",
                        "PRAGMA synchronous=NORMAL",
                        "PRAGMA journal_mode=WAL",
-                       # v2.1.64：显式页缓存 8 MiB（负值 = KiB）。默认仅 2 MiB，
-                       # 24k 行资源表反复扫描时页频繁换入换出；8 MiB 常驻换少量
-                       # SQLite 侧内存换更少的磁盘读，不碰任何业务判据。
-                       "PRAGMA cache_size=-8192"):
+                       # v2.1.67（内存）：回到 SQLite 默认的 2 MiB（负值 = KiB）。
+                       #
+                       # v2.1.64 曾把它提到 8 MiB，理由是「2.4 万行反复扫描时页频繁
+                       # 换入换出」。实测（2026-11-29，容器内开 16 条连接各扫一遍全表）
+                       # 这个代价被严重低估了：
+                       #   · 每条连接填满缓存后实际吃 **9.5 MiB RSS**（不止 8 MiB）；
+                       #   · 16 条 = +152.4 MiB，**连接归还后只回 2.9 MiB**——连接留在
+                       #     池里，缓存就一直是常驻的；
+                       #   · job 池 8+8、API 池 10+20 → 最多 46 条 ⇒ 常态约 171 MiB、
+                       #     峰值可达 437 MiB，全是匿名内存，直接算进容器 RSS。
+                       # 而库文件只有 139 MB，页本来就被 OS page cache 兜着（那部分
+                       # 是 file-backed、可回收，不算真实占用）。6 MiB/连接买到的
+                       # 读放大收益，远小于它的常驻成本。
+                       #
+                       # 池容量**不动**：实测缩池只能再省约 30 MiB，却会让前端一次
+                       # load() 的 23 个并发请求更容易撞上 5 秒 pool_timeout
+                       # （表现为接口 500），风险不对等。
+                       "PRAGMA cache_size=-2048"):
             try:
                 cur = dbapi_conn.cursor()
                 cur.execute(pragma)

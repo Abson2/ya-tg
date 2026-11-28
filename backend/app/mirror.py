@@ -990,6 +990,115 @@ def purge_archived_files(db: Session, rule: MirrorRule, ids: list[int],
     return out
 
 
+async def _purge_empty_b_dir_tree(db: Session, api: "GuangYaWebFiles", root_dir_id: str,
+                                  *, label: str = "") -> dict:
+    """v2.1.67：把 B 库一棵「递归 0 文件」的空目录壳从网盘删掉（内置能力，默认开）。
+
+    真机（2026-11-28）：诉讼女王等资源已归档、B 库文件也被 C 类删净，但作品目录 +
+    季目录空壳留在网盘。网盘 delete_file 支持传目录 id（HAR w.har #37/39/40 实证），
+    此前项目无「识别空壳 → 删它」的上层动作。本函数补这个能力，C 类删文件后与
+    存量幽灵目录扫描两处共用。
+
+    安全底线（改前必读）
+      · 只删**递归确认 0 文件**的目录；任一子目录列举失败 / 超深 / 未知 resType
+        一律整棵跳过，绝不猜、绝不删。
+      · 后序删（子目录先、父目录后）；每删一个前**重新列举确认该层仍为空**，
+        防运行期有新写入导致误删。
+      · 开关 runtime_config.mirror_purge_empty_dirs 默认 true（真删）；
+        设 false 只统计不删（dry-run，便于人工核对）。
+      · 只动网盘目录，不改任何库内行（归档历史、mirror_media、mirror_files 都不碰）。
+    """
+    out = {"candidates": 0, "empty": 0, "dirs_deleted": 0, "skipped": 0,
+           "failed": 0, "dry_run": False}
+    root = str(root_dir_id or "").strip()
+    if not root:
+        return out
+    raw = str(runtime_config.get(db, "mirror_purge_empty_dirs") or "true").strip().lower()
+    do_delete = raw not in ("0", "false", "off", "no")
+    out["dry_run"] = not do_delete
+    MAX_DEPTH = 4
+
+    async def _children(pid: str) -> list[dict]:
+        data = await api.list_files(parent_id=pid, page=0, page_size=200)
+        return list(data.get("list") or [])
+
+    dirs_post: list[str] = []
+    state = {"files": 0, "unknown": 0, "error": ""}
+
+    async def walk(pid: str, depth: int) -> bool:
+        if depth > MAX_DEPTH:
+            state["error"] = "超深"
+            return False
+        try:
+            items = await _children(pid)
+        except Exception as exc:
+            state["error"] = f"列举失败 {str(exc)[:60]}"
+            return False
+        ok = True
+        for it in items:
+            rt = str(it.get("resType"))
+            if rt == "1":
+                state["files"] += 1
+            elif rt == "2":
+                child = str(it.get("fileId") or "")
+                if not child:
+                    state["unknown"] += 1
+                    continue
+                if not await walk(child, depth + 1):
+                    ok = False
+            else:
+                state["unknown"] += 1
+        dirs_post.append(pid)
+        return ok
+
+    out["candidates"] = 1
+    ok = await walk(root, 0)
+    is_empty = bool(ok and not state["error"] and state["files"] == 0 and state["unknown"] == 0)
+    if not is_empty:
+        out["skipped"] = 1
+        logger.info("[mirror1.1] 空目录壳清理跳过 %s：files=%s unknown=%s %s",
+                    label or root, state["files"], state["unknown"], state["error"])
+        return out
+    out["empty"] = 1
+    if not do_delete:
+        return out
+
+    for dir_id in dirs_post:
+        try:
+            still = await _children(dir_id)  # 删前二次确认：这一层必须仍为空
+        except Exception:
+            out["failed"] += 1
+            break
+        if still:
+            out["failed"] += 1
+            logger.warning("[mirror1.1] 空目录壳 %s 删前出现新内容，跳过不删", dir_id)
+            break
+        try:
+            task_id = await api.delete_files([dir_id])
+            # 轮询确认（status=2 且 detail.code=0 才算删成）
+            done = False
+            for _ in range(12):
+                st = await api.get_task_status(task_id)
+                if str(st.get("status")) == "3":
+                    break
+                if str(st.get("status")) == "2":
+                    done = not int((st.get("detail") or {}).get("code") or 0)
+                    break
+                await asyncio.sleep(1.0)
+            if done:
+                out["dirs_deleted"] += 1
+            else:
+                out["failed"] += 1
+                break
+        except Exception as exc:
+            out["failed"] += 1
+            logger.warning("[mirror1.1] 空目录壳删除失败 %s：%s", dir_id, exc)
+            break
+    logger.info("[mirror1.1] 空目录壳清理 %s：删 %s 层，失败 %s",
+                label or root, out["dirs_deleted"], out["failed"])
+    return out
+
+
 async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                                       works: list, api: GuangYaWebFiles, stats: dict,
                                       *, complete: bool) -> tuple[list[str], list[str]]:
@@ -1132,6 +1241,9 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                 # target_file_id，rows 与其共享 identity map，事后取不到。
                 b_ids: list[str] = [str(r.target_file_id) for r in rows
                                     if r.target_file_id and str(r.target_file_id).strip()]
+                # v2.1.67：target_dir_id 在清清单前捕获（清 MirrorFile 不动它，
+                # 但保守起见统一在写之前取），供下面删空目录壳用。
+                _target_dir = str(getattr(media, "target_dir_id", "") or "")
                 # 先清清单（不跨 await），再删 B 库（网络 await 前已 commit）
                 #
                 # v2.1.36（真机反馈）：A 库已无该作品时，源文件**客观上不存在**，
@@ -1145,11 +1257,28 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                            "把源文件放回 A 库后重新同步即可恢复")
                 if b_ids:
                     try:
-                        await api.delete_files(b_ids)
+                        _del_task = await api.delete_files(b_ids)
                         prepass["c_b_files_removed"] += len(b_ids)
+                        # v2.1.67：先等文件删除任务落地，再判空目录——否则删目录的
+                        # 列举会撞上还没真删的文件，误判为「非空」而永久留壳。
+                        for _ in range(12):
+                            _st = await api.get_task_status(_del_task)
+                            if str(_st.get("status")) in ("2", "3"):
+                                break
+                            await asyncio.sleep(1.0)
                     except Exception as exc:
                         logger.warning("[mirror1.1] C类(full)删B库失败 wk=%s：%s", wk, exc)
                         prepass["c_delete_failed"] = prepass.get("c_delete_failed", 0) + 1
+                # v2.1.67：C 类文件删净后，顺手把该作品 B 库空目录壳（作品目录 +
+                # 季目录）清掉。_target_dir 在清清单前已捕获。
+                prepass.setdefault("c_dir_purge", {"candidates": 0, "empty": 0,
+                                                    "dirs_deleted": 0, "skipped": 0, "failed": 0})
+                try:
+                    _pr = await _purge_empty_b_dir_tree(db, api, _target_dir, label=wk)
+                    for _k in ("candidates", "empty", "dirs_deleted", "skipped", "failed"):
+                        prepass["c_dir_purge"][_k] += _pr.get(_k, 0)
+                except Exception as exc:
+                    logger.warning("[mirror1.1] C类空目录壳清理异常 wk=%s：%s", wk, exc)
                 continue
 
             # 作品 A 库还在 → B 类整部缺失 / A 类单文件缺集或变化 / D 无变化
@@ -1207,6 +1336,33 @@ async def reconcile_mappings_prepass(db: Session, rule: MirrorRule, nodes: dict,
                 prepass["a_single_file_fix"] += 1
             else:
                 prepass["d_unchanged"] += 1
+
+        # v2.1.67：存量幽灵目录清理——C 类只遍历有 mirror_media 映射的作品，
+        # 但诉讼女王这类「已归档 + 映射已清」的历史遗留（实测 24 个归档 B 目录里
+        # 22 个无映射）C 类 100% 扫不到。这里用已归档行的 share_dir_id 作候选
+        # 补一轮，与 C 类共用同一个判空删除函数。只在完整 A 树 + 完整轮次跑，
+        # 避免半轮误判。候选/删除数受运行时开关控制，默认开。
+        try:
+            _ghost_limit = max(0, int(runtime_config.get(db, "mirror_purge_ghost_dirs_max") or 50))
+            if complete and _ghost_limit:
+                from .db import include_archived
+                with include_archived():
+                    _ghosts = db.execute(select(Resource.share_dir_id).where(
+                        Resource.clean_state == "cleaned",
+                        Resource.clean_reason.like("B库内容已%"),
+                        Resource.share_dir_id.isnot(None),
+                        Resource.share_dir_id != "",
+                    ).distinct()).all()
+                prepass["ghost_dir_candidates"] = len(_ghosts)
+                prepass["ghost_dir_purge"] = {"empty": 0, "dirs_deleted": 0,
+                                               "skipped": 0, "failed": 0}
+                for (_gid,) in _ghosts[:_ghost_limit]:
+                    _pr = await _purge_empty_b_dir_tree(db, api, str(_gid), label="ghost")
+                    for _k in ("empty", "dirs_deleted", "skipped", "failed"):
+                        prepass["ghost_dir_purge"][_k] += _pr.get(_k, 0)
+        except Exception as exc:
+            logger.warning("[mirror1.1] 存量幽灵目录清理异常（不阻断同步）：%s", exc)
+            prepass["ghost_dir_error"] = str(exc)[:200]
         return reprocess_keys, missing_keys
     except Exception as exc:
         logger.warning("[mirror1.1] 三方对比预扫描异常（不阻断同步）：%s", exc)

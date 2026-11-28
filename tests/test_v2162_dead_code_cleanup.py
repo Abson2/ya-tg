@@ -50,5 +50,5 @@ def test_share_center_uses_backend_labels_not_raw_codes():
 
 
 def test_version_locked_to_2162():
-    assert 'app = FastAPI(title="Ya-TG", version="2.1.66"' in MAIN
-    assert "v2.1.66 · Asia/Shanghai" in APP
+    assert 'app = FastAPI(title="Ya-TG", version="2.1.67"' in MAIN
+    assert "v2.1.67 · Asia/Shanghai" in APP

@@ -20,7 +20,7 @@ import httpx
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import and_, select, update, func, or_, delete, distinct
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from . import runtime_config, utils
 from .db import get_db
@@ -1198,6 +1198,31 @@ def _ensure_category(db: Session, category_key: str, media_type: str, name: str 
     db.flush()
 
 
+# v2.1.67（内存：容器 RSS 长期钉在 1.3 GB）：本函数跑在 5 秒周期里，却整表实例化
+# `Resource` 实体。实测（2026-11-29，2.59 万行）：
+#   · 全量实体：常驻 134.8 MiB / 峰值 147.9 MiB / 单轮 1.35s，连跑 8 轮 RSS
+#     每轮 +2.2 MiB 单调上涨（pymalloc 的 arena 只要还剩一个活对象就不还 OS）；
+#   · 13 列投影：常驻 14.8 MiB / 峰值 17.2 MiB / 单轮 0.68s，连跑 8 轮 RSS 零增长。
+# 同一个库、同样的计算，只换取数方式，省 9 倍内存且快一倍。
+#
+# 字段逐个核对过，无遗漏：
+#   · 分组键 `utils.work_group_key` —— share_dir_name / path_hint / media_title /
+#     tmdb_id / media_type / file_id（6 列）
+#   · 稳定序 ———————————————— file_id / size / utime
+#   · `_primary_category` —————— media_type / genres
+#   · `utils.work_display_meta` —— media_title / media_type / parent_id /
+#     poster_path / share_dir_id / share_dir_name / tmdb_id
+#   · 写快照 ——————————————————— id（resource_ids_json）
+#   · `recompute_work_categories` 另需 name（变更明细里展示「判不出标题时」的兜底）
+# 用 ORM 列（`getattr(Resource, c)`）而不是 Core 的 `Resource.__table__.c`，
+# 这样 `db.py` 里「排除已归档行」的全局过滤器照样生效（实测行数与实体查询一致）。
+_SYNC_VERSION_COLS = (
+    "id", "file_id", "size", "utime", "path_hint", "share_dir_name",
+    "media_title", "tmdb_id", "media_type", "genres", "parent_id",
+    "poster_path", "share_dir_id", "name",
+)
+
+
 def sync_library_versions(db: Session) -> dict[str, int]:
     """按资源事实生成作品级版本快照与唯一主归属。
 
@@ -1208,9 +1233,10 @@ def sync_library_versions(db: Session) -> dict[str, int]:
     实测证据：`朱雀堂` 资源识别 05:48:34、归类 05:48:38（识别早 4 秒，genres 当时已在库），
     仍被判成未分类 —— 说明不是时序问题，就是「只写一次、从不重算」。
     """
-    resources = list(db.scalars(select(Resource)).all())
-    grouped: dict[str, list[Resource]] = {}
-    for res in resources:
+    rows = db.execute(select(
+        *[getattr(Resource, c) for c in _SYNC_VERSION_COLS])).all()
+    grouped: dict[str, list] = {}
+    for res in rows:
         grouped.setdefault(utils.work_group_key(res), []).append(res)
 
     created = 0
@@ -1486,9 +1512,11 @@ def recompute_work_categories(db: Session, *, dry_run: bool = False) -> dict[str
 
     `dry_run=True` 返回将要变更的明细（影响清单），一个字都不写库。
     """
-    resources = list(db.scalars(select(Resource)).all())
-    grouped: dict[str, list[Resource]] = {}
-    for res in resources:
+    # v2.1.67：同 `sync_library_versions`，窄投影替代整表实体（省 9 倍内存、快一倍）。
+    rows = db.execute(select(
+        *[getattr(Resource, c) for c in _SYNC_VERSION_COLS])).all()
+    grouped: dict[str, list] = {}
+    for res in rows:
         grouped.setdefault(utils.work_group_key(res), []).append(res)
 
     owners = {str(r.work_key or ""): r for r in db.scalars(select(SCWorkCategory)).all()}
@@ -4422,9 +4450,25 @@ class _RepResolver:
         self._by_key: dict[str, Resource] | None = None
         self._members: dict[str, list[Resource]] | None = None
 
+    # v2.1.67（内存）：本方法整表实体化时的峰值实测 145.5 MiB，仅次于 5 秒周期的
+    # `sync_library_versions`。这里**不换数据结构**——返回的仍是真正的 `Resource`
+    # 实体，因为下游读得太广（`publisher` 就用了 share_url / vote_average /
+    # origin_country / overview / genres 等 20 多列，`_share_target` 用 name 与
+    # share_dir_name，门禁逐项核验成员），换投影会漏字段。
+    #
+    # 只排掉推送链路**确定不读**的三列大文本：`dir_chain_json`（目录 fileId 链）、
+    # `thumbnail`（缩略图 URL）、`identify_note`（识别备注）。这三列都不参与
+    # 分组键、展示元数据、分享目标、推送门禁与消息正文。未加载的列若被读，
+    # SQLAlchemy 照常按需懒加载——session 在整轮 dispatch 内有效，功能零影响。
+    _LIGHT_SKIP = ("dir_chain_json", "thumbnail", "identify_note")
+
     def _build(self) -> None:
+        cols = [c for c in Resource.__mapper__.columns.keys()
+                if c not in self._LIGHT_SKIP]
         grouped: dict[str, list[Resource]] = {}
-        for res in self.db.scalars(select(Resource)).all():
+        for res in self.db.scalars(
+                select(Resource).options(load_only(
+                    *[getattr(Resource, c) for c in cols]))).all():
             grouped.setdefault(utils.work_group_key(res), []).append(res)
         table: dict[str, Resource] = {}
         for wk, rows in grouped.items():

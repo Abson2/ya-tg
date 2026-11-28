@@ -296,11 +296,18 @@ def test_resource_light_cols_cover_all_gate_fields():
 
 
 def test_sqlite_cache_size_set():
-    assert "PRAGMA cache_size=-8192" in DB_SRC
+    """v2.1.64 曾设 8 MiB；v2.1.67 内存优化回退到 2 MiB（口径反转，见 test_v2167_memory_projection）。
+
+    实测（2026-11-29）：8 MiB/连接实际吃 9.5 MiB RSS 且连接归还后只回 2.9 MiB，
+    46 条连接常态约 171 MiB 常驻；库文件仅 139 MB、OS page cache 已兜住读放大。
+    历史背景保留在此测试，但断言必须跟随当前口径 -2048，否则全量假红。
+    """
+    assert "PRAGMA cache_size=-2048" in DB_SRC
+    assert "cache_size=-8192" not in DB_SRC
     # cache_size 必须在两个池共用的 pragma 函数里（对所有连接生效）
     pragma_fn = DB_SRC[DB_SRC.index("def _sqlite_pragmas"):
-                       DB_SRC.index("def _sqlite_pragmas") + 1400]
-    assert "cache_size=-8192" in pragma_fn
+                       DB_SRC.index("def _sqlite_pragmas") + 1800]
+    assert "cache_size=-2048" in pragma_fn
 
 
 def test_migration_runs_after_alter_columns():

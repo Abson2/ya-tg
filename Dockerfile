@@ -8,7 +8,14 @@ RUN npm run build
 FROM python:3.12-slim
 LABEL org.opencontainers.image.title="Ya-TG" \
       org.opencontainers.image.description="光鸭网盘扫描、TMDB 识别与 Telegram 多频道分发"
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=Asia/Shanghai
+# v2.1.67（内存）：限制 glibc 的 malloc arena 数量。
+# 默认每条「新线程首次分配」都可能开一个新 arena（上限 8 × CPU 核数），
+# 每个 arena 独立持有自己的空闲页、各自只在自己的顶层空闲时才归还——多线程
+# 交错分配后 RSS 会成倍虚高。本进程 12 个线程、绝大多数时间在等网络/磁盘，
+# 限制到 2 个 arena 的锁竞争代价可忽略，而碎片显著收敛。
+# 必须在进程启动前生效，所以放 ENV（entrypoint 的 gosu 不会清掉环境变量）。
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=Asia/Shanghai \
+    MALLOC_ARENA_MAX=2
 WORKDIR /app
 # 阶段四 B-12：加 gosu 供 entrypoint 降权；固定 UID/GID 10001 便于 NAS 侧授权。
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata gosu && rm -rf /var/lib/apt/lists/*

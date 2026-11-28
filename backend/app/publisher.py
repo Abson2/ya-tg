@@ -24,6 +24,24 @@ MAX_ATTEMPTS = 8
 _FALLBACK_TEMPLATE = DEFAULT_TEMPLATE
 logger = logging.getLogger(__name__)
 
+# v2.1.67（内存）：整剧统计要的是「同一部作品的全部单集」，原实现为了拿到这几十行，
+# 把整张 `resources` 表实例化成 ORM 实体再按 work_group_key 过滤——实测单次
+# 常驻 134.8 MiB / 峰值 147.9 MiB（2026-11-29，2.59 万行）。推送是低频率动作，
+# 但每推一条就吃一次这个峰值，也是 RSS 被抬高后回不去的贡献者之一。
+#
+# 改用 14 列窄投影、**筛选逻辑一个字不动**（仍按 work_group_key 精确比对），
+# 只是不再把 overview / dir_chain_json 这些大文本列一并读进来。字段已逐个核对：
+#   · work_group_key —— share_dir_name / path_hint / media_title / tmdb_id /
+#     media_type / file_id
+#   · is_video_file —— name / ext
+#   · work_episode_numbers —— season / episode / name / path_hint
+#   · 汇总计算 —— size / total_episodes / finish_status
+_EPISODE_STAT_COLS = (
+    "id", "file_id", "size", "path_hint", "share_dir_name", "media_title",
+    "tmdb_id", "media_type", "name", "ext", "season", "episode",
+    "total_episodes", "finish_status",
+)
+
 # v2.1.3 真机死锁根治：单轮发送的墙钟预算（秒）。
 # 一轮最坏 = 20 条 × (节流间隔 + 建分享 + 发 TG)。真机上单轮可达数分钟，
 # 而 queue_worker 的调度周期是 30~60s 且 max_instances=1 → 上一轮永不结束 →
@@ -239,8 +257,10 @@ def _build_message(db: Session, res: Resource, share_url: str) -> tuple[str, str
     episode_status = ""
     if res.media_type == "tv":
         key = work_group_key(res)
-        sibs = [s for s in db.scalars(select(Resource)).all()
-                if work_group_key(s) == key]
+        # v2.1.67：窄投影取兄弟行，筛选判据与原来完全一致（见 _EPISODE_STAT_COLS 注释）。
+        sib_rows = db.execute(select(
+            *[getattr(Resource, c) for c in _EPISODE_STAT_COLS])).all()
+        sibs = [s for s in sib_rows if work_group_key(s) == key]
         videos = [s for s in sibs if is_video_file(s)] or sibs
         if videos:
             total_size = sum(int(s.size or 0) for s in videos)
