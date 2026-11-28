@@ -11,7 +11,8 @@
 判定口径（全部复用 v2.1.57 已落地的实现，不另写一套）
   · 目标目录与标题：`share_center_v2._share_target()`（排除季目录 + 作品级标题）
   · 「这条分享已经是作品级」的**唯一**判据：分享根目录恰好一个条目，
-    且 `file_id == 目标目录 id`、`is_dir` 为真；
+    且 `file_id == 目标目录 id`。**不看 `is_dir`**——实测该接口返回 `isDir: null`，
+    `share_root_files` 把它折成 False，一挂上这个条件就全库误判（见 Prober 注释）；
   · 一部作品只要有一条已经是作品级 → 保留它（随手改名成作品名），其余删除；
     一条都没有 → 按作品目录**新建**一条，库内引用全部改指新链接，旧链接删除。
 
@@ -73,25 +74,32 @@ def load_members(db) -> dict:
 
 
 class Prober:
-    """把一条分享归类：dead / empty / work_level / other。"""
+    """把一条分享归类：dead / empty / work_level / other，并把根目录那唯一一项的名字带回去。
+
+    判据只用「根目录恰好一项 + 该项 file_id == 作品目录 id」。
+    **不再看 `is_dir`**——真机实测（2026-11-28）`get_share_page_files_list` 返回的
+    `isDir` 是 `null`，而 `GuangYaWebFiles.share_root_files` 只认 `True/1/"1"`，
+    于是 `is_dir` 恒为 False：第一版把这个条件写进判据，导致 317 部作品**全部**被判成
+    「需要新建」（实际抽查其中大部分根目录已经是作品目录），白建了 300 多条分享、
+    把老链接全删了。file_id 相同即证明分享的就是那个目录，不需要 is_dir 佐证。
+    """
 
     def __init__(self, wf, target_dir: str):
         self.wf = wf
         self.target_dir = str(target_dir or "")
 
-    async def __call__(self, url: str) -> str:
+    async def __call__(self, url: str) -> tuple[str, str]:
         try:
             tok = await self.wf.share_access_token(share_tail_of(url))
         except Exception:
-            return "dead"
+            return ("dead", "")
         try:
             files = await self.wf.share_root_files(tok, max_items=5)
         except Exception:
-            return "empty"
-        if len(files) == 1 and files[0].get("is_dir") and \
-                str(files[0].get("file_id") or "") == self.target_dir:
-            return "work_level"
-        return "other"
+            return ("empty", "")
+        if len(files) == 1 and str(files[0].get("file_id") or "") == self.target_dir:
+            return ("work_level", str(files[0].get("name") or ""))
+        return ("other", "")
 
 
 def build_plan(db, members_by_key: dict) -> list[dict]:
@@ -128,18 +136,50 @@ def build_plan(db, members_by_key: dict) -> list[dict]:
 
 
 def decide(plan: list[dict], verdicts: dict) -> list[dict]:
-    """把探测结果折成动作：留一条作品级 / 新建一条。"""
+    """把探测结果折成动作：留一条作品级 / 新建一条。
+
+    `verdicts[url] = (verdict, 根目录那一项的名字)`。名字用来判断**要不要改名**：
+    已经是作品目录、标题也已经是作品名的分享，连 `update` 都不用调，省一次写接口。
+    """
     for item in plan:
         if item["action"] != "probe":
             continue
-        vs = [(u, verdicts.get(u, "other")) for u in item["urls"]]
-        keep = next((u for u, v in vs if v == "work_level"), "")
+        vs = []
+        for u in item["urls"]:
+            verdict, name = verdicts.get(u) or ("other", "")
+            vs.append((u, verdict, name))
+        keep = next((u for u, v, _ in vs if v == "work_level"), "")
+        keep_name = next((n for u, _, n in vs if u == keep), "")
         item["keep"] = keep
-        item["drop"] = [u for u, _ in vs if u != keep] if keep else [u for u, _ in vs]
-        item["rename"] = bool(keep)
-        item["verdicts"] = [v for _, v in vs]
+        item["keep_name"] = keep_name
+        item["drop"] = [u for u, _, _ in vs if u != keep] if keep else [u for u, _, _ in vs]
+        item["rename"] = bool(keep) and keep_name.strip() != str(item["title"]).strip()
+        item["verdicts"] = [v for _, v, _ in vs]
         item["action"] = "keep" if keep else "create"
     return plan
+
+
+def _is_token_error(exc) -> bool:
+    """光鸭侧会话被轮换/失效：长驻进程握着旧 token，重读一次 DB 里的新 token 即可。"""
+    msg = str(exc)
+    return any(k in msg for k in ("无效token", "会话可能已失效", "登录已过期", "unauthor"))
+
+
+async def _retry_once(make_coro, db, client):
+    """先跑一次；只在「token 失效」时重读配置换客户端再跑一次（其它错误直接抛）。
+
+    `make_coro(client)` 必须用传进来的 client 发请求，不能在闭包里捕获旧 client ——
+    光鸭侧轮换 token 后旧 client 的请求头永远无效，重试多少次都一样。
+    """
+    try:
+        return await make_coro(client)
+    except Exception as exc:
+        if not _is_token_error(exc):
+            raise
+        print("    · token 失效，重读配置后重试一次")
+        fresh = GuangYaShareClient(db)
+        fresh.headers = fresh._fresh_headers()
+        return await make_coro(fresh)
 
 
 async def apply_plan(db, plan: list[dict], *, sleep: float = 1.2) -> dict:
@@ -157,16 +197,20 @@ async def apply_plan(db, plan: list[dict], *, sleep: float = 1.2) -> dict:
             new_url = item["keep"]
             new_id = share_id_of(new_url)
             stats["kept"] += 1
-            try:
-                await client.update(new_id, title, settings.share_duration)
-                stats["renamed"] += 1
-            except Exception as exc:
-                stats["errors"].append(f"rename {wk}: {str(exc)[:120]}")
-            await asyncio.sleep(sleep)
+            # 只在标题确实不一致时改名（`update` 会顺带把有效期刷成当前配置）
+            if item.get("rename"):
+                try:
+                    await _retry_once(
+                        lambda c: c.update(new_id, title, settings.share_duration), db, client)
+                    stats["renamed"] += 1
+                except Exception as exc:
+                    stats["errors"].append(f"rename {wk}: {str(exc)[:120]}")
+                await asyncio.sleep(sleep)
         else:
             try:
-                new_id, new_url = await create_share_parsed(client, dir_id, title,
-                                                            settings.share_duration)
+                new_id, new_url = await _retry_once(
+                    lambda c: create_share_parsed(c, dir_id, title, settings.share_duration),
+                    db, client)
             except Exception as exc:
                 stats["errors"].append(f"create {wk}: {str(exc)[:120]}")
                 await asyncio.sleep(sleep)
@@ -200,7 +244,7 @@ async def apply_plan(db, plan: list[dict], *, sleep: float = 1.2) -> dict:
         # ② 删旧链（含已失效的，删失败只记账不中断）
         for url in item["drop"]:
             try:
-                await client.delete(share_id_of(url))
+                await _retry_once(lambda c, sid=share_id_of(url): c.delete(sid), db, client)
                 stats["deleted"] += 1
             except Exception as exc:
                 stats["errors"].append(f"delete {share_id_of(url)}: {str(exc)[:100]}")
@@ -208,11 +252,27 @@ async def apply_plan(db, plan: list[dict], *, sleep: float = 1.2) -> dict:
     return stats
 
 
+def _pick(plan: list[dict], args) -> list[dict]:
+    """按 --work / --limit 取本次要处理的作品（--work 优先）。"""
+    raw = str(getattr(args, "work", "") or "")
+    if raw.startswith("@"):            # 作品多时用文件传，避免命令行引号/长度问题
+        raw = open(raw[1:], encoding="utf-8").read().replace("\n", ",")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if keys:
+        wanted = {k if k.startswith("work:") else f"work:{k}" for k in keys}
+        picked = [i for i in plan if i["work_key"] in wanted]
+        missing = wanted - {i["work_key"] for i in picked}
+        if missing:
+            print(f"⚠️ 这些作品没有分享记录，跳过：{sorted(missing)}")
+        return picked
+    return plan[:args.limit] if args.limit else plan
+
+
 async def run(args) -> int:
     with SessionLocal() as db:
         members_by_key = load_members(db)
         plan = build_plan(db, members_by_key)
-        todo = plan[:args.limit] if args.limit else plan
+        todo = _pick(plan, args)
         print(f"有分享记录的作品：{len(plan)}｜本次处理：{len(todo)}")
 
         wf = GuangYaWebFiles(db)
@@ -235,6 +295,7 @@ async def run(args) -> int:
 
         keep = [i for i in todo if i["action"] == "keep"]
         create = [i for i in todo if i["action"] == "create"]
+        noop = [i for i in keep if not i.get("rename")]
         undecided = [i for i in todo if i["action"] == "probe-skipped"]
         drop = sum(len(i.get("drop") or []) for i in todo)
         stat: dict[str, int] = defaultdict(int)
@@ -244,7 +305,8 @@ async def run(args) -> int:
         if undecided:
             print(f"作品数：{len(todo)}｜未探测（--skip-probe，只列目录与标题）{len(undecided)}")
         else:
-            print(f"判定：作品级可留 {len(keep)}｜需要新建 {len(create)}｜待删旧链 {drop}")
+            print(f"判定：作品级可留 {len(keep)}（其中已合规、无需改动 {len(noop)}）｜"
+                  f"需要新建 {len(create)}｜待删旧链 {drop}")
             print(f"　　　分享体检：作品级 {stat['work_level']}｜单集/多项 {stat['other']}｜"
                   f"内容不可读 {stat['empty']}｜已失效 {stat['dead']}")
         for i in todo[:8]:
@@ -273,6 +335,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 部作品")
     ap.add_argument("--skip-probe", action="store_true",
                     help="不探测网盘，只列「作品→目录→名字」（快，只看计划用）")
+    ap.add_argument("--work", type=str, default="",
+                    help="只处理这些作品（逗号分隔的 work_key，可省略 work: 前缀）")
     return asyncio.run(run(ap.parse_args()))
 
 

@@ -53,16 +53,23 @@ def test_share_id_forms():
 # ---------- 动作判定 ----------
 def test_decide_keeps_the_work_level_share():
     plan = [_item([URL_A, URL_B])]
-    RWS.decide(plan, {URL_A: "other", URL_B: "work_level"})
+    RWS.decide(plan, {URL_A: ("other", ""), URL_B: ("work_level", "某剧")})
     assert plan[0]["action"] == "keep"
     assert plan[0]["keep"] == URL_B
     assert plan[0]["drop"] == [URL_A]
+    assert plan[0]["rename"] is False      # 名字已是作品名 → 不调 update
+
+
+def test_decide_renames_when_title_differs():
+    plan = [_item([URL_A])]
+    RWS.decide(plan, {URL_A: ("work_level", "某剧·第一季·第01集")})
+    assert plan[0]["action"] == "keep" and plan[0]["rename"] is True
 
 
 def test_decide_creates_when_nothing_is_work_level():
     """真机三部失效作品就落在这条：全 dead → 必须新建，旧链全删。"""
     plan = [_item([URL_A])]
-    RWS.decide(plan, {URL_A: "dead"})
+    RWS.decide(plan, {URL_A: ("dead", "")})
     assert plan[0]["action"] == "create"
     assert plan[0]["keep"] == ""
     assert plan[0]["drop"] == [URL_A]
@@ -70,7 +77,7 @@ def test_decide_creates_when_nothing_is_work_level():
 
 def test_decide_prefers_earliest_work_level():
     plan = [_item([URL_A, URL_B])]
-    RWS.decide(plan, {URL_A: "work_level", URL_B: "work_level"})
+    RWS.decide(plan, {URL_A: ("work_level", "某剧"), URL_B: ("work_level", "某剧")})
     assert plan[0]["keep"] == URL_A
     assert plan[0]["drop"] == [URL_B]
 
@@ -80,6 +87,34 @@ def test_decide_skips_untouched_items():
              "reason": "没有实时资源行（作品已不在库里）", "dir_id": "", "title": ""}]
     RWS.decide(plan, {})
     assert plan[0]["action"] == "skip"
+
+
+# ---------- 回归：判据不许再看 is_dir ----------
+def test_prober_ignores_is_dir_flag():
+    """真机 2026-11-28：`get_share_page_files_list` 返回 `isDir: null`，
+    `share_root_files` 把它折成 False。第一版判据要求 `is_dir` 为真，于是 317 部
+    作品**全部**被判成「需要新建」，白建 300+ 条分享、把能用的老链接全删了。"""
+    class FakeWf:
+        async def share_access_token(self, _tail):
+            return "tok"
+
+        async def share_root_files(self, _tok, max_items=5):
+            return [{"file_id": "999", "name": "某剧", "size": 0, "is_dir": False}]
+
+    verdict, name = asyncio.run(RWS.Prober(FakeWf(), "999")(URL_A))
+    assert verdict == "work_level" and name == "某剧"
+
+
+def test_prober_rejects_other_dir_even_if_dir_flag_true():
+    """反证：id 对不上就是别人的目录，`is_dir=True` 也不能算作品级。"""
+    class FakeWf:
+        async def share_access_token(self, _tail):
+            return "tok"
+
+        async def share_root_files(self, _tok, max_items=5):
+            return [{"file_id": "888", "name": "别的剧", "size": 0, "is_dir": True}]
+
+    assert asyncio.run(RWS.Prober(FakeWf(), "999")(URL_A))[0] == "other"
 
 
 # ---------- 落库顺序 ----------
@@ -167,3 +202,27 @@ def test_apply_does_not_delete_when_create_fails(monkeypatch):
     assert res.share_url == URL_A          # 旧链完好
     db.close()
     _clean()
+
+
+# ---------- 长跑韧性：token 被轮换 / 只跑指定作品 ----------
+def test_token_error_detection():
+    """真机事故：跑到第 283 部时光鸭轮换了 token，后续 create/delete 全失败。"""
+    assert RWS._is_token_error(Exception("网页分享会话可能已失效：无效token。请在 NAS 本机重新抓包"))
+    assert RWS._is_token_error(Exception("登录已过期"))
+    assert not RWS._is_token_error(Exception("网页分享接口 share_file 失败：容量不足"))
+
+
+def test_pick_filters_by_work_keys(tmp_path):
+    plan = [{"work_key": "work:A", "urls": ["u1"], "action": "probe"},
+            {"work_key": "work:B", "urls": ["u2"], "action": "probe"},
+            {"work_key": "work:C", "urls": ["u3"], "action": "probe"}]
+    args = type("A", (), {"work": "A,C", "limit": 0})()
+    assert [i["work_key"] for i in RWS._pick(plan, args)] == ["work:A", "work:C"]
+    # work: 前缀可省略
+    args = type("A", (), {"work": "work:B", "limit": 0})()
+    assert [i["work_key"] for i in RWS._pick(plan, args)] == ["work:B"]
+    # @文件：作品多时用文件传，避免命令行引号/长度问题
+    f = tmp_path / "keys.txt"
+    f.write_text("A\nB\n", encoding="utf-8")
+    args = type("A", (), {"work": f"@{f}", "limit": 0})()
+    assert [i["work_key"] for i in RWS._pick(plan, args)] == ["work:A", "work:B"]

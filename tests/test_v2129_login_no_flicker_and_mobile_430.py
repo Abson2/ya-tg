@@ -69,13 +69,20 @@ def test_boot_screen_rendered_before_login_and_app():
 
 
 def test_restore_failure_falls_to_login():
-    """改三态后必须自己收口：旧布尔版靠初值 false 兜底，三态版漏写就卡在骨架屏。"""
+    """三态必须自己收口：绝不能停在 null（骨架屏），也绝不能让有效会话被超时踢掉。
+
+    v2.1.59 起落定语义变了：有 token 立即落 true（先放行进主界面，数据后台补），
+    不再有「await 完再 true / 失败再 false」的分支。原本由这里显式落的 false，
+    改由 api() 的 401 → forceSessionExpired 负责。本用例守护的不变量仍成立：
+    ① 有 token 时必须落 true，不许停在 null；② 会话失效路径必须存在 false 落定。
+    """
     app = _script(_app())
     seg = app[app.index("if (sessionToken.value) {"):]
     seg = seg[:seg.index("pollSession")] if "pollSession" in seg else seg[:600]
-    assert "authed.value = true" in seg, "恢复成功要落 true"
-    assert "authed.value = false" in seg, (
-        "恢复失败必须显式落 false —— 否则 authed 永远停在 null，页面卡在骨架屏")
+    assert "authed.value = true" in seg, "有 token 必须立即落 true，不许停在 null 骨架屏"
+    # 会话失效落 false 的最终路径必须存在（401 → forceSessionExpired），否则会永远停在
+    # 主界面/骨架屏。它在 App.vue 全局存在即可，不再要求写在这段启动块里。
+    assert "authed.value = false" in app, "会话失效必须有一条显式落 false 的路径"
 
 
 def test_login_and_app_content_not_removed():

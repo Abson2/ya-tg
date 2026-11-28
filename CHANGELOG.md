@@ -8,6 +8,79 @@
 
 ---
 
+## v2.1.59 (2026-11-28)
+
+> 纯体验与内存优化，不改变任何业务判据：
+> **①** 刷新要盯着「正在恢复会话」等几秒才进；
+> **②** 登录输完密码后不是立即响应，要等加载跑完；
+> **③** 进页面后数据一片空，要等很久才一次性冒出来；
+> **④** 内存短时冲到 1G —— `/api/library/series` 全表实例化 2.5 万行 ORM。
+
+### 一、事故现场
+
+| 项 | 实测 |
+|---|---|
+| 启动 | `onMounted` 里 `await withTimeout(load(), 12s)` 之后才落 `authed=true`，全量加载完才放行 |
+| 登录 | `login()` 里 `await load()` 之后才 `authed.value=true` + 弹成功提示 |
+| 加载 | `load()` = `Promise.allSettled(23 个接口)`，**全部落定后**才统一赋值 |
+| 内存 | 主进程 `VmRSS=953MB`、`VmHWM=1031MB`；cgroup peak 1128MB；`resources` 表 25,663 行 |
+
+### 二、根因
+
+1. **放行被全量加载阻塞**。`authed` 落定排在 `await load()` 之后，而 `load()` 要等 23 个
+   接口全部返回（最慢的 `/logs/overview`、`/library/series`、`/audit` 是重查询），
+   于是刷新/登录都要等最慢那个。v2.1.58 的 12 秒总闸只是「上限保护」，不是「秒开」。
+2. **统一赋值导致数据全空**。赋值语句全排在 `await Promise.allSettled(...)` 之后，
+   快接口（`/overview` 100ms 就好）的值也要等最慢接口回来才被赋上 → 页面一片空。
+3. **全表 ORM 实体化**。`/api/library/series` 用 `select(Resource)` 把 25,663 行全部
+   实例化成 ORM 对象（单实体约 5 KiB → 一次请求峰值 +120 MiB），而这个接口前端每次
+   刷新/登录都打。对照 `/api/resources` 有 `limit(min(limit,500))` 保护，不爆。
+
+### 三、收口（本版改动）
+
+- **启动立即放行**：有 token 先 `authed.value=true`（再 `await nextTick()` 渲染一帧），
+  `load()` 丢后台跑；总闸保留，只用于收敛后台任务。会话真失效仍由 `api()` 的
+  401 → `forceSessionExpired` 落 `false` 回登录页——超时/断网不再把有效会话踢掉。
+- **登录立即响应**：token 落盘后立即放行 + 弹「登录成功」，`load()` 后台跑并带总闸兜底。
+- **逐接口回填**：`load()` 新增 `applyLoadItem(i, v)`，每个接口 fulfilled 即回填自己那块
+  ref（失败按原口径降级），快模块先显示、慢模块各自转，互不阻塞。完成语义不变
+  （仍 `await Promise.allSettled` 供总闸收敛）。
+- **内存投影**：`/api/library/series` 改**列投影 + `SimpleNamespace`**，只取聚合实际
+  读到的 25 列，不再全实体化；`ShareRecord`/`SCPublishTask` 两处查询同样改投影。
+  与 v2.1.56 对账红线同款做法，禁止退回全量 ORM 实体。
+- `loadSc()` 的 `allSettled` 暂不改：其内部 `hw` 依赖 `ov.active_version_id` 有交叉时序，
+  且它在主界面之后串行加载，不影响首屏；留待后续单独处理。
+
+### 四、验证
+
+- 新增 `tests/test_v2159_ux_and_memory.py`（6 项）：启动/登录放行顺序、逐接口回填、
+  投影断言、投影后聚合语义不变；**双向反证**：把投影退回 `select(Resource)`、
+  把登录改回 `await load()` 后置放行，对应用例均变红，已还原。
+- 同步更新 `test_v2158_boot_and_identify.py` / `test_v2129_login_no_flicker_and_mobile_430.py`
+  里锁定旧结构（必须 `await` 总闸 / 启动块内必须落 false）的断言，保留其真正守护的
+  不变量：authed 绝不停在 null、会话失效必须有落 false 的路径。
+- 前端 `npm run build` 通过。
+- 全量 **2415 passed**（分块独立进程跑同一套测试，规避本机内存限制；结果口径与单进程一致）。
+
+### 五、同车修复：存量分享重建脚本 `is_dir` 误判（scripts/rebuild_work_shares.py）
+
+- 真机 2026-11-28 跑 `--apply` 时发现：`get_share_page_files_list` 返回的 `isDir` 是
+  `null`，而 `share_root_files` 只认 `True/1/"1"` → `is_dir` 恒为 False。
+- 第一版判据把「`is_dir` 为真」当必要条件，于是 317 部作品**全部**被判成「需要新建」，
+  白建 300 多条分享、老链接被删。**判据改为只看「根目录恰好一项 + 该项 file_id ==
+  作品目录 id」**，不再看 `is_dir`（file_id 相同即证明分享的就是那个目录）。
+- 新增回归用例 `test_prober_ignores_is_dir_flag` /
+  `test_prober_rejects_other_dir_even_if_dir_flag_true` / `test_decide_renames_when_title_differs`
+  / `test_token_error_detection` / `test_pick_filters_by_work_keys`。
+- 本项只改脚本与测试，**不动线上数据**；被误删的老链接需按现场实际情况人工确认后再重建。
+
+### 六、回滚
+
+- 回滚镜像：`IMAGE_TAG=v2.1.58`（本版无数据迁移、无表结构变更，回退即恢复旧行为）。
+- 本版只改前端加载时序与后端查询形态，不改任何业务判据，回滚无数据风险。
+
+---
+
 ## v2.1.58 (2026-11-28)
 
 > 两件真机问题 + 一件遗留问题：

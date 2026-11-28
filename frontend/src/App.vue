@@ -1529,58 +1529,75 @@ function withTimeout(p, ms, label = '加载') {
   })
   return Promise.race([p, guard]).finally(() => clearTimeout(t))
 }
+// v2.1.59（用户体验）：把「23 个接口全等齐再统一赋值」改成「谁先回来谁先显示」。
+// 此前 `await Promise.allSettled(...)` 之后才逐条赋值，重查询（logs/overview、
+// library/series、audit）不回时，overview/resources 这些快的也一直空着，
+// 用户看到的就是「进页面一片空、要等很久才出来」。
+// 现在每个接口 fulfilled 立刻回填自己那块 ref，慢接口只拖自己。
+// 完成语义不变：仍 await 全部落定，供 onMounted/login 的总闸收敛。
+function applyLoadItem(i, v) {
+  // 失败(i 传 null)时的降级口径与改造前逐条赋值完全一致，不改任何语义。
+  switch (i) {
+    case 0: overview.value = v || overview.value; break
+    case 1:
+      task.value = v || task.value
+      // v0.8.0：每个新模块独立加载，任一接口异常不影响主界面（沿用既有约定）
+      try { scanInterval.value = task.value.interval_minutes || 0; scanCustom.value = !task.value.interval_minutes } catch (e) {}
+      break
+    case 2: resources.value = v || resources.value; break
+    case 3: seriesGroups.value = v || []; break
+    case 4: reviews.value = v || reviews.value; break
+    case 5: queue.value = v || queue.value; break
+    case 6: templates.value = v || templates.value; break
+    case 7: tplPresets.value = v || []; break
+    case 8: audit.value = v || audit.value; break
+    case 9: diagnostics.value = v || { blockers: [] }; break
+    case 10: if (v) telegramBase.value = v.base_url || v.default || ''; break
+    case 11: queueSchedule.value = v || queueSchedule.value; break
+    case 12: mirrorCfg.value = v || mirrorCfg.value; break
+    case 13: mirrorStatus.value = v || mirrorStatus.value; break
+    case 14: scanBatches.value = v || []; break
+    case 15:
+      interactionCfg.value = v || interactionCfg.value
+      // v0.9.16 #278：初次加载即同步 Bot 下拉来源（bot_options 来自配置接口）
+      syncDiscBots()
+      break
+    case 16:
+      if (v) {
+        pushCfg.value = { bot: v.bot || null, max_routes: v.max_routes || 10 }
+        pushRoutes.value = (v.routes && v.routes.length)
+          ? v.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '',
+            targets: (r.targets || []).map(t => ({ kind: t.kind || 'channel', chat_id: t.chat_id || '', name: t.name || '' })),
+            note: r.note || '' }))
+          : [{ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' }]
+      }
+      break
+    // v0.9.14 #258：自动发现群组 / 统一推送目标
+    case 17: if (v) discoverChats.value = v.chats || []; break
+    case 18: interactionStatus.value = v || interactionStatus.value; break
+    case 19: contributions.value = v || []; break
+    case 20: mediaRequests.value = v || []; break
+    case 21:
+      if (v) {
+        logCfg.value = v.config || logCfg.value
+        logStats.value = v.tables || []
+        logOverview.value = { total_rows: v.total_rows || 0, total_pruneable: v.total_pruneable || 0,
+          container_log: v.container_log || '' }
+      }
+      break
+    case 22: feedbacks.value = v || feedbacks.value; break
+  }
+}
 async function load() {
-  // 阶段三 D-07：无依赖的纯 GET 并行拉取（Promise.allSettled，单个失败不影响其它）。
-  // 赋值语义与降级口径与改造前逐条 await 完全一致；内部有依赖的 load* 函数保持原顺序。
+  // 阶段三 D-07：无依赖的纯 GET 并行拉取（单个失败不影响其它）。
+  // v2.1.59：每条 fulfilled 即回填（见 applyLoadItem），不再等全量。
   const keys = ['overview', 'scan-task', 'resources', 'library/series', 'review', 'queue',
     'templates', 'templates/presets', 'audit', 'diagnostics', 'telegram/config',
     'queue/schedule', 'mirror/config', 'mirror/status', 'scan/batches?limit=5',
     'interaction/config', 'push/routes', 'discover/chats', 'interaction/status',
     'contributions?limit=50', 'media-requests?limit=50', 'logs/overview', 'feedback?limit=50']
-  const settled = await Promise.allSettled(keys.map(k => api('/' + k)))
-  const v = i => settled[i]?.status === 'fulfilled' ? settled[i].value : null
-  overview.value = v(0) || overview.value
-  task.value = v(1) || task.value
-  resources.value = v(2) || resources.value
-  seriesGroups.value = v(3) || []
-  reviews.value = v(4) || reviews.value
-  queue.value = v(5) || queue.value
-  templates.value = v(6) || templates.value
-  tplPresets.value = v(7) || []
-  audit.value = v(8) || audit.value
-  diagnostics.value = v(9) || { blockers: [] }
-  const tg = v(10); if (tg) telegramBase.value = tg.base_url || tg.default || ''
-  queueSchedule.value = v(11) || queueSchedule.value
-  mirrorCfg.value = v(12) || mirrorCfg.value
-  mirrorStatus.value = v(13) || mirrorStatus.value
-  scanBatches.value = v(14) || []
-  interactionCfg.value = v(15) || interactionCfg.value
-  // v0.8.0：每个新模块独立加载，任一接口异常不影响主界面（沿用既有约定）
-  try { scanInterval.value = task.value.interval_minutes || 0; scanCustom.value = !task.value.interval_minutes } catch (e) {}
-  // v0.9.16 #278：初次加载即同步 Bot 下拉来源（bot_options 来自配置接口）
-  syncDiscBots()
-  const pr = v(16)
-  if (pr) {
-    pushCfg.value = { bot: pr.bot || null, max_routes: pr.max_routes || 10 }
-    pushRoutes.value = (pr.routes && pr.routes.length)
-      ? pr.routes.map(r => ({ dir_id: r.dir_id || '', channel_id: r.channel_id || '', group_id: r.group_id || '',
-        targets: (r.targets || []).map(t => ({ kind: t.kind || 'channel', chat_id: t.chat_id || '', name: t.name || '' })),
-        note: r.note || '' }))
-      : [{ dir_id: '', channel_id: '', group_id: '', targets: [], note: '' }]
-  }
-  // v0.9.14 #258：自动发现群组 / 统一推送目标
-  const dc = v(17); if (dc) discoverChats.value = dc.chats || []
-  interactionStatus.value = v(18) || interactionStatus.value
-  contributions.value = v(19) || []
-  mediaRequests.value = v(20) || []
-  feedbacks.value = v(22) || feedbacks.value
-  const lg = v(21)
-  if (lg) {
-    logCfg.value = lg.config || logCfg.value
-    logStats.value = lg.tables || []
-    logOverview.value = { total_rows: lg.total_rows || 0, total_pruneable: lg.total_pruneable || 0,
-      container_log: lg.container_log || '' }
-  }
+  await Promise.allSettled(keys.map((k, i) =>
+    api('/' + k).then(v => applyLoadItem(i, v)).catch(() => applyLoadItem(i, null))))
   // 分享中心：统一走新数据体系（/api/sc/*），失败不影响主界面
   try { await loadSc() } catch (e) {}
   // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
@@ -1655,10 +1672,17 @@ async function login() {
     sessionToken.value = d.token
     localStorage.setItem(SESSION_KEY, d.token)   // 只存 token，绝不写明文密码
     password.value = ''                          // 立即清空登录框里的密码
-    await load()
+    // v2.1.59（用户体验）：登录成功**立即放行**到主界面并弹提示，
+    // 数据由 load() 在后台补——此前是 `await load()` 之后才放行，23 个接口
+    // 全部返回前按钮一直转、进不去，实测能等数秒。放行后就算后续接口慢，
+    // 用户也已能操作，各模块数据陆续填入。
     authed.value = true
     sessionRemaining.value = d.idle_seconds || 0
     ElMessage.success(`已登录（闲置 ${Math.round((d.idle_seconds || 7200) / 60)} 分钟自动退出）`)
+    // 后台加载：总闸只用于收敛，超时也不影响已放行的界面。
+    const loadP = load().catch(e => { console.warn('[login] 登录后加载未完成', e) })
+    withTimeout(loadP, BOOT_TIMEOUT_MS, '登录加载')
+      .catch(e => { console.warn('[login] 登录后加载超时，数据后台继续补', e) })
   } catch (e) { ElMessage.error(e.message) }
 }
 async function logout() {
@@ -3791,18 +3815,20 @@ onMounted(async () => {
   // v2.1.29：三态落定——成功 true、失败**必须显式**落 false，
   // 否则 `null` 会一直停在骨架屏（旧布尔版靠初值 false 兜底，改三态后必须自己收口）。
   if (sessionToken.value) {
-    // v2.1.58：`load()` 各模块自带兜底后本身不再抛，这里再压一道总超时。
-    // 落定规则：**只有会话真的失效才回登录页**——那条路径由 api() 里的 401 →
-    // forceSessionExpired 负责（会清 token 并把 authed 落 false）。超时/断网
-    // 不等于会话失效，此时进主界面让数据自己补；绝不再把有效会话踢成登录页，
-    // 也绝不永久停在 null（就是「永远正在恢复会话」那个坑）。
+    // v2.1.59（用户体验）：**有 token 就立即放行**到主界面，不再等 load() 全量。
+    // 此前是 await 完 12 秒总闸/全部接口才落 authed，于是每次刷新都要盯着
+    // 「正在恢复会话」等几秒。现在立即进主界面、数据后台陆续补——观感接近秒开。
+    //
+    // 会话真失效的安全网不变：api() 收到 401 会走 forceSessionExpired，清 token
+    // 并把 authed 落 false（自动回登录页）；超时/断网不等于会话失效，进主界面
+    // 让数据自己补，绝不把有效会话踢成登录页，也绝不永久停在 null 骨架屏。
+    authed.value = true
+    // 先渲染一帧主界面，再在下一帧启动加载：避免 23 个 api() 的同步建链
+    // 抢在首帧绘制之前，保证「立即看到界面」是真立即。
+    await nextTick()
     const loadP = load().catch(e => { console.warn('[boot] 首次加载未完成', e) })
-    try { await withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载') }
-    catch (e) { console.warn('[boot] 首次加载超时，先放行到主界面', e) }
-    // 落定：token 还在 → 进主界面（数据可能没加载全，让轮询慢慢补）；
-    // token 已被 401 那条路清掉 → 回登录页。两种都必须**显式**落，不许停在 null。
-    if (sessionToken.value) authed.value = true
-    else authed.value = false
+    withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载')
+      .catch(e => { console.warn('[boot] 首次加载超时，数据后台继续补', e) })
   }
   // 会话状态 30s 轮询一次（只读，不刷新活跃时间），剩余时间到期由服务端 401 强制退出
   sessionPollTimer = setInterval(pollSession, 30000)
@@ -3853,7 +3879,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.58 · Asia/Shanghai</span>
+          <span>v2.1.59 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>

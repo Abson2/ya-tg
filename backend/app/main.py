@@ -1200,7 +1200,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.58", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.59", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1211,7 +1211,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.58", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.59", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -4869,10 +4869,29 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
     每个作品返回海报、标题、年份、类型、集数范围、识别/分享汇总，并带成员单集 id 列表，
     前端据此按「一部剧一张卡」呈现，操作（推送/识别/取消分享）落到代表资源。
     """
-    stmt = select(Resource).order_by(Resource.id.desc())
+    # v2.1.59（内存根治）：**只投影聚合需要的列**，不再 `select(Resource)` 全实体。
+    # 真机 25,663 行资源全实体化，单实体约 5 KiB → 一次请求峰值 +120 MiB，而这
+    # 个接口每次刷新/登录都打（前端 load() 必拉）。与 v2.1.56 对账同一红线：
+    # 只许列投影 + SimpleNamespace，禁止退回全量 ORM 实体。
+    # 投影列 = 本函数与 work_group_key / _first_seen_of 实际读到的全部字段；
+    # 少一列会在 getattr 处静默取默认值，导致分组或角标错，故必须与代码逐一对应。
+    _cols = (
+        Resource.id, Resource.file_id, Resource.name, Resource.path_hint,
+        Resource.share_dir_name, Resource.media_title, Resource.media_type,
+        Resource.poster_path, Resource.overview, Resource.genres,
+        Resource.vote_average, Resource.tmdb_id, Resource.source_title,
+        Resource.source_tmdb_id, Resource.source_media_type,
+        Resource.identify_status, Resource.share_url, Resource.share_status,
+        Resource.share_duration, Resource.finish_status, Resource.finish_locked,
+        Resource.season, Resource.episode, Resource.first_seen_at, Resource.scanned_at,
+    )
+    stmt = select(*_cols).order_by(Resource.id.desc())
     if media_type in ("movie", "tv"):
         stmt = stmt.where(Resource.media_type == media_type)
-    rows = list(db.scalars(stmt).all())
+    # 用 SimpleNamespace 承载投影行：属性名与 ORM 实体一致，下游（work_group_key /
+    # _first_seen_of / 本函数）零改动；只留纯数据，不带 ORM 实例身份与脏检查。
+    from types import SimpleNamespace
+    rows = [SimpleNamespace(**dict(r._mapping)) for r in db.execute(stmt)]
     by_id = {x.id: x for x in rows}  # 阶段三 A-08：复用已取资源，避免筛选时逐条 db.get
     # 阶段六资源卡角标：一次性预加载「已推送资源集合」与「作品→链接状态」，
     # 避免逐卡查询（N+1）。两者均来自本地库，失败降级为空不阻断列表。
@@ -4889,8 +4908,9 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         from .models import ShareRecord as _SR
         sent_ids = {r[0] for r in db.execute(select(QueueItem.resource_id).where(
             QueueItem.sent_at.isnot(None))).all()}
-        link_by_key = {r.work_key: str(r.link_state or "active") for r in db.scalars(
-            select(_SR).where(_SR.current_flag == 1)).all()}
+        # v2.1.59：只投影两列（work_key / link_state），不再全实体化 ShareRecord。
+        link_by_key = {r.work_key: str(r.link_state or "active") for r in db.execute(
+            select(_SR.work_key, _SR.link_state).where(_SR.current_flag == 1))}
     except Exception:
         sent_ids, link_by_key = set(), {}
     # v2 分享中心：作品 → (是否已建链有链接, 是否已推送)
@@ -4899,7 +4919,10 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
         v2_shared: set[str] = set()
         v2_pushed: set[str] = set()
         v2_url_by_key: dict[str, str] = {}
-        for t in db.scalars(select(_SPT)).all():
+        # v2.1.59：只投影四列（work_key / share_url / link_state / status），
+        # 不再全实体化 SCPublishTask（真机 1585 行）。
+        for t in db.execute(select(
+                _SPT.work_key, _SPT.share_url, _SPT.link_state, _SPT.status)):
             wk = str(t.work_key or "")
             if not wk:
                 continue

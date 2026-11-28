@@ -129,12 +129,16 @@ def test_load_tail_awaits_are_guarded():
 def test_boot_has_timeout_gate_and_settles():
     assert "const BOOT_TIMEOUT_MS = 12000" in APP
     assert "function withTimeout(p, ms, label = '加载')" in APP
-    assert "await withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载')" in APP
-    # 落定必须无条件执行（不在 try 里，抛错也要落 true/false）
+    # v2.1.59：不再 await 总闸（那正是「刷新要等几秒」的根因），改为立即放行 +
+    # 总闸只在后台收敛。总闸仍必须存在（防止 load 永不结束把后台任务吊死）。
+    assert "withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载')" in APP
+    assert "await withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载')" not in APP
+    # 落定：有 token 必须先无条件放行到主界面（v2.1.59 先放行，数据后台补）
     seg = APP[APP.index("if (sessionToken.value) {"):]
     seg = seg[:seg.index("sessionPollTimer = setInterval")]
-    assert "if (sessionToken.value) authed.value = true" in seg
-    assert "else authed.value = false" in seg
+    assert "authed.value = true" in seg
+    # token 已被 401 清掉时，api() 的 forceSessionExpired 负责把 authed 落 false
+    assert "authed.value = false" in APP
 
 
 def test_boot_timeout_does_not_log_user_out():
