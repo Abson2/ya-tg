@@ -78,4 +78,4 @@ def test_all_card_buttons_still_present():
 
 
 def test_version_locked_to_current():
-    assert "v2.1.62 · Asia/Shanghai" in APP
+    assert "v2.1.63 · Asia/Shanghai" in APP

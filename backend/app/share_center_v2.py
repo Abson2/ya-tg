@@ -1094,6 +1094,44 @@ def _existing_share_on_dir(db: Session, dir_id: str) -> str:
     return str(url or "")
 
 
+def _existing_work_share_url(db: Session, work_key: str,
+                             exclude_task_id: int = 0) -> str:
+    """同一作品（work_key）任一渠道任务已建过的有效分享链接（v2.1.63）。
+
+    用户口径：一部作品只生成一条分享链接，无论推到频道还是群都复用这一条。
+
+    真机 2026-11-28：439 部作品每部都配 2 个群渠道（chat_id 只有两个），但
+    v2.1.57 的 `_existing_share_on_dir` 只查 `Resource` 表，而作品级建链成功后
+    只写 `task.share_url`、**从不写回 Resource**（git 确认 v2.1.56/57 都没有
+    写回代码）→ 第二条渠道任务查不到同目录已有链接，又新建一条，26 部真出双链。
+
+    这里按**作品维度跨 task** 查，取 id 最小的有效链接（即最早建、已发出去那条）；
+    失效态（cleaned/invalid）一律不复用，与 `reuse_link` 的判据逐字一致。
+    """
+    wk = str(work_key or "").strip()
+    if not wk:
+        return ""
+    try:
+        stmt = (select(SCPublishTask.id, SCPublishTask.share_url,
+                       SCPublishTask.link_state)
+                .where(SCPublishTask.work_key == wk,
+                       SCPublishTask.share_url.isnot(None),
+                       SCPublishTask.share_url != "")
+                .order_by(SCPublishTask.id).limit(64))
+        if exclude_task_id:
+            stmt = stmt.where(SCPublishTask.id != exclude_task_id)
+        rows = db.execute(stmt).all()
+    except Exception:
+        return ""
+    for _tid, url, link_state in rows:
+        if str(link_state or "") in INVALID_LINK_STATES:
+            continue
+        candidate = str(url or "").strip()
+        if candidate:
+            return candidate
+    return ""
+
+
 def _primary_category(resource: Resource) -> tuple[str, str]:
     """资源的主分类键（`genre:<中文名>`）与媒体类型。
 
@@ -4741,10 +4779,24 @@ async def dispatch_ready_tasks(db: Session, limit: int = 20) -> dict[str, int]:
                 released_works.add(wk)
         reuse_link = (str(task.share_url or "").strip()
                       and str(task.link_state or "") not in INVALID_LINK_STATES)
-        if reuse_link:
+        # v2.1.63：一部作品只生成一条分享链接，无论哪个渠道推送都复用这一条。
+        # 同轮两条渠道任务：第一条建链后在这里 commit（见本函数末尾 db.commit()），
+        # 第二条进来时它的 share_url 已在库里，但旧逻辑只认「自己这条 task」的
+        # share_url（`reuse_link`），查不到 → 又建一条（真机 26 部双链）。
+        # 现在自己的链接无效/为空时，先按作品维度跨 task 查同作品已建的有效链接：
+        #   · 查到 → 复用，计入 linked（与 v2.1.57 的 linked 同义：去重）；
+        #   · 查不到 → 才走下面的新建（含 _existing_share_on_dir 的目录级兜底）。
+        work_link = ""
+        if not reuse_link:
+            work_link = _existing_work_share_url(
+                db, str(task.work_key or ""), exclude_task_id=task.id)
+        if reuse_link or work_link:
+            if work_link:
+                task.share_url = work_link
+                task.link_state = "active"
             task.status = "ready"
             task.error = ""
-            stats["reused"] += 1
+            stats["reused" if reuse_link else "linked"] += 1
             db.commit()
         else:
             task.status = "building"
