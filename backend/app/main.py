@@ -1201,7 +1201,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.65", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.66", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1212,7 +1212,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.65", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.66", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -4328,6 +4328,79 @@ async def _post_scan_identify(db: Session, *, publish_after_identify: bool = Tru
     return stats
 
 
+def _revive_archived_with_a_source(db: Session) -> list[str]:
+    """v2.1.66：对账前先把「A 库还有源文件」的归档行复活（去掉归档标记）。
+
+    用户口径（2026-11-28）：归档作品只要每次同步对账时发现 A 库还有文件，就归属为
+    正常作品、去掉归档标记，避免清理遗留后重新入库仍被标记为异常。
+
+    实测现场（线上只读探针 2026-11-28）
+      · 1571 条归档行全部带 A 库回填字段 source_name / source_title / path_hint；
+      · 归档行 source_name 与 mirror_files.file_name（A 源文件名）精确匹配
+        1559/1571 条，且这些 mirror_files 全部 status in (synced, done)
+        且 source_file_id 非空——A 库确实还有该文件；
+      · 21 部作品出现「归档行 + 正常行并存」（B 库重建产生新 fileId，旧归档行留着），
+        但归档 source_name 与正常 name 交集为 0 → 复活不会造成面板重复。
+
+    判据（按用户选的「按 A 源文件精确匹配」）
+      resources.clean_state='cleaned' 且 source_name 精确命中
+      mirror_files.file_name，对应行 status in (synced, done) 且 source_file_id 非空。
+      「作品名粗匹配」不用——会把 A 库已删部分集的行也误复活。
+
+    为什么在归档判定之前跑（不能放之后）
+      归档动作有副作用：取消分享、归档队列、清 share_status。复活只清
+      clean_state/cleaned_at/clean_reason 三个字段，无法撤销那些副作用。
+      故先复活、再把复活行的 file_id 纳入 seen，让它们本轮不被当作「B 库已无」
+      重新归档——B 库缺集由镜像同步链路补，资源库不该把它当删除。
+      A 库源真被删后 mirror_files 会转 failed/清句柄，判据不成立，正常归档闭环。
+
+    性能：一次批量 UPDATE，不逐行实例化 ORM。读归档行必须 include_archived()
+    （db.py 的归档过滤钩子连 Core table 查询也递归覆盖，实测）。
+    只读 A 库事实，不猜、不改 mirror_files、不碰正常行、不物理删除任何行。
+    返回复活行的 file_id 列表（供对账 seen 使用）。
+    """
+    from .models import include_archived
+
+    # 1) 归档行（含 source_name）→ id 映射；必须在 include_archived 下读
+    with include_archived():
+        archived = db.execute(select(
+            Resource.id, Resource.file_id, Resource.source_name
+        ).where(Resource.clean_state == "cleaned",
+                Resource.source_name.isnot(None),
+                Resource.source_name != "")).all()
+    if not archived:
+        return []
+    by_name: dict[str, list[tuple[int, str]]] = {}
+    for rid, fid, sname in archived:
+        by_name.setdefault(str(sname), []).append((int(rid), str(fid)))
+
+    # 2) A 库仍有的源文件名集合（mirror_files 是 A→B 镜像事实，A 源只读）
+    live_names = db.execute(select(MirrorFile.file_name).where(
+        MirrorFile.status.in_(("synced", "done")),
+        MirrorFile.source_file_id.isnot(None),
+        MirrorFile.source_file_id != "")).all()
+    revive_ids: list[int] = []
+    revive_fids: list[str] = []
+    seen_names: set[str] = set()
+    for (fname,) in live_names:
+        name = str(fname or "")
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        for rid, fid in by_name.get(name, []):
+            revive_ids.append(rid)
+            revive_fids.append(fid)
+    if not revive_ids:
+        return []
+
+    # 3) 批量复活：clean_state 归零 + 清归档时间/原因，走 models.revive_archived 同语义
+    db.query(Resource).filter(Resource.id.in_(revive_ids)).update(
+        {Resource.clean_state: "", Resource.cleaned_at: None,
+         Resource.clean_reason: ""}, synchronize_session=False)
+    logger.info("[library] v2.1.66 对账前复活归档行：%s 条（A 库仍有源文件）", len(revive_ids))
+    return revive_fids
+
+
 async def _reconcile_library(db: Session, seen_file_ids: list[str],
                              cancel_shares: bool = True, scan_complete: bool = True,
                              resumed: bool = False, batch_id: int | None = None,
@@ -4381,6 +4454,12 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
         return {"removed": 0, "shares_cancelled": 0, "queue_cleared": 0, "skipped": skipped}
     if empty_ok and not seen:
         logger.info("[library] 用户主动刷新：B 库可信空批次，按实际内容清空资源库面板")
+    # v2.1.66：对账前先复活「A 库仍有源文件」的归档行，并把它们纳入 seen——
+    # 这些行 file_id 是 B 库旧 id（重建后已不存在），若不纳入 seen 会被本轮
+    # 立刻重新归档，白复活。A 库缺集交给镜像同步补，资源库不当删除处理。
+    revived_fids = _revive_archived_with_a_source(db)
+    if revived_fids:
+        seen = seen | set(revived_fids)
     # v2.1.56：**投影查询，不再实例化 ORM**。
     # 实测（tracemalloc，容器内）：单个 Resource ORM 对象 5.14 KiB，2.4 万行一起
     # 加载 = +120.8 MiB。而这里只需要「哪些行没被扫到」这一个判断，归档那一步
@@ -4468,7 +4547,7 @@ async def _reconcile_library(db: Session, seen_file_ids: list[str],
                                  "queue_cleared": q, "empty_seen_allowed": empty_ok,
                                  "archived": True}))
     out = {"removed": len(ids), "shares_cancelled": cancelled, "queue_cleared": q,
-           "archived": True}
+           "archived": True, "revived": len(revived_fids)}
     if empty_ok:
         out["empty_seen_allowed"] = True
     return out

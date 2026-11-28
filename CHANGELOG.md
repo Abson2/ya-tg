@@ -6,6 +6,70 @@
 
 > 文档分工：`README.md` 只讲功能、部署与使用；逐版本的变更与修复细节统一写在这里，不写进 README。
 
+## v2.1.66 (2026-11-28)
+
+> 两件同源问题：**① 已归档作品的 B 库空目录壳删不掉；② 归档行在 A 库还有文件时仍挂着异常标记**。
+> 用户拍板「1+2+3」= 只清「已归档 + B 库实时确认为空」的目录壳 + 手动 dry-run 先行 + 脚本发版；
+> 复活口径选「按 A 源文件精确匹配」+「定时扫描对账时」触发。只新增清理路径与复活步骤，
+> 不动镜像同步、门禁、队列、分享链接、存量数据。
+
+### 一、事故现场（线上只读探针，2026-11-28）
+
+| 项 | 实测 |
+|---|---|
+| 诉讼女王 B 库 | 作品目录 `1973626330418212961` 仍在，下面 `Season 2` **0 文件**（文件已删净，只剩空壳）；A 源对应目录也已空 |
+| 6 个归档目录递归文件数 | MobLand / 缅北-纪录片 / 缅北-剧集 / 诉讼女王 = **0**（真空壳）；完美世界 = **200**、不为人知的故事 = **8**（已归档但 B 库仍有内容，必须跳过） |
+| 归档行并存 | 21 部作品「归档行 + 正常行并存」（如完美世界 284+284，fileId 全不同），因 B 库重建产生新 fileId，旧归档行留着 |
+| 归档行 A 源字段 | 1571 条归档行**全部**带 `source_name`/`source_title`/`path_hint`；`source_name` 精确命中 `mirror_files.file_name`（A 源原名、synced/done、有 source_file_id）**1559 条**；归档 source_name 与正常 name 交集 **0** |
+
+### 二、根因
+
+1. C 类删除 `mirror.py:1148` 只调 `api.delete_files(b_ids)` 删文件；网盘 `delete_file` 虽支持传目录 id
+   （HAR 实证 w.har entry #37 create_dir → #39 delete_file 删 resType=2 目录、status=2 完成），
+   但项目无任何「识别空壳目录 → 删它」的上层动作，且这些作品 `mirror_media=0`、C 类遍历
+   `select(MirrorMedia)` 根本扫不到。
+2. `find_resource_by_file_id` 复活只在**同 fileId** 命中归档行时生效；B 库重建产生新 fileId →
+   INSERT 新行，旧归档行永远留着 `cleaned`，历史/审计视角看是异常遗留。
+
+### 三、收口（本版改动）
+
+**A. B 库空目录壳清理脚本 `scripts/purge_empty_archived_dirs.py`（手动、dry-run 默认）**
+- 候选只来自 `resources` 里 `clean_state='cleaned'` + `clean_reason` 精确匹配的 distinct `share_dir_id`；
+  绝不扫描正常目录、不硬编码线上 id。
+- 「空」判据 = 递归列举整棵子树（≤4 层）后**文件数恰好为 0**；列举失败 / 超深 / 未知 resType 一律 skip。
+  实测反证：完美世界 200 文件、不为人知的故事 8 文件均被自动跳过。
+- 删除后序（子目录先、父目录后），每删一个前**重新列举确认仍为空**（防运行期新写入误删）；
+  删后轮询 taskId=status=2 才算完成；单目录失败只记录继续。
+- `--apply` 才写，`--limit`/`--work`/`--sleep` 可调节；只删网盘目录壳，不改库内归档行（历史保留）。
+
+**B. 对账前复活「A 库仍有源文件」的归档行 `main._revive_archived_with_a_source()`**
+- 判据：归档行 `source_name` 精确命中 `mirror_files.file_name`，且该 mirror_file
+  `status in (synced, done)`、`source_file_id` 非空——A 库确实还有该文件。
+  不用「作品名粗匹配」（会误复活 A 库已删部分集的行）。两类归档原因（手动清理 / 已移除）都复活。
+- 放在 `_reconcile_library` 归档判定**之前**（不能放之后：归档会取消分享、归档队列、清 share_status，
+  复活只清三字段无法撤销副作用）；复活行 file_id 纳入 `seen`，本轮不被当作「B 库已无」重新归档——
+  B 库缺集交给镜像同步补，资源库不当删除。A 库源真删后 mirror_file 转 failed/清句柄，判据不成立，闭环。
+- 批量 UPDATE（1568 行不逐行实例化 ORM），只清 `clean_state/cleaned_at/clean_reason` 三字段；
+  读归档行用 `include_archived()`（归档过滤钩子连 Core table 查询也递归覆盖，实测）。
+- 返回值新增 `revived` 计数。
+
+### 四、验证
+
+- 新增 `tests/test_v2166_purge_empty_dirs.py`（18 项）：判空逻辑（真空壳/有文件/列举失败/未知项/超深）、
+  删前二次确认、后序删除、taskId 轮询、dry-run 零写、非空跳过、精确复活、非 synced 不复活、
+  无标题复活、源码锚点反证。
+- 线上只读预演复活判据：1559 条可复活、file_id 重复风险 0、两类归档原因分布符合预期。
+- 前端 `npm run build` 通过；全量 **2498 passed, 0 failed, 0 error**（分块 ALL_GREEN）。
+
+### 五、边界与回滚
+
+- 空目录清理**只删实时确认 0 文件的目录壳**，从不碰有内容的目录；默认 dry-run，需用户显式 `--apply`。
+- 复活只按 A 源文件精确匹配，不猜、不改 mirror_files、不碰正常行、不物理删除任何行；
+  纯数据标记变更，`--apply` 前建议先在只读探针核对清单。
+- 回滚：`IMAGE_TAG=v2.1.65`（复活是标记变更、脚本独立运行，回滚代码不影响已改数据，但不再自动复活）。
+
+---
+
 ## v2.1.65 (2026-11-28)
 
 > 一件真机问题：**李卫当官推送信息不全——只有标题和文件名，没有海报、TMDB、简介**。

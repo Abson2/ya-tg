@@ -231,6 +231,6 @@ def test_load_sends_critical_first_then_idle():
 
 def test_version_locked_to_current():
     """版本锁跟着当前版本走（本文件其余用例锁的仍是 v2.1.60 的行为）。"""
-    assert 'app = FastAPI(title="Ya-TG", version="2.1.65"' in MAIN
-    assert '"version": "2.1.65"' in MAIN
-    assert "v2.1.65 · Asia/Shanghai" in APP
+    assert 'app = FastAPI(title="Ya-TG", version="2.1.66"' in MAIN
+    assert '"version": "2.1.66"' in MAIN
+    assert "v2.1.66 · Asia/Shanghai" in APP
