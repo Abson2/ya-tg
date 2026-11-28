@@ -6,6 +6,55 @@
 
 > 文档分工：`README.md` 只讲功能、部署与使用；逐版本的变更与修复细节统一写在这里，不写进 README。
 
+## v2.1.65 (2026-11-28)
+
+> 一件真机问题：**李卫当官推送信息不全——只有标题和文件名，没有海报、TMDB、简介**。
+> 用户拍板「两个一起做」：① 代表资源优先选已识别有海报；② 快照 metadata 补 `poster_path` 回填。
+> 只改「挑哪条资源当代表」与「回填哪些字段」，不动门禁、不动队列、不动分享链接。
+
+### 一、事故现场（线上只读探针，2026-11-28）
+
+| 项 | 实测 |
+|---|---|
+| 李卫当官资源 | 62 条全部 `identified`，`poster_path=/48Q7HqaOOrq2SV4BnBNguPzcbh0.jpg`、`tmdb_id=87590`、简介齐全 |
+| 快照 | `sc_library_versions` id 832，`metadata_json.poster_path=""`、title 是文件名、`tmdb_id=null` |
+| 代表资源 | 快照 `resource_ids_json` 第一个 id 10669：`identify_status=unidentified` / `poster_path=""` / `media_title=""` |
+| 全库影响 | 1186 部中 **365 部**代表资源命中这类未识别空壳行，**886 部**快照 meta 无海报，其中 **89 部**组内确有海报可救 |
+
+### 二、根因
+
+1. `_RepResolver.resolve()` 取快照 `resource_ids_json` **第一个存在的 id** 当代表；快照按 file_id 排序，
+   第一条恰是未识别空壳行。`publisher` 按 `res.poster_path` 决定 `sendPhoto` / `sendMessage`，
+   海报空就退化成纯文字，TMDB 与简介也跟着空——数据层明明齐全，推送却是半残。
+2. `recompute_version_metadata()` 的回填字段列表漏了 `poster_path`：识别补出的海报永远进不了
+   快照 `metadata_json`，即使重算也填不回。
+
+### 三、收口（本版改动）
+
+**A. 代表资源优先已识别有海报**
+- 新增 `_pick_representative(rows)`，四级优先：① 已识别 + 有海报 → ② 已识别 → ③ 有海报 →
+  ④ 退回传入顺序第一条（老行为，**绝不返回 None**）。
+- `_RepResolver.resolve()` 快照分支改为一次 `IN` 查询取回全部成员（顺带消除逐条 `db.get` 的 N+1），
+  再按上述优先级挑代表。
+- `_RepResolver._build()` 实时回退分支同样改用该函数，不再盲目取 file_id 最小那条。
+- `rows` 用 `getattr` 读属性，Resource ORM 与 `SimpleNamespace` 通用；不改任何数据、不造版本、不动指纹。
+
+**B. poster_path 回填快照**
+- `recompute_version_metadata()` 字段列表补 `poster_path`，仍守「判不出就不动」：空海报不写、
+  保留旧值，绝不抹掉、绝不猜。
+
+### 四、验证
+
+- 新增 `tests/test_v2165_representative_has_poster.py`（10 项）：四级优先级、快照场景选有海报资源、
+  源码反证、`poster_path` 回填/不造版本/幂等/空海报不抹掉。
+- 前端 `npm run build` 通过；全量 **2480 passed, 0 failed, 0 error**（分块 ALL_GREEN）。
+
+### 五、边界与回滚
+
+- 只改代表资源选择与快照元数据回填，不动门禁、队列、分享链接，不改存量数据。
+- 已发出的半残推送不回溯；存量快照需在下次 metadata 重算时才补回海报（重算入口不变）。
+- 回滚：`IMAGE_TAG=v2.1.64`。
+
 ---
 
 ## v2.1.64 (2026-11-28)

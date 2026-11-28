@@ -1356,8 +1356,11 @@ def recompute_version_metadata(db: Session, *, dry_run: bool = False) -> dict[st
         meta = utils.work_display_meta(members)
         old = _jload(ver.metadata_json, {}) or {}
         new = dict(old)
+        # v2.1.65：补 poster_path——此前漏了它，导致识别回填的海报永远进不了快照
+        # metadata_json（真机 886/1186 部快照无海报）。仍守「判不出就不动」：
+        # 空海报不写，保留旧值，绝不抹掉、绝不猜。
         for field in ("title", "share_dir_id", "share_dir_name",
-                      "media_type", "tmdb_id"):
+                      "media_type", "tmdb_id", "poster_path"):
             val = meta.get(field)
             if field in ("tmdb_id",):
                 if val:
@@ -4366,6 +4369,44 @@ def forecast_schedule(db: Session, *, scan_limit: int = 4000,
         out["notes"].append("未配置发布时段：全天都允许排期。")
     return out
 
+def _pick_representative(rows: list):
+    """v2.1.65：从同一作品的资源行里挑「代表资源」——优先已识别且有海报的那条。
+
+    真机事故（2026-11-28，李卫当官）：快照 resource_ids_json 第一个 id 指向的
+    恰好是未识别空壳行（identify_status=unidentified / poster_path 空 / media_title
+    空），`resolve()` 取它当代表 → publisher 用它的 poster_path 判 sendPhoto/sendMessage，
+    海报空就退化成纯文字，TMDB/简介也全空，用户看到「只有标题和文件名」的半残推送。
+    全库 1186 部里 365 部代表资源命中这类空壳行，其中 89 部组内其实有海报可救。
+
+    选择口径（不改任何数据、不造版本、不动指纹）：
+      ① 已识别 + 有海报  → 最优，直接发 sendPhoto + 完整信息；
+      ② 已识别           → 次优（TMDB 确实无海报时仍要有正确标题/简介）；
+      ③ 有海报           → 再次（未识别但海报是识别副产物，有则优先于空壳）；
+      ④ 以上都没有       → 退回传入顺序第一条（老行为，绝不返回 None）。
+    rows 用 getattr 读属性，Resource ORM 与 SimpleNamespace 都能用。
+    """
+    rows = list(rows or [])
+    if not rows:
+        return None
+
+    def _identified(r):
+        return str(getattr(r, "identify_status", "") or "").strip() == "identified"
+
+    def _has_poster(r):
+        return bool(str(getattr(r, "poster_path", "") or "").strip())
+
+    for r in rows:
+        if _identified(r) and _has_poster(r):
+            return r
+    for r in rows:
+        if _identified(r):
+            return r
+    for r in rows:
+        if _has_poster(r):
+            return r
+    return rows[0]
+
+
 class _RepResolver:
     """发布任务的代表资源解析器（v2.1.1）。
 
@@ -4389,7 +4430,9 @@ class _RepResolver:
         for wk, rows in grouped.items():
             ordered = sorted(rows, key=lambda r: (str(r.file_id or ""), int(r.size or 0), int(r.utime or 0)))
             if ordered:
-                table[wk] = ordered[0]
+                # v2.1.65：实时回退也优先「已识别+有海报」，不再盲目取 file_id 最小
+                # 那条（它可能正是未识别空壳行，导致推送无海报/TMDB/简介）。
+                table[wk] = _pick_representative(ordered)
         self._by_key = table
         self._members = grouped
 
@@ -4419,20 +4462,32 @@ class _RepResolver:
         return [rep] if rep is not None else []
 
     def resolve(self, lv: SCLibraryVersion) -> tuple[Resource | None, str]:
-        """返回 (代表资源, 失败原因)。失败原因为空表示解析成功。"""
-        for rid in _jload(lv.resource_ids_json, []) or []:
+        """返回 (代表资源, 失败原因)。失败原因为空表示解析成功。
+
+        v2.1.65：快照 id 命中的资源**不再取第一个存在的**，而是一次查出全部，
+        优先挑「已识别+有海报」那条（见 `_pick_representative`）。病根：快照
+        按 file_id 排序，第一条常是未识别空壳行（李卫当官 id 10669）， publisher
+        按它的空 poster_path 退化成纯文字推送，用户看到无海报/无 TMDB/无简介。
+        快照 id 全失效时仍退回实时分组（也已改为优先有海报）。
+        """
+        rids = _jload(lv.resource_ids_json, []) or []
+        if rids:
+            # 一次查询取回快照全部成员（避免逐条 db.get 的 N+1），再按优先级挑代表。
             try:
-                res = self.db.get(Resource, int(rid))
+                ids = [int(r) for r in rids]
             except (TypeError, ValueError):
-                res = None
-            if res is not None:
-                return res, ""
+                ids = []
+            if ids:
+                rows = list(self.db.scalars(
+                    select(Resource).where(Resource.id.in_(ids))).all())
+                if rows:
+                    return _pick_representative(rows), ""
         if self._by_key is None:
             self._build()
         live = (self._by_key or {}).get(str(lv.work_key or ""))
         if live is not None:
             return live, ""
-        if _jload(lv.resource_ids_json, []) or []:
+        if rids:
             return None, "作品资源已从资源库移除（快照资源失效且实时无匹配）"
         return None, "资源版本快照缺少资源 id"
 
