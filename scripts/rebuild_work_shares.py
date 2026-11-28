@@ -135,11 +135,17 @@ def build_plan(db, members_by_key: dict) -> list[dict]:
     return plan
 
 
-def decide(plan: list[dict], verdicts: dict) -> list[dict]:
+def decide(plan: list[dict], verdicts: dict, rename: bool = False) -> list[dict]:
     """把探测结果折成动作：留一条作品级 / 新建一条。
 
-    `verdicts[url] = (verdict, 根目录那一项的名字)`。名字用来判断**要不要改名**：
-    已经是作品目录、标题也已经是作品名的分享，连 `update` 都不用调，省一次写接口。
+    `verdicts[url] = (verdict, 根目录那一项的名字)`。
+
+    改名默认**不做**（`rename=False`）。原因：分享根目录那一项是**目录名**
+    （`仙·逆 (2023) {tmdb-223911}`），跟作品展示名（`仙逆`）天生不同，
+    拿它来判断「标题要不要改」永远为真，会把全库分享都 update 一遍——
+    而 update 会顺带把有效期刷成当前配置，等于给 300 多条分享做无谓的写操作。
+    现在这批分享本来就是脚本按作品名建的，标题已经对；确实要统一改名的场合
+    显式加 `--rename`。
     """
     for item in plan:
         if item["action"] != "probe":
@@ -153,7 +159,7 @@ def decide(plan: list[dict], verdicts: dict) -> list[dict]:
         item["keep"] = keep
         item["keep_name"] = keep_name
         item["drop"] = [u for u, _, _ in vs if u != keep] if keep else [u for u, _, _ in vs]
-        item["rename"] = bool(keep) and keep_name.strip() != str(item["title"]).strip()
+        item["rename"] = bool(keep) and bool(rename)
         item["verdicts"] = [v for _, v, _ in vs]
         item["action"] = "keep" if keep else "create"
     return plan
@@ -291,7 +297,7 @@ async def run(args) -> int:
                 for u in item["urls"]:
                     verdicts[u] = await prober(u)
                     await asyncio.sleep(0.6)
-            decide(todo, verdicts)
+            decide(todo, verdicts, rename=args.rename)
 
         keep = [i for i in todo if i["action"] == "keep"]
         create = [i for i in todo if i["action"] == "create"]
@@ -305,8 +311,8 @@ async def run(args) -> int:
         if undecided:
             print(f"作品数：{len(todo)}｜未探测（--skip-probe，只列目录与标题）{len(undecided)}")
         else:
-            print(f"判定：作品级可留 {len(keep)}（其中已合规、无需改动 {len(noop)}）｜"
-                  f"需要新建 {len(create)}｜待删旧链 {drop}")
+            print(f"判定：作品级可留 {len(keep)}｜需要新建 {len(create)}｜待删旧链 {drop}"
+                  f"｜改名 {len(keep) - len(noop)}")
             print(f"　　　分享体检：作品级 {stat['work_level']}｜单集/多项 {stat['other']}｜"
                   f"内容不可读 {stat['empty']}｜已失效 {stat['dead']}")
         for i in todo[:8]:
@@ -335,6 +341,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 部作品")
     ap.add_argument("--skip-probe", action="store_true",
                     help="不探测网盘，只列「作品→目录→名字」（快，只看计划用）")
+    ap.add_argument("--rename", action="store_true",
+                    help="把保留下来的分享标题统一改成作品名（默认不改：现有分享标题已经是作品名，"
+                         "update 会顺带刷新有效期，属无谓写操作）")
     ap.add_argument("--work", type=str, default="",
                     help="只处理这些作品（逗号分隔的 work_key，可省略 work: 前缀）")
     return asyncio.run(run(ap.parse_args()))

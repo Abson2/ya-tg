@@ -57,13 +57,18 @@ def test_decide_keeps_the_work_level_share():
     assert plan[0]["action"] == "keep"
     assert plan[0]["keep"] == URL_B
     assert plan[0]["drop"] == [URL_A]
-    assert plan[0]["rename"] is False      # 名字已是作品名 → 不调 update
+    assert plan[0]["rename"] is False      # 默认不改名 → 不调 update
 
 
-def test_decide_renames_when_title_differs():
+def test_decide_renames_only_when_asked():
+    """分享根目录那一项是**目录名**（带 tmdb 后缀），拿它跟作品名比永远不等，
+    所以改名必须是显式开关，不能靠名字比较自动触发（否则全库分享被 update 一遍）。"""
     plan = [_item([URL_A])]
-    RWS.decide(plan, {URL_A: ("work_level", "某剧·第一季·第01集")})
-    assert plan[0]["action"] == "keep" and plan[0]["rename"] is True
+    RWS.decide(plan, {URL_A: ("work_level", "某·剧 (2024) {tmdb-1}")})
+    assert plan[0]["rename"] is False
+    plan = [_item([URL_A])]
+    RWS.decide(plan, {URL_A: ("work_level", "某·剧 (2024) {tmdb-1}")}, rename=True)
+    assert plan[0]["rename"] is True
 
 
 def test_decide_creates_when_nothing_is_work_level():
