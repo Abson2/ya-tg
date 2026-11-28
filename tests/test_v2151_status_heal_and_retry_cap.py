@@ -289,9 +289,10 @@ def test_default_key_registered():
 
 
 def _pending_media(db, rule, i, *, status="pending", attempts=0):
+    # v2.1.64：唯一身份 (rule_id, source_dir_id)，循环里每条必须不同源目录 id。
     m = MirrorMedia(rule_id=rule.id, work_key=f"work:待重试{i}", title_standard=f"待重试{i}",
-                    media_type="tv", source_dir_id=A_WORK, target_dir_id=B_WORK,
-                    status="failed")
+                    media_type="tv", source_dir_id=f"{A_WORK}-{i}",
+                    target_dir_id=f"{B_WORK}-{i}", status="failed")
     db.add(m)
     db.commit()
     db.add(MirrorFile(rule_id=rule.id, media_id=m.id, identity=f"i{i}",

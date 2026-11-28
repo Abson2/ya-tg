@@ -8,6 +8,77 @@
 
 ---
 
+## v2.1.64 (2026-11-28)
+
+> 真机三项排查的治本与优化：**① 37 部同名重拍剧永远镜像不上；② 被删作品 B 库目录残留；
+> ③ 运行内存稳态偏高**。用户拍板「镜像源目录身份治本」+「纳入镜像覆盖」+「不影响性能的内存优化」。
+> 全局 `work_key` 语义不动（推送/分享/排期照旧共用），只改镜像层的作品身份。
+
+### 一、事故现场（线上只读探针，2026-11-28）
+
+| 项 | 实测 |
+|---|---|
+| A 库作品 / 已映射 / 未镜像 | 718 / 681 / **37** |
+| 37 部成因 | 全是同名重拍剧（英雄 2001/2002、倚天屠龙记多版）——`normalize_work_name` 剥掉年份/TMDB 后撞同一个 `work:xxx`，被唯一约束 `uq_mirror_rule_work(rule_id, work_key)` 吞掉后到的版本 |
+| 被删作品 B 库残留 | 诉讼女王等 B 库有目录、`resources` 有文件，但 `mirror_media=0`，C 类删除只扫有映射行的作品 → 扫不到 |
+| 镜像几小时无复制 | 非缺陷：681 media / 24021 files 全 `synced`、930 tasks 全 `done`，跑的是核对/识别/推送 |
+| 内存（PID 1 uvicorn） | VmRSS ≈ 499–508 MiB、VmHWM ≈ 550–565 MiB，稳态非尖峰；多处 `select(Resource)` 全实体加载 24k 行（含 overview 等大 Text） |
+
+### 二、根因
+
+1. 镜像层作品身份误用全局 `work_key`：重拍剧归一后同键，唯一约束让第二版永远建不进映射，
+   选批/去重又都按 work_key 判「已镜像」→ 37 部反复被当成已处理、排不上。
+2. 幽灵目录（B 库有、无映射）不在 C 类删除的 `all_medias` 循环里，full 镜像也清不掉。
+3. 推送链路 `_push_gate_passed` / `_enqueue_ready` 每次按作品圈成员都 `select(Resource)` 全实体
+   加载 24k 行；实测 24k 行全实体峰值 116.9 MiB、投影仅 24.6 MiB（省 79%）。
+
+### 三、收口（本版改动）
+
+**A. 镜像身份治本（全局 work_key 不动）**
+- `MirrorMedia` 唯一身份从 `(rule_id, work_key)` 改为 `(rule_id, source_dir_id)`：
+  A 源目录 fileId 才是作品真实身份；`work_key` 照旧写规范键供全局共用。
+- `sync_rule` 建映射查重锚点 `work_key` → `source_dir_id`（同名重拍剧各自建映射）。
+- `plan_work_batch` 新增可选 `mapped_source_ids`：判「是否已镜像」按 source_dir_id，
+  **游标仍用 work_key 持久化**（语义不动），传 None 时旧版行为零变化。
+- `run_queue` 三段去重锚点 work_key → source_dir_id（同名版本不再互相跳过整部）。
+- `unmapped_total` / `new_works` 统计口径同步改为 source_dir_id。
+
+**B. 幽灵目录纳入覆盖**
+- 未镜像作品按 source_dir_id 判「未镜像优先」，A 源还有文件的幽灵目录在轮到时补建
+  `MirrorMedia` 纳入正常镜像管理，随之可被 C 类对账与后续同步覆盖。
+
+**C. 内存优化（判据零变化）**
+- 推送链路两处高频全实体加载改列投影 + `SimpleNamespace`（与 v2.1.59 library/series 同范式）：
+  `_RESOURCE_LIGHT_COLS` 只含 work_group_key / 门禁三项 / 镜像兜底实际读到的列；大 Text 字段不进投影。
+- SQLite 两个连接池统一加 `PRAGMA cache_size=-8192`（8 MiB 页缓存，默认仅 2 MiB）。
+
+**D. 旧库迁移（一次性、幂等、防御）**
+- `migrate()` 在 ALTER 补列之后、任何同步之前调 `_migrate_mirror_media_unique_by_source()`：
+  检测旧唯一约束才重建 `mirror_media` 表（`CREATE 新表 → INSERT SELECT → DROP → RENAME`），
+  保留 id（子表 `mirror_files.media_id` 引用不变）与两个普通索引。
+- 已是新约束 → 返回 0 不动；`source_dir_id` 有重复 → 记 error 跳过、绝不猜/改存量；
+  异常整笔回滚、旧表原样保留、不阻断启动。
+
+### 四、验证
+
+- 新增 `tests/test_v2164_mirror_identity_by_source.py`（16 项）：迁移旧→新/幂等/重复守卫/子表保留/
+  同名共存、模型约束、选批身份、源码锚点反证、投影判据列完整、cache_size、迁移顺序。
+- 适配 6 个老测试夹具（MirrorMedia 补唯一 source_dir_id，测试意图不变）。
+- tracemalloc 实测 24k 行：全实体 116.9 MiB → 投影 24.6 MiB（-79%）。
+- 前端 `npm run build` 通过；全量 **2470 passed, 0 failed, 0 error**（分块 ALL_GREEN）。
+
+### 五、边界与回滚
+
+- **存量 26 部双分享链接**：按用户决定仍不处理（v2.1.63 口径）。
+- **A 源已删除、B 库残留、且无任何映射行的幽灵目录**：本次身份治本覆盖不到（无映射行可改），
+  如需清理须单独做「B 库目录树扫描比对」并真删 B 库文件，属写操作，未在本版擅自加入。
+- 迁移若因重复 source_dir_id 跳过：日志会打 `[db] mirror_media 存在重复 ...`，此时 37 部问题不解决，
+  需人工核实重复行后再启动；服务本身不受影响。
+- 回滚：`IMAGE_TAG=v2.1.63`（库表已重建为 source_dir_id 唯一约束，回滚到旧版代码会按 work_key 查映射，
+  重拍剧仍各自有映射行、不会数据丢失；但旧版不会再用 source_dir_id 身份）。
+
+---
+
 ## v2.1.63 (2026-11-28)
 
 > 一件真机问题：**同一部作品被建了两条分享链接**（网盘「我的分享」里同剧两条）。

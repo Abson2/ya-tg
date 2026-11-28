@@ -525,7 +525,13 @@ class MirrorMedia(Base):
     status: Mapped[str] = mapped_column(String(24), default="pending")     # pending/syncing/synced/blocked/failed
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    __table_args__ = (UniqueConstraint("rule_id", "work_key", name="uq_mirror_rule_work"),)
+    # v2.1.64：唯一身份从 (rule_id, work_key) 改为 (rule_id, source_dir_id)。
+    # 病根：work_key 归一化剥掉年份/TMDB → 英雄(2001)/(2002)、倚天屠龙记多版
+    # 撞同一个 work:英雄 / work:倚天屠龙记，唯一约束让后到的版本永远建不进映射
+    # （线上 37 部未镜像全是这类重拍剧）。A 源目录 id 才是作品的真实身份，
+    # work_key 保留规范名供全局（推送/分享/排期）共用，不改其语义。
+    __table_args__ = (UniqueConstraint("rule_id", "source_dir_id",
+                                       name="uq_mirror_rule_source"),)
 
 
 class MirrorFile(Base):

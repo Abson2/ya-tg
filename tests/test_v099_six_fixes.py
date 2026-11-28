@@ -173,10 +173,13 @@ def test_media_clear_includes_synced_without_files(session):
     r = MirrorRule(name="r", source_root_id="A", target_root_id="B", enabled=True)
     session.add(r); session.flush()
     # synced 状态但没有任何文件 = 历史遗留僵尸行，应可清理
-    m = MirrorMedia(rule_id=r.id, work_key="wk:zombie", title_standard="僵尸剧", status="synced")
+    # v2.1.64：MirrorMedia 唯一身份为 (rule_id, source_dir_id)，夹具给各自源目录 id。
+    m = MirrorMedia(rule_id=r.id, work_key="wk:zombie", title_standard="僵尸剧",
+                    source_dir_id="A-zombie", status="synced")
     session.add(m); session.flush()
     # pending 进行中 = 不能清理
-    m2 = MirrorMedia(rule_id=r.id, work_key="wk:running", title_standard="进行中", status="pending")
+    m2 = MirrorMedia(rule_id=r.id, work_key="wk:running", title_standard="进行中",
+                     source_dir_id="A-running", status="pending")
     session.add(m2); session.flush()
     invalid = main._invalid_media_rows(session)
     ids = {x.id for x in invalid}

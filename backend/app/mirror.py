@@ -750,7 +750,8 @@ def detect_increments(db: Session, rule: MirrorRule, works: list,
 
 def plan_work_batch(works: list, max_works: int, cursor: str = "",
                     hard_max: int = 100,
-                    mapped_keys: set[str] | None = None) -> tuple[list, str, bool]:
+                    mapped_keys: set[str] | None = None,
+                    mapped_source_ids: set[str] | None = None) -> tuple[list, str, bool]:
     """v0.9.0：把一次镜像要处理的作品按「单轮上限 + 轮转游标」切成一批。
 
     - max_works<=0：不限量，返回全部（仍受 hard_max 防御性上限约束，保持旧行为）。
@@ -778,6 +779,11 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
       - 注：**已镜像作品的作品内变化（增量）不在本函数范围内**——它们由 sync_rule
         的 `incr_works` 排在队首优先处理，且**不占本轮名额**（见 sync_rule 注释）。
       - 传 None（默认）时**完全保持 v0.9.0 旧语义**，其他调用点零影响。
+
+    v2.1.64：`mapped_source_ids`（已镜像作品的 A 源目录 id 集合）优先于
+    `mapped_keys` 作为「是否已镜像」的判据。病根：同名重拍剧（英雄 2001/2002）
+    共用 work_key，若按 work_key 判，后到的版本永远被当成已镜像而排不上；
+    source_dir_id 才是作品真实身份。传 None 时行为与旧版完全一致。
     """
     if not works:
         return [], "", False
@@ -785,6 +791,16 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
         # 不限量（配置为 0）：沿用旧行为，一次给到 hard_max 防御上限
         return works[:hard_max], "", False
     keys = [work_key_of(w) for w, _ in works]
+    # v2.1.64：判「是否已镜像」的身份键可与游标键分离。
+    # 游标仍用 work_key（持久化在 rule.works_cursor，语义不动）；
+    # 身份用 source_dir_id（node["id"]，A 源目录 fileId）——同名重拍剧
+    # 共用 work_key，若按 work_key 判会把后到的版本误判为已镜像、永远排不上。
+    # mapped_source_ids 传 None 时 identity==keys，旧版行为零变化。
+    if mapped_source_ids is not None:
+        identity = [str((w or {}).get("id") or "") for w, _ in works]
+        mapped_keys = mapped_source_ids
+    else:
+        identity = keys
     n = len(keys)
     start = 0
     if cursor:
@@ -805,7 +821,7 @@ def plan_work_batch(works: list, max_works: int, cursor: str = "",
         return batch, new_cursor, wrapped
     # ---- v2.1.44：游标之后未镜像优先，取不满用已镜像存量补位，名额不变 ----
     ring = list(range(start, n)) + list(range(0, start))
-    picked: list[int] = [i for i in ring if keys[i] not in mapped_keys][:max_works]
+    picked: list[int] = [i for i in ring if identity[i] not in mapped_keys][:max_works]
     if len(picked) < max_works:
         _got = set(picked)
         for i in ring:
@@ -2392,6 +2408,13 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # **未镜像优先**取批——名额仍严格等于 max_works（不另开旁路批），
     # 游标仍只有一个字段、每轮接着上一轮的位置往后走。
     try:
+        # v2.1.64：身份判据改按 source_dir_id（A 源目录 id 才是作品真实身份）。
+        # 同名重拍剧（英雄 2001/2002）共用 work_key，按 work_key 判会让后到的
+        # 版本永远被当成已镜像、排不上；按 source_dir_id 才能各自独立建映射。
+        mapped_source_ids = {str(s or "") for (s,) in db.execute(
+            select(MirrorMedia.source_dir_id).where(
+                MirrorMedia.rule_id == rule.id)).all() if str(s or "").strip()}
+        # work_key 集合仍保留，供「待重试作品优先」等按 work_key 归集的路径使用。
         mapped_keys = {str(k or "") for (k,) in db.execute(
             select(MirrorMedia.work_key).where(
                 MirrorMedia.rule_id == rule.id)).all()}
@@ -2403,9 +2426,11 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
         # 本轮退回 v0.9.0 纯游标轮转口径，保证故障时不产生重复复制风暴。
         logger.warning("[mirror] 已镜像作品清单查询失败（本轮退回纯游标轮转）：%s", exc)
         mapped_keys = None
+        mapped_source_ids = None
     stats["unmapped_total"] = (
-        sum(1 for p in works if work_key_of(p[0]) not in mapped_keys)
-        if mapped_keys is not None else 0)
+        sum(1 for p in works if str((p[0] or {}).get("id") or "")
+            not in mapped_source_ids)
+        if mapped_source_ids is not None else 0)
     # 镜像1.1：单轮开始三方对比预扫描（A树/B树/映射清单查漏补缺）。
     # reprocess_keys（B类整部失效）重排到 works 前部、占本批部数名额；
     # missing_keys（A类单文件缺集）抽成不占 max_works 的优先补丁批次，本轮先补齐
@@ -2443,15 +2468,17 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     if max_works > 0:
         batch, new_cursor, wrapped = plan_work_batch(
             works, max_works, str(getattr(rule, "works_cursor", "") or ""),
-            hard_max=max_media, mapped_keys=mapped_keys)
+            hard_max=max_media, mapped_keys=mapped_keys,
+            mapped_source_ids=mapped_source_ids)
     else:
         batch, new_cursor, wrapped = works[:max_media], "", False
     # 本轮批里有多少部是「从未镜像过」的（回显 & 余量统计用）
-    if mapped_keys is None:
+    if mapped_source_ids is None:
         stats["new_works"] = 0
         stats["new_works_left"] = 0
     else:
-        _n_new = sum(1 for p in batch if work_key_of(p[0]) not in mapped_keys)
+        _n_new = sum(1 for p in batch if str((p[0] or {}).get("id") or "")
+                     not in mapped_source_ids)
         stats["new_works"] = _n_new
         stats["new_works_left"] = max(0, int(stats.get("unmapped_total") or 0) - _n_new)
     # v2.1.9：待重试作品优先——有 pending / failed 文件待复制的作品，
@@ -2515,12 +2542,15 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
     # 三段之间用 seen 去重：同一部作品绝不允许在一轮里被处理两次
     #（A 侧新增集 + B 侧缺集 + 新作品完全可能同时命中同一部剧）。
     run_queue: list = []
+    # v2.1.64：三段去重锚点从 work_key 改为 source_dir_id——同名重拍剧共用
+    # work_key，按 work_key 去重会把后到的版本整部跳过（37 部未镜像的成因之一）。
+    # 同一部作品在三段里 source_dir_id 恒等，原「不处理两次」语义不变。
     _seen_wk: set[str] = set()
     for _pair in incr_works + priority_works + batch:
-        _wk = work_key_of(_pair[0])
-        if _wk in _seen_wk:
+        _ident = str((_pair[0] or {}).get("id") or "") or work_key_of(_pair[0])
+        if _ident in _seen_wk:
             continue
-        _seen_wk.add(_wk)
+        _seen_wk.add(_ident)
         run_queue.append(_pair)
     stats["queue_size"] = len(run_queue)
     for work, cats in run_queue:
@@ -2560,8 +2590,14 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
                     # v0.8.3：降级为不带标记名称时，展示与实际网盘目录保持一致
                     expected = actual
 
+            # v2.1.64（镜像源目录身份治本）：查重锚点从 work_key 改为 source_dir_id。
+            # 病根：normalize_work_name 剥掉年份/TMDB → 英雄(2001)/(2002)、
+            # 倚天屠龙记多版撞同一个 work:xxx，唯一约束让后到的版本永远建不进映射
+            # （线上 37 部未镜像全是这类重拍剧）。A 源目录 id 才是作品真实身份。
+            # work_key 照旧写规范键（推送/分享/排期全局共用，语义不变）。
             media = db.scalar(select(MirrorMedia).where(
-                MirrorMedia.rule_id == rule.id, MirrorMedia.work_key == wkey))
+                MirrorMedia.rule_id == rule.id,
+                MirrorMedia.source_dir_id == str(work["id"])))
             if not media:
                 media = MirrorMedia(rule_id=rule.id, work_key=wkey, title_standard=title,
                                     title_mirror=expected, source_dir_id=work["id"],
@@ -2572,7 +2608,9 @@ async def sync_rule(db: Session, rule: MirrorRule, *, max_polls: int = 8,
             else:
                 media.title_standard = title
                 media.title_mirror = expected
-                media.source_dir_id = work["id"]
+                # source_dir_id 是身份键，命中即相等，不再改写；
+                # work_key 仍每轮刷新为最新规范名（全局口径不变）。
+                media.work_key = wkey
                 media.category_path = cat_path
                 if target_dir_id and not missing_all:
                     media.target_dir_id = target_dir_id

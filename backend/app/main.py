@@ -1201,7 +1201,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.63", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.64", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1212,7 +1212,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.63", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.64", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -5581,6 +5581,30 @@ def _work_key(x: Resource) -> str:
     return _series_group_key(x)
 
 
+# v2.1.64（内存优化，判据零变化）：推送链路上「按作品键圈定成员」只需要固定几列，
+# 不能再 `select(Resource)` 全实体——24k 行 × 单实体约 5 KiB（含 overview/genres/
+# dir_chain_json 等大 Text）→ 一次扫描峰值 +120 MiB。与 v2.1.59 library/series
+# 投影范式一致：列投影 + SimpleNamespace，属性名与 ORM 一致，下游 getattr 零改动。
+# 投影列 = work_group_key / _member_items / find_mirror_media 实际读到的全部字段，
+# 少一列会静默取默认值导致分组或门禁错判，故逐一对应、不得裁剪。
+_RESOURCE_LIGHT_COLS = (
+    Resource.id, Resource.file_id, Resource.path_hint, Resource.share_dir_name,
+    Resource.media_title, Resource.original_title, Resource.media_type,
+    Resource.tmdb_id, Resource.identify_status, Resource.poster_path,
+)
+
+
+def _resource_light_rows(db: Session) -> list:
+    """轻量读取全部资源行（只含判据列），返回 SimpleNamespace 列表。
+
+    严禁在此加 overview / genres / origin_country / dir_chain_json 等大 Text 列——
+    这些字段推送门禁与作品分组都不读，加回来就是把内存峰值再顶回去。
+    """
+    from types import SimpleNamespace
+    stmt = select(*_RESOURCE_LIGHT_COLS)
+    return [SimpleNamespace(**dict(r._mapping)) for r in db.execute(stmt)]
+
+
 def _push_gate_passed(db: Session, x: Resource) -> bool:
     """推送门禁判定（旧链入队用）。True = 五项前置条件全部满足。
 
@@ -5592,7 +5616,8 @@ def _push_gate_passed(db: Session, x: Resource) -> bool:
     """
     from .push_gate import evaluate_push_gate
     key = _work_key(x)
-    members = [s for s in db.scalars(select(Resource)).all() if _work_key(s) == key]
+    # v2.1.64：投影化——成员判定只读固定列，不再全实体加载 24k 行。
+    members = [s for s in _resource_light_rows(db) if _work_key(s) == key]
     if not members:
         members = [x]
     gate = evaluate_push_gate(db, key, members)
@@ -5632,7 +5657,8 @@ def _enqueue_ready(db: Session, x: Resource, rule: Rule) -> bool:
     if not ch or not ch.enabled or not bot or not bot.enabled:
         return False  # 停用的频道/Bot 不入队，启用后由回溯补齐
     # 同一作品（含自身与所有兄弟单集）在该频道已有任意队列项就不再入队
-    all_members = [s.id for s in db.scalars(select(Resource)).all()
+    # v2.1.64：投影化——入队去重只要 id + 作品键列，不再全实体加载 24k 行。
+    all_members = [s.id for s in _resource_light_rows(db)
                    if _work_key(s) == _work_key(x)]
     exists = db.scalar(select(QueueItem).where(
         QueueItem.resource_id.in_(all_members),

@@ -134,8 +134,11 @@ def test_scan_async_rejects_bad_mode(db):
 def test_prune_missing_media_deletes_verified_empty(db):
     r = MirrorRule(name="r", source_root_id="A", target_root_id="B", enabled=True)
     db.add(r); db.flush()
-    gone = MirrorMedia(rule_id=r.id, work_key="wk-gone", title_standard="已删剧", status="synced")
-    alive = MirrorMedia(rule_id=r.id, work_key="wk-alive", title_standard="仍在剧", status="synced")
+    # v2.1.64：MirrorMedia 唯一身份为 (rule_id, source_dir_id)，夹具给各自源目录 id。
+    gone = MirrorMedia(rule_id=r.id, work_key="wk-gone", title_standard="已删剧",
+                       source_dir_id="A-gone", status="synced")
+    alive = MirrorMedia(rule_id=r.id, work_key="wk-alive", title_standard="仍在剧",
+                        source_dir_id="A-alive", status="synced")
     db.add_all([gone, alive]); db.flush()
     db.add(MirrorFile(media_id=gone.id, rule_id=r.id, file_name="g.mkv", status="synced"))
     db.add(MirrorFile(media_id=alive.id, rule_id=r.id, file_name="a.mkv", status="synced"))

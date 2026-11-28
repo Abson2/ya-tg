@@ -94,9 +94,11 @@ def _media(db, rule, *, work="work:测试剧", title="测试剧", english_source
     要作用的目标状态。需要 ignored 语义时由调用方显式传 english_source="ignored"。
     """
     from app.models import MirrorMedia
+    # v2.1.64：唯一身份 (rule_id, source_dir_id)，按 work 给各自源目录 id，
+    # 否则同 rule 多条映射夹具会撞唯一约束。
     m = MirrorMedia(rule_id=rule.id, work_key=work, title_standard=title,
                     title_mirror=title, media_type="tv",
-                    source_dir_id="s1", target_dir_id="t1",
+                    source_dir_id=work, target_dir_id="t1",
                     english_title=english_title, english_source=english_source)
     db.add(m)
     db.commit()

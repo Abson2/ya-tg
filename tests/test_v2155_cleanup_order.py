@@ -60,8 +60,9 @@ def _rule(db) -> MirrorRule:
 
 def _media(db, rule, title, *, status="failed", n_synced=0, n_failed=0) -> int:
     """造一部映射。`n_synced` 是已同步文件行数，`n_failed` 是失败文件行数。"""
+    # v2.1.64：唯一身份 (rule_id, source_dir_id)，按 title 给各自源目录 id。
     m = MirrorMedia(rule_id=rule.id, work_key=f"work:{title}", title_standard=title,
-                    status=status, target_dir_id="B-dir-1")
+                    status=status, source_dir_id=f"A-dir-{title}", target_dir_id="B-dir-1")
     db.add(m)
     db.flush()
     for i in range(n_synced):

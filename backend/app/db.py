@@ -55,7 +55,11 @@ if _IS_SQLITE:
         """
         for pragma in ("PRAGMA busy_timeout=30000",
                        "PRAGMA synchronous=NORMAL",
-                       "PRAGMA journal_mode=WAL"):
+                       "PRAGMA journal_mode=WAL",
+                       # v2.1.64：显式页缓存 8 MiB（负值 = KiB）。默认仅 2 MiB，
+                       # 24k 行资源表反复扫描时页频繁换入换出；8 MiB 常驻换少量
+                       # SQLite 侧内存换更少的磁盘读，不碰任何业务判据。
+                       "PRAGMA cache_size=-8192"):
             try:
                 cur = dbapi_conn.cursor()
                 cur.execute(pragma)
@@ -877,6 +881,92 @@ def _backfill_first_seen(db) -> int:
     return changed
 
 
+def _rebuild_mirror_media_unique(conn) -> int:
+    """v2.1.64（纯函数，供迁移与测试共用）：把 mirror_media 的表级唯一约束
+    从 (rule_id, work_key) 重建为 (rule_id, source_dir_id)。
+
+    幂等：已是新约束 → 返回 0 不动；形态异常 → 记 error 返回 0 不动。
+    防御：source_dir_id 有重复（新约束建不起来）→ 记 error 返回 0 不动，
+    绝不编造/篡改存量数据。调用方用 engine.begin() 包住，任何异常整笔回滚。
+    返回迁移行数；子表 mirror_files.media_id 引用原 id，重建时保留 id 不变。
+    """
+    names = {r[0] for r in conn.execute(text(
+        "SELECT name FROM sqlite_master WHERE type='table'")).all()}
+    if "mirror_media" not in names:
+        return 0
+    # 找到表级 UNIQUE 约束（origin='u'）的列组合；普通 CREATE INDEX 是 'c'，跳过。
+    old_cols: set[str] = set()
+    for r in conn.execute(text("PRAGMA index_list(mirror_media)")).all():
+        iname, uniq, origin = r[1], r[2], r[3]
+        if not uniq or origin != "u":
+            continue
+        old_cols = {ir[2] for ir in conn.execute(
+            text(f'PRAGMA index_info("{iname}")')).all()}
+        break
+    if old_cols == {"rule_id", "source_dir_id"}:
+        return 0  # 已迁移（全新库由 create_all 直接建的新约束也走这里）
+    if old_cols != {"rule_id", "work_key"}:
+        logger.error("[db] mirror_media 唯一约束形态异常 %s，跳过迁移（旧表保留）", old_cols)
+        return 0
+    dup = conn.execute(text(
+        "SELECT rule_id, source_dir_id, COUNT(*) FROM mirror_media "
+        "GROUP BY rule_id, source_dir_id HAVING COUNT(*) > 1 LIMIT 5")).all()
+    if dup:
+        logger.error(
+            "[db] mirror_media 存在重复 (rule_id, source_dir_id) %s，跳过迁移；"
+            "需人工清理后再启动（绝不猜/改存量数据）", dup)
+        return 0
+    total = int(conn.execute(text("SELECT COUNT(*) FROM mirror_media")).scalar() or 0)
+    conn.execute(text("""
+        CREATE TABLE mirror_media_new (
+            id INTEGER NOT NULL PRIMARY KEY,
+            rule_id INTEGER NOT NULL,
+            work_key VARCHAR(256) DEFAULT '' NOT NULL,
+            title_standard VARCHAR(512) DEFAULT '' NOT NULL,
+            title_mirror VARCHAR(512) DEFAULT '' NOT NULL,
+            tmdb_id INTEGER,
+            media_type VARCHAR(16) DEFAULT '' NOT NULL,
+            source_dir_id VARCHAR(64) DEFAULT '' NOT NULL,
+            target_dir_id VARCHAR(64) DEFAULT '' NOT NULL,
+            category_path VARCHAR(512) DEFAULT '' NOT NULL,
+            english_title VARCHAR(512) DEFAULT '' NOT NULL,
+            english_source VARCHAR(24) DEFAULT '' NOT NULL,
+            status VARCHAR(24) DEFAULT 'pending' NOT NULL,
+            last_synced_at DATETIME,
+            created_at DATETIME NOT NULL,
+            UNIQUE (rule_id, source_dir_id)
+        )
+    """))
+    conn.execute(text("""
+        INSERT INTO mirror_media_new
+        (id, rule_id, work_key, title_standard, title_mirror, tmdb_id, media_type,
+         source_dir_id, target_dir_id, category_path, english_title, english_source,
+         status, last_synced_at, created_at)
+        SELECT id, rule_id, work_key, title_standard, title_mirror, tmdb_id, media_type,
+               source_dir_id, target_dir_id, category_path, english_title, english_source,
+               status, last_synced_at, created_at
+        FROM mirror_media
+    """))
+    conn.execute(text("DROP TABLE mirror_media"))
+    conn.execute(text("ALTER TABLE mirror_media_new RENAME TO mirror_media"))
+    conn.execute(text("CREATE INDEX ix_mirror_media_work_key ON mirror_media (work_key)"))
+    conn.execute(text("CREATE INDEX ix_mirror_media_rule_id ON mirror_media (rule_id)"))
+    logger.info("[db] mirror_media 唯一身份迁移完成：%s 行（(rule_id, work_key) → (rule_id, source_dir_id)）", total)
+    return total
+
+
+def _migrate_mirror_media_unique_by_source() -> int:
+    """v2.1.64：非 SQLite 跳过；任何异常整笔回滚、旧表保留、不阻断启动。"""
+    if not _IS_SQLITE:
+        return 0
+    try:
+        with engine.begin() as conn:
+            return _rebuild_mirror_media_unique(conn)
+    except Exception as exc:
+        logger.exception("[db] mirror_media 唯一身份迁移失败（已回滚，旧表原样保留）：%s", exc)
+        return 0
+
+
 def migrate() -> None:
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
@@ -889,6 +979,11 @@ def migrate() -> None:
             if name not in existing:
                 with engine.begin() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+    # v2.1.64：create_all 只建新表、不改老表约束；老库在这里重建唯一身份。
+    # 必须在列补齐（上面的 ALTER 循环）之后、任何同步/写入之前——重建 SELECT
+    # 引用了 category_path/english_title 等列，缺列时先重建会失败；放到 ALTER
+    # 后则保证列齐全。重建后这些列已在，ALTER 循环不会重复加。
+    _migrate_mirror_media_unique_by_source()
     # Bot token 存量明文由 security.decrypt_secret 读取时兼容，写入时自动加密。
     # 默认模板只建一次；若仍是 v0.5.x 原版且用户没改过，自动升级到带标签的新版。
     from .models import AppConfig, MessageTemplate, utcnow

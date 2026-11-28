@@ -669,10 +669,13 @@ def test_works_with_pending_files_collects_retryable_works(env):
         db.add(r)
         db.commit()
 
+        # v2.1.64：唯一身份 (rule_id, source_dir_id)，夹具给各自源目录 id。
         m1 = MirrorMedia(rule_id=r.id, work_key="work:待重试剧",
-                         title_standard="待重试剧", media_type="tv")
+                         title_standard="待重试剧", media_type="tv",
+                         source_dir_id="A-待重试剧")
         m2 = MirrorMedia(rule_id=r.id, work_key="work:已同步剧",
-                         title_standard="已同步剧", media_type="tv")
+                         title_standard="已同步剧", media_type="tv",
+                         source_dir_id="A-已同步剧")
         db.add(m1)
         db.add(m2)
         db.commit()

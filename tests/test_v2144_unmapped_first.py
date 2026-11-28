@@ -218,7 +218,10 @@ def test_empty_works_is_safe():
 # ===========================================================================
 
 def test_sync_rule_passes_mapped_keys_into_batch():
-    assert "hard_max=max_media, mapped_keys=mapped_keys)" in MIRROR_SRC
+    # v2.1.64：调用行新增 mapped_source_ids=mapped_source_ids（身份按 source_dir_id），
+    # 但 mapped_keys 仍传入（兼容未传 source ids 的降级路径）。
+    assert ("hard_max=max_media, mapped_keys=mapped_keys,\n"
+            "            mapped_source_ids=mapped_source_ids)" in MIRROR_SRC)
 
 
 def test_no_side_batch_anymore():
