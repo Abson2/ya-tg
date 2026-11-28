@@ -234,9 +234,9 @@ def test_source_counts_broken_dirs_into_stats():
 
 def test_version_is_current_everywhere():
     """版本锁：用例名不带死版本号，否则下一版又要改名字（v2.1.47 踩过）。"""
-    assert 'version="2.1.57"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
-    assert "v2.1.57 · Asia/Shanghai" in (ROOT / "frontend/src/App.vue").read_text(
+    assert 'version="2.1.58"' in (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
+    assert "v2.1.58 · Asia/Shanghai" in (ROOT / "frontend/src/App.vue").read_text(
         encoding="utf-8")
     assert json.loads((ROOT / "frontend/package.json").read_text(
-        encoding="utf-8"))["version"] == "2.1.57"
-    assert "当前版本：v2.1.57" in (ROOT / "README.md").read_text(encoding="utf-8")
+        encoding="utf-8"))["version"] == "2.1.58"
+    assert "当前版本：v2.1.58" in (ROOT / "README.md").read_text(encoding="utf-8")

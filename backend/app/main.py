@@ -1200,7 +1200,7 @@ async def lifespan(app: FastAPI):
         logger.warning("[bot] 退出时轮询状态落库失败（不影响停止）：%s", exc)
 
 
-app = FastAPI(title="Ya-TG", version="2.1.57", lifespan=lifespan)
+app = FastAPI(title="Ya-TG", version="2.1.58", lifespan=lifespan)
 ADMIN = [Depends(check_admin)]
 # 分享中心 v2：所有端点走后台会话鉴权；前端只做管理入口。
 app.include_router(share_center_v2.router, prefix="/api/sc", dependencies=ADMIN)
@@ -1211,7 +1211,7 @@ app.include_router(tg_stats_api.router, prefix="/api/sc", dependencies=ADMIN)
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.57", "app": "Ya-TG"}
+    return {"ok": True, "timezone": "Asia/Shanghai", "version": "2.1.58", "app": "Ya-TG"}
 
 
 @app.exception_handler(PoolTimeoutError)
@@ -4940,7 +4940,13 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
                 "source_title": src_title,
                 "source_tmdb_id": src_tmdb,
                 "source_media_type": src_type,
-                "identify_status": x.identify_status,
+                # v2.1.58（真机：浴血红颜 48 集 / 大宅门 72 集）：作品级识别状态
+                # **不再照抄首行**。首行是「最新入库那一集」的语义，那一集恰好 failed，
+                # 整部剧就被前端「待识别」tab（`identify_status !== 'identified'`）收进去，
+                # 明明 40/48 集已识别也显示成识别失败。判据改成「组内任一成员 identified
+                # 即算已识别」，在下面的成员循环里收口（见 `_identify_rank`）。
+                # 一个都没识别时保留首个非识别成功成员的状态，供卡片角标显示失败原因。
+                "identify_status": "",
                 "share_url": "",
                 "share_status": "not_created",
                 "share_duration": 0,
@@ -4979,8 +4985,15 @@ def library_series(q: str = "", media_type: str = "", finish: str = "",
             g["media_type"] = x.media_type
         if x.identify_status == "identified":
             g["identified_count"] += 1
+            # v2.1.58：作品级判据——任一成员识别成功即为「已识别」，且**粘住**，
+            # 不会被后续 failed 成员覆盖（组内顺序按 id，最新入库那集通常在后）。
+            g["identify_status"] = "identified"
         else:
             g["unidentified_count"] += 1
+            # 还没出现过 identified 时，留第一个失败成员的状态做展示口径；
+            # 一旦已 identified 就保持 identified（下面这个 if 自然挡住覆盖）。
+            if not g["identify_status"]:
+                g["identify_status"] = x.identify_status or ""
         if x.poster_path and not g["poster_path"]:
             g["poster_path"] = x.poster_path
         if x.overview and not g["overview"]:

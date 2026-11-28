@@ -1484,10 +1484,19 @@ function forceSessionExpired(reason) {
     setTimeout(() => { _expiryNotified = false }, 1500)
   }
 }
-async function api(path, opt = {}, timeoutMs = 0) {
+// v2.1.58（真机：刷新偶发永久卡在「正在恢复会话…」）：单请求默认超时。
+// 此前 `timeoutMs = 0` 表示**不设超时**，而 `load()` 是 23 个请求的
+// `Promise.allSettled`——只要有一个请求 pending 不返回（连接池被长任务占住时就会），
+// `allSettled` 永不落定 → `onMounted` 的 `await load()` 永不返回 → `authed` 停在
+// `null` → 页面永久骨架屏。日志里全是 200 也符合这个症状：没完成的请求不留完成日志。
+// 现在默认 30 秒，超时即失败，页面能落定；长任务照旧在调用点显式放宽
+// （`/mirror/run`、`/mirror/rename` 300s，`/mirror/tasks/poll`、`/library/finish-check` 120s）。
+const API_TIMEOUT_MS = 30000
+async function api(path, opt = {}, timeoutMs = API_TIMEOUT_MS) {
   // v0.7.1：全量重扫可能耗时数分钟，允许单独放宽超时（AbortSignal 不影响其它请求）
-  const ctl = timeoutMs ? new AbortController() : null
-  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null
+  const _ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : 0
+  const ctl = _ms ? new AbortController() : null
+  const timer = ctl ? setTimeout(() => ctl.abort(), _ms) : null
   try {
     const r = await fetch('/api' + path, { ...opt, ...(ctl ? { signal: ctl.signal } : {}),
       headers: { ...headers(), ...(opt.headers || {}) } })
@@ -1503,9 +1512,22 @@ async function api(path, opt = {}, timeoutMs = 0) {
     }
     return d
   } catch (e) {
-    if (ctl && ctl.signal.aborted) throw Error('扫描仍在进行中，请稍后刷新资源库查看结果')
+    // v2.1.58：超时与被后台中止分开报。原来的「扫描仍在进行中」是扫描专用口径，
+    // 加了默认超时后所有接口都会走到这里，再套用那句话会误导排查。
+    if (ctl && ctl.signal.aborted) throw Error(`请求超时（${Math.round(_ms / 1000)} 秒未返回）：${path}`)
     throw e
   } finally { if (timer) clearTimeout(timer) }
+}
+// v2.1.58：启动总闸——`load()` 再慢也不许把页面钉在骨架屏上。
+// 与 api() 的默认超时是两道独立保险：api() 管单个请求，这里管整批（23 个请求
+// 即使每个都在 30 秒内回来，串行尾巴也可能拖很久）。
+const BOOT_TIMEOUT_MS = 12000
+function withTimeout(p, ms, label = '加载') {
+  let t = null
+  const guard = new Promise((_, rej) => {
+    t = setTimeout(() => rej(Error(`${label}超时（${Math.round(ms / 1000)} 秒未返回）`)), ms)
+  })
+  return Promise.race([p, guard]).finally(() => clearTimeout(t))
 }
 async function load() {
   // 阶段三 D-07：无依赖的纯 GET 并行拉取（Promise.allSettled，单个失败不影响其它）。
@@ -1564,9 +1586,13 @@ async function load() {
   // 内部有依赖的函数保持原顺序（不再与上面的 GET 混排）
   try { await loadTgExtra() } catch (e) {}
   try { await loadPushStats() } catch (e) {}
-  await loadAuth()
-  await loadTmdb()
-  await loadAi()
+  // v2.1.58：这三个此前是**裸 await**，前面 loadSc/loadTgExtra/loadPushStats 都有
+  // try/catch 兜底，唯独它们会往外抛。虽然启动失败已由 onMounted 的兜底接住，
+  // 但同一个加载流程两种口径本身是隐患（抛错会把整个 load 重跑一遍的人都带沟里），
+  // 统一按「单个模块失败不影响主界面」的既有约定收口。
+  try { await loadAuth() } catch (e) {}
+  try { await loadTmdb() } catch (e) {}
+  try { await loadAi() } catch (e) {}
 }
 async function loadLogs() {
   try {
@@ -3765,11 +3791,18 @@ onMounted(async () => {
   // v2.1.29：三态落定——成功 true、失败**必须显式**落 false，
   // 否则 `null` 会一直停在骨架屏（旧布尔版靠初值 false 兜底，改三态后必须自己收口）。
   if (sessionToken.value) {
-    try { await load(); authed.value = true }
-    catch (e) {
-      sessionToken.value = ''; localStorage.removeItem(SESSION_KEY)
-      authed.value = false
-    }
+    // v2.1.58：`load()` 各模块自带兜底后本身不再抛，这里再压一道总超时。
+    // 落定规则：**只有会话真的失效才回登录页**——那条路径由 api() 里的 401 →
+    // forceSessionExpired 负责（会清 token 并把 authed 落 false）。超时/断网
+    // 不等于会话失效，此时进主界面让数据自己补；绝不再把有效会话踢成登录页，
+    // 也绝不永久停在 null（就是「永远正在恢复会话」那个坑）。
+    const loadP = load().catch(e => { console.warn('[boot] 首次加载未完成', e) })
+    try { await withTimeout(loadP, BOOT_TIMEOUT_MS, '首次加载') }
+    catch (e) { console.warn('[boot] 首次加载超时，先放行到主界面', e) }
+    // 落定：token 还在 → 进主界面（数据可能没加载全，让轮询慢慢补）；
+    // token 已被 401 那条路清掉 → 回登录页。两种都必须**显式**落，不许停在 null。
+    if (sessionToken.value) authed.value = true
+    else authed.value = false
   }
   // 会话状态 30s 轮询一次（只读，不刷新活跃时间），剩余时间到期由服务端 401 强制退出
   sessionPollTimer = setInterval(pollSession, 30000)
@@ -3820,7 +3853,7 @@ onUnmounted(() => { clearInterval(clockTimer); clearInterval(webqrTimer); clearT
       <div class="sidebar-foot">
         <div class="foot-status"><span class="dot" :class="overview.auth === 'ok' ? 'on' : 'off'"></span>{{ overview.auth === 'ok' ? '光鸭已授权' : '光鸭未授权' }}</div>
         <div class="foot-version">
-          <span>v2.1.57 · Asia/Shanghai</span>
+          <span>v2.1.58 · Asia/Shanghai</span>
           <a class="foot-gh" href="https://github.com/Abson2/ya-tg" target="_blank" rel="noopener noreferrer" title="在 GitHub 查看 Ya-TG 开源项目">GitHub</a>
         </div>
       </div>
